@@ -3,6 +3,7 @@ import CoreFoundation
 
 /// PushKit display data is untrusted. Media/action authorization still comes from the authenticated API.
 struct NuwaxVoipPushInvitation {
+    let scene: String
     let callId: String
     let calleeId: String
     let expiresAt: Double
@@ -10,6 +11,10 @@ struct NuwaxVoipPushInvitation {
     let displayName: String
     let convId: String?
     let msgId: String?
+    /// Meeting-only fields. They never authorize media; they only locate the invite.
+    let inviteId: String?
+    let roomName: String?
+    let title: String?
 
     init?(_ raw: [AnyHashable: Any], userId: String, business: Bool, now: Double, requiredRegistrationId: String? = nil) {
         var payload = raw
@@ -21,7 +26,10 @@ struct NuwaxVoipPushInvitation {
         }
         if let requiredRegistrationId,
            requiredRegistrationId.isEmpty || payload["routeRegistrationId"] as? String != requiredRegistrationId { return nil }
-        guard let id = payload["callId"] as? String,
+        let scene = payload["scene"] as? String ?? "call"
+        guard scene == "call" || scene == "meeting" else { return nil }
+        let rawCallId = payload["callId"] as? String ?? (scene == "meeting" ? payload["inviteId"] as? String : nil)
+        guard let id = rawCallId,
               id.range(of: "^[A-Za-z0-9_-]{1,128}\\z", options: .regularExpression) != nil,
               !userId.isEmpty, let callee = payload["calleeId"] as? String, callee == userId,
               let expiry = payload["expiresAt"] as? NSNumber, CFGetTypeID(expiry) != CFBooleanGetTypeID(),
@@ -31,17 +39,52 @@ struct NuwaxVoipPushInvitation {
         // Transport int64 IDs as strings. Reject numbers that may already have been rounded by a sender.
         let conv = Self.locator(payload["convId"]), msg = Self.locator(payload["msgId"])
         guard !business || (conv != nil && msg != nil && payload["type"] as? String == "voip") else { return nil }
+        var invite: String?
+        var room: String?
+        var meetingTitle: String?
+        if scene == "meeting" {
+            guard let value = payload["inviteId"] as? String,
+                  value.range(of: "^[A-Za-z0-9._-]{1,128}\\z", options: .regularExpression) != nil,
+                  let roomValue = payload["roomName"] as? String,
+                  roomValue.range(of: "^[A-Za-z0-9._-]{1,128}\\z", options: .regularExpression) != nil,
+                  let titleValue = payload["title"] as? String, !titleValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+            invite = value; room = roomValue; meetingTitle = titleValue
+        }
+        self.scene = scene
         callId = id; calleeId = callee; expiresAt = expiry.doubleValue; mediaType = media
         convId = conv; msgId = msg
+        inviteId = invite; roomName = room; title = meetingTitle
         let name = (payload["displayName"] as? String ?? "Nuwax").trimmingCharacters(in: .whitespacesAndNewlines)
         displayName = name.isEmpty ? "Nuwax" : String(name.prefix(80))
     }
 
-    var report: [AnyHashable: Any] { ["callId": callId, "displayName": displayName, "mediaType": mediaType] }
+    var report: [AnyHashable: Any] {
+        // The system UI shows the meeting title for meeting invites, the caller for calls.
+        let label = scene == "meeting" ? (title ?? displayName) : displayName
+        return ["callId": callId, "displayName": label, "mediaType": mediaType, "scene": scene]
+    }
 
     func matches(_ message: [String: Any], now: Double) -> Bool {
+        scene == "meeting" ? matchesMeeting(message, now: now) : matchesCall(message, now: now)
+    }
+
+    private func matchesCall(_ message: [String: Any], now: Double) -> Bool {
         guard let body = message["body"] as? [String: Any], body["callId"] as? String == callId,
               body["mediaType"] as? String == mediaType, message["msgType"] as? String == "voip",
+              Self.responseId(message["convId"]) == convId, Self.responseId(message["msgId"]) == msgId,
+              let sent = message["sendTime"] as? NSNumber else { return false }
+        return expiresAt > now && sent.doubleValue > 0 && sent.doubleValue <= now + 5_000
+            && sent.doubleValue + 60_000 > now && expiresAt <= sent.doubleValue + 60_000
+    }
+
+    /// Meeting invites are ordinary `meeting_invite` messages; the push is only a locator.
+    private func matchesMeeting(_ message: [String: Any], now: Double) -> Bool {
+        guard let body = message["body"] as? [String: Any],
+              message["msgType"] as? String == "meeting_invite",
+              (message["senderType"] as? Int ?? 1) == 1, (message["msgStatus"] as? Int ?? 1) == 1,
+              let expectedInvite = inviteId, body["inviteId"] as? String == expectedInvite,
+              let expectedRoom = roomName, body["roomName"] as? String == expectedRoom,
               Self.responseId(message["convId"]) == convId, Self.responseId(message["msgId"]) == msgId,
               let sent = message["sendTime"] as? NSNumber else { return false }
         return expiresAt > now && sent.doubleValue > 0 && sent.doubleValue <= now + 5_000

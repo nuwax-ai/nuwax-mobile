@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto')
-const { prepareVoip, prepareNativeVoip, prepareVoipScene } = require('./voip')
+const { prepareVoip, prepareNativeVoip, prepareVoipScene, prepareMeetingRingInvitation } = require('./voip')
 const { callTargetCids, loadDeviceRoutes, routeForCid } = require('./device-routes')
 
 const APP_ID = '__UNI__8BF05E4'          // 本项目的 DCloud AppID
@@ -278,19 +278,40 @@ function callTransportEnabled(route) {
 }
 
 async function sendNativeVoip(body, route, nativeVoip) {
-  const nativeOptions = mergeOptions(nativeVoip.options, buildChannelOptions(body.channelId))
+  const android = route.platform === 'android'
+  if (android && typeof uniPush.request !== 'function') {
+    return { errCode: 503, errMsg: 'UniPush transmission adapter unavailable', data: { requestId: nativeVoip.requestId } }
+  }
   try {
-    const result = await uniPush.sendMessage({
-      push_clientid: [route.cid],
-      title: clip(body.title, MAX_TITLE),
-      content: clip(body.content, MAX_CONTENT),
-      payload: nativeVoip.payload,
-      settings: nativeVoip.settings,
-      category: CALL_CATEGORY,
-      force_notification: false,
-      request_id: nativeVoip.requestId,
-      ...(nativeOptions ? { options: nativeOptions } : {})
-    })
+    let result
+    if (android) {
+      const transmission = JSON.stringify({ unipush_version: '2.0', payload: nativeVoip.payload })
+      // sendMessage builds ups.notification even when force_notification is false.
+      result = await uniPush.request({
+        method: 'POST',
+        module: '/push/single/cid',
+        requestData: {
+          request_id: nativeVoip.requestId,
+          audience: { cid: [route.cid] },
+          settings: nativeVoip.settings,
+          push_message: { transmission },
+          push_channel: { android: { ups: { transmission } } }
+        }
+      })
+    } else {
+      const nativeOptions = mergeOptions(nativeVoip.options, buildChannelOptions(body.channelId))
+      result = await uniPush.sendMessage({
+        push_clientid: [route.cid],
+        title: clip(body.title, MAX_TITLE),
+        content: clip(body.content, MAX_CONTENT),
+        payload: nativeVoip.payload,
+        settings: nativeVoip.settings,
+        category: CALL_CATEGORY,
+        force_notification: false,
+        request_id: nativeVoip.requestId,
+        ...(nativeOptions ? { options: nativeOptions } : {})
+      })
+    }
     const errCode = result?.errCode ?? -1
     const details = result?.data && typeof result.data === 'object'
       ? Object.entries(result.data).filter(([key, value]) =>
@@ -309,7 +330,7 @@ async function sendNativeVoip(body, route, nativeVoip) {
   }
 }
 
-async function sendCallToDevice(body, invitation, cid, binding) {
+async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting) {
   const { calleeId, callId, expiresAt } = invitation.payload
   const result = { clientid: cid }
   if (binding && (binding.active !== true || binding.appId !== APP_ID || binding.calleeId !== calleeId)) {
@@ -324,20 +345,23 @@ async function sendCallToDevice(body, invitation, cid, binding) {
     const nativeVoip = prepareNativeVoip({ ...body, push_clientid: cid, payload: invitation.payload, callRoute: route }, now)
     if (!nativeVoip.error && callTransportEnabled(route)) {
       const sent = await sendNativeVoip(body, route, nativeVoip)
-      return { ...result, errCode: sent.errCode, delivery: 'native', transport: route.transport, ...sent.data }
+      return { ...result, errCode: sent.errCode, errMsg: sent.errMsg, delivery: 'native', transport: route.transport, ...sent.data }
     }
   }
 
-  const notice = prepareVoip({ ...body, payload: invitation.payload }, now)
   // Each fallback has its own provider request ID, even if IM supplied a batch ID.
   const requestId = crypto.createHash('sha256')
     .update(JSON.stringify(['voip-notification', cid, callId]))
     .digest('hex').slice(0, 32)
-  const sent = await sendOrdinaryPush({ ...body, request_id: requestId }, [cid], notice, null, true)
+  const sent = fallbackMeeting != null
+    // 会议响铃的原生通道不可用时，回退普通 IM 通知（保留会议邀请卡片），不占用 VOIP 分类。
+    ? await sendOrdinaryPush({ ...body, request_id: requestId }, [cid], null, fallbackMeeting, false)
+    : await sendOrdinaryPush({ ...body, request_id: requestId }, [cid],
+      prepareVoip({ ...body, payload: invitation.payload }, now), null, true)
   return { ...result, errCode: sent.data.results[0]?.errCode ?? -1, delivery: 'notification', requestId }
 }
 
-async function sendRegisteredCalls(body, ids, invitation) {
+async function sendRegisteredCalls(body, ids, invitation, fallbackMeeting) {
   let bindings
   try {
     bindings = await loadDeviceRoutes(uniCloud.database(), ids)
@@ -350,7 +374,8 @@ async function sendRegisteredCalls(body, ids, invitation) {
   const concurrency = 8
   for (let i = 0; i < ids.length; i += concurrency) {
     const chunk = ids.slice(i, i + concurrency)
-    results.push(...await Promise.all(chunk.map(cid => sendCallToDevice(body, invitation, cid, bindings.get(cid)))))
+    results.push(...await Promise.all(chunk.map(cid =>
+      sendCallToDevice(body, invitation, cid, bindings.get(cid), fallbackMeeting))))
   }
   const failed = results.find(entry => entry.errCode !== 0)
   return {
@@ -384,26 +409,33 @@ exports.main = async (event) => {
   if (scene?.meeting && JSON.stringify(scene.meeting).length > MAX_PAYLOAD) {
     return { errCode: 400, errMsg: 'meeting invitation payload too large' }
   }
-  // 会议邀请永远走普通 IM 通道；通话带 callRoute 时优先单设备原生投递。
-  // ★scene="call" 下 callRoute 只是增强：设备路由不完整时回退普通 VOIP 通知，
-  //   不能因为多设备或平台不匹配把整条通话邀请拒掉。
-  const nativeAttempt = scene?.meeting ? null : prepareNativeVoip(body)
-  const nativeVoip = nativeAttempt?.error && scene?.call ? null : nativeAttempt
+  // 会议响铃：走原生来电通道（PushKit / 全屏 Intent / 前台服务），让熄屏和进程被杀时
+  // 也能亮屏、响铃并出现来电卡片。端上原生能力就绪前用环境变量关闭，保持普通 IM 通知。
+  // silent=true 的群卡片、以及没有 callRoute/设备路由来源的请求，一律不响铃。
+  const lookupRoutes = process.env.NUWAX_VOIP_DEVICE_ROUTE_LOOKUP === '1'
+  const meetingRinging = scene?.meeting != null &&
+    body.payload?.silent !== true &&
+    process.env.NUWAX_VOIP_MEETING_RING === '1' &&
+    (body.callRoute != null || lookupRoutes)
+  const strictCids = scene?.call != null || meetingRinging
+  // 通话/会议响铃开启 CID 查询时，以设备登记绑定为准，忽略调用方的 callRoute。
+  const useDeviceRoutes = strictCids && lookupRoutes
+  const nativeAttempt = (scene?.meeting && !meetingRinging) || useDeviceRoutes ? null : prepareNativeVoip(body)
+  const nativeVoip = nativeAttempt?.error && strictCids ? null : nativeAttempt
   if (nativeVoip) {
     if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
     if (nativeVoip.expired) return { errCode: 0, data: { skipped: true } }
     if (!body.title || !body.content) return { errCode: 400, errMsg: 'title/content required' }
     const route = body.callRoute
     if (!callTransportEnabled(route)) {
-      // scene="call" 的 callRoute 只是增强：通道没配好时回退下面的普通 VOIP 通知，
-      // 不能因为原生通道未启用把整条通话邀请拒掉（无 scene 的定向请求仍 fail-closed）。
-      if (!scene?.call) return { errCode: 503, errMsg: 'call transport unavailable' }
+      // 定向原生请求（无 scene/call）仍 fail-closed；通话/会议回退普通通知。
+      if (!strictCids) return { errCode: 503, errMsg: 'call transport unavailable' }
     } else {
       return sendNativeVoip(body, route, nativeVoip)
     }
   }
 
-  const ids = scene?.call
+  const ids = strictCids
     ? callTargetCids(body.push_clientid)
     : Array.isArray(body.push_clientid) ? body.push_clientid : [body.push_clientid]
   if (!ids?.length || !ids[0]) return { errCode: 400, errMsg: 'push_clientid required' }
@@ -413,8 +445,16 @@ exports.main = async (event) => {
   if (voip && voip.error) return { errCode: 400, errMsg: voip.error }
   if (voip && voip.expired) return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
 
-  if (scene?.call && process.env.NUWAX_VOIP_DEVICE_ROUTE_LOOKUP === '1') {
-    return sendRegisteredCalls(body, ids, scene.call)
+  if (useDeviceRoutes) {
+    if (meetingRinging) {
+      const ringInvitation = prepareMeetingRingInvitation(body)
+      if (ringInvitation.error) return { errCode: 400, errMsg: ringInvitation.error }
+      if (ringInvitation.expired) {
+        return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
+      }
+      return sendRegisteredCalls(body, ids, ringInvitation, scene.meeting)
+    }
+    return sendRegisteredCalls(body, ids, scene.call, null)
   }
   return sendOrdinaryPush(body, ids, voip, scene?.meeting, scene?.call != null)
 }

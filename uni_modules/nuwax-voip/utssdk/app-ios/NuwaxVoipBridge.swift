@@ -38,6 +38,10 @@ import LiveKit
     private var callUUIDs: [String: UUID] = [:]
     private struct PendingPush { let invitation: NuwaxVoipPushInvitation; var declined = false }
     private var pendingPushes: [UUID: PendingPush] = [:]
+    /// Meeting ringing is a locator only: it never enters the 1:1 snapshot state machine.
+    private var meetingPushUUIDs = Set<UUID>()
+    private var meetingValidatedUUIDs = Set<UUID>()
+    private var meetingInvites: [UUID: NuwaxVoipPushInvitation] = [:]
     private var pendingPushExpiry: [UUID: Task<Void, Never>] = [:]
     private var pushWork: [UUID: NuwaxVoipPushWork] = [:]
     private var pushRegistration: NuwaxVoipApnsRegistration?
@@ -124,10 +128,17 @@ import LiveKit
         emit("snapshot", ["snapshot": value, "nativeIncomingUI": nativeIncoming])
     }
     fileprivate func systemIncomingReady(_ uuid: UUID) {
+        // Meeting invites have no business snapshot; they open the meeting page from the
+        // accepted/rejected events instead.
+        if meetingPushUUIDs.contains(uuid) { trace("meeting incoming ready"); return }
         guard validatedSystemUUID(uuid), let value = snapshot else { return }
         emitSnapshot(value)
     }
     fileprivate func systemIncomingFailed(_ uuid: UUID, error: Error) {
+        if meetingPushUUIDs.contains(uuid) {
+            clearMeeting(uuid)
+            return
+        }
         guard validatedSystemUUID(uuid) else { return }
         let failure = NuwaxVoipIncomingFailure(error)
         emit("error", ["code": failure.code]); finish(failure.reason)
@@ -749,6 +760,7 @@ import LiveKit
         getuiBindingTask?.cancel(); getuiBindingTask = nil; getuiBinding = nil
         for work in Array(pushWork.values) { work.cancel() }; pushWork = [:]
         for task in pendingPushExpiry.values { task.cancel() }; pendingPushExpiry = [:]; pendingPushes = [:]
+        meetingPushUUIDs.removeAll(); meetingValidatedUUIDs.removeAll(); meetingInvites.removeAll()
         pushRegistry?.desiredPushTypes = []; pushRegistry = nil
         if #available(iOS 17.4, *), let system = systemBridge as? NuwaxSystemCalls { system.invalidate() }
         systemBridge = nil; configuration = [:]; events = []; terminal = []; terminalOrder = []; callUUIDs = [:]
@@ -765,7 +777,19 @@ import LiveKit
         pendingPushExpiry[uuid] = Task { @MainActor in
             let wait = max(0, invitation.expiresAt - Date().timeIntervalSince1970 * 1000)
             do { try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000)) } catch { return }
-            guard run == self.generation, self.pendingPushes[uuid] != nil, !self.validatedSystemUUID(uuid) else { return }
+            guard run == self.generation else { return }
+            // Meeting invites leave pendingPushes after validation; keep the ringing
+            // window alive through meetingInvites and close it with a timeout event.
+            if self.meetingInvites[uuid] != nil {
+                self.clearMeeting(uuid)
+                self.emit("meetingInvite", ["action": "timeout", "callId": invitation.callId,
+                    "inviteId": invitation.inviteId ?? "", "roomName": invitation.roomName ?? "",
+                    "title": invitation.title ?? "", "mediaType": invitation.mediaType,
+                    "convId": invitation.convId ?? "", "msgId": invitation.msgId ?? ""])
+                if #available(iOS 17.4, *), let system = self.systemBridge as? NuwaxSystemCalls { system.end(uuid: uuid) }
+                return
+            }
+            guard self.pendingPushes[uuid] != nil, !self.validatedSystemUUID(uuid) else { return }
             self.rememberTerminal(invitation.callId)
             self.removePendingPush(uuid)
             if #available(iOS 17.4, *), let system = self.systemBridge as? NuwaxSystemCalls { system.end(uuid: uuid) }
@@ -773,12 +797,44 @@ import LiveKit
     }
     fileprivate func uuid(_ id: String) -> UUID { if let existing = callUUIDs[id] { return existing }; let result = UUID(); callUUIDs[id] = result; if !configuration.isEmpty { persist() }; return result }
     fileprivate func ownsSystemUUID(_ uuid: UUID) -> Bool {
-        validatedSystemUUID(uuid) || (pendingPushes[uuid] != nil && pendingPushes[uuid]?.declined == false)
+        meetingPushUUIDs.contains(uuid) || validatedSystemUUID(uuid) || (pendingPushes[uuid] != nil && pendingPushes[uuid]?.declined == false)
     }
     fileprivate func validatedSystemUUID(_ uuid: UUID) -> Bool {
+        // Meeting presence alone is not validation: only a verified meeting_invite message
+        // may enter the meeting flow. Ownership is tracked separately for system actions.
+        if meetingPushUUIDs.contains(uuid) { return meetingValidatedUUIDs.contains(uuid) }
         guard let id = snapshot?["callId"] as? String else { return false }; return callUUIDs[id] == uuid
     }
+    fileprivate func isMeetingSystemCall(_ uuid: UUID) -> Bool { meetingInvites[uuid] != nil }
+
+    private func clearMeeting(_ uuid: UUID) {
+        meetingPushUUIDs.remove(uuid)
+        meetingValidatedUUIDs.remove(uuid)
+        meetingInvites.removeValue(forKey: uuid)
+    }
+
+    /// Meeting answer/reject never enters the 1:1 call state machine. The JS layer
+    /// opens the meeting room or reports `meeting-invite-handled`.
+    fileprivate func meetingAccepted(_ uuid: UUID) {
+        guard let invitation = meetingInvites[uuid] else { return }
+        clearMeeting(uuid)
+        emit("meetingInvite", ["action": "accept", "callId": invitation.callId,
+            "inviteId": invitation.inviteId ?? "", "roomName": invitation.roomName ?? "",
+            "title": invitation.title ?? "", "mediaType": invitation.mediaType,
+            "convId": invitation.convId ?? "", "msgId": invitation.msgId ?? ""])
+        if #available(iOS 17.4, *), let system = systemBridge as? NuwaxSystemCalls { system.end(uuid: uuid) }
+    }
+
     fileprivate func endSystemCall(_ uuid: UUID) {
+        if let invitation = meetingInvites[uuid] {
+            clearMeeting(uuid)
+            emit("meetingInvite", ["action": "reject", "callId": invitation.callId,
+                "inviteId": invitation.inviteId ?? "", "roomName": invitation.roomName ?? "",
+                "title": invitation.title ?? "", "mediaType": invitation.mediaType,
+                "convId": invitation.convId ?? "", "msgId": invitation.msgId ?? ""])
+            if #available(iOS 17.4, *), let system = systemBridge as? NuwaxSystemCalls { system.end(uuid: uuid) }
+            return
+        }
         if var pending = pendingPushes[uuid], !validatedSystemUUID(uuid) {
             pending.declined = true; pendingPushes[uuid] = pending; rememberTerminal(pending.invitation.callId)
             if #available(iOS 17.4, *), let system = systemBridge as? NuwaxSystemCalls { system.end(uuid: uuid) }
@@ -790,6 +846,7 @@ import LiveKit
     fileprivate func systemReset() {
         for pending in pendingPushes.values { rememberTerminal(pending.invitation.callId) }
         for task in pendingPushExpiry.values { task.cancel() }; pendingPushExpiry = [:]; pendingPushes = [:]
+        meetingPushUUIDs.removeAll(); meetingValidatedUUIDs.removeAll(); meetingInvites.removeAll()
         finish("systemReset")
     }
     fileprivate func ownsSystemManager(_ manager: AnyObject) -> Bool { systemBridge === manager }
@@ -1081,6 +1138,12 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
                 pendingPushes[systemUUID] = PendingPush(invitation: invitation)
                 expirePendingPush(systemUUID, invitation: invitation)
             }
+            // Mark the meeting UUID before report so an early answer still routes to the
+            // meeting flow instead of the 1:1 call state machine.
+            if let invitation, invitation.scene == "meeting", snapshot == nil, !terminal.contains(invitation.callId) {
+                meetingPushUUIDs.insert(systemUUID)
+                meetingInvites[systemUUID] = invitation
+            }
             let workID = UUID()
             var backgroundID = UIBackgroundTaskIdentifier.invalid
             let work = NuwaxVoipPushWork(finished: { [weak self] in
@@ -1138,6 +1201,33 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         if validatedSystemUUID(systemUUID) { removePendingPush(systemUUID); return }
         guard pendingPushes[systemUUID] != nil, !terminal.contains(invitation.callId) || pendingPushes[systemUUID]?.declined == true else { removePendingPush(systemUUID); endIfUnverified(); return }
         defer { if run == generation { removePendingPush(systemUUID) } }
+        if invitation.scene == "meeting" {
+            // Busy: keep the chat card only, never interrupt an active call.
+            guard snapshot == nil else { system.end(uuid: systemUUID); return }
+            do {
+                guard let conv = invitation.convId, let msg = invitation.msgId,
+                      let pending = pendingPushes[systemUUID] else {
+                    clearMeeting(systemUUID)
+                    endIfUnverified(); return
+                }
+                let message = try await request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true)
+                guard !Task.isCancelled, run == generation, route == requiredPushRegistration,
+                      invitation.matches(message, now: Date().timeIntervalSince1970 * 1000) else {
+                    clearMeeting(systemUUID)
+                    endIfUnverified(); return
+                }
+                if pending.declined {
+                    clearMeeting(systemUUID)
+                    system.end(uuid: systemUUID); return
+                }
+                meetingValidatedUUIDs.insert(systemUUID)
+                system.invitationReady(uuid: systemUUID)
+            } catch {
+                clearMeeting(systemUUID)
+                endIfUnverified()
+            }
+            return
+        }
         do {
             if business, let conv = invitation.convId, let msg = invitation.msgId {
                 let message = try await request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true)
@@ -1343,6 +1433,13 @@ private enum VoipError: Error { case invalid }
         guard owner?.ownsSystemManager(self) == true, owner?.validatedSystemUUID(uuid) == true,
               let join = joining[uuid], !registry.hasEnded(uuid), !answering.contains(uuid), !permissionRequests.contains(uuid) else { return }
         guard join.timeoutDate > Date() else { owner?.finish("permissionRequired"); return }
+        if owner?.isMeetingSystemCall(uuid) == true {
+            // Meeting answer opens the meeting page; it does not start a 1:1 call.
+            answering.insert(uuid); permissionWaiting.remove(uuid); answerModes.removeValue(forKey: uuid)
+            joining.removeValue(forKey: uuid)?.fulfill(dateConnected: Date())
+            owner?.meetingAccepted(uuid)
+            return
+        }
         let media = answerModes[uuid] ?? "audio"
         switch owner?.permissionPlan(media) {
         case .foreground: permissionWaiting.insert(uuid); owner?.permissionPending(); return

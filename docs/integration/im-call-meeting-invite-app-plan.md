@@ -227,17 +227,35 @@ outgoing/incoming ──单方取消──> ended(canceled)
 |---|---|---|
 | App 前台（WS 在线） | 3007 + 消息帧 | 来电页/邀请浮层，无系统通知 |
 | App 后台但进程存活 | 厂商通道 + 在线透传 | Android 系统通知；iOS 由端上补本地通知 |
-| App 无进程 | 普通通知或单聊 VoIP 原生来电通道 | 普通通知按点击路由处理。原生来电按 §5.2.2 的 `callRoute` 和 `payload.expiresAt` 验证系统来电 |
+| App 无进程 | 普通通知或单聊 VoIP 原生来电通道 | 普通通知按点击路由处理。原生来电按 §5.2.2 的 `payload` 校验被叫归属与过期时间 |
 | 鸿蒙退后台 | Push Kit | 系统通知；进程被冻结，点击后才恢复 |
 
 **必须做去重**：同一条消息可能同时经 WS 与推送到达，按 `msgId`（通话再叠 `callId`）只处理一次。
 
 ### 4.6 多设备
 
-- 邀请扇出到用户所有设备（服务端按 `sourceDeviceId` 排除发起端）。
-- 任一端接听 → `/answered` → 其余端停铃。
-- 任一端拒绝 → `/declined` → 其余端停铃。
-- 会议邀请同理，任一端加入/忽略 → `meeting-invite-handled`。
+**现有行为。** 单聊邀请按账号扇出，排除发起端。被叫入房后调用 `/calls/answered`，IM 用 3007 的 `voip:answered` 通知被叫账号停铃。任一端拒绝沿用 `/calls/declined`。会议邀请继续用 `meeting-invite-handled` 同步加入或忽略。
+
+**单聊 VoIP 补充场景（待评审，语音、视频共用）。** 当前原生来电联调继续按 §5.2.2 的字段与请求示例推进。接听仲裁和停铃补偿列在本节，供后端对齐。
+
+| 场景 | 沿用现有能力 | 需补齐的行为 |
+| --- | --- | --- |
+| 同账号一台在线，另一台锁屏或无进程 | 原 IM 消息扇出与设备登记，原生投递用 §5.2.2 | 邀请覆盖被叫账号在当前环境的所有有效设备，在线状态不能把某台设备排除在外。单台设备收到 WS 和推送时按同一 `callId` 去重 |
+| 退出登录、切换账号或环境 | 现有设备登记与下线机制 | 只投递当前账号和环境仍有效的设备绑定。旧账号发出的新来电不能再触达该设备 |
+| 两台设备同时接听 | 业务 `callId`、已登记的 `deviceId`、RTC 凭证接口 | 入房前由 IM 原子确认唯一接听设备，凭证签发检查接听权。失败设备停铃并提示「已在其他设备接听」。同一胜出设备因网络超时重试，返回同一接听结果 |
+| 其余设备暂时断线或停铃事件丢失 | 3007 `voip:answered`、`callId` 和 60 秒来电窗口 | 接听权确认后尽快通知其余设备关闭系统来电和通知。重连后对账，没收到事件也按 `expiresAt` 停铃。iOS 停铃走已有信令连接，PushKit 用于发起来电。[Apple PushKit 来电处理](https://developer.apple.com/documentation/pushkit/responding-to-voip-notifications-from-pushkit?changes=_6) |
+| 主叫取消、被叫拒绝或到期时恰好接听 | `/calls/ended`、`/calls/declined` 与现有事件 | 服务端用同一呼叫状态处理竞争。只有尚在响铃且未到期的呼叫可以提交接听，取消、拒绝或过期先成立时，后续接听不得入房 |
+
+#### 接听仲裁最小字段
+
+| 字段 | 用法 |
+| --- | --- |
+| `convId`、`msgId`、`callId` | 原样复用。前两项定位原邀请，`callId` 关联同一呼叫的多设备请求及事件 |
+| `deviceId` | 复用设备登记标识。优先从已鉴权的设备上下文取得，否则随接听请求带上并由 IM 校验归属 |
+| `answeredByDeviceId` | IM 需补记的接听结果，与呼叫状态原子更新。若 `voip:answered` 仍向整个被叫账号广播，事件可带此字段供接听设备识别自己 |
+| `already_answered` | 其他设备竞争失败的建议机器码，HTTP 状态与 IM 错误码由后端确认 |
+
+当前 `/calls/answered` 在入房后发事件，无法挡住同时入房。后端评审优先在现有 IM 和 RTC 链路补接听前校验，确认能否兼容扩展 `/calls/answered`，以及签发凭证时如何核对胜出设备。LiveKit 继续使用现有 `tenant:user:platform` identity，同平台重复入房会替换原连接，因此接听权要在签发前确认。[LiveKit 参与者身份](https://docs.livekit.io/intro/basics/rooms-participants-tracks/participants/)
 
 ---
 
@@ -283,7 +301,9 @@ for each 被邀请人:
 
 ##### 单聊 VoIP（语音与视频）
 
-IM → 云函数新增一个顶层对象 `callRoute`。现有 `payload` 补四个必传字段 `callId`、`mediaType`、`calleeId`、`expiresAt`，`displayName` 默认为可选展示字段。主叫继续以 `msgType="voip"` 和原邀请正文发消息。
+IM → 云函数的候选入口在信封顶层读取 `callRoute`。它由投递层为每台设备临时组装，用于进入原生投递分支并选择该设备的通道。没有该对象时走普通推送分支。被叫账号哪些设备收到邀请按 §4.6 决定。
+
+`callRoute.platform` 和 `callRoute.cid` 可复用现有设备登记的 `platform` 和 `pushToken`。Android 的 `transport` 还需要设备的厂商来电能力，仅有 `platform="android"` 无法区分华为安卓与荣耀；iOS 参数见下文。现有 `payload` 补四个必传字段 `callId`、`mediaType`、`calleeId`、`expiresAt`，`displayName` 默认为可选展示字段。主叫继续以 `msgType="voip"` 和原邀请正文发消息。
 
 下面把 §2.4 的同一条视频邀请发给一台华为安卓设备。语音使用相同格式，`mediaType` 取 `"audio"`。同一邀请发送多台设备时，每台设备各有一份请求，`callId` 和消息定位字段相同。
 
@@ -314,8 +334,8 @@ IM → 云函数新增一个顶层对象 `callRoute`。现有 `payload` 补四�
 | 变化 | 字段 | 格式与来源 |
 | --- | --- | --- |
 | 原样复用 | `payload.type`、`convType`、`convId`、`msgId` | `"voip"`、整数 `1`、会话和消息 ID 的十进制字符串。用 `convId + msgId` 回查原邀请。 |
-| 复用设备字段，原生入口改单设备 | `push_clientid`、`title`、`content` | `push_clientid` 用单个字符串，取服务端选中的被叫设备 CID，必须等于 `callRoute.cid`。`title`、`content` 保持字符串。 |
-| **新增顶层对象，原生来电必传** | `callRoute` | 后端从被叫设备登记组装。所有子字段均为字符串，`cid` 为 1–128 位字母、数字、下划线或连字符。Android 的 `platform="android"`，`transport` 取 `android-huawei` 或 `android-honor`。iOS 登记和路由见下表。普通消息和会议请求沿用原信封。 |
+| 原生来电每设备一份投递 | `push_clientid`、`title`、`content` | `push_clientid` 用单个字符串，取这份投递对应的被叫设备 CID，必须等于 `callRoute.cid`。`title`、`content` 保持字符串。 |
+| **候选云函数的原生投递参数** | `callRoute` | 后端从被叫设备登记组装。所有子字段均为字符串，`cid` 为 1–128 位字母、数字、下划线或连字符。Android 的 `platform="android"`，`transport` 取 `android-huawei` 或 `android-honor`。iOS 登记和通道见下表。普通消息和会议请求沿用原信封。 |
 | **在现有 `payload` 补传** | `callId`、`mediaType` | 从原邀请正文复制。当前原生来电支持 1–128 位字母、数字、下划线或连字符组成的 `callId`，已有 UUID 可原样使用。`mediaType` 为小写字符串 `"audio"` 或 `"video"`，按原邀请透传。 |
 | **在现有 `payload` 补传** | `calleeId`、`expiresAt` | `calleeId` 从原消息发送者和单聊关系取对端，以十进制字符串下发。`expiresAt` 取服务端原消息 `sendTime + 60000`，为 Unix 毫秒整数，重试沿用原截止时间。 |
 | 展示字段，建议可选 | `displayName` | 从可信的主叫 `senderName` 映射，原生分支最多保留 80 个字符。若产品要求 iPhone 系统来电首屏展示主叫姓名，双方将其确认成必传。 |
@@ -414,7 +434,7 @@ apiImCallDeclined({ convId, msgId })
 apiImMeetingInviteHandled({ convId, msgId, inviteId, roomName })
 ```
 
-全部 fire-and-forget，失败只记日志，**绝不影响本地入会/停铃**。
+以上为现有上报流程。多设备接听增加 §4.6 的入房前同步确认，获得接听权后再按 §5.5 换取 RTC 凭证。
 
 ### 5.4 事件接收（服务端 → App）
 
@@ -504,6 +524,7 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 | 推送 `payload.type` | ✅ 已有（wire 值） | 无需改动 |
 | 单聊 VoIP 原生来电 | 普通推送已有 `convId/convType/type/msgId` | IM 后端按 §5.2.2 提供 `callRoute`，并补四个必传业务字段 |
 | 云函数原生来电分支 | 移动端仓已有候选字段校验 | 以实际联调部署验证厂商路由与下行字段 |
+| 单聊 VoIP 多设备接听 | `/calls/answered` 入房后广播停铃 | 补充评审项。按 §4.6 确认设备扇出、接听仲裁与 RTC 凭证检查 |
 | 推送文案 | 通用会话摘要 | `voip`：「张三邀请你语音通话」；会议：「会议邀请：周会」 |
 | 60 秒 TTL | ✅ 服务端常量 `CALL_RING_TTL_SEC` | 确认离线推送时的过期处理（过期推送到端后不应再响） |
 | 群通话扇出 | PC 前端拼装 | 保持前端拼装即可，服务端无需新增 |
@@ -548,7 +569,7 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 4. A 打给 B，A 在第 5 秒取消 → B 立即停铃（不残留 55 秒）。
 5. B 已有一通通话时 A 再打 → B 不弹窗，消息显示「忙线未接」。
 6. B 无进程且设备完成原生来电登记。A 分别发起单聊语音和视频，按同一 `callId` 核对投递、原生回调及系统来电页。接听后确认双向语音，视频场景同时确认双向画面。普通通知另验点击恢复。
-7. 同账号 B 两台设备 → 一台接听，另一台立即停铃。
+7. 同账号 B 的一台设备在线、另一台锁屏无进程，两台收到同一 `callId`，每台只响一次。一台接听，另一台收到 3007 后停铃。
 8. 会议创建时邀请 3 人 → 3 人各收到卡片 + 浮层；1 人加入后其另一台设备停止响铃。
 9. 会中邀请新成员 → 新成员可加入同一房间。
 10. 群通话选 2 人 → 群内出现卡片但不响铃；被选的 2 人响铃；未选成员点卡片可加入。
@@ -558,6 +579,9 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 14. 群通话卡片推送到未勾选成员 → 只出卡片，不弹邀请浮层。
 15. 会议邀请携带密码 → 冷启动点通知直接入会，不出现「要密码但不知道密码」。
 16. 单聊语音和视频在系统允许响铃时播放 App 的默认来电音频。验证 Android 用户自选铃声及静音后仍按其设置生效，并确认接听、拒接、取消和超时会停铃。
+17. 同账号两台设备同时接听，仅一个设备能取到被叫 RTC 凭证。胜出设备重试仍成功，另一台提示「已在其他设备接听」。
+18. 让另一台设备漏收停铃事件，确认它重连后按服务端状态关闭来电，离线时按截止时间停铃。再验证过期或已取消的来电不能接听。
+19. 被叫设备退出或切换账号、切换环境并重新登录，旧账号有新来电时，该设备不响铃。
 
 ---
 

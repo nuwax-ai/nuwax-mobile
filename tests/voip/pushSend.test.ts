@@ -48,15 +48,40 @@ describe('native call delivery', () => {
     expect(send.mock.calls[2][0].request_id).not.toBe(args.request_id);
   });
 
-  it.each([['android-huawei', 'hw'], ['android-honor', 'ho']])('routes %s to its vendor with the validated native invitation', async (transport, key) => {
-    const { call, send } = load(source, env);
+  it.each([
+    ['android-huawei', 'hw'],
+    ['android-honor', 'ho'],
+    ['android-xiaomi', 'xm'],
+    ['android-vivo', 'vv'],
+    ['android-oppo', 'op'],
+    ['android-oppo-global', 'opg'],
+    ['android-meizu', 'mz'],
+    ['android-smartisan', 'st'],
+  ])('routes %s to its vendor only when enabled', async (transport, key) => {
     const body = makeBody();
-    await call({ ...body, callRoute: { cid, platform: 'android', transport }, settings: { ttl: 2000 }, options: { ios: { type: 'voip' } } });
+    const request = { ...body, callRoute: { cid, platform: 'android', transport }, settings: { ttl: 2000 }, options: { ios: { type: 'voip' } } };
+    const disabled = load();
+    expect((await disabled.call(request)).errCode).toBe(503);
+    expect(disabled.send).not.toHaveBeenCalled();
+
+    const { call, send } = load(source, { NUWAX_VOIP_ANDROID_TRANSPORTS: transport });
+    expect((await call(request)).errCode).toBe(0);
     expect(send.mock.calls[0][0]).toMatchObject({
       settings: { ttl: 2000, strategy: { [key]: 2 } },
       payload: { ...body.payload, delivery: 'android-native' },
     });
     expect(send.mock.calls[0][0]).not.toHaveProperty('options');
+  });
+
+  it.each([
+    ['harmony-huawei', 'harmonyos'],
+    ['harmony-huawei', 'android'],
+    ['android-fcm', 'android'],
+  ])('keeps %s unavailable for native calls on %s', async (transport, platform) => {
+    const { call, send } = load(source, { NUWAX_VOIP_ANDROID_TRANSPORTS: transport });
+    const result = await call({ ...makeBody(), callRoute: { cid, platform, transport } });
+    expect(result).toEqual({ errCode: 400, errMsg: 'native call transport unavailable' });
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('fails closed for mixed devices, wrong platform, invalid invites, missing configuration and wrong signed environment', async () => {

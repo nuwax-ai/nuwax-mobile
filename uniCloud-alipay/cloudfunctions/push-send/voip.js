@@ -38,7 +38,22 @@ exports.prepareVoip = (body, now = Date.now()) => {
   return { payload, settings: { ttl } }
 }
 
-const strategies = { 'ios-voip': 'ios', 'android-huawei': 'hw', 'android-honor': 'ho' }
+// Mobile vendor keys from the provider's REST v2 settings.strategy table.
+const strategies = {
+  'ios-voip': 'ios',
+  'android-huawei': 'hw',
+  'android-honor': 'ho',
+  'android-xiaomi': 'xm',
+  'android-vivo': 'vv',
+  // Includes OnePlus and realme devices registered with domestic OPPO PUSH.
+  'android-oppo': 'op',
+  'android-oppo-global': 'opg',
+  'android-meizu': 'mz',
+  'android-smartisan': 'st',
+  'harmony-huawei': 'hoshw',
+  // Samsung devices with Google Play services can register for FCM, a separate transport.
+  'android-fcm': null,
+}
 const registrationId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 
 // One authenticated IM route per request. No caller-controlled vendor options or broadcast target.
@@ -46,7 +61,10 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   if (!Object.prototype.hasOwnProperty.call(body, 'callRoute')) return null
   const route = body.callRoute
   if (!route || typeof route.transport !== 'string' || !Object.prototype.hasOwnProperty.call(strategies, route.transport)) return { error: 'unsupported call route' }
-  const ios = route.transport === 'ios-voip'
+  const strategy = strategies[route.transport]
+  // FCM and HarmonyOS need dedicated delivery paths before they can be used for calls.
+  if (strategy === null || strategy === 'hoshw') return { error: 'native call transport unavailable' }
+  const ios = strategy === 'ios'
   if (route.platform !== (ios ? 'ios' : 'android') ||
       typeof route.cid !== 'string' || !route.cid || route.cid.length > 128 || /[^A-Za-z0-9_-]/.test(route.cid) ||
       body.push_clientid !== route.cid) return { error: 'one matching call device is required' }
@@ -70,7 +88,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
     .digest('hex').slice(0, 32)
   return {
     payload, requestId,
-    settings: { ttl: Math.min(5_000, invitation.settings.ttl), strategy: { [strategies[route.transport]]: 2 } },
+    settings: { ttl: Math.min(5_000, invitation.settings.ttl), strategy: { [strategy]: 2 } },
     ...(ios ? { options: { ios: { type: 'voip', payload: JSON.stringify(payload) } } } : {})
   }
 }

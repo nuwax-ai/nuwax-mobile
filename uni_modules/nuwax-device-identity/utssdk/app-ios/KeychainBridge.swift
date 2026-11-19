@@ -12,6 +12,7 @@
 // public 类对同目录 index.uts 直接可见（无需 import）；桥接方法无参，规避
 // UTS↔Swift 参数标签映射问题。Security 为系统框架，config.json 无需 pod。
 
+import Foundation
 import Security
 
 public class KeychainBridge {

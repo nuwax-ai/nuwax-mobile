@@ -16,7 +16,7 @@
    - `meeting_invite`：会议邀请，**整场会议有效**，不超时。
 2. 瞬时状态（接听/拒绝/挂断/超时/已处理）走 `MSG_CUSTOM_EVENT(3007)`，由 4 个 REST 端点触发，**不落库、不补发**。
 3. RTC 统一用 LiveKit：1v1 通话与多人会议是**同一个房间概念**，复用 `nunuax-livekit` 插件与 `utils/meeting/meetingMedia.uts`，区别只在房间的创建者与生命周期。
-4. 单聊 VoIP 原生来电由 IM 在 `payload` 带上完整邀请定位、被叫身份和截止时间。云函数按目标 CID 组装内部 `callRoute`。字段见 §5.2.2。
+4. IM 发给云函数的通话和会议邀请统一用 `payload.type="voip"`，按 `payload.scene` 分流。语音和视频来电由 IM 提供被叫身份与截止时间，云函数按目标 CID 组装内部 `callRoute`。字段见 §5.2.2。
 5. App 端缺口集中在：协议解析、通话状态机、来电/邀请界面、铃声与音频会话、推送点击路由、消息卡片渲染。
 
 ---
@@ -299,9 +299,24 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
 
 #### 5.2.2 payload 字段（完整清单）
 
+##### IM → 云函数的共用信封
+
+通话与会议邀请在这段链路统一使用 `payload.type="voip"`。云函数先按 `payload.scene` 选择投递规则，再按现有端上协议下发。IM 落库仍使用 §2.1 的 `msgType`。
+
+| 字段 | 必填条件 | 格式与用途 |
+| --- | --- | --- |
+| `push_clientid` | 共用必填 | 目标 CID 数组。同一请求内的 CID 属于同一个接收账号。 |
+| 顶层 `type` | 可选 | 普通消息可传 `message`，通话和会议邀请可传 `voip`。分流依据为 `payload.type` 和 `payload.scene`。 |
+| `title`、`content` | 共用必填 | 通知标题与正文。普通消息用会话摘要，通话用主叫姓名和语音或视频来电文案，会议用邀请人姓名和会议邀请文案。 |
+| `badge` | 可选 | 被叫账号的未读总数，绝对值。按普通通知规则处理角标。 |
+| `category`、`channelId` | 按厂商通知场景配置 | 会议按普通 IM 通知分类。华为安卓的来电分类和通知渠道按已开通能力配置。原生来电渠道由端上注册。 |
+| `request_id` | 可选 | 普通推送沿用现有幂等键。原生来电由云函数按设备和 `callId` 生成下游请求标识。 |
+| `payload.convId`、`payload.msgId`、`payload.convType` | 共用必填 | 会话和消息 ID 用十进制字符串。会话类型按现有 IM 定义，单聊为 `1`，普通群聊为 `2`。 |
+| `payload.type`、`payload.scene` | 通话、会议必填 | `type` 均为 `voip`。通话的 `scene` 为 `call`，会议为 `meeting`。普通消息沿用原有 `payload.type`。 |
+
 ##### 单聊 VoIP（语音与视频）
 
-**IM → 云函数请求。** 后端沿用 `push_clientid` 传目标 CID，在 `payload` 补四个必传字段 `callId`、`mediaType`、`calleeId`、`expiresAt`，`displayName` 为可选展示字段。主叫继续以 `msgType="voip"` 和原邀请正文发消息。
+**IM → 云函数请求。** `scene="call"`。在同事提供的字段基础上，新增必填 `calleeId` 和 `expiresAt`。主叫继续以 `msgType="voip"` 和原邀请正文发消息。
 
 下例沿用 §2.4 的 CID 数组。语音使用相同格式，`mediaType` 取 `"audio"`。多个 CID 对应同一个 `callId` 和消息定位。
 
@@ -312,6 +327,7 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
   "content": "张三邀请你视频通话",
   "payload": {
     "type": "voip",
+    "scene": "call",
     "convType": 1,
     "convId": "90001",
     "msgId": "80001",
@@ -319,18 +335,19 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
     "mediaType": "video",
     "calleeId": "10002",
     "expiresAt": 1795050060000,
-    "displayName": "张三"
+    "senderName": "张三"
   }
 }
 ```
 
 | 变化 | 字段 | 格式与来源 |
 | --- | --- | --- |
-| 原样复用 | `payload.type`、`convType`、`convId`、`msgId` | `"voip"`、整数 `1`、会话和消息 ID 的十进制字符串。用 `convId + msgId` 回查原邀请。 |
+| 原样复用 | `payload.type`、`scene`、`convType`、`convId`、`msgId` | `"voip"`、`"call"`、整数 `1`、会话和消息 ID 的十进制字符串。用 `convId + msgId` 回查原邀请。 |
 | 原样复用 | `push_clientid`、`title`、`content` | IM 按现有格式传目标 CID 数组和字符串文案。云函数逐 CID 准备原生投递。 |
-| **在现有 `payload` 补传** | `callId`、`mediaType` | 从原邀请正文复制。当前原生来电支持 1–128 位字母、数字、下划线或连字符组成的 `callId`，已有 UUID 可原样使用。`mediaType` 为小写字符串 `"audio"` 或 `"video"`，按原邀请透传。 |
-| **在现有 `payload` 补传** | `calleeId`、`expiresAt` | `calleeId` 从原消息发送者和单聊关系取对端，以十进制字符串下发。`expiresAt` 取服务端原消息 `sendTime + 60000`，为 Unix 毫秒整数，重试沿用原截止时间。 |
-| 展示字段，建议可选 | `displayName` | 从可信的主叫 `senderName` 映射，原生分支最多保留 80 个字符。若产品要求 iPhone 系统来电首屏展示主叫姓名，双方将其确认成必传。 |
+| 必填，沿用同事稿 | `callId`、`mediaType` | 从原邀请正文复制。当前原生来电支持 1–128 位字母、数字、下划线或连字符组成的 `callId`，已有 UUID 可原样使用。`mediaType` 为小写字符串 `"audio"` 或 `"video"`。 |
+| **新增，必填** | `calleeId` | IM 从原通话的被叫账号取十进制字符串。端上据此核对当前登录账号。设备登录和重新绑定可沿用同一个 `deviceId`，因此应保留原通话的被叫身份。 |
+| **新增，必填** | `expiresAt` | IM 按原消息的服务端 `sendTime + 60000` 计算 Unix 毫秒截止时间。重试沿用原值，云函数校验是否过期并据此限制投递 TTL。 |
+| 可选 | `sendTime`、`senderName` | `sendTime` 用于排查，`senderName` 用于主叫名字展示。云函数将 `senderName` 映射为端上的 `displayName`，最多保留 80 个字符。 |
 
 **云函数内部参数。** `callRoute` 由移动端侧维护的云函数组装。下面是解析到华为安卓设备后的内部对象。
 
@@ -361,12 +378,14 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
 
 截至 11 月 18 日，华为独立透传已观察到冷启动，独立试点当前只接受 `mediaType="audio"`。红米拨 iPhone 16 的实际请求只有 `type="voip"` 和消息定位等普通推送字段，缺少关联原生来电所需的 `callId`。目标 CID 被 UniPush 以 `20001 / target user is invalid` 拒绝，设备状态查询无记录。需先核对有效 CID，再验同一 `callId` 的原生来电投递。视频已通过候选云函数字段校验，锁屏、无进程来电及接听后的双向画面待真机验收。
 
-**meeting_invite**
+##### 会议邀请
+
+IM → 云函数使用 `payload.type="voip"` 和 `payload.scene="meeting"`。云函数按普通通知投递，下发给 App 时映射为现有的 `payload.type="meeting_invite"`。
 
 | 字段 | 用途 | 必要性 |
 |---|---|---|
 | `convId` / `convType` / `msgId` | 已有 | 已有 |
-| `type` | 已有：值为 `meeting_invite` | 已有 |
+| `type`、`scene` | 云函数入参固定为 `voip`、`meeting` | **必须** |
 | `inviteId` | 去重（同一条邀请重复投递只响一次） | **必须** |
 | `roomName` | 点「加入」直接入会（`create=false`） | **必须** |
 | `title` | 浮层/卡片标题；不带就得先拉消息 | **必须** |
@@ -378,22 +397,30 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
 
 ```json
 {
-  "convId": "1879...", "convType": 2, "msgId": "1879...",
-  "type": "meeting_invite",
-  "inviteId": "mi-lx2k3-ab12",
-  "roomName": "123456789",
-  "title": "周会",
-  "mediaType": "video",
-  "silent": false,
-  "groupCall": false,
-  "passcode": "1234",
-  "senderName": "张三"
+  "push_clientid": ["example-device-cid"],
+  "title": "张三",
+  "content": "会议邀请：周会",
+  "payload": {
+    "type": "voip",
+    "scene": "meeting",
+    "convId": "90001",
+    "convType": 1,
+    "msgId": "80002",
+    "inviteId": "mi-lx2k3-ab12",
+    "roomName": "123456789",
+    "title": "周会",
+    "mediaType": "video",
+    "silent": false,
+    "groupCall": false,
+    "passcode": "1234",
+    "senderName": "张三"
+  }
 }
 ```
 
 > `silent` 漏了会直接出事故：群通话是往群里发一条 `silent=true` 的 `meeting_invite`，会推送给全群成员。离线端若在 payload 里拿不到 `silent`，只能先拉消息才知道，弱网下会按「响铃邀请」处理。
 >
-> `passcode` 放 payload 是安全的：payload 不渲染到通知栏/锁屏（展示的只有 `title`/`content`），且与 PC「邀请卡片随身带密码」的约定一致。
+> `passcode` 只放有密码的会议邀请 `payload`，沿用邀请卡片的入会流程。通知栏展示信封的 `title` 和 `content`。
 
 **不要放进 payload**：
 
@@ -415,7 +442,7 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
 2. **同一会话还有其他未读**（`others > 0`）——通知文案已不是单纯那一条，不能弹来电界面；
 3. **voip 已超过 60 秒响铃窗口**——补推候选可存活 7 天，昨天的未接电话今天不能再来电。
 
-以上描述普通通知的聚合逻辑。原生来电需要 `type=voip` 和 §5.2.2 约定的有效字段。会议邀请不受 60 秒限制。
+以上描述普通通知的聚合逻辑。新协议的原生来电请求需要 `type=voip`、`scene=call` 和 §5.2.2 约定的有效字段。会议邀请按 `scene=meeting` 处理，不受 60 秒限制。
 
 **`badge` 的未读口径待产品确认。** payload 里的 `badge` 是未读总数，`voip` / `meeting_invite` 当前按普通消息计入未读：
 
@@ -427,7 +454,9 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
 
 #### 5.2.3 云函数连带改动
 
-候选代码当前从请求顶层读取 `callRoute`。按双方确认的接法，待调整为云函数接收 §5.2.2 的业务字段后逐 CID 组装，再复用现有的原生字段校验和厂商投递。有效 CID 暂无可确认的来电通道时按普通通知处理。回执用于按同一 `callId` 跟踪各设备的投递。
+1. 先按 `scene` 分流，会议走普通 IM 通知，下发兼容现有 App 的 `meeting_invite`。旧请求沿用原来的类型和投递分支。
+2. 通话校验 IM 提供的 `calleeId`、`expiresAt` 和邀请定位，再按已确认的 CID 登记组装 `callRoute`。复用现有原生字段校验和厂商投递。有效 CID 暂无可确认的来电通道时按普通通知处理。
+3. 本地代码已接入 `scene` 分流和字段校验。新通话请求当前走普通通知，逐 CID 的原生投递仍需接入可信设备登记查询。联调按同一 `callId` 跟踪每台设备的回执与原生回调。
 
 ### 5.3 状态上报（App → 服务端）
 
@@ -525,14 +554,14 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 | `voip` / `meeting_invite` 消息类型 | ✅ 已有 | 无需改动 |
 | 4 个 calls REST 端点 | ✅ 已有 | 确认 App 鉴权头/平台参数一致 |
 | 3007 事件下发 | ✅ 已有 | 无需改动 |
-| 推送 `payload.type` | ✅ 已有（wire 值） | 无需改动 |
-| 单聊 VoIP 原生来电 | 普通推送已有目标 CID 和 `convId/convType/type/msgId` | IM 后端按 §5.2.2 复用目标 CID，并在 `payload` 补四个必传业务字段 |
-| 云函数原生来电分支 | 移动端仓已有候选字段校验 | 移动端侧的云函数逐 CID 组装 `callRoute`，联调核对厂商通道与下行字段 |
+| 推送 `payload.type`、`scene` | 通话和会议在 IM 内已有各自的消息类型 | IM 按 §5.2.2 统一向云函数发送 `voip`，用 `scene` 标识通话或会议 |
+| 单聊 VoIP 原生来电 | 普通推送已有目标 CID 和消息定位 | IM 后端补齐来电业务字段，包含最终新增的 `calleeId` 和 `expiresAt` |
+| 云函数原生来电分支 | 本地已接入场景分流和字段校验 | 移动端侧待接入可信设备登记，逐 CID 组装 `callRoute`，联调核对厂商通道与下行字段 |
 | 单聊 VoIP 多设备接听 | `/calls/answered` 入房后广播停铃 | 补充评审项。按 §4.6 确认设备扇出、接听仲裁与 RTC 凭证检查 |
 | 推送文案 | 通用会话摘要 | `voip`：「张三邀请你语音通话」；会议：「会议邀请：周会」 |
 | 60 秒 TTL | ✅ 服务端常量 `CALL_RING_TTL_SEC` | 确认离线推送时的过期处理（过期推送到端后不应再响） |
 | 群通话扇出 | PC 前端拼装 | 保持前端拼装即可，服务端无需新增 |
-| 会议邀请的推送 | ✅ 走通用消息推送 | 确认 `type=meeting_invite` 且不带 VOIP 分类 |
+| 会议邀请的推送 | 走通用消息推送 | 核对上游 `type=voip, scene=meeting`，端上收到 `type=meeting_invite` 和 IM 分类 |
 | 未接来电记录 | 由 `voip` 消息本身承载 | 若要独立通话记录页，另立接口 |
 
 ---

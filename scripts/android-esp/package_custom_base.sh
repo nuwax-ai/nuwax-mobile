@@ -60,6 +60,7 @@ write_local_properties "$PROJ"
 echo "==== 1) sync + inject + configure ===="
 "$SCRIPT_DIR/sync_local_pack_resources.sh"
 python3 "$SCRIPT_DIR/configure_app.py"
+ANDROID_ESP_PROJECT="$PROJ" python3 "$WT_ROOT/scripts/voip-native/device/configure-android.py"
 
 echo "==== 2) gradlew ${GRADLE_TASK} (pack only, BUILD_TYPE=${BUILD_TYPE}) ===="
 cd "$PROJ"
@@ -92,15 +93,19 @@ DEST="$OUT_DIR/${OUT_NAME}-$STAMP.apk"
 cp -f "$APK" "$DEST"
 ln -sfn "$(basename "$DEST")" "$OUT_DIR/${OUT_NAME}-latest.apk"
 
-for DBG in "$WT_ROOT/unpackage/debug" "$MAIN_ROOT/unpackage/debug"; do
-  mkdir -p "$DBG"
-  cp -f "$DEST" "$DBG/${OUT_NAME}.apk"
-  echo "✓ 已写入 $DBG/${OUT_NAME}.apk"
-done
+if [[ "${ANDROID_COPY_CUSTOM_BASE:-1}" == "1" ]]; then
+  for DBG in "$WT_ROOT/unpackage/debug" "$MAIN_ROOT/unpackage/debug"; do
+    mkdir -p "$DBG"
+    cp -f "$DEST" "$DBG/${OUT_NAME}.apk"
+    echo "✓ 已写入 $DBG/${OUT_NAME}.apk"
+  done
+fi
 
 echo ""
 echo "==== 完成（未安装设备）===="
-echo "产物名: unpackage/debug/${OUT_NAME}.apk"
+if [[ "${ANDROID_COPY_CUSTOM_BASE:-1}" == "1" ]]; then
+  echo "产物名: unpackage/debug/${OUT_NAME}.apk"
+fi
 echo "归档: $DEST"
 if [[ "$BUILD_TYPE" == "release" ]]; then
   echo "说明: Release + ENABLE_HX_DEBUG 当前值=${ENABLE_HX_DEBUG:-默认1}；发测试建议 ENABLE_HX_DEBUG=0"

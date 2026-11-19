@@ -465,12 +465,25 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 
 | 项 | 工作 |
 |---|---|
-| 铃声/震动 | 来电铃声（可循环）、震动；停止时机与音频会话协调 |
+| VoIP 来电铃声与震动 | 单聊语音和视频共用 App 的默认来电铃声，遵循系统声音与震动设置。平台实现与验收见下节 |
 | 音频会话 | 统一 `meetingMedia` 的音频占用：会议/通话/语音消息/ASR 互斥，入会前抢占、退出后释放 |
 | 推送路由 | 原生通话入口按 `expiresAt` 判断有效期。普通通知的点击分支仍按 `type` 路由，旧来电从原消息 `sendTime` 判 60 秒窗口，过期显示「未接来电」 |
 | 原生来电展示 | Android 原生来电使用端上已有的电话通知渠道。iPhone 按 PushKit 回调上报系统来电。普通通知按现有规则展示 |
 | 权限 | 麦克风/摄像头申请时机：发起或接听时；拒绝后给「仅收听」降级路径 |
 | 前后台 | `App.onHide` 不主动断 RTC（会议模块已约定）；来电页在后台时由通知承载 |
+
+#### 6.3.1 VoIP 默认来电铃声
+
+本期范围为被叫端的单聊 VoIP 来电。App 随包提供一段默认铃声，语音与视频共用。铃声由端上原生来电配置选定，现有 `callRoute` 与 `payload` 字段足以完成投递。静音、勿扰及用户已设置的通知偏好由系统处理。
+
+| 平台 | 当前实现 | 需要验证 |
+|---|---|---|
+| Android | 音视频来电渠道 `nuwax-voip-incoming-v2` 默认使用随包音频 `nuwax_voip_ring.wav`。从旧渠道迁移时保留用户已有的自选声音、静音和震动设置。接听后切到静音通话状态渠道。 | 华为已有锁屏响铃记录，系统最终返回的是默认通知声音 URI，内置旋律仍待确认。荣耀铃声待复测。按系统实际播放音频验收。 |
+| iPhone | 系统来电由 LiveCommunicationKit 管理，当前 `ringtoneName=nil`，尚未指定女娲内置铃声。 | 将铃声资源随宿主 App 打包，用 `ConversationManager.Configuration.ringtoneName` 指定。系统来电能送达后，分别验证锁屏下的语音、视频来电铃声。 |
+
+响铃从有效 VoIP 邀请到达开始。同一 `callId` 的重复通知不重启铃声，接听、拒接、主叫取消和超时均停止响铃。
+
+[Android 通知渠道](https://developer.android.com/develop/ui/compose/notifications/channels) · [Apple ringtoneName](https://developer.apple.com/documentation/livecommunicationkit/conversationmanager/configuration-swift.struct/ringtonename) · [现有真机验收记录](../engineering/voip-acceptance.md#1900-华为新包锁屏来电铃声亮屏原生界面通过)
 
 ### 6.4 关键约束（踩坑预防）
 
@@ -523,7 +536,7 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 | P1 | 单聊语音和视频的原生来电字段与云函数选路，普通通知点击恢复 | 用真实拨号分别验证语音和视频的系统来电页与接听后媒体。普通通知点开后按平台处理 |
 | P2 | 会议邀请：创建/会中加人、邀请浮层、卡片、handled 同步 | 收到邀请可加入会议，多端同步停铃 |
 | P3 | 群通话：群卡片 + 单聊邀请、选人弹窗 | 群内只叫勾选的人，其余人可点卡片加入 |
-| P4 | 体验完善：铃声/震动、音频路由、弱网重连、多设备兜底 | 待定 |
+| P4 | VoIP 默认来电铃声、震动、音频路由、弱网重连、多设备兜底 | 默认铃声及停铃按 §6.3.1 验收，其余待定 |
 
 ---
 
@@ -544,6 +557,7 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 13. 推送延迟 3 分钟送达 → 点击后不弹来电页，显示「未接来电」。
 14. 群通话卡片推送到未勾选成员 → 只出卡片，不弹邀请浮层。
 15. 会议邀请携带密码 → 冷启动点通知直接入会，不出现「要密码但不知道密码」。
+16. 单聊语音和视频在系统允许响铃时播放 App 的默认来电音频。验证 Android 用户自选铃声及静音后仍按其设置生效，并确认接听、拒接、取消和超时会停铃。
 
 ---
 

@@ -1,0 +1,234 @@
+import {
+  fetchAuthProtectedFileAkUrl,
+  isAuthProtectedFileUrl,
+  openRemoteFileUrl,
+  resolveAuthProtectedFileFetchUrl,
+} from "@/utils/authProtectedFileUrl";
+import { extOf, urlExtOf } from "@/utils/imChatAttachments";
+// App 下载落盘 + 打开（公共/沙盒 Download、已下载打标与系统查看器）
+// #ifdef APP
+import { imFileDownloadKey, markImFileDownloaded } from "@/utils/imFileDownloadRegistry";
+import { downloadFileInApp, openDownloadedFile, resolveDownloadedFilePath } from "@/subpackages/utils/fileTree";
+// #endif
+import { getApiBaseUrl } from "@/constants/config";
+import { gfCanPreviewUrl } from "@/components/im-file-pane/gf-models";
+import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+
+/**
+ * 会话文件「点击即用」的统一分流（顶部「文件」页签的行点击/预览按钮、聊天页文件
+ * 卡片、引用详情、合并转发详情的文件卡片共用）。
+ *
+ * <h2>口径（对齐 PC 与文件页签）</h2>
+ * <ul>
+ *   <li><b>能预览的不落盘</b>：预览网关白名单（{@code gfCanPreviewUrl}，与文件页签
+ *       「预览」按钮同一份 PREVIEWABLE_EXTS）→ 站内 webview 打开平台预览网关
+ *       {@code /static/file-preview.html?fileUrl=…}；受保护 {@code /api/f/} 地址
+ *       webview 带不了 Bearer，先换 ak 匿名直链（同文件页签预览链路）；</li>
+ *   <li><b>预览不了的走真下载</b>：下载名先过 {@link imFileDownloadNameOf} 归一，
+ *       App 走 {@code downloadFileInApp} + {@code openDownloadedFile}（落公共/沙盒
+ *       Download、打「已下载」标，再交系统查看器；已有落盘副本直接打开不重下），
+ *       H5 普通地址拉字节转 blob（octet-stream 强制下载，CORS 不放行再退新页）。</li>
+ * </ul>
+ *
+ * ★预览失败（ak 换链失败）只 toast、不静默回落下载：用户点的是「预览」，静默变成
+ *   下载会更困惑（文件页签预览按钮同一取舍）。
+ * ★本文件是唯一实现：文件页签、聊天页、引用/合并转发详情不许各自再抄一份，
+ *   否则「同一个文件在不同入口点击行为不一致」这种分叉会再次出现。
+ */
+
+/**
+ * 下载文件名（对齐 PC {@code media.ts downloadNameOf} 的关键规则）：
+ * 名字里的 / \ 压平（带分隔符时浏览器会静默忽略 download 属性）；
+ * 没后缀时从 URL 借一个，都取不到给通用兜底 {@code file}。
+ */
+export function imFileDownloadNameOf(fileName: string, url: string): string {
+  let raw = fileName.trim();
+  while (
+    raw.length > 0 &&
+    (raw.charAt(0) == "/" || raw.charAt(0) == "\\" || raw.charAt(0) == ".")
+  ) {
+    raw = raw.substring(1);
+  }
+  raw = raw.split("/").join("_").split("\\").join("_");
+  if (raw.length > 0 && extOf(raw).length > 0) {
+    return raw;
+  }
+  const ext = urlExtOf(url);
+  if (raw.length == 0) {
+    return ext.length > 0 ? `file.${ext}` : "file";
+  }
+  return ext.length > 0 ? `${raw}.${ext}` : raw;
+}
+
+// #ifdef H5 || WEB
+/**
+ * H5 普通地址下载：拉字节转 blob（octet-stream 强制走下载而非导航），
+ * CORS 不放行或请求失败时退回新页打开（不让用户点了没反应）。
+ */
+function downloadNormalUrlOnH5(url: string, name: string): Promise<void> {
+  return new Promise<void>((resolve, _reject) => {
+    uni.request({
+      url,
+      method: "GET",
+      responseType: "arraybuffer",
+      // 默认 dataType=json 会尝试 JSON.parse，二进制会失败
+      dataType: "text",
+      success: (res) => {
+        if (res.statusCode == 200 && res.data != null) {
+          const blob = new Blob([res.data as ArrayBuffer], { type: "application/octet-stream" });
+          const objectUrl = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = objectUrl;
+          link.download = name;
+          link.click();
+          setTimeout(() => {
+            URL.revokeObjectURL(objectUrl);
+          }, 60000);
+          resolve();
+          return;
+        }
+        window.open(url, "_blank");
+        resolve();
+      },
+      fail: (_err) => {
+        window.open(url, "_blank");
+        resolve();
+      },
+    });
+  });
+}
+// #endif
+
+/** 站内 webview 打开预览网关页（fileUrl 为网关渲染目标：ak 直链或普通绝对地址）。 */
+function openPreviewGatewayWebview(gatewayUrl: string): void {
+  uni.navigateTo({
+    url: `/subpackages/pages/webview/webview?url=${encodeURIComponent(gatewayUrl)}`,
+  });
+}
+
+/**
+ * 打开文件预览（预览网关 webview）。
+ * 受保护 /api/f/ 地址先换 ak 匿名直链；换链失败 toast，不回落下载。
+ */
+export function openImFilePreview(url: string): void {
+  if (url.length == 0) {
+    return;
+  }
+  const gateway = `${getApiBaseUrl()}/static/file-preview.html?fileUrl=`;
+  if (!isAuthProtectedFileUrl(url)) {
+    openPreviewGatewayWebview(
+      `${gateway}${encodeURIComponent(resolveAuthProtectedFileFetchUrl(url))}`,
+    );
+    return;
+  }
+  uni.showLoading({ title: "" });
+  fetchAuthProtectedFileAkUrl(url)
+    .then((akUrl: string) => {
+      uni.hideLoading();
+      openPreviewGatewayWebview(`${gateway}${encodeURIComponent(akUrl)}`);
+    })
+    .catch((_e: any | null) => {
+      uni.hideLoading();
+      uni.showToast({
+        title: translateFn("Mobile.Message.loadFailed", emptyI18nParams(), ""),
+        icon: "none",
+      });
+    });
+}
+
+// #ifdef APP
+/**
+ * App 下载分支：先按文件名回捞已落盘副本（公共/沙盒 Download 异步实查——iOS 上该
+ * 目录会被系统清理，不能只信注册表 flag），有就直接交系统查看器，避免重下一遍；
+ * 没有才真下载（落公共/沙盒 Download + 打「已下载」标，聊天文件卡片的次行状态靠它）
+ * 再打开。与旧文件详情页的「下载 → 打开」语义一致，只是不再经过中间页。
+ */
+async function downloadAndOpenInApp(url: string, name: string): Promise<void> {
+  const localPath = await resolveDownloadedFilePath(name);
+  if (localPath.length > 0) {
+    openDownloadedFile(localPath);
+    return;
+  }
+  const protectedFile = isAuthProtectedFileUrl(url);
+  const downloadUrl = protectedFile ? resolveAuthProtectedFileFetchUrl(url) : url;
+  const path = await downloadFileInApp(downloadUrl, name, protectedFile, true);
+  openDownloadedFile(path);
+}
+// #endif
+
+/**
+ * 真下载一个文件（不再进文件详情页）：返回值于链路终态 resolve，调用方可据此收
+ * 「下载中」态。App 下完直接交系统查看器（apk 走安装 Intent）；H5 落浏览器下载。
+ * ★失败提示由链路内部弹出（App = downloadFileInApp，H5 受保护地址 =
+ *   openRemoteFileUrl 的 failToast），调用方不必再 toast。
+ */
+export function downloadImFileUrl(url: string, fileName: string): Promise<void> {
+  const name = imFileDownloadNameOf(fileName, url);
+  // #ifdef APP
+  return downloadAndOpenInApp(url, name).then((): void => {
+    // 补标本页键（fileName 优先、缺省 url）：downloadFileInApp 只按下载名打标，
+    // 下载名被归一或 fileName 为空时，聊天卡片按 url 查状态会 miss（文件详情页同款补标）
+    markImFileDownloaded(imFileDownloadKey(fileName, url));
+  });
+  // #endif
+  // #ifndef APP
+  // #ifdef H5 || WEB
+  // 普通地址在浏览器里没有「下载」语义（window.open 会当导航/被拦），统一拉 blob 再存
+  if (!isAuthProtectedFileUrl(url)) {
+    return downloadNormalUrlOnH5(url, name);
+  }
+  // #endif
+  return openRemoteFileUrl(url, name, "", true);
+  // #endif
+}
+
+/**
+ * 文件点击的统一入口（聊天页文件卡片、引用详情、合并转发详情、文件页签行点击）：
+ * 能预览 → 预览网关；否则 → 真下载（App 下完直接交系统查看器）。
+ *
+ * @param showDownloadLoading 下载分支是否弹全局 loading。聊天/引用/合并转发详情没有
+ *   行内「下载中」态，必须传 true（大文件下载期间否则毫无反馈）；文件页签行自带
+ *   行内下载态，传 false 免叠两层。
+ * @param onDownloadDone 下载/打开链路成功后的回调（可空）。聊天/引用/合并转发详情
+ *   用它 bump downloadTick 重估卡片「已下载/未下载」——原先这个刷新只在「从文件
+ *   详情页返回」的 onShow 里发生，现在下载在页内完成，必须自己驱动一次。
+ */
+export function openImFileOnTap(
+  url: string,
+  fileName: string,
+  showDownloadLoading: boolean = false,
+  onDownloadDone: (() => void) | null = null,
+): void {
+  if (url.length == 0) {
+    return;
+  }
+  if (gfCanPreviewUrl(url)) {
+    openImFilePreview(url);
+    return;
+  }
+  if (!showDownloadLoading) {
+    downloadImFileUrl(url, fileName)
+      .then((): void => {
+        const done = onDownloadDone;
+        if (done != null) {
+          done();
+        }
+      })
+      .catch((_e: any | null) => {
+        // 失败 toast 由链路内部弹出，这里只吞未处理拒绝
+      });
+    return;
+  }
+  uni.showLoading({ title: "" });
+  downloadImFileUrl(url, fileName)
+    .then((): void => {
+      uni.hideLoading();
+      const done = onDownloadDone;
+      if (done != null) {
+        done();
+      }
+    })
+    .catch((_e: any | null) => {
+      uni.hideLoading();
+    });
+}

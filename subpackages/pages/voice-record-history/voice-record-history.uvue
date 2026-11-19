@@ -8,7 +8,7 @@
       <text class="vh-nav__title">历史记录</text>
       <view class="vh-nav__side"></view>
     </view>
-    <scroll-view class="vh-list" scroll-y="true">
+    <scroll-view class="vh-list" scroll-y="true" @scrolltolower="loadMore">
       <view v-for="item in records" :key="item.id" class="vh-card">
         <view class="vh-card__head">
           <text class="vh-card__title">{{ item.title }}</text>
@@ -28,11 +28,10 @@
 
 <script setup lang="uts">
 /**
- * 录音历史。数据来自本机缓存的语音笔记（noteId、分段路径、上传状态）。
- * 转写成功后点卡片打开资料库文档。
+ * 录音历史。列表来自 POST /api/voice/note/list。
+ * 转写成功后点下载，再查详情拿到 docUrl 打开文稿。
  */
-import { listCachedVoiceNotes } from "@/utils/voice-note/voiceNoteEngine.uts";
-import { VoiceNoteRecord } from "@/utils/voice-note/voiceNoteStore.uts";
+import { apiVoiceNoteDetail, apiVoiceNoteList } from "@/servers/voiceNote.uts";
 
 type VoiceRecordHistoryItem = {
   id: string;
@@ -40,10 +39,15 @@ type VoiceRecordHistoryItem = {
   duration: string;
   recordedAt: string;
   detail: string;
+  status: string;
   docUrl: string;
 };
 
 const records = ref<VoiceRecordHistoryItem[]>([]);
+const loading = ref<boolean>(false);
+const hasMore = ref<boolean>(true);
+const lastId = ref<string>("");
+const pageSize = 20;
 
 function pad2(n: number): string {
   if (n < 10) return "0" + n.toString();
@@ -74,68 +78,132 @@ function formatClock(ts: number): string {
   );
 }
 
-function phaseLabel(record: VoiceNoteRecord): string {
-  if (record.phase == "recording") return "录音中";
-  if (record.phase == "uploading") return "上传中";
-  if (record.phase == "processing") return "转写中";
-  if (record.phase == "success") return "已完成";
-  if (record.phase == "failed") return "失败";
-  if (record.phase == "stopped") return "已停止";
-  return record.phase;
+function readItemString(obj: UTSJSONObject, key: string): string {
+  const raw = obj[key];
+  if (raw == null) return "";
+  return `${raw}`;
 }
 
-function detailOf(record: VoiceNoteRecord): string {
-  let uploaded = 0;
-  const total = record.segments.length;
-  let path = "";
-  for (let i = 0; i < total; i++) {
-    const row = record.segments[i];
-    if (row.uploadStatus == "uploaded") uploaded = uploaded + 1;
-    if (path.length == 0 && row.filePath.length > 0) path = row.filePath;
-  }
-  let text = phaseLabel(record) + " · " + uploaded + "/" + total + " 段已上传";
-  if (record.noteId.length > 0) text = text + " · noteId " + record.noteId;
-  if (record.docUrl.length > 0) text = text + " · " + record.docUrl;
-  if (path.length > 0) text = text + " · " + path;
-  if (record.error.length > 0) text = text + " · " + record.error;
+function readItemNumber(obj: UTSJSONObject, key: string): number {
+  const raw = obj[key];
+  if (raw == null) return 0;
+  const value = parseFloat(`${raw}`);
+  if (isNaN(value)) return 0;
+  return value;
+}
+
+function statusLabel(status: string): string {
+  if (status == "UPLOADING") return "传输中";
+  if (status == "PROCESSING") return "转写中";
+  if (status == "ASR_PARTIAL_FAILED") return "部分转写失败";
+  if (status == "DOC_FAILED") return "文档生成失败";
+  if (status == "SUCCESS") return "已完成";
+  if (status == "DOC_REMOVED") return "文档已删除";
+  return status;
+}
+
+function formatCreated(raw: string): string {
+  if (raw.length == 0) return "";
+  const value = parseFloat(raw);
+  const digitsOnly = !isNaN(value) && `${Math.floor(value)}` == raw;
+  if (digitsOnly && value > 1000000000000) return formatClock(value);
+  if (digitsOnly && value > 1000000000) return formatClock(value * 1000);
+  const text = raw.replace("T", " ");
+  if (text.length > 16) return text.substring(0, 16);
   return text;
 }
 
-function loadRecords(): void {
-  const rows = listCachedVoiceNotes();
-  const next: VoiceRecordHistoryItem[] = [];
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const title = row.title.length > 0 ? row.title : "语音笔记 " + formatClock(row.startedAt);
-    const item: VoiceRecordHistoryItem = {
-      id: row.localId,
-      title: title,
-      duration: formatDuration(row.elapsedMs),
-      recordedAt: formatClock(row.startedAt),
-      detail: detailOf(row),
-      docUrl: row.docUrl,
-    };
-    next.push(item);
+function mapHistoryItem(row: UTSJSONObject): VoiceRecordHistoryItem {
+  const noteId = readItemString(row, "noteId");
+  const titleRaw = readItemString(row, "title");
+  const status = readItemString(row, "status");
+  const segmentCount = readItemNumber(row, "segmentCount");
+  const created = formatCreated(readItemString(row, "created"));
+  const title = titleRaw.length > 0 ? titleRaw : "语音笔记";
+  const item: VoiceRecordHistoryItem = {
+    id: noteId,
+    title: title,
+    duration: formatDuration(readItemNumber(row, "totalDurationMs")),
+    recordedAt: created,
+    detail: statusLabel(status) + " · " + segmentCount.toString() + " 段",
+    status: status,
+    docUrl: "",
+  };
+  return item;
+}
+
+async function loadRecords(reset: boolean): Promise<void> {
+  if (loading.value) return;
+  if (!reset && !hasMore.value) return;
+  loading.value = true;
+  const cursor = reset ? "" : lastId.value;
+  try {
+    const rows = await apiVoiceNoteList(cursor, pageSize);
+    const next: VoiceRecordHistoryItem[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const item = mapHistoryItem(rows[i]);
+      if (item.id.length > 0) next.push(item);
+    }
+    if (reset) {
+      records.value = next;
+    } else {
+      const merged: VoiceRecordHistoryItem[] = [];
+      for (let i = 0; i < records.value.length; i++) {
+        merged.push(records.value[i]);
+      }
+      for (let i = 0; i < next.length; i++) {
+        merged.push(next[i]);
+      }
+      records.value = merged;
+    }
+    if (next.length > 0) lastId.value = next[next.length - 1].id;
+    hasMore.value = rows.length >= pageSize;
+  } catch (_error) {
+    uni.showToast({ title: "历史记录加载失败", icon: "none" });
+  } finally {
+    loading.value = false;
   }
-  records.value = next;
+}
+
+function loadMore(): void {
+  void loadRecords(false);
 }
 
 function handleBack(): void {
   uni.navigateBack({ delta: 1 });
 }
 
-function handleDownload(item: VoiceRecordHistoryItem): void {
-  if (item.docUrl.length == 0) {
-    uni.showToast({ title: "文档还未生成", icon: "none" });
-    return;
-  }
+function openDoc(item: VoiceRecordHistoryItem, docUrl: string): void {
   uni.navigateTo({
-    url: "/subpackages/pages/webview/webview?url=" + encodeURIComponent(item.docUrl) + "&title=" + encodeURIComponent(item.title),
+    url: "/subpackages/pages/webview/webview?url=" + encodeURIComponent(docUrl) + "&title=" + encodeURIComponent(item.title),
   });
 }
 
+async function handleDownload(item: VoiceRecordHistoryItem): Promise<void> {
+  if (item.status != "SUCCESS") {
+    uni.showToast({ title: "文档还未生成", icon: "none" });
+    return;
+  }
+  if (item.docUrl.length > 0) {
+    openDoc(item, item.docUrl);
+    return;
+  }
+  try {
+    const detail = await apiVoiceNoteDetail(item.id);
+    const docUrl = detail != null && detail["docUrl"] != null ? `${detail["docUrl"]}` : "";
+    if (docUrl.length == 0) {
+      uni.showToast({ title: "文档还未生成", icon: "none" });
+      return;
+    }
+    item.docUrl = docUrl;
+    openDoc(item, docUrl);
+  } catch (_error) {
+    uni.showToast({ title: "文档还未生成", icon: "none" });
+  }
+}
+
 onShow(() => {
-  loadRecords();
+  void loadRecords(true);
 });
 </script>
 

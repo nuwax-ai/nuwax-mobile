@@ -306,7 +306,7 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
 | 字段 | 必填条件 | 格式与用途 |
 | --- | --- | --- |
 | `push_clientid` | 共用必填 | 目标 CID 数组。同一请求内的 CID 属于同一个接收账号。 |
-| 顶层 `type` | 可选 | 普通消息可传 `message`，通话和会议邀请可传 `voip`。分流依据为 `payload.type` 和 `payload.scene`。 |
+| 顶层 `type` | 可选 | 普通消息可传 `message`，通话和会议邀请可传 `voip`。当 `payload.type` 缺失且 `payload` 含明确邀请字段时，云函数可据此补成 `voip`，再按 `payload.scene` 分流。 |
 | `title`、`content` | 共用必填 | 通知标题与正文。普通消息用会话摘要，通话用主叫姓名和语音或视频来电文案，会议用邀请人姓名和会议邀请文案。 |
 | `badge` | 可选 | 被叫账号的未读总数，绝对值。按普通通知规则处理角标。 |
 | `category`、`channelId` | 按厂商通知场景配置 | 会议按普通 IM 通知分类。华为安卓的来电分类和通知渠道按已开通能力配置。原生来电渠道由端上注册。 |
@@ -346,8 +346,8 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
 | 原样复用 | `push_clientid`、`title`、`content` | IM 按现有格式传目标 CID 数组和字符串文案。云函数逐 CID 准备原生投递。 |
 | 必填，沿用同事稿 | `callId`、`mediaType` | 从原邀请正文复制。当前原生来电支持 1–128 位字母、数字、下划线或连字符组成的 `callId`，已有 UUID 可原样使用。`mediaType` 为小写字符串 `"audio"` 或 `"video"`。 |
 | **新增，必填** | `calleeId` | IM 从原通话的被叫账号取十进制字符串。端上据此核对当前登录账号。设备登录和重新绑定可沿用同一个 `deviceId`，因此应保留原通话的被叫身份。 |
-| **新增，必填** | `expiresAt` | IM 按原消息的服务端 `sendTime + 60000` 计算 Unix 毫秒截止时间。重试沿用原值，云函数校验是否过期并据此限制投递 TTL。 |
-| 可选 | `sendTime`、`senderName` | `sendTime` 用于排查，`senderName` 用于主叫名字展示。云函数将 `senderName` 映射为端上的 `displayName`，最多保留 80 个字符。 |
+| **新增，联调必填** | `expiresAt` | IM 按原消息的服务端 `sendTime + 60000` 计算 Unix 毫秒截止时间。重试沿用原值，云函数校验是否过期并据此限制投递 TTL。云函数兼容只传原消息 `sendTime` 的请求。 |
+| 可选 | `sendTime`、`senderName`、`roomName` | `sendTime` 为原消息服务端时间，`roomName` 可透传原邀请中的房间名。云函数将 `senderName` 映射为端上的 `displayName`，最多保留 80 个字符。 |
 
 **云函数内部参数。** `callRoute` 由移动端侧维护的云函数组装。下面是解析到华为安卓设备后的内部对象。
 
@@ -359,7 +359,18 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
 }
 ```
 
-云函数从当前服务空间的 `voip-device-routes` 按 CID 查询设备登记。集合以 CID 为 `_id`，由可信服务端按设备登记维护，客户端无读写权限。云函数逐台核对 `appId`、`calleeId` 和 `active`，再读取 `platform`、`transport`。Android 联调录入已核实的华为安卓和荣耀 CID，分别使用 `android-huawei` 和 `android-honor`。UniPush 设备详情可辅助核对机型。 [DCloud 设备详情接口](https://doc.dcloud.net.cn/uniCloud/uni-cloud-push/api)
+云函数从当前服务空间的 `voip-device-routes` 按 CID 查询设备登记。集合以 CID 为 `_id`，由可信服务端按设备登记维护，客户端无读写权限。云函数逐台核对 `appId`、`calleeId` 和 `active`，再读取 `platform`、`transport`。UniPush 设备详情可辅助核对机型。 [DCloud 设备详情接口](https://doc.dcloud.net.cn/uniCloud/uni-cloud-push/api)
+
+| 设备通道 | `transport` | 当前投递 |
+| --- | --- | --- |
+| 华为安卓 | `android-huawei` | 开启能力后用 UniPush 扩展发厂商纯透传，填充 `push_channel.android.ups.transmission` |
+| 荣耀 | `android-honor` | 普通通知，原生来电待接入专用接口 |
+| 小米、vivo、OPPO 国内及海外、魅族、坚果 | `android-xiaomi`、`android-vivo`、`android-oppo`、`android-oppo-global`、`android-meizu`、`android-smartisan` | 普通通知，原生来电按各厂商能力单独对接 |
+| 三星等已注册 FCM 的设备 | `android-fcm` | 普通通知，原生来电待接入 FCM 路径 |
+| 华为鸿蒙 | `harmony-huawei` | 普通通知，原生来电待接入鸿蒙路径 |
+| iPhone | `ios-voip` | 已核对 PushKit 登记和 APNs 环境时，走 iOS VoIP |
+
+当前 UniPush 的标准 UPS 纯透传示例明示适用华为安卓。荣耀的系统 VoIP 由其专用下行能力提供。其余通道按表内路径验收。 [UPS 请求说明](https://docs.getui.com/getui/server/rest_v2/common_args/) · [荣耀 VoIP 下行消息](https://developer.honor.com/cn/kitdoc?category=%25E5%259F%25BA%25E7%25A1%2580%25E6%259C%258D%25E5%258A%25A1&docId=downlink-message.md&kitId=11002&navigation=ref&token=)
 
 一条华为安卓测试设备登记示例
 
@@ -470,8 +481,8 @@ IM → 云函数使用 `payload.type="voip"` 和 `payload.scene="meeting"`。云
 #### 5.2.3 云函数连带改动
 
 1. 先按 `scene` 分流，会议走普通 IM 通知，下发兼容现有 App 的 `meeting_invite`。旧请求沿用原来的类型和投递分支。
-2. 测试空间通过 `NUWAX_VOIP_DEVICE_ROUTE_LOOKUP=1` 启用逐 CID 查询。通话校验 IM 提供的 `calleeId`、`expiresAt` 和邀请定位，再从登记组装 `callRoute`。Android 沿用 `NUWAX_VOIP_ANDROID_TRANSPORTS` 白名单，iOS 沿用 `NUWAX_VOIP_IOS_APNS_ENVIRONMENT`。未知或暂未开通原生通道的 CID 按普通通知处理。查询失败返回 503，已核对为撤销或归属不符的设备返回 403。
-3. 每个已处理的 CID 在 `data.results` 中返回 `clientid` 和 `errCode`。已发起送出的结果带 `delivery` 和 `requestId`，原生回执带可匹配的任务状态。联调按同一 `callId` 核对各设备回执与原生回调。逐 CID 查询关闭时，新通话沿用普通通知路径。
+2. 测试空间通过 `NUWAX_VOIP_DEVICE_ROUTE_LOOKUP=1` 启用逐 CID 查询。通话校验 IM 提供的 `calleeId`、`expiresAt` 和邀请定位，再从登记组装 `callRoute`。华为安卓纯透传沿用 `NUWAX_VOIP_ANDROID_TRANSPORTS` 白名单，iOS 沿用 `NUWAX_VOIP_IOS_APNS_ENVIRONMENT`。未知或暂未开通原生通道的 CID 按普通通知处理。查询失败或 UPS 发送方法不可用时返回 503，已核对为撤销或归属不符的设备返回 403。
+3. 每个已处理的 CID 在 `data.results` 中返回 `clientid` 和 `errCode`。已发起送出的结果带 `delivery` 和 `requestId`，原生回执带可匹配的任务状态。联调按同一 `callId` 核对各设备回执与原生回调。逐 CID 查询启用时，以登记为准。查询关闭时，兼容带有效 `callRoute` 的已签名单设备请求，其余新通话走普通通知。普通通话通知按场景设置 VOIP 分类，并支持与角标配置合并华为 `VoipCall` 通知渠道。
 
 ### 5.3 状态上报（App → 服务端）
 

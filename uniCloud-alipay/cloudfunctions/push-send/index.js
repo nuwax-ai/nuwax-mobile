@@ -278,19 +278,40 @@ function callTransportEnabled(route) {
 }
 
 async function sendNativeVoip(body, route, nativeVoip) {
-  const nativeOptions = mergeOptions(nativeVoip.options, buildChannelOptions(body.channelId))
+  const android = route.platform === 'android'
+  if (android && typeof uniPush.request !== 'function') {
+    return { errCode: 503, errMsg: 'UniPush transmission adapter unavailable', data: { requestId: nativeVoip.requestId } }
+  }
   try {
-    const result = await uniPush.sendMessage({
-      push_clientid: [route.cid],
-      title: clip(body.title, MAX_TITLE),
-      content: clip(body.content, MAX_CONTENT),
-      payload: nativeVoip.payload,
-      settings: nativeVoip.settings,
-      category: CALL_CATEGORY,
-      force_notification: false,
-      request_id: nativeVoip.requestId,
-      ...(nativeOptions ? { options: nativeOptions } : {})
-    })
+    let result
+    if (android) {
+      const transmission = JSON.stringify({ unipush_version: '2.0', payload: nativeVoip.payload })
+      // sendMessage builds ups.notification even when force_notification is false.
+      result = await uniPush.request({
+        method: 'POST',
+        module: '/push/single/cid',
+        requestData: {
+          request_id: nativeVoip.requestId,
+          audience: { cid: [route.cid] },
+          settings: nativeVoip.settings,
+          push_message: { transmission },
+          push_channel: { android: { ups: { transmission } } }
+        }
+      })
+    } else {
+      const nativeOptions = mergeOptions(nativeVoip.options, buildChannelOptions(body.channelId))
+      result = await uniPush.sendMessage({
+        push_clientid: [route.cid],
+        title: clip(body.title, MAX_TITLE),
+        content: clip(body.content, MAX_CONTENT),
+        payload: nativeVoip.payload,
+        settings: nativeVoip.settings,
+        category: CALL_CATEGORY,
+        force_notification: false,
+        request_id: nativeVoip.requestId,
+        ...(nativeOptions ? { options: nativeOptions } : {})
+      })
+    }
     const errCode = result?.errCode ?? -1
     const details = result?.data && typeof result.data === 'object'
       ? Object.entries(result.data).filter(([key, value]) =>
@@ -324,7 +345,7 @@ async function sendCallToDevice(body, invitation, cid, binding) {
     const nativeVoip = prepareNativeVoip({ ...body, push_clientid: cid, payload: invitation.payload, callRoute: route }, now)
     if (!nativeVoip.error && callTransportEnabled(route)) {
       const sent = await sendNativeVoip(body, route, nativeVoip)
-      return { ...result, errCode: sent.errCode, delivery: 'native', transport: route.transport, ...sent.data }
+      return { ...result, errCode: sent.errCode, errMsg: sent.errMsg, delivery: 'native', transport: route.transport, ...sent.data }
     }
   }
 
@@ -384,10 +405,9 @@ exports.main = async (event) => {
   if (scene?.meeting && JSON.stringify(scene.meeting).length > MAX_PAYLOAD) {
     return { errCode: 400, errMsg: 'meeting invitation payload too large' }
   }
-  // 会议邀请永远走普通 IM 通道；通话带 callRoute 时优先单设备原生投递。
-  // ★scene="call" 下 callRoute 只是增强：设备路由不完整时回退普通 VOIP 通知，
-  //   不能因为多设备或平台不匹配把整条通话邀请拒掉。
-  const nativeAttempt = scene?.meeting ? null : prepareNativeVoip(body)
+  const useDeviceRoutes = scene?.call != null && process.env.NUWAX_VOIP_DEVICE_ROUTE_LOOKUP === '1'
+  // When CID lookup is enabled, the stored account binding is authoritative for new calls.
+  const nativeAttempt = scene?.meeting || useDeviceRoutes ? null : prepareNativeVoip(body)
   const nativeVoip = nativeAttempt?.error && scene?.call ? null : nativeAttempt
   if (nativeVoip) {
     if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
@@ -413,7 +433,7 @@ exports.main = async (event) => {
   if (voip && voip.error) return { errCode: 400, errMsg: voip.error }
   if (voip && voip.expired) return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
 
-  if (scene?.call && process.env.NUWAX_VOIP_DEVICE_ROUTE_LOOKUP === '1') {
+  if (useDeviceRoutes) {
     return sendRegisteredCalls(body, ids, scene.call)
   }
   return sendOrdinaryPush(body, ids, voip, scene?.meeting, scene?.call != null)

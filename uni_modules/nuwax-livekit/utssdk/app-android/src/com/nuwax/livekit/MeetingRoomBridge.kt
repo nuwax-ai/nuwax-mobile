@@ -1,11 +1,18 @@
 package com.nuwax.livekit
 
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color
 import android.media.AudioManager
+import android.app.Activity
+import org.json.JSONObject
 import io.livekit.android.LiveKit
+import io.livekit.android.events.RoomEvent
+import io.livekit.android.events.collect
 import io.livekit.android.renderer.SurfaceViewRenderer
 import io.livekit.android.room.Room
+import io.livekit.android.room.track.DataPublishReliability
+import io.livekit.android.room.track.screencapture.ScreenCaptureParams
 import io.livekit.android.room.track.CameraPosition
 import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.room.track.Track
@@ -15,6 +22,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
  * 会议房间桥接（Kotlin 侧，LiveKit Android SDK 2.28.x）。
@@ -55,6 +63,18 @@ class MeetingRoomBridge(context: Context) {
   private var cameraPosition: CameraPosition = CameraPosition.FRONT
   /** 远端成员 identity → 渲染视图（同一人复用，离开会议统一释放）。 */
   private val remoteRenderers = HashMap<String, SurfaceViewRenderer>()
+  private val meetingMessages = ConcurrentLinkedQueue<String>()
+  @Volatile private var screenShareOn = false
+  @Volatile private var screenShareError = ""
+
+  companion object {
+    @Volatile private var activeBridge: MeetingRoomBridge? = null
+
+    @JvmStatic
+    fun completeScreenCapture(resultCode: Int, data: Intent?) {
+      activeBridge?.onScreenCaptureResult(resultCode, data)
+    }
+  }
 
   /**
    * 连接已有房间（不建房）。重复调用会先断开上一场。
@@ -68,6 +88,10 @@ class MeetingRoomBridge(context: Context) {
     cameraOn: Boolean,
   ) {
     disconnectInternal(false)
+    activeBridge = this
+    meetingMessages.clear()
+    screenShareOn = false
+    screenShareError = ""
     lastErrorText = ""
     val newScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     scope = newScope
@@ -77,6 +101,13 @@ class MeetingRoomBridge(context: Context) {
         room = created
         // 2.28.x 的第三个参数是 ConnectOptions，默认值即可（自适应流/联播用 SDK 默认）
         created.connect(serverUrl, token)
+        newScope.launch {
+          created.events.collect { event ->
+            if (event is RoomEvent.DataReceived) {
+              acceptMeetingData(event)
+            }
+          }
+        }
         // 入会口径：语音开局 → 开麦、不开摄像头（失败不阻断入会，例如麦克风权限被拒）
         try {
           created.localParticipant.setMicrophoneEnabled(micOn)
@@ -97,6 +128,115 @@ class MeetingRoomBridge(context: Context) {
       }
     }
   }
+
+  private fun acceptMeetingData(event: RoomEvent.DataReceived) {
+    val topic = event.topic ?: return
+    if (topic != "meeting-chat" && topic != "danmaku") return
+    try {
+      val payload = JSONObject(String(event.data, Charsets.UTF_8))
+      val text = payload.optString("text", "").trim()
+      if (text.isEmpty() || text.length > 120) return
+      val item = JSONObject()
+      item.put("text", text)
+      item.put("name", payload.optString("name", event.participant?.name ?: ""))
+      item.put("identity", event.participant?.identity?.value ?: "")
+      item.put("self", false)
+      item.put("topic", topic)
+      item.put("at", System.currentTimeMillis())
+      queueMessage(item.toString())
+    } catch (_: Throwable) {
+    }
+  }
+
+  private fun queueMessage(message: String) {
+    meetingMessages.offer(message)
+    while (meetingMessages.size > 100) meetingMessages.poll()
+  }
+
+  /** Sends PC-compatible meeting chat/danmaku using LiveKit's reliable data packet. */
+  fun sendMeetingMessage(text: String, displayName: String, danmaku: Boolean) {
+    val r = room ?: return
+    val s = scope ?: return
+    val cleanText = text.trim()
+    if (!connectedFlag || cleanText.isEmpty() || cleanText.length > 120) return
+    val topic = if (danmaku) "danmaku" else "meeting-chat"
+    val payload = JSONObject().put("text", cleanText).put("name", displayName).toString().toByteArray(Charsets.UTF_8)
+    s.launch {
+      try {
+        val result = r.localParticipant.publishData(payload, DataPublishReliability.RELIABLE, topic)
+        if (result.isSuccess) {
+          val item = JSONObject()
+          item.put("text", cleanText)
+          item.put("name", displayName)
+          item.put("identity", r.localParticipant.identity?.value ?: "")
+          item.put("self", true)
+          item.put("topic", topic)
+          item.put("at", System.currentTimeMillis())
+          queueMessage(item.toString())
+        }
+      } catch (_: Throwable) {
+      }
+    }
+  }
+
+  /** Drain queued DataChannel messages as JSON for the UTS polling bridge. */
+  fun drainMeetingMessages(): String {
+    val out = org.json.JSONArray()
+    while (true) {
+      val item = meetingMessages.poll() ?: break
+      try { out.put(JSONObject(item)) } catch (_: Throwable) {}
+    }
+    return out.toString()
+  }
+
+  fun requestScreenCapture(context: Context) {
+    try {
+      screenShareError = ""
+      val intent = Intent(context, MediaProjectionPermissionActivity::class.java)
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      context.startActivity(intent)
+    } catch (e: Throwable) {
+      screenShareError = e.message ?: "screen_capture_request"
+    }
+  }
+
+  private fun onScreenCaptureResult(resultCode: Int, data: Intent?) {
+    if (resultCode != Activity.RESULT_OK || data == null) {
+      screenShareError = "cancelled"
+      return
+    }
+    val r = room ?: return
+    val s = scope ?: return
+    s.launch {
+      try {
+        val started = r.localParticipant.setScreenShareEnabled(
+          true,
+          ScreenCaptureParams(mediaProjectionPermissionResultData = data, onStop = {
+            screenShareOn = false
+            screenShareError = "stopped"
+          }),
+        )
+        screenShareOn = started
+        if (!started) screenShareError = "screen_share_publish"
+      } catch (e: Throwable) {
+        screenShareOn = false
+        screenShareError = e.message ?: "screen_share_publish"
+      }
+    }
+  }
+
+  fun stopScreenShare() {
+    val r = room ?: return
+    val s = scope ?: return
+    s.launch {
+      try { r.localParticipant.setScreenShareEnabled(false) } catch (_: Throwable) {}
+      screenShareOn = false
+    }
+  }
+
+  fun isScreenShareOn(): Boolean = screenShareOn
+
+  fun screenShareError(): String = screenShareError
 
   /** 最近一次连接失败原因（空串=无错）。 */
   fun lastError(): String {
@@ -322,10 +462,11 @@ class MeetingRoomBridge(context: Context) {
       val participant = target ?: return null
       // ★TrackPublication 上没有 videoTrack 便捷属性：统一 `track as? VideoTrack`
       val cameraPublication = participant.getTrackPublication(Track.Source.CAMERA)
-      var track = if (cameraPublication != null && !cameraPublication.muted) {
-        cameraPublication.track as? VideoTrack
+      val screenPublication = participant.getTrackPublication(Track.Source.SCREEN_SHARE)
+      val track = if (screenPublication != null && !screenPublication.muted) {
+        screenPublication.track as? VideoTrack
       } else {
-        null
+        if (cameraPublication != null && !cameraPublication.muted) cameraPublication.track as? VideoTrack else null
       }
       val video = track ?: return null
       val existing = remoteRenderers[identity]
@@ -382,8 +523,10 @@ class MeetingRoomBridge(context: Context) {
   /** 这个远端是否已经订阅到视频轨道（`track as? VideoTrack` 判空，同 createRemoteRenderer）。 */
   private fun hasVideoTrack(p: io.livekit.android.room.participant.RemoteParticipant): Boolean {
     return try {
-      val pub = p.getTrackPublication(Track.Source.CAMERA)
-      pub != null && !pub.muted && (pub.track as? VideoTrack) != null
+      val camera = p.getTrackPublication(Track.Source.CAMERA)
+      val screen = p.getTrackPublication(Track.Source.SCREEN_SHARE)
+      (camera != null && !camera.muted && (camera.track as? VideoTrack) != null) ||
+        (screen != null && !screen.muted && (screen.track as? VideoTrack) != null)
     } catch (e: Throwable) {
       false
     }
@@ -393,6 +536,9 @@ class MeetingRoomBridge(context: Context) {
 
 
   private fun disconnectInternal(notify: Boolean) {
+    screenShareOn = false
+    meetingMessages.clear()
+    if (activeBridge === this) activeBridge = null
     releaseRenderer()
     releaseRemoteRenderers()
     val r = room

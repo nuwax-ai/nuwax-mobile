@@ -9,8 +9,8 @@
 
 | 平台 | SDK | 状态 |
 |---|---|---|
-| Android | `io.livekit:livekit-android:2.28.2`（Maven） | 已接线：`MeetingRoomBridge.kt` 负责连接/退房/麦克风/摄像头/音频路由/人数 |
-| iOS | CocoaPods `LiveKitClient 2.19.0` | 已接线：`MeetingRoomBridge.swift` + AVAudioSession 统一管理；版本固定在 `config.json` |
+| Android | `io.livekit:livekit-android:2.28.2`（Maven） | 已接线：连接/退房/麦克风/摄像头/音频路由/人数、可靠 DataChannel 会中聊天、MediaProjection 屏幕共享；需自定义基座和真机授权验证 |
+| iOS | CocoaPods `LiveKitClient 2.19.0` | 已接线：设备/音频、可靠 DataChannel 会中聊天、ReplayKit **应用内画面**共享；需自定义基座和真机验证。跨 App/控制中心广播仍需 Broadcast Upload Extension target |
 | 鸿蒙 | — | 占位：`isSupported()` 恒 false |
 
 **`isSupported()` 在 Android/iOS 返回 true** ⇒ 会中页进页即签发令牌并连房；鸿蒙/标准基座
@@ -94,7 +94,7 @@ Swift 6.1 / Xcode 16.3+；当前本机 Xcode 26.6 工具链满足要求。
 1. 验证自建 LiveKit 地址是手机可达的 **`wss://`**（`ws://` 私网真机进不去；iOS ATS 也会拦）。
 2. **Android 事件订阅**：`room.events.collect` 的重载歧义解决后，把成员进出/重连/断开接上（替换现在的 3 秒轮询）。
 3. 新版 iOS 自定义基座上的本机/远端视频真机验收，以及崩溃报告归档。
-4. 屏幕共享（Android MediaProjection / iOS ReplayKit 扩展）、成员治理、DataChannel 聊天。
+4. iOS Broadcast Upload Extension（跨 App/控制中心全设备共享）；iOS 当前实现仅捕获本 App 画面。Android DataChannel 聊天和 MediaProjection 共享、iOS DataChannel 聊天与应用内共享均待自定义基座真机验收。
 5. 鸿蒙：自研 LiveKitClient（见 `utssdk/app-harmony/index.uts` 文件头）。
 
 ## 不要做的事

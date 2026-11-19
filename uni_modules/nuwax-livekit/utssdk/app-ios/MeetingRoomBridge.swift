@@ -4,6 +4,7 @@ import UIKit
 // CocoaPods 的 pod 名是 LiveKitClient，Swift 模块名随之也是 LiveKitClient
 // （`import LiveKit` 是 SPM 的模块名，云打包实测解析不到）
 import LiveKitClient
+import ReplayKit
 
 /**
  * 会议房间桥（iOS，LiveKit Swift SDK 2.19.x）。
@@ -18,13 +19,15 @@ import LiveKitClient
  *   <li>`VideoView` 的镜像属性叫 `mirrorMode`（`.auto/.off/.mirror`）；
  *       填充策略叫 `layoutMode`（`.fit/.fill`），**不是** `mirror`。</li>
  *   <li>UTS 的 `number` 在 Swift 侧是 `NSNumber`：回调用 `NSNumber`、返回值也返回 `NSNumber`。</li>
- *   <li>不实现 `RoomDelegate`：连接结果以 `connect` 是否抛错 + 轮询人数为准，
- *       少一层协议方法名风险（事件流后续再补）。</li>
+ *   <li>`RoomDelegate` 只用于可靠 DataChannel 会中聊天/弹幕；连接结果仍以
+ *       `connect` 是否抛错 + 轮询人数为准，避免把连接状态回调跨到 UTS。</li>
  * </ul>
  *
- * <h2>待补（下一批）</h2>
+ * <h2>当前限制</h2>
  * <p>切前后摄像头（`CameraCapturer`/`LocalVideoTrack` 的入口名待核实）、远端画面订阅、
- * 音量（`audioLevel`）—— 这三项目前返回"无操作/0"，不影响入会与互相看见。</p>
+ * 音量（`audioLevel`）—— 这三项目前返回"无操作/0"，不影响入会与互相看见。
+ * 屏幕共享采用 ReplayKit 应用内采集；跨 App/控制中心共享需要额外的 Broadcast Upload
+ * Extension target，当前 uni-app 插件不包含该 target。</p>
  */
 public class MeetingRoomBridge: NSObject {
   /// 与页面诊断配套；只有重新制作原生基座才会更新。
@@ -40,6 +43,26 @@ public class MeetingRoomBridge: NSObject {
   private static var deviceErrorText = ""
   /// 远端成员 identity → 当前渲染视图（重新挂载 native-view 时替换）
   private static var remoteViews: [String: VideoView] = [:]
+  private static var meetingMessages: [[String: Any]] = []
+  private static let meetingMessagesLock = NSLock()
+  private static var screenShareTrack: LocalVideoTrack?
+  private static var screenShareErrorText = ""
+  private static var screenShareRequestID = 0
+  private static let screenShareLock = NSLock()
+  private static var dataDelegate: MeetingDataDelegate?
+
+  private final class MeetingDataDelegate: NSObject, RoomDelegate, @unchecked Sendable {
+    func room(
+      _ room: Room,
+      participant: RemoteParticipant?,
+      didReceiveData data: Data,
+      forTopic topic: String,
+      encryptionType: EncryptionType
+    ) {
+      guard topic == "meeting-chat" || topic == "danmaku" else { return }
+      MeetingRoomBridge.receiveMeetingData(data, topic: topic, participant: participant)
+    }
+  }
 
   // MARK: - 线程
 
@@ -130,7 +153,9 @@ public class MeetingRoomBridge: NSObject {
         do {
           try activateAudioSession()
           bridgeLog("audio session active cat=\(AVAudioSession.sharedInstance().category.rawValue)")
-          let created = Room()
+          let delegate = MeetingDataDelegate()
+          dataDelegate = delegate
+          let created = Room(delegate: delegate)
           room = created
           try await created.connect(url: serverUrl, token: token)
           // ★先置 connected：设备开关可能弹权限框停留十几秒，不能让它把「入会成功」拖成超时
@@ -206,9 +231,16 @@ public class MeetingRoomBridge: NSObject {
   /// 离开：只断本端，不删房。
   public static func disconnect() {
     bridgeLog("disconnect \(debugSnapshot())")
+    screenShareLock.lock()
+    screenShareRequestID += 1
+    screenShareLock.unlock()
     onMain {
       releaseVideoView()
       releaseRemoteVideoViews()
+      stopScreenShareInternal(room: room)
+      meetingMessagesLock.lock()
+      meetingMessages.removeAll()
+      meetingMessagesLock.unlock()
       // Room.disconnect() 在 Swift SDK 里是 async：必须放进 Task 里跑
       if let current = room {
         Task { await current.disconnect() }
@@ -219,6 +251,181 @@ public class MeetingRoomBridge: NSObject {
       deviceErrorText = ""
       deactivateAudioSession()
     }
+  }
+
+  // MARK: - 会中聊天 / 弹幕
+
+  private static func receiveMeetingData(_ data: Data, topic: String, participant: RemoteParticipant?) {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let text = object["text"] as? String else { return }
+    let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanText.isEmpty else { return }
+    let item: [String: Any] = [
+      "text": String(cleanText.prefix(120)),
+      "name": (object["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? participant?.name ?? "参会人",
+      "identity": participant?.identity?.stringValue ?? "",
+      "self": false,
+      "topic": topic,
+      "at": Int64(Date().timeIntervalSince1970 * 1000),
+    ]
+    meetingMessagesLock.lock()
+    defer { meetingMessagesLock.unlock() }
+    meetingMessages.append(item)
+    if meetingMessages.count > 100 { meetingMessages.removeFirst(meetingMessages.count - 100) }
+  }
+
+  public static func sendMeetingMessage(_ text: String, displayName: String, danmaku: Bool) {
+    guard connectedFlag, let current = room else { return }
+    let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanText.isEmpty, cleanText.count <= 120 else { return }
+    let topic = danmaku ? "danmaku" : "meeting-chat"
+    let payloadObject: [String: String] = ["text": cleanText, "name": displayName]
+    guard let payload = try? JSONSerialization.data(withJSONObject: payloadObject) else { return }
+    Task { @MainActor in
+      do {
+        try await current.localParticipant.publish(
+          data: payload,
+          options: DataPublishOptions(topic: topic, reliable: true)
+        )
+        let item: [String: Any] = [
+          "text": cleanText,
+          "name": displayName,
+          "identity": current.localParticipant.identity?.stringValue ?? "",
+          "self": true,
+          "topic": topic,
+          "at": Int64(Date().timeIntervalSince1970 * 1000),
+        ]
+        meetingMessagesLock.lock()
+        defer { meetingMessagesLock.unlock() }
+        meetingMessages.append(item)
+        if meetingMessages.count > 100 { meetingMessages.removeFirst(meetingMessages.count - 100) }
+      } catch {
+        bridgeLog("meeting message publish failed: \(error)")
+      }
+    }
+  }
+
+  public static func drainMeetingMessages() -> String {
+    meetingMessagesLock.lock()
+    defer { meetingMessagesLock.unlock() }
+    var result = "[]"
+    if let data = try? JSONSerialization.data(withJSONObject: meetingMessages),
+       let json = String(data: data, encoding: .utf8) {
+      result = json
+      meetingMessages.removeAll()
+    }
+    return result
+  }
+
+  // MARK: - ReplayKit 应用内屏幕共享
+
+  public static func requestScreenShare() {
+    screenShareLock.lock()
+    screenShareRequestID += 1
+    let requestID = screenShareRequestID
+    screenShareLock.unlock()
+    onMain {
+      guard connectedFlag, let current = room else {
+        screenShareErrorText = "not_connected"
+        return
+      }
+      screenShareLock.lock()
+      let alreadySharing = screenShareTrack != nil
+      screenShareLock.unlock()
+      if alreadySharing { return }
+      screenShareErrorText = ""
+    Task { @MainActor in
+      do {
+        guard RPScreenRecorder.shared().isAvailable else {
+          screenShareErrorText = "replaykit_unavailable"
+          return
+        }
+        let options = ScreenShareCaptureOptions(
+          dimensions: .h1080_169,
+          fps: 15,
+          showCursor: false,
+          appAudio: false,
+          useBroadcastExtension: false,
+          useScreenCaptureKit: false,
+          includeCurrentApplication: true
+        )
+        let track = await LocalVideoTrack.createInAppScreenShareTrack(options: options)
+        screenShareLock.lock()
+        let requestStillActive = requestID == screenShareRequestID
+        screenShareLock.unlock()
+        guard requestStillActive, connectedFlag, room === current else {
+          _ = try? await track.capturer.stopCapture()
+          return
+        }
+        _ = try await current.localParticipant.publish(videoTrack: track)
+        screenShareLock.lock()
+        let publishStillActive = requestID == screenShareRequestID
+        screenShareLock.unlock()
+        guard publishStillActive, connectedFlag, room === current else {
+          if let publication = current.localParticipant.firstScreenSharePublication as? LocalTrackPublication {
+            try? await current.localParticipant.unpublish(publication: publication)
+          }
+          _ = try? await track.capturer.stopCapture()
+          return
+        }
+        screenShareLock.lock()
+        screenShareTrack = track
+        screenShareLock.unlock()
+        screenShareErrorText = ""
+        bridgeLog("in-app screen share published")
+      } catch {
+        screenShareLock.lock()
+        let requestStillActive = requestID == screenShareRequestID
+        screenShareLock.unlock()
+        guard requestStillActive else { return }
+        screenShareLock.lock()
+        screenShareTrack = nil
+        screenShareLock.unlock()
+        screenShareErrorText = error.localizedDescription
+        bridgeLog("in-app screen share failed: \(error)")
+      }
+    }
+    }
+  }
+
+  private static func stopScreenShareInternal(room current: Room?) {
+    screenShareLock.lock()
+    let track = screenShareTrack
+    screenShareTrack = nil
+    screenShareLock.unlock()
+    guard let track = track else { return }
+    Task { @MainActor in
+      do {
+        if let current = current,
+           let publication = current.localParticipant.firstScreenSharePublication as? LocalTrackPublication {
+          try await current.localParticipant.unpublish(publication: publication)
+        }
+        _ = try await track.capturer.stopCapture()
+      } catch {
+        bridgeLog("in-app screen share stop failed: \(error)")
+      }
+    }
+  }
+
+  public static func stopScreenShare() {
+    screenShareLock.lock()
+    screenShareRequestID += 1
+    screenShareLock.unlock()
+    onMain {
+      stopScreenShareInternal(room: room)
+    }
+  }
+
+  public static func isScreenShareOn() -> Bool {
+    screenShareLock.lock()
+    defer { screenShareLock.unlock() }
+    return screenShareTrack != nil
+  }
+
+  public static func screenShareError() -> String {
+    screenShareLock.lock()
+    defer { screenShareLock.unlock() }
+    return screenShareErrorText
   }
 
   // MARK: - 设备

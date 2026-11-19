@@ -1132,7 +1132,7 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
             }
             // Mark the meeting UUID before report so an early answer still routes to the
             // meeting flow instead of the 1:1 call state machine.
-            if let invitation, invitation.scene == "meeting", !terminal.contains(invitation.callId) {
+            if let invitation, invitation.scene == "meeting", snapshot == nil, !terminal.contains(invitation.callId) {
                 meetingPushUUIDs.insert(systemUUID)
                 meetingInvites[systemUUID] = invitation
             }
@@ -1194,6 +1194,8 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         guard pendingPushes[systemUUID] != nil, !terminal.contains(invitation.callId) || pendingPushes[systemUUID]?.declined == true else { removePendingPush(systemUUID); endIfUnverified(); return }
         defer { if run == generation { removePendingPush(systemUUID) } }
         if invitation.scene == "meeting" {
+            // Busy: keep the chat card only, never interrupt an active call.
+            guard snapshot == nil else { system.end(uuid: systemUUID); return }
             do {
                 guard let conv = invitation.convId, let msg = invitation.msgId,
                       let pending = pendingPushes[systemUUID] else {

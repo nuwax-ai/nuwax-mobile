@@ -1,0 +1,241 @@
+/**
+ * 伙伴页录音会话的本地缓存。
+ * 每次状态变化都写入 uni storage（App 端即本地持久化），进程被杀掉后仍能补传。
+ */
+
+import { pushVoiceNoteDebug } from "@/utils/voiceNoteDebugLog.uts";
+
+const STORAGE_KEY = "nuwax_voice_note_sessions";
+const MAX_SESSIONS = 50;
+
+export class VoiceNoteSegmentRecord {
+  segmentIndex: number = 0;
+  filePath: string = "";
+  durationMs: number = 0;
+  startedAt: number = 0;
+  endedAt: number = 0;
+  /** recording 不会落盘；pending / uploading / uploaded / failed */
+  uploadStatus: string = "pending";
+  segmentId: string = "";
+  isLast: boolean = false;
+  error: string = "";
+}
+
+export class VoiceNoteRecord {
+  localId: string = "";
+  noteId: string = "";
+  title: string = "";
+  /**
+   * recording 录音中 / paused 已暂停可继续 / stopped 已停止 /
+   * uploading 上传与收尾 / processing 转写中 / success 完成 / failed 失败 / discarded 已放弃
+   */
+  phase: string = "recording";
+  startedAt: number = 0;
+  /** 已落下的录音时长，不含当前正在写的这一段。暂停时计时停在这里。 */
+  accumulatedMs: number = 0;
+  /** 当前这一段里已经暂停累计的时长。暂停不落盘，继续写同一个文件。 */
+  openElapsedMs: number = 0;
+  elapsedMs: number = 0;
+  /** 当前未落盘分段的起点；没有未完成分段时为 0 */
+  segmentStartedAt: number = 0;
+  openSegmentIndex: number = 0;
+  /** 正在写的分段绝对路径。进程被杀掉后用来把这段补成暂停分段，会话不结束。 */
+  openSegmentPath: string = "";
+  /** 用户点了完成，队列清空后要调用 complete */
+  awaitComplete: boolean = false;
+  serverStatus: string = "";
+  docUrl: string = "";
+  asrText: string = "";
+  error: string = "";
+  updatedAt: number = 0;
+  segments: VoiceNoteSegmentRecord[] = [];
+}
+
+function readNumber(raw: any | null): number {
+  if (raw == null) return 0;
+  const value = parseFloat(`${raw}`);
+  if (isNaN(value)) return 0;
+  return value;
+}
+
+function readBool(raw: any | null): boolean {
+  if (raw == true) return true;
+  if (`${raw}` == "true") return true;
+  return false;
+}
+
+function readString(raw: any | null): string {
+  if (raw == null) return "";
+  return `${raw}`;
+}
+
+function segmentFromJson(obj: UTSJSONObject): VoiceNoteSegmentRecord {
+  const row = new VoiceNoteSegmentRecord();
+  row.segmentIndex = readNumber(obj["segmentIndex"]);
+  row.filePath = readString(obj["filePath"]);
+  row.durationMs = readNumber(obj["durationMs"]);
+  row.startedAt = readNumber(obj["startedAt"]);
+  row.endedAt = readNumber(obj["endedAt"]);
+  row.uploadStatus = readString(obj["uploadStatus"]);
+  if (row.uploadStatus.length == 0) row.uploadStatus = "pending";
+  row.segmentId = readString(obj["segmentId"]);
+  row.isLast = readBool(obj["isLast"]);
+  row.error = readString(obj["error"]);
+  return row;
+}
+
+function recordFromJson(obj: UTSJSONObject): VoiceNoteRecord {
+  const row = new VoiceNoteRecord();
+  row.localId = readString(obj["localId"]);
+  row.noteId = readString(obj["noteId"]);
+  row.title = readString(obj["title"]);
+  row.phase = readString(obj["phase"]);
+  if (row.phase.length == 0) row.phase = "recording";
+  row.startedAt = readNumber(obj["startedAt"]);
+  row.accumulatedMs = readNumber(obj["accumulatedMs"]);
+  row.openElapsedMs = readNumber(obj["openElapsedMs"]);
+  row.elapsedMs = readNumber(obj["elapsedMs"]);
+  row.segmentStartedAt = readNumber(obj["segmentStartedAt"]);
+  row.openSegmentIndex = readNumber(obj["openSegmentIndex"]);
+  row.openSegmentPath = readString(obj["openSegmentPath"]);
+  row.awaitComplete = readBool(obj["awaitComplete"]);
+  row.serverStatus = readString(obj["serverStatus"]);
+  row.docUrl = readString(obj["docUrl"]);
+  row.asrText = readString(obj["asrText"]);
+  row.error = readString(obj["error"]);
+  row.updatedAt = readNumber(obj["updatedAt"]);
+  const rawSegments = obj["segments"];
+  if (rawSegments != null) {
+    const list = rawSegments as UTSJSONObject[];
+    for (let i = 0; i < list.length; i++) {
+      row.segments.push(segmentFromJson(list[i]));
+    }
+  }
+  return row;
+}
+
+function segmentToJson(row: VoiceNoteSegmentRecord): UTSJSONObject {
+  const obj = {} as UTSJSONObject;
+  obj["segmentIndex"] = row.segmentIndex;
+  obj["filePath"] = row.filePath;
+  obj["durationMs"] = row.durationMs;
+  obj["startedAt"] = row.startedAt;
+  obj["endedAt"] = row.endedAt;
+  obj["uploadStatus"] = row.uploadStatus;
+  obj["segmentId"] = row.segmentId;
+  obj["isLast"] = row.isLast;
+  obj["error"] = row.error;
+  return obj;
+}
+
+function recordToJson(row: VoiceNoteRecord): UTSJSONObject {
+  const obj = {} as UTSJSONObject;
+  obj["localId"] = row.localId;
+  obj["noteId"] = row.noteId;
+  obj["title"] = row.title;
+  obj["phase"] = row.phase;
+  obj["startedAt"] = row.startedAt;
+  obj["accumulatedMs"] = row.accumulatedMs;
+  obj["openElapsedMs"] = row.openElapsedMs;
+  obj["elapsedMs"] = row.elapsedMs;
+  obj["segmentStartedAt"] = row.segmentStartedAt;
+  obj["openSegmentIndex"] = row.openSegmentIndex;
+  obj["openSegmentPath"] = row.openSegmentPath;
+  obj["awaitComplete"] = row.awaitComplete;
+  obj["serverStatus"] = row.serverStatus;
+  obj["docUrl"] = row.docUrl;
+  obj["asrText"] = row.asrText;
+  obj["error"] = row.error;
+  obj["updatedAt"] = row.updatedAt;
+  const segments: UTSJSONObject[] = [];
+  for (let i = 0; i < row.segments.length; i++) {
+    segments.push(segmentToJson(row.segments[i]));
+  }
+  obj["segments"] = segments;
+  return obj;
+}
+
+export function loadVoiceNotes(): VoiceNoteRecord[] {
+  const raw = uni.getStorageSync(STORAGE_KEY);
+  if (raw == null || `${raw}`.length == 0) return [];
+  try {
+    const parsed = JSON.parse(`${raw}`) as UTSJSONObject[];
+    const rows: VoiceNoteRecord[] = [];
+    for (let i = 0; i < parsed.length; i++) {
+      const row = recordFromJson(parsed[i]);
+      if (row.localId.length > 0) rows.push(row);
+    }
+    return rows;
+  } catch (_e) {
+    return [];
+  }
+}
+
+export function saveVoiceNotes(rows: VoiceNoteRecord[]): void {
+  const kept: VoiceNoteRecord[] = [];
+  for (let i = 0; i < rows.length && kept.length < MAX_SESSIONS; i++) {
+    if (rows[i].phase == "discarded") continue;
+    kept.push(rows[i]);
+  }
+  const payload: UTSJSONObject[] = [];
+  for (let i = 0; i < kept.length; i++) {
+    payload.push(recordToJson(kept[i]));
+  }
+  uni.setStorageSync(STORAGE_KEY, JSON.stringify(payload));
+}
+
+function cacheSignature(record: VoiceNoteRecord): string {
+  let text = record.phase + "|" + record.noteId + "|" + (record.awaitComplete ? "1" : "0") + "|" + record.error;
+  for (let i = 0; i < record.segments.length; i++) {
+    const row = record.segments[i];
+    text = text + ";" + row.segmentIndex.toString() + ":" + row.uploadStatus + ":" + row.segmentId + ":" + (row.isLast ? "1" : "0");
+  }
+  return text;
+}
+
+export function upsertVoiceNote(record: VoiceNoteRecord): void {
+  record.updatedAt = Date.now();
+  const rows = loadVoiceNotes();
+  let previous: VoiceNoteRecord | null = null;
+  const next: VoiceNoteRecord[] = [record];
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].localId == record.localId) {
+      previous = rows[i];
+    } else {
+      next.push(rows[i]);
+    }
+  }
+  saveVoiceNotes(next);
+  const before = previous != null ? cacheSignature(previous) : "";
+  if (before != cacheSignature(record)) {
+    pushVoiceNoteDebug(
+      "缓存",
+      "写入 phase=" + record.phase + " noteId=" + (record.noteId.length > 0 ? record.noteId : "空") + " 段=" + record.segments.length.toString(),
+    );
+  }
+}
+
+export function removeVoiceNote(localId: string): void {
+  const rows = loadVoiceNotes();
+  const next: VoiceNoteRecord[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].localId != localId) next.push(rows[i]);
+  }
+  saveVoiceNotes(next);
+  pushVoiceNoteDebug("缓存", "删除 localId=" + localId);
+}
+
+/** 正在录音优先；否则最近一条还没成功入库的会话。 */
+export function findOpenVoiceNote(): VoiceNoteRecord | null {
+  const rows = loadVoiceNotes();
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].phase == "recording") return rows[i];
+  }
+  for (let i = 0; i < rows.length; i++) {
+    const phase = rows[i].phase;
+    if (phase == "paused" || phase == "stopped" || phase == "uploading" || phase == "processing" || phase == "failed") {
+      return rows[i];
+    }
+  }
+  return null;
+}

@@ -1,0 +1,781 @@
+<template>
+  <!--
+    分享面板，对齐微信浏览器点「···」后的底部菜单。
+    由需要分享的页面引入。chooseShareTarget 通知当前页最上层的这一组件打开。
+    转发给最近会话、转发给朋友、更多打开方式、复制链接、浏览器打开、刷新（调用方有刷新时）可用。
+  -->
+  <uni-modal-popup
+    ref="popupRef"
+    position="bottom"
+    height="auto"
+    :show-header="false"
+    :show-close-btn="false"
+    :body-scroll="false"
+    :z-index="10050"
+    overlay-style="background-color: rgba(0, 0, 0, 0.45);"
+    @update-visible="onPopupVisible"
+  >
+    <view class="share-sheet" @tap.stop="onSheetTap">
+      <view class="share-panel">
+        <text v-if="hostText.length > 0" class="share-host">{{ hostText }}</text>
+        <template v-if="recents.length > 0">
+        <text class="share-section">{{ t("Mobile.Share.forwardTo") }}</text>
+        <scroll-view class="share-scroll share-scroll--recent" direction="horizontal" :show-scrollbar="false">
+          <view class="share-scroll__inner share-scroll__inner--recent" :style="{ width: recentWidth }">
+            <view
+              v-for="item in recents"
+              :key="item.key"
+              class="share-cell"
+              @tap="onRecent(item)"
+            >
+              <view class="share-avatar-wrap">
+                <view
+                  v-if="item.avatarLoaded != true || item.avatarFailed == true"
+                  class="share-avatar"
+                  :style="{ backgroundImage: item.gradient }"
+                >
+                  <text class="share-avatar__letter">{{ item.letter }}</text>
+                </view>
+                <view
+                  v-if="item.avatarDisplay.length > 0 && item.avatarFailed != true"
+                  class="share-avatar share-avatar--clip"
+                >
+                  <image
+                    class="share-avatar__img"
+                    :src="item.avatarDisplay"
+                    mode="aspectFill"
+                    :fade-show="false"
+                    @load="onAvatarLoad(item.key)"
+                    @error="onAvatarError(item.key)"
+                  />
+                </view>
+              </view>
+              <text class="share-cell__label share-cell__label--single">{{ item.name }}</text>
+            </view>
+          </view>
+        </scroll-view>
+        <view class="share-divider-wrap share-divider-wrap--loose">
+          <view class="share-divider" />
+        </view>
+        </template>
+        <scroll-view class="share-scroll" direction="horizontal" :show-scrollbar="false">
+          <view class="share-scroll__inner" :style="{ width: rowOneWidth }">
+            <view
+              v-for="item in rowOne"
+              :key="item.key"
+              class="share-cell"
+              @tap="onAction(item.key)"
+            >
+              <view class="share-icon" :style="{ backgroundColor: item.bg }">
+                <view v-if="item.glyph == 'more'" class="share-dots">
+                  <view class="share-dots__dot" />
+                  <view class="share-dots__dot" />
+                  <view class="share-dots__dot" />
+                </view>
+                <svg-icon v-else :name="item.icon" size="26" unit="px" :color="item.color" />
+              </view>
+              <text class="share-cell__label">{{ item.label }}</text>
+            </view>
+          </view>
+        </scroll-view>
+        <scroll-view class="share-scroll share-scroll--last" direction="horizontal" :show-scrollbar="false">
+          <view class="share-scroll__inner share-scroll__inner--last" :style="{ width: rowTwoWidth }">
+            <view
+              v-for="item in rowTwo"
+              :key="item.key"
+              class="share-cell"
+              @tap="onAction(item.key)"
+            >
+              <view class="share-icon share-icon--plain">
+                <text v-if="item.glyph.length > 0" class="share-icon__glyph">{{ item.glyph }}</text>
+                <svg-icon v-else :name="item.icon" size="26" unit="px" :color="item.color" />
+              </view>
+              <text class="share-cell__label">{{ item.label }}</text>
+            </view>
+          </view>
+        </scroll-view>
+      </view>
+      <view class="share-divider-wrap">
+        <view class="share-divider share-divider--full" />
+      </view>
+      <view class="share-cancel" @tap="onDismiss">
+        <text class="share-cancel__text">{{ t("Mobile.Common.cancel") }}</text>
+      </view>
+      <view class="share-safe" :style="{ height: safeSpace }" />
+    </view>
+  </uni-modal-popup>
+</template>
+
+<script setup lang="uts">
+  import { ComponentPublicInstance, computed, onMounted, onUnmounted, ref } from "vue";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiImSendTextMsg } from "@/servers/im";
+  import { apiResCode, apiResMessage } from "@/utils/apiResponse";
+  import { hasLoginSession } from "@/utils/authSession";
+  import { generateUUID } from "@/utils/common";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+  import { isAuthProtectedFileUrl, resolveAuthProtectedFileFetchUrl } from "@/utils/authProtectedFileUrl";
+  import { resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+  import { readImConvCache } from "@/utils/im/imListCache";
+  import { openExternalUrl } from "@/utils/openExternalUrl";
+  import { getSafeAreaBottom } from "@/utils/system";
+  import {
+    bindShareSheet,
+    dismissShareSheet,
+    isShareSheetOpen,
+    peekShareSheet,
+    runShareOutside,
+    runShareRefresh,
+    runShareToNuwax,
+    unbindShareSheet,
+  } from "@/utils/appShare";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 一行操作。glyph 非空时画文字（调整字体的 Aa），不再画图标。 */
+  class ShareAction {
+    key: string = "";
+    label: string = "";
+    icon: string = "";
+    glyph: string = "";
+    bg: string = "#ffffff";
+    color: string = "#ffffff";
+  }
+
+  /** 最近会话。pick=true 是「选择会话」，没有最近会话时单独出现。 */
+  class ShareRecent {
+    key: string = "";
+    convId: string = "";
+    name: string = "";
+    avatarUrl: string = "";
+    avatarDisplay: string = "";
+    letter: string = "";
+    gradient: string = "";
+    avatarFailed: boolean = false;
+    avatarLoaded: boolean = false;
+    pick: boolean = false;
+  }
+
+  const AVATAR_GRADIENTS: string[] = [
+    "linear-gradient(to bottom right, #8f9bf0, #5a67d9)",
+    "linear-gradient(to bottom right, #7fe0c8, #3fae94)",
+    "linear-gradient(to bottom right, #f0c06a, #e0942e)",
+    "linear-gradient(to bottom right, #7fb0f0, #4a7fd9)",
+    "linear-gradient(to bottom right, #f0b06a, #e08a2e)",
+  ];
+
+  const visible = ref<boolean>(false);
+  const popupRef = ref<any | null>(null);
+  const safeBottom = ref<number>(getSafeAreaBottom());
+  const sending = ref<boolean>(false);
+  const recents = ref<ShareRecent[]>([]);
+  const rowOne = ref<ShareAction[]>([]);
+  const rowTwo = ref<ShareAction[]>([]);
+  const shareBody = ref<string>("");
+  const shareUrl = ref<string>("");
+  const host = ref<string>("");
+  let bindingId = 0;
+
+  const hostText = computed((): string => {
+    if (host.value.length == 0) return "";
+    const params = new Map<string, string | number>();
+    params.set("host", host.value);
+    return translateFn("Mobile.Share.providedBy", toI18nParams(params), "");
+  });
+
+  const safeSpace = computed((): string => {
+    let inset = safeBottom.value;
+    // 网页页里 page-container 常读到安全区为 0，手势条会压住取消文字。
+    // #ifdef APP
+    if (inset < 34) inset = 34;
+    // #endif
+    return inset.toString() + "px";
+  });
+
+  /** 横滑行内容宽。UTS 不提升函数，必须写在 computed 调用之前。 */
+  function rowInnerWidth(count: number): string {
+    const cells = count > 0 ? count : 1;
+    return (cells * 76 + 16).toString() + "px";
+  }
+
+  const recentWidth = computed((): string => {
+    return rowInnerWidth(recents.value.length);
+  });
+  const rowOneWidth = computed((): string => {
+    return rowInnerWidth(rowOne.value.length);
+  });
+  const rowTwoWidth = computed((): string => {
+    return rowInnerWidth(rowTwo.value.length);
+  });
+
+  function makeAction(
+    key: string,
+    labelKey: string,
+    icon: string,
+    glyph: string,
+    bg: string,
+    color: string,
+  ): ShareAction {
+    const item = new ShareAction();
+    item.key = key;
+    item.label = t(labelKey);
+    item.icon = icon;
+    item.glyph = glyph;
+    item.bg = bg;
+    item.color = color;
+    return item;
+  }
+
+  function readStr(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    if (raw == null) return "";
+    const text = `${raw}`.trim();
+    if (text == "null" || text == "undefined") return "";
+    return text;
+  }
+
+  function readNum(obj: UTSJSONObject, key: string): number {
+    const raw = obj[key];
+    if (raw == null) return 0;
+    const n = parseFloat(`${raw}`);
+    if (n != n) return 0;
+    return n;
+  }
+
+  function isDigits(raw: string): boolean {
+    if (raw.length == 0) return false;
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw.charAt(i);
+      if (ch < "0" || ch > "9") return false;
+    }
+    return true;
+  }
+
+  function gradientOf(name: string): string {
+    let code = 0;
+    if (name.length > 0) {
+      const raw = name.charCodeAt(0);
+      if (raw != null) code = raw;
+    }
+    const index = code % AVATAR_GRADIENTS.length;
+    return AVATAR_GRADIENTS[index];
+  }
+
+  function letterOf(name: string): string {
+    if (name.length == 0) return "";
+    return name.substring(0, 1);
+  }
+
+  /** 受保护头像换成可展示地址后再绑定。换不出来就保持字母，不把原地址绑上去。 */
+  function resolveRecentAvatars(): void {
+    const list = recents.value;
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      const raw = item.avatarUrl;
+      if (raw.length == 0 || item.avatarDisplay.length > 0) continue;
+      const key = item.key;
+      resolveDisplayImageUrl(raw, 104, 104).then((resolved: string) => {
+        if (resolved.length == 0 || resolved == raw) return;
+        const live = recents.value;
+        const next: ShareRecent[] = [];
+        for (let j = 0; j < live.length; j++) {
+          const row = live[j];
+          if (row.key == key && row.avatarUrl == raw) {
+            row.avatarDisplay = resolved;
+            row.avatarFailed = false;
+            row.avatarLoaded = false;
+          }
+          next.push(row);
+        }
+        recents.value = next;
+      });
+    }
+  }
+
+  function buildRecents(): void {
+    const out: ShareRecent[] = [];
+    if (hasLoginSession() == true) {
+      const cache = readImConvCache();
+      if (cache != null) {
+        const records = cache.records;
+        for (let i = 0; i < records.length && out.length < 8; i++) {
+          const rec = records[i];
+          const convId = readStr(rec, "convId");
+          if (isDigits(convId) != true) continue;
+          const convType = readNum(rec, "convType");
+          const name = readStr(rec, "name");
+          const peerName = readStr(rec, "peerName");
+          const avatar = readStr(rec, "avatar");
+          const peerAvatar = readStr(rec, "peerAvatar");
+          let displayName = "";
+          let avatarRaw = "";
+          if (convType == 1) {
+            displayName = peerName.length > 0 ? peerName : name;
+            avatarRaw = peerAvatar.length > 0 ? peerAvatar : avatar;
+          } else {
+            displayName = name.length > 0 ? name : peerName;
+            avatarRaw = avatar;
+          }
+          if (displayName.length == 0) displayName = t("Mobile.Share.unnamedChat");
+          const item = new ShareRecent();
+          item.key = convId;
+          item.convId = convId;
+          item.name = displayName;
+          item.letter = letterOf(displayName);
+          item.gradient = gradientOf(displayName);
+          item.avatarUrl = avatarRaw;
+          let directBind = avatarRaw.length > 0;
+          // #ifdef APP-HARMONY
+          // 与伙伴页一致：鸿蒙不把受保护地址直接绑给 image，等换成可展示地址后再显示。
+          if (isAuthProtectedFileUrl(avatarRaw)) directBind = false;
+          // #endif
+          if (directBind) {
+            item.avatarDisplay = resolveAuthProtectedFileFetchUrl(avatarRaw);
+          }
+          out.push(item);
+        }
+      }
+    }
+    recents.value = out;
+    resolveRecentAvatars();
+  }
+
+  function buildActions(): void {
+    const first: ShareAction[] = [];
+    first.push(makeAction("forwardFriend", "Mobile.Share.forwardFriend", "icon-AppShare", "", "#ffffff", "#07c160"));
+    first.push(makeAction("openBrowser", "Mobile.Share.openBrowser", "icon-Globe", "", "#ffffff", "#4aa3ff"));
+    // #ifndef APP-HARMONY
+    first.push(makeAction("openOther", "Mobile.Share.openOther", "", "more", "#ffffff", "#333333"));
+    // #endif
+    rowOne.value = first;
+
+    const second: ShareAction[] = [];
+    second.push(makeAction("copyLink", "Mobile.Share.copyLink", "icon-Link", "", "#ffffff", "#666666"));
+    second.push(makeAction("refresh", "Mobile.Share.refresh", "icon-refresh", "", "#ffffff", "#666666"));
+    rowTwo.value = second;
+  }
+
+  function placeholder(): void {
+    uni.showToast({ title: t("Mobile.Common.comingSoon"), icon: "none" });
+  }
+
+  function copyLink(): void {
+    const data = shareUrl.value.length > 0 ? shareUrl.value : shareBody.value;
+    if (data.length == 0) {
+      uni.showToast({ title: t("Mobile.Share.noLink"), icon: "none" });
+      return;
+    }
+    uni.setClipboardData({
+      data: data,
+      success: () => {
+        uni.showToast({ title: t("Mobile.Share.linkCopied"), icon: "none" });
+        dismissShareSheet();
+      },
+      fail: () => {
+        uni.showToast({ title: t("Mobile.Share.shareFailed"), icon: "none" });
+      },
+    });
+  }
+
+  async function openInBrowser(): Promise<void> {
+    if (shareUrl.value.length == 0) {
+      uni.showToast({ title: t("Mobile.Share.noLink"), icon: "none" });
+      return;
+    }
+    const url = shareUrl.value;
+    dismissShareSheet();
+    // #ifdef H5 || WEB
+    try {
+      window.open(url, "_blank");
+    } catch (_e) {
+      uni.showToast({ title: t("Mobile.Share.noLink"), icon: "none" });
+    }
+    // #endif
+    // #ifdef APP
+    try {
+      await openExternalUrl(url);
+    } catch (_e) {
+      uni.showToast({ title: t("Mobile.Share.shareFailed"), icon: "none" });
+    }
+    // #endif
+  }
+
+  function refreshPage(): void {
+    if (runShareRefresh() != true) placeholder();
+  }
+
+  function onAction(key: string): void {
+    if (key == "forwardFriend") {
+      runShareToNuwax();
+      return;
+    }
+    if (key == "openOther") {
+      runShareOutside();
+      return;
+    }
+    if (key == "copyLink") {
+      copyLink();
+      return;
+    }
+    if (key == "openBrowser") {
+      void openInBrowser();
+      return;
+    }
+    if (key == "refresh") {
+      refreshPage();
+      return;
+    }
+    placeholder();
+  }
+
+  async function sendToConv(convId: string): Promise<void> {
+    if (sending.value == true) return;
+    sending.value = true;
+    try {
+      const res = await apiImSendTextMsg(convId, shareBody.value, generateUUID());
+      if (apiResCode(res) != SUCCESS_CODE) {
+        const message = apiResMessage(res);
+        uni.showToast({
+          title: message.length > 0 ? message : t("Mobile.Share.shareFailed"),
+          icon: "none",
+        });
+        sending.value = false;
+        return;
+      }
+      dismissShareSheet();
+      setTimeout(() => {
+        uni.showToast({ title: t("Mobile.Share.sent"), icon: "none" });
+      }, 200);
+    } catch (_error) {
+      sending.value = false;
+      uni.showToast({ title: t("Mobile.Share.shareFailed"), icon: "none" });
+    }
+  }
+
+  function onRecent(item: ShareRecent): void {
+    if (item.pick == true || item.convId.length == 0) {
+      runShareToNuwax();
+      return;
+    }
+    if (hasLoginSession() != true) {
+      runShareToNuwax();
+      return;
+    }
+    if (sending.value == true) return;
+    if (shareBody.value.length == 0) {
+      uni.showToast({ title: t("Mobile.Share.shareFailed"), icon: "none" });
+      return;
+    }
+    const convId = item.convId;
+    const name = item.name;
+    let preview = shareBody.value;
+    if (preview.length > 80) preview = preview.substring(0, 80);
+    uni.showModal({
+      title: t("Mobile.Share.sendTo") + " " + name,
+      content: preview,
+      confirmText: t("Mobile.Common.confirm"),
+      cancelText: t("Mobile.Common.cancel"),
+      success: (res) => {
+        if (res.confirm != true) return;
+        void sendToConv(convId);
+      },
+    });
+  }
+
+  function patchRecentAvatar(key: string, loaded: boolean, failed: boolean): void {
+    const list = recents.value;
+    const next: ShareRecent[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      if (item.key == key) {
+        item.avatarLoaded = loaded;
+        item.avatarFailed = failed;
+      }
+      next.push(item);
+    }
+    recents.value = next;
+  }
+
+  function onAvatarLoad(key: string): void {
+    patchRecentAvatar(key, true, false);
+  }
+
+  function onAvatarError(key: string): void {
+    patchRecentAvatar(key, false, true);
+  }
+
+  function callPopup(method: string): void {
+    if (popupRef.value == null) return;
+    (popupRef.value as ComponentPublicInstance).$callMethod(method);
+  }
+
+  function onDismiss(): void {
+    dismissShareSheet();
+  }
+
+  /** 点遮罩或 page-container 自己关掉时，同步收起分享状态。 */
+  function onPopupVisible(shown: boolean): void {
+    if (shown == true) return;
+    if (isShareSheetOpen() == true) dismissShareSheet();
+  }
+
+  function onSheetTap(): void {}
+
+  /** 当前页 chooseShareTarget 打开或收起时刷新本组件。 */
+  function applyShareSheet(): void {
+    if (isShareSheetOpen() != true) {
+      visible.value = false;
+      sending.value = false;
+      callPopup("close");
+      return;
+    }
+    const sheet = peekShareSheet();
+    if (sheet == null) {
+      visible.value = false;
+      callPopup("close");
+      return;
+    }
+    shareBody.value = sheet.body.length > 0 ? sheet.body : sheet.title;
+    shareUrl.value = sheet.url;
+    host.value = sheet.host;
+    buildRecents();
+    const bottom = getSafeAreaBottom();
+    if (bottom > 0) safeBottom.value = bottom;
+    if (visible.value != true) {
+      visible.value = true;
+      callPopup("open");
+    }
+  }
+
+  buildActions();
+
+  onMounted(() => {
+    bindingId = bindShareSheet((): void => {
+      applyShareSheet();
+    });
+  });
+
+  onUnmounted(() => {
+    unbindShareSheet(bindingId);
+  });
+</script>
+
+<style lang="scss" scoped>
+  .share-sheet {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    background-color: #f7f7f7;
+  }
+
+  .share-panel {
+    background-color: #f7f7f7;
+    border-radius: 14px 14px 0 0;
+    padding-top: 14px;
+    padding-bottom: 6px;
+  }
+
+  .share-host {
+    font-size: 12px;
+    line-height: 18px;
+    color: #888888;
+    text-align: center;
+    padding: 0 16px 4px;
+  }
+
+  .share-section {
+    font-size: 15px;
+    line-height: 22px;
+    font-weight: 600;
+    color: #191919;
+    padding: 8px 16px 4px;
+  }
+
+  .share-divider-wrap {
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+
+  .share-divider-wrap--loose {
+    padding-top: 18px;
+    padding-bottom: 18px;
+  }
+
+  .share-divider {
+    height: 1px;
+    margin-left: 16px;
+    margin-right: 16px;
+    background-color: #e6e6e6;
+  }
+
+  .share-divider--full {
+    margin-left: 0;
+    margin-right: 0;
+  }
+
+  .share-scroll {
+    width: 100%;
+    height: 90px;
+  }
+
+  .share-scroll--recent {
+    height: 76px;
+  }
+
+  .share-scroll--last {
+    height: 76px;
+  }
+
+  .share-scroll__inner {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    height: 90px;
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .share-scroll__inner--recent {
+    height: 76px;
+  }
+
+  .share-scroll__inner--last {
+    height: 76px;
+  }
+
+  .share-cell {
+    width: 76px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .share-avatar-wrap {
+    width: 52px;
+    height: 52px;
+    position: relative;
+  }
+
+  .share-avatar {
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+
+  .share-avatar--clip {
+    overflow: hidden;
+    position: absolute;
+    top: 0;
+    left: 0;
+  }
+
+  .share-avatar--action {
+    background-color: #07c160;
+    border-radius: 50%;
+  }
+
+  .share-avatar__img {
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+    position: absolute;
+    top: 0;
+    left: 0;
+  }
+
+  .share-avatar__fallback {
+    width: 52px;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .share-avatar__letter {
+    font-size: 18px;
+    color: #ffffff;
+    font-weight: 600;
+  }
+
+  .share-icon {
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: #ffffff;
+  }
+
+  .share-dots {
+    width: 28px;
+    height: 28px;
+    border-radius: 14px;
+    background-color: #f2f2f2;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .share-dots__dot {
+    width: 3px;
+    height: 3px;
+    margin-left: 1px;
+    margin-right: 1px;
+    border-radius: 2px;
+    background-color: #8c8c8c;
+  }
+
+  .share-icon--plain {
+    background-color: #ffffff;
+  }
+
+  .share-icon__glyph {
+    font-size: 16px;
+    color: #333333;
+    font-weight: 700;
+  }
+
+  .share-cell__label {
+    width: 68px;
+    margin-top: 6px;
+    font-size: 11px;
+    line-height: 15px;
+    color: #666666;
+    text-align: center;
+    lines: 2;
+  }
+
+  .share-cell__label--single {
+    lines: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .share-cancel {
+    background-color: #f7f7f7;
+    padding-bottom: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .share-safe {
+    background-color: #f7f7f7;
+  }
+
+  .share-cancel__text {
+    font-size: 17px;
+    line-height: 24px;
+    color: #576b95;
+  }
+</style>

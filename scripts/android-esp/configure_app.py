@@ -516,11 +516,12 @@ def configure_splash_screen() -> None:
             "android:windowNoTitle": "true",
         },
     )
+    # 业务 Activity 不再使用带 Logo 的背景；避免系统启动屏退出后再出现一遍 Logo。
     upsert_style(
         resources,
         "Theme.Nuwax.UniAppContent",
         "@style/UniAppX.Activity.DefaultTheme",
-        {"android:windowBackground": "@drawable/nuwax_splash_background"},
+        {"android:windowBackground": "@android:color/white"},
     )
     write_resources_xml(themes_path, resources)
 
@@ -533,7 +534,7 @@ def configure_splash_screen() -> None:
             "android:windowSplashScreenBackground": "#FFFFFF",
             "android:windowSplashScreenAnimatedIcon": "@drawable/nuwax_splash_icon",
             "android:windowSplashScreenIconBackgroundColor": "#FFFFFF",
-            "android:windowBackground": "@drawable/nuwax_splash_background",
+            "android:windowBackground": "@android:color/white",
             "android:windowNoTitle": "true",
         },
     )

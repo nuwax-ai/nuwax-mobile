@@ -15,20 +15,21 @@
         </view>
       </template>
       <template v-slot:right>
-        <svg-icon
-          name="icon-More"
-          size="18"
-          unit="px"
-          @click="handleShare"
-        />
+        <view class="webview-share" @click="handleShare">
+          <svg-icon name="icon-More" size="18" unit="px" />
+        </view>
       </template>
     </custom-nav-bar>
     <!-- #endif -->
 
     <view class="webview-content">
+      <view v-if="loadProgress > 0" class="webview-progress-track">
+        <view class="webview-progress-bar" :style="'width:' + loadProgress + '%'"></view>
+      </view>
       <web-view
         class="web-view"
-        v-if="url.length != 0"
+        :class="repoPageCover ? 'web-view--hidden' : ''"
+        v-if="webViewMounted && url.length != 0"
         :src="url"
         id="webview"
         <!-- #ifndef APP -->
@@ -42,13 +43,14 @@
       <view class="webview-placeholder" />
       <!-- #endif -->
     </view>
+    <share-sheet />
   </view>
 </template>
 
 <script lang="uts" setup>
   import { switchMainTab } from "@/utils/mainTabNavigation";
 
-  import { computed, ref, watch } from "vue";
+  import { computed, nextTick, ref, watch } from "vue";
   // #ifdef APP
   import { getCurrentInstance } from "vue";
   // #endif
@@ -61,6 +63,8 @@
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { onLoad, onUnload, onBackPress, onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
   import { isRepoLibraryPath } from "@/utils/repoLibraryLink";
+  import { prepareRepoPageShare, readRepoPageShareUrl } from "./repoPageShare";
+  import { filePreviewPath, prepareFilePageShare, readFilePageShareUrl } from "./filePageShare";
   import { isTabPage } from "@/utils/commonBusiness";
   // #ifdef APP-IOS
   // iOS：返回时须显式恢复 TabBar（常驻壳关壳可能 hide 过）
@@ -82,20 +86,30 @@
     enableAppWebViewBackGesture,
   } from "@/subpackages/utils/appWebViewHistory";
   // #endif
+  import ShareSheet from "@/components/share-sheet/share-sheet.uvue";
   import { useShareLink, ShareLinkOptions } from "@/hooks/useShareLink";
-  import { buildShareOpenUrl, chooseShareTarget, ShareTarget } from "@/utils/appShare";
+  import { buildOutgoingShareUrl, chooseShareTarget, dismissShareSheet, isShareSheetOpen, ShareTarget } from "@/utils/appShare";
 
   const { t: tFn } = useI18n();
   const t = (key: string): string => tFn(key, emptyI18nParams(), "");
   // uvue 中直接调用 t() 会因缺少 params 形参报错，这里包一层单参版本
 
   const url = ref<string>("");
+  /** 为 false 时卸掉 web-view。资料库预写页不能留在历史栈里，写完 token 后重建。 */
+  const webViewMounted = ref<boolean>(true);
+  /** 0 表示不显示。进入页面和切换地址时从 8 爬到 90，加载完成清掉。 */
+  const loadProgress = ref<number>(0);
+  let loadProgressTimer: number = 0;
+  /** 资料库登录态还没写完时，先不把网页铺开，避免闪出预写页源码。 */
+  const repoPageCover = ref<boolean>(false);
   const method = ref<string>("");
   const data_type = ref<string>("");
   const request_id = ref<string>("");
   const pageTitle = ref<string>("");
   /** 当前地址的域名。加载完成前单独居中显示。 */
   const pageHost = ref<string>("");
+  /** 内嵌 webview / iframe 当前地址。分享按这个地址生成，页内跳转后会更新。 */
+  const embeddedPageUrl = ref<string>("");
   /** 内嵌页 document.title。读到之后才显示在域名上方。 */
   const embeddedTitle = ref<string>("");
   let navSyncTimer: number = 0;
@@ -107,6 +121,11 @@
   let webViewContext: WebviewContext | null = null;
   let repoCookieTimer: number = 0;
   let repoCookieAttempts = 0;
+  /** 正在同源页预写登录态，资料库地址先不打开。Android、iOS、鸿蒙同一时机。 */
+  const repoPriming = ref<boolean>(false);
+  let repoPrimeTarget = "";
+  let repoPrimeTimer: number = 0;
+  let repoPrimeAttempts = 0;
   // #endif
   // #ifdef APP-IOS
   /** iOS 页面侧滑是否已按网页 canGoBack 锁住。-1 表示还没设置过。 */
@@ -212,10 +231,35 @@
   };
 
   /**
+   * 记下内嵌页当前地址。和上次不同时，资料库、文件预览重新取分享链接。
+   */
+  const rememberEmbeddedPage = (rawUrl: string): void => {
+    if (rawUrl.indexOf("http://") != 0 && rawUrl.indexOf("https://") != 0) {
+      return;
+    }
+    const clean = removeQueryCompat(rawUrl, ["_ticket"]);
+    if (clean.length == 0 || clean == embeddedPageUrl.value) {
+      return;
+    }
+    embeddedPageUrl.value = clean;
+    if (isRepoLibraryPath(clean)) {
+      prepareRepoPageShare(clean);
+    }
+    if (filePreviewPath(clean).length > 0) {
+      prepareFilePageShare(clean);
+    }
+  };
+
+  /**
    * 读取内嵌页标题和当前地址。
    * App 走原生 WebView；H5 只在同源 iframe 可读，跨域时保持域名单行。
    */
   const syncEmbeddedNav = (): void => {
+    // #ifdef APP
+    if (repoPriming.value == true) {
+      return;
+    }
+    // #endif
     let nextUrl = "";
     let nextTitle = "";
     // #ifdef APP
@@ -227,10 +271,19 @@
       const frames = document.getElementsByTagName("iframe");
       if (frames.length > 0) {
         const frame = frames[frames.length - 1];
-        const doc = frame.contentDocument;
-        if (doc != null) {
-          nextTitle = doc.title != null ? `${doc.title}` : "";
-          nextUrl = frame.contentWindow != null ? `${frame.contentWindow.location.href}` : "";
+        const frameSrc = frame.src != null ? `${frame.src}` : "";
+        try {
+          const doc = frame.contentDocument;
+          if (doc != null) {
+            nextTitle = doc.title != null ? `${doc.title}` : "";
+            nextUrl = frame.contentWindow != null ? `${frame.contentWindow.location.href}` : "";
+          }
+        } catch (_eCross) {
+          // 外链跨域读不到 location，退回 iframe 自己的地址。
+          nextUrl = frameSrc;
+        }
+        if (nextUrl.length == 0) {
+          nextUrl = frameSrc;
         }
       }
     } catch (_eFrame) {
@@ -242,6 +295,9 @@
     const host = hostOf(hostSource);
     if (host.length > 0) {
       pageHost.value = host;
+    }
+    if (nextUrl.length > 0) {
+      rememberEmbeddedPage(nextUrl);
     }
     if (isDocumentTitle(nextTitle, hostSource)) {
       applyNavTitle(nextTitle.trim());
@@ -303,7 +359,7 @@
     }
     try {
       context.evalJS(
-        "(function(){try{var t=document.title||'';var u=location.href||'';if(!t){return;}" +
+        "(function(){try{var t=document.title||'';var u=location.href||'';if(!t&&!u){return;}" +
           "var p={type:'nuwax-webview-title',title:t,url:u};" +
           "if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:p});return;}" +
           "if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:p});}" +
@@ -311,6 +367,30 @@
       );
     } catch (_eEval) {
       // 文档还在加载时 evalJS 可能抛错，交给下一次轮询
+    }
+  };
+
+  let iosUrlSyncTimer: number = 0;
+
+  /** 页内跳到外链后，持续读取当前网址，供分享使用。 */
+  const startIosEmbeddedUrlSync = (): void => {
+    if (iosUrlSyncTimer != 0) {
+      return;
+    }
+    iosUrlSyncTimer = setInterval((): void => {
+      if (repoPriming.value == true) {
+        return;
+      }
+      if (isNeedCallApi.value == false) {
+        requestWebViewDocumentTitle();
+      }
+    }, 500) as number;
+  };
+
+  const stopIosEmbeddedUrlSync = (): void => {
+    if (iosUrlSyncTimer != 0) {
+      clearInterval(iosUrlSyncTimer);
+      iosUrlSyncTimer = 0;
     }
   };
 
@@ -367,6 +447,7 @@
       if (host.length > 0) {
         pageHost.value = host;
       }
+      rememberEmbeddedPage(nextUrl);
     }
     const title = nextTitle.trim();
     if (isDocumentTitle(title, nextUrl)) {
@@ -377,12 +458,38 @@
   };
   // #endif
 
+  const stopLoadProgress = (): void => {
+    if (loadProgressTimer != 0) {
+      clearInterval(loadProgressTimer);
+      loadProgressTimer = 0;
+    }
+    loadProgress.value = 0;
+  };
+
+  /** 地址一开始加载就露出进度，避免停在 90 之前。 */
+  const startLoadProgress = (): void => {
+    if (loadProgress.value == 0) {
+      loadProgress.value = 8;
+    }
+    if (loadProgressTimer != 0) {
+      return;
+    }
+    loadProgressTimer = setInterval((): void => {
+      if (loadProgress.value < 90) {
+        loadProgress.value = loadProgress.value + 7;
+      }
+    }, 200) as number;
+  };
+
   watch(url, (value: string): void => {
     const host = hostOf(value);
     if (host.length > 0) {
       pageHost.value = host;
     }
     embeddedTitle.value = "";
+    if (value.length > 0) {
+      startLoadProgress();
+    }
   });
 
   /**
@@ -451,6 +558,13 @@
 
   // WebView 加载错误处理
   const handleWebviewError = (e: any) => {
+    // #ifdef APP
+    if (repoPriming.value == true) {
+      console.error("资料库登录态预写失败:", e);
+      finishRepoTokenPrime();
+      return;
+    }
+    // #endif
     console.error("WebView 加载错误:", e);
     uni.showToast({
       title: t("Mobile.Webview.loadFailed"),
@@ -587,6 +701,149 @@
     // #endif
   };
 
+  // #ifdef APP
+  const REPO_TOKEN_READY_TYPE = "nuwax-repo-token-ready";
+
+  /** 资料库地址的站点源。localStorage 按源隔离，预写页必须和资料库同域。 */
+  const originOfAbsolute = (raw: string): string => {
+    const value = raw.trim();
+    const proto = value.indexOf("://");
+    if (proto < 0) {
+      return "";
+    }
+    const rest = value.substring(proto + 3);
+    let end: number = rest.length;
+    const slash = rest.indexOf("/");
+    if (slash >= 0 && slash < end) {
+      end = slash;
+    }
+    const query = rest.indexOf("?");
+    if (query >= 0 && query < end) {
+      end = query;
+    }
+    const hash = rest.indexOf("#");
+    if (hash >= 0 && hash < end) {
+      end = hash;
+    }
+    if (end <= 0) {
+      return "";
+    }
+    return value.substring(0, proto + 3 + end);
+  };
+
+  const stopRepoTokenPrimeTimer = (): void => {
+    if (repoPrimeTimer != 0) {
+      clearInterval(repoPrimeTimer);
+      repoPrimeTimer = 0;
+    }
+  };
+
+  /** 登录态已经写入当前源，再打开真正的资料库地址。 */
+  const finishRepoTokenPrime = (): void => {
+    if (repoPriming.value != true) {
+      return;
+    }
+    const target = repoPrimeTarget;
+    repoPriming.value = false;
+    repoPrimeTarget = "";
+    stopRepoTokenPrimeTimer();
+    webViewContext = null;
+    if (target.length == 0) {
+      repoPageCover.value = false;
+      stopLoadProgress();
+      return;
+    }
+    // 预写页已经在 web-view 历史里。卸掉再打开资料库，左滑才不会先回到空白页。
+    repoPageCover.value = true;
+    webViewMounted.value = false;
+    url.value = "";
+    nextTick((): void => {
+      url.value = target;
+      webViewMounted.value = true;
+    });
+  };
+
+  /**
+   * 在同源静态文档上写入 ACCESS_TOKEN，并通知本页可以打开资料库。
+   * 不判断路径：这个文档不是 /repo/，判断会把写入跳过。
+   */
+  const writeRepoTokenBeforeNavigation = (): void => {
+    const cachedToken = readCachedAccessToken();
+    const tokenToInject = cachedToken.length > 0 ? cachedToken : repoPageTicket;
+    if (tokenToInject.length == 0) {
+      finishRepoTokenPrime();
+      return;
+    }
+    let ctx: WebviewContext | null = webViewContext;
+    if (ctx == null) {
+      try {
+        ctx = uni.createWebviewContext(
+          WEBVIEW_ELEMENT_ID,
+          instance != null ? instance.proxy : null,
+        );
+        webViewContext = ctx;
+      } catch (_e) {
+        return;
+      }
+      if (ctx == null) {
+        return;
+      }
+    }
+    const ticketLiteral = JSON.stringify(tokenToInject);
+    try {
+      ctx.evalJS(
+        "try{localStorage.setItem('ACCESS_TOKEN'," + ticketLiteral + ");" +
+          "var p={type:'" + REPO_TOKEN_READY_TYPE + "'};" +
+          "if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:p});}" +
+          "else if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:p});}" +
+          "}catch(e){}",
+      );
+    } catch (_eEval) {
+      // 网页还没挂上时失败，下一轮再写
+    }
+  };
+
+  /**
+   * 先打开同域静态脚本，让 localStorage 落在资料库所在源上。
+   * 写完后再把 web-view 切到资料库，页面脚本才能读到 token。
+   */
+  const startRepoTokenPrime = (target: string): boolean => {
+    const origin = originOfAbsolute(target);
+    if (origin.length == 0) {
+      return false;
+    }
+    repoPrimeTarget = target;
+    repoPrimeAttempts = 0;
+    repoPriming.value = true;
+    repoPageCover.value = true;
+    stopRepoTokenPrimeTimer();
+    url.value = origin + "/m/static/uni.webview.1.5.5.js";
+    repoPrimeTimer = setInterval((): void => {
+      if (repoPriming.value != true) {
+        stopRepoTokenPrimeTimer();
+        return;
+      }
+      repoPrimeAttempts++;
+      writeRepoTokenBeforeNavigation();
+      if (repoPrimeAttempts >= 20) {
+        finishRepoTokenPrime();
+      }
+    }, 200) as number;
+    return true;
+  };
+
+  const consumeRepoTokenReadyMessage = (messages: Array<UTSJSONObject>): boolean => {
+    for (let i = 0; i < messages.length; i++) {
+      const typeVal = messages[i]["type"];
+      if (typeVal != null && `${typeVal}` == REPO_TOKEN_READY_TYPE) {
+        finishRepoTokenPrime();
+        return true;
+      }
+    }
+    return false;
+  };
+  // #endif
+
   /**
    * iOS：网页还能后退时关掉页面侧滑，边缘手势交给 WKWebView；
    * 已经在第一页时恢复页面侧滑，右滑离开本页。
@@ -596,7 +853,8 @@
     // #ifdef APP-IOS
     enableAppWebViewBackGesture(WEBVIEW_ELEMENT_ID);
     const canGoBack = appWebViewCanGoBack(WEBVIEW_ELEMENT_ID);
-    const locked = canGoBack ? 1 : 0;
+    const sheetOpen = isShareSheetOpen();
+    const locked = canGoBack || sheetOpen ? 1 : 0;
     if (iosSwipeLocked == locked) {
       return;
     }
@@ -605,7 +863,7 @@
       return;
     }
     const style = new UTSJSONObject();
-    style["disableSwipeBack"] = canGoBack;
+    style["disableSwipeBack"] = canGoBack || sheetOpen;
     try {
       pages[pages.length - 1].setPageStyle(style);
       iosSwipeLocked = locked;
@@ -637,7 +895,20 @@
   };
 
   // WebView 加载完成
-  const handleWebviewLoad = (e: any) => {
+  const handleWebviewLoad = (e: UniWebViewLoadEvent) => {
+    // #ifdef APP
+    // 预写页只负责把 token 放进同源 localStorage，不把它当成资料库页面。
+    if (repoPriming.value == true) {
+      writeRepoTokenBeforeNavigation();
+      return;
+    }
+    // #endif
+    repoPageCover.value = false;
+    stopLoadProgress();
+    const loadedSrc = e.detail.src;
+    if (loadedSrc.length > 0) {
+      rememberEmbeddedPage(loadedSrc);
+    }
     // Android 内嵌 H5 字体放大修复：@load 时 WebView 必已存在，立即复位 textZoom
     fixAppWebviewTextZoom();
     syncIosWebViewSwipe();
@@ -681,6 +952,11 @@
    * 3. 如果没有，检查网页端代码是否正确调用 wx.miniProgram.postMessage
    */
   const handleWebviewMessage = (e: UniWebViewMessageEvent): void => {
+    // #ifdef APP
+    if (consumeRepoTokenReadyMessage(e.detail.data)) {
+      return;
+    }
+    // #endif
     // #ifdef APP-IOS
     // 标题桥消息先消费掉，避免落进下面「取最后一条 html」的逻辑
     if (consumeWebViewTitleMessage(e.detail.data)) {
@@ -713,7 +989,8 @@
    * 小程序转发（拼进内部路径）与「复制链接/系统分享」（需要真实可直接打开的外链）共用同一份清理逻辑。
    */
   const buildCleanShareTargetUrl = (): string => {
-    return removeQueryCompat(url.value, ["_ticket"]);
+    const source = embeddedPageUrl.value.length > 0 ? embeddedPageUrl.value : url.value;
+    return removeQueryCompat(source, ["_ticket"]);
   };
 
   /**
@@ -724,9 +1001,8 @@
   };
 
   /**
-   * 分享链接：中转页内嵌当前网页。
+   * 分享当前网页的真实地址。
    * 文件预览只带 sk，避免把整段文件地址再嵌进链接后被飞书截断。
-   * 微信里点「打开 App」只提示改用浏览器；其它应用里可以直接看内容，并唤起女娲。
    */
   const readQueryValue = (raw: string, key: string): string => {
     const mark = key + "=";
@@ -756,6 +1032,26 @@
     const target = new ShareTarget();
     target.title = displayPageTitle.value;
     const cleanUrl = buildCleanShareTargetUrl();
+    // 资料库：用进入页面时准备好的分享地址。那次失败或还没有地址时，点击分享再取一次。
+    if (isRepoLibraryPath(cleanUrl)) {
+      let repoShareUrl = readRepoPageShareUrl(cleanUrl);
+      if (repoShareUrl.length == 0) {
+        repoShareUrl = await prepareRepoPageShare(cleanUrl);
+      }
+      if (repoShareUrl.length > 0) {
+        return repoShareUrl;
+      }
+    }
+    // 文件预览（路径含 /api/f/）：用进入页面时换好的 ak 直链。没有地址时再换一次。其它页面不走这里。
+    if (filePreviewPath(cleanUrl).length > 0) {
+      let fileShareUrl = readFilePageShareUrl(cleanUrl);
+      if (fileShareUrl.length == 0) {
+        fileShareUrl = await prepareFilePageShare(cleanUrl);
+      }
+      if (fileShareUrl.length > 0) {
+        return fileShareUrl;
+      }
+    }
     const shareKey = readQueryValue(cleanUrl, "sk");
     if (cleanUrl.indexOf("file-preview.html") >= 0 && shareKey.length > 0) {
       target.kind = "file";
@@ -771,7 +1067,7 @@
       target.kind = "page";
       target.pageUrl = cleanUrl;
     }
-    const shareUrl = buildShareOpenUrl(target);
+    const shareUrl = buildOutgoingShareUrl(target);
     if (shareUrl.indexOf("http://") != 0 && shareUrl.indexOf("https://") != 0) {
       throw new Error(t("Mobile.Share.shareFailed"));
     }
@@ -795,12 +1091,41 @@
   shareOptions.getShareUrl = getShareUrl;
   const share = useShareLink(shareOptions);
   const handleShareOutside = share.handleShare;
+
+  /** 分享面板里的「刷新」：先走网页自身刷新，不行再重设地址。 */
+  const reloadCurrentWebView = (): void => {
+    // #ifdef APP
+    try {
+      let ctx: WebviewContext | null = webViewContext;
+      if (ctx == null) {
+        ctx = uni.createWebviewContext(
+          WEBVIEW_ELEMENT_ID,
+          instance != null ? instance.proxy : null,
+        );
+        webViewContext = ctx;
+      }
+      if (ctx != null) {
+        ctx.reload();
+        return;
+      }
+    } catch (_e) {
+      // 原生刷新不可用时重设地址
+    }
+    // #endif
+    const current = url.value;
+    if (current.length == 0) return;
+    url.value = "";
+    nextTick(() => {
+      url.value = current;
+    });
+  };
+
   const handleShare = async (): Promise<void> => {
     try {
       const shareUrl = await getShareUrl();
       chooseShareTarget(shareTitle(), shareUrl, () => {
         handleShareOutside();
-      });
+      }, reloadCurrentWebView);
     } catch (_error) {
       uni.showToast({
         title: t("Mobile.Share.shareFailed"),
@@ -862,7 +1187,6 @@
     if (currentUrl.length == 0) {
       return;
     }
-    const queryParams = getQueryParams(currentUrl);
 
     // 设置页面标题：优先取本页路由参数 title（外部链接不便在目标 URL 上拼 query），
     // 其次取目标 URL 自带的 title（站内页沿用原有约定），都没有才用默认标题
@@ -873,6 +1197,9 @@
       const decodedTitle = decodeURIComponent(`${routeTitleRaw}`);
       routeTitle = decodedTitle != null ? decodedTitle : "";
     }
+
+    // 获取查询参数
+    const queryParams = getQueryParams(currentUrl);
     const titleRaw = queryParams["title"];
     const title =
       routeTitle.length > 0
@@ -892,15 +1219,31 @@
     } else {
       url.value = window.location.origin + currentUrl;
     }
+    if (isRepoLibraryPath(url.value)) {
+      prepareRepoPageShare(url.value);
+    }
+    // 文件预览进入页面时先换成可分享的 ak 直链，避免点分享时才等待。
+    if (filePreviewPath(url.value).length > 0) {
+      prepareFilePageShare(url.value);
+    }
     // #endif
 
     // #ifdef MP-WEIXIN || APP
     // 资料库（首页或某篇文档）不签发 _ticket，把本地登录 token 写入页面。
     if (isRepoLibraryPath(currentUrl)) {
-      url.value = currentUrl;
+      prepareRepoPageShare(currentUrl);
       const cachedToken = readCachedAccessToken();
       if (cachedToken.length > 0) {
         rememberRepoPageTicket(currentUrl, cachedToken);
+      }
+      // #ifdef APP
+      // 先在同域静态页写入 token，再打开资料库，避免页面脚本读到空登录态后跳登录。
+      if (cachedToken.length > 0 && startRepoTokenPrime(currentUrl)) {
+        return;
+      }
+      // #endif
+      url.value = currentUrl;
+      if (cachedToken.length > 0) {
         injectRepoTicketCookie();
       }
       return;
@@ -921,9 +1264,13 @@
     // 只有跳转时带 pageApp=1 才签发票据，并拼到目标地址的 _ticket= 上。
     if (isPageApp != true) {
       url.value = currentUrl;
+      if (filePreviewPath(currentUrl).length > 0) {
+        prepareFilePageShare(currentUrl);
+      }
       return;
     }
 
+    // 网页应用跳转时签发票据，并拼到目标地址的 _ticket= 上。
     // #ifdef MP-WEIXIN
     globalThis.appConfig.redirectUrl = urlStr; // 未解码
     // #endif
@@ -947,6 +1294,9 @@
     fixAppWebviewTextZoom();
     startIosWebViewSwipeSync();
     startEmbeddedNavSync();
+    // #ifdef APP-IOS
+    startIosEmbeddedUrlSync();
+    // #endif
   });
 
   // 导航栏返回不走 onBackPress。系统返回键、Android/鸿蒙侧滑走这里。
@@ -956,6 +1306,10 @@
     if (options.from == "navigateBack") {
       return false;
     }
+    if (isShareSheetOpen() == true) {
+      dismissShareSheet();
+      return true;
+    }
     return consumeWebViewBack();
   });
   // #endif
@@ -963,12 +1317,15 @@
   onUnload(() => {
     // #ifdef APP
     stopRepoTicketCookieInject();
+    stopRepoTokenPrimeTimer();
     // #endif
     // #ifdef APP-IOS
     stopWebViewTitleRead();
+    stopIosEmbeddedUrlSync();
     // #endif
     stopIosWebViewSwipeSync();
     stopEmbeddedNavSync();
+    stopLoadProgress();
   });
 
   // #ifdef MP-WEIXIN
@@ -1025,15 +1382,52 @@
     justify-content: center;
   }
 
+  .webview-share {
+    /* 图标仍是 18px。热区扩到 44px，负边距把字形留在原来的位置。 */
+    width: 44px;
+    height: 44px;
+    margin-right: -13px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+  }
+
   .webview-content {
     flex: 1;
     min-height: 0;
     overflow: hidden;
+    position: relative;
+    background-color: #ffffff;
+  }
+
+  .webview-progress-track {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 2px;
+    z-index: 6;
+    background-color: #e8e8ee;
+  }
+
+  .webview-progress-bar {
+    height: 2px;
+    background-color: #4c6fff;
   }
 
   .web-view {
     width: 100%;
     height: 100%;
+  }
+
+  .web-view--hidden {
+    position: absolute;
+    left: -2000px;
+    top: 0;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
   }
 
   .webview-placeholder {

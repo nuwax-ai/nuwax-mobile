@@ -1,0 +1,369 @@
+import { nextTick, ref } from "vue";
+import { gestureTouchSlop } from "@/utils/gestureTouchSlop";
+// #ifdef APP-ANDROID
+import Build from "android.os.Build";
+import Context from "android.content.Context";
+import Vibrator from "android.os.Vibrator";
+import VibratorManager from "android.os.VibratorManager";
+import VibrationEffect from "android.os.VibrationEffect";
+// #endif
+
+/**
+ * 伙伴页录音层开关。false：不显示顶部录音图标，右滑也不会打开录音面板。
+ * 改成 true 即恢复现在的录音入口。
+ */
+export const partnerVoiceRecordEnabled = false;
+
+/** 松手完成切换的距离：右滑、左滑都是滑过屏幕宽度的三成。越过这条线轻震一下。 */
+const partnerVoiceCommitRatio = 0.3;
+/** 当前松手是否会停在录音页。和这次震动一致。 */
+let hapticPast = false;
+
+/** 伙伴页右滑位移（px）。0 为伙伴页，等于屏幕宽度时录音铺满整屏。左右并排，一起平移。 */
+export const partnerVoiceOffset = ref<number>(0);
+/** 跟手拖动中：两层都不做过渡，松手后再缓动到开或关。 */
+export const partnerVoiceDragging = ref<boolean>(false);
+/** 已吸附打开。 */
+export const partnerVoiceOpen = ref<boolean>(false);
+/** 录音进行中：伙伴页麦克风保持红色。 */
+export const partnerVoiceRecording = ref<boolean>(false);
+/** 横向拖动时锁住会话列表的纵向滚动，避免又滑又滚。 */
+export const partnerVoiceScrollLock = ref<boolean>(false);
+/** 第一次露出后保持挂载，收回动画时左边的录音层不会先消失。 */
+export const partnerVoiceAlive = ref<boolean>(false);
+/** 卸掉左侧录音页时不做位移动画，避免伙伴页再从左边滑进来一次。 */
+export const partnerVoiceSnapless = ref<boolean>(false);
+
+let maxOffsetPx = 0;
+let startX = 0;
+let startY = 0;
+let startOffset = 0;
+let beginTime = 0;
+let lastX = 0;
+let lastTime = 0;
+let velocity = 0;
+let axis = "";
+let tracking = false;
+let aliveTimer = 0;
+/** 最近一次松手是否算横滑。列表用它吞掉随后的点击，函数本身保持无返回值。 */
+let partnerVoiceClaimed = false;
+/** 点麦克风会作废同一次触摸里尚未结算的回弹，避免刚打开又被拉回伙伴页。 */
+let gestureEpoch = 0;
+
+function cancelPartnerVoiceAliveTimer(): void {
+  if (aliveTimer != 0) {
+    clearTimeout(aliveTimer);
+    aliveTimer = 0;
+  }
+}
+
+/** 收回动画结束后卸掉左侧录音页，页面恢复单屏，避免路由一直处于横滑锁定。 */
+function schedulePartnerVoiceUnmount(): void {
+  cancelPartnerVoiceAliveTimer();
+  aliveTimer = setTimeout(() => {
+    aliveTimer = 0;
+    if (!partnerVoiceOpen.value && partnerVoiceOffset.value <= 0 && !partnerVoiceDragging.value && !tracking) {
+      partnerVoiceSnapless.value = true;
+      partnerVoiceAlive.value = false;
+      nextTick(() => {
+        partnerVoiceSnapless.value = false;
+      });
+    }
+  }, 320);
+}
+
+/** 录音铺满整屏时，伙伴页（含底栏）右移一整屏。 */
+export function partnerVoiceMaxOffset(): number {
+  const width = Math.round(uni.getWindowInfo().windowWidth);
+  // tab-shell setup 首拍在部分 Android 设备上早于窗口尺寸就绪，windowWidth 会短暂为 0。
+  // 兜底 240 只能用于这一拍，不能写进缓存；否则华为 362dp 宽屏会永久只渲染 240dp，
+  // 右侧露出 Stage 灰底。后续 onReady/onResize 重算时用真实宽度覆盖缓存。
+  if (width >= 240) {
+    maxOffsetPx = width;
+    return maxOffsetPx;
+  }
+  return maxOffsetPx >= 240 ? maxOffsetPx : 240;
+}
+
+export function setPartnerVoiceRecording(recording: boolean): void {
+  partnerVoiceRecording.value = recording;
+}
+
+/** 麦克风点击：先无动画把录音页放在左边，再把伙伴页连底栏滑到右侧。 */
+export function openPartnerVoiceDrawer(): void {
+  if (partnerVoiceRecordEnabled != true) {
+    return;
+  }
+  gestureEpoch = gestureEpoch + 1;
+  const epoch = gestureEpoch;
+  cancelPartnerVoiceAliveTimer();
+  partnerVoiceDragging.value = false;
+  partnerVoiceScrollLock.value = false;
+  tracking = false;
+  axis = "";
+  hapticPast = true;
+  partnerVoiceOpen.value = true;
+  const max = partnerVoiceMaxOffset();
+  const wasAlive = partnerVoiceAlive.value;
+  partnerVoiceAlive.value = true;
+  if (partnerVoiceOffset.value >= max) {
+    partnerVoiceSnapless.value = false;
+    return;
+  }
+  if (!wasAlive) {
+    partnerVoiceSnapless.value = true;
+    partnerVoiceOffset.value = 0;
+  }
+  nextTick(() => {
+    if (epoch != gestureEpoch) {
+      return;
+    }
+    partnerVoiceSnapless.value = false;
+    partnerVoiceOffset.value = partnerVoiceMaxOffset();
+  });
+}
+
+/** 录音层返回，或切离伙伴页。 */
+export function closePartnerVoiceDrawer(): void {
+  partnerVoiceDragging.value = false;
+  partnerVoiceScrollLock.value = false;
+  tracking = false;
+  axis = "";
+  velocity = 0;
+  hapticPast = false;
+  partnerVoiceOffset.value = 0;
+  partnerVoiceOpen.value = false;
+  schedulePartnerVoiceUnmount();
+}
+
+/** 右滑从伙伴页算，越过 30% 打开；左滑从录音页算，滑回 30% 就收回。 */
+function partnerVoiceReleaseOpens(offset: number): boolean {
+  const max = partnerVoiceMaxOffset();
+  const closing = startOffset > max * 0.5;
+  if (closing) {
+    return offset > max * (1 - partnerVoiceCommitRatio);
+  }
+  return offset >= max * partnerVoiceCommitRatio;
+}
+
+export function beginPartnerVoiceDrag(x: number, y: number): void {
+  if (partnerVoiceRecordEnabled != true) {
+    return;
+  }
+  gestureEpoch = gestureEpoch + 1;
+  cancelPartnerVoiceAliveTimer();
+  tracking = true;
+  axis = "";
+  startX = x;
+  startY = y;
+  startOffset = partnerVoiceOffset.value;
+  beginTime = Date.now();
+  lastX = x;
+  lastTime = beginTime;
+  velocity = 0;
+  hapticPast = partnerVoiceReleaseOpens(startOffset);
+  partnerVoiceScrollLock.value = false;
+}
+
+/** 比系统 light 更短、幅度更低。安卓 light 仍接近满幅短震。 */
+const partnerVoiceHapticMs = 8;
+const partnerVoiceHapticAmplitude = 28;
+
+// #ifdef APP-ANDROID
+function androidVibrator(): Vibrator | null {
+  const context = UTSAndroid.getAppContext();
+  if (context == null) {
+    return null;
+  }
+  if (Build.VERSION.SDK_INT >= 31) {
+    const manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager | null;
+    if (manager == null) {
+      return null;
+    }
+    return manager.getDefaultVibrator();
+  }
+  return context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator | null;
+}
+// #endif
+
+function pulsePartnerVoiceHaptic(): void {
+  // #ifdef APP-ANDROID
+  try {
+    const vibrator = androidVibrator();
+    if (vibrator != null && vibrator.hasVibrator()) {
+      if (Build.VERSION.SDK_INT >= 26) {
+        vibrator.vibrate(VibrationEffect.createOneShot(partnerVoiceHapticMs.toLong(), partnerVoiceHapticAmplitude.toInt()));
+      } else {
+        vibrator.vibrate(partnerVoiceHapticMs.toLong());
+      }
+      return;
+    }
+  } catch (_error) {
+    // 取不到震动器时走下面的系统短震。
+  }
+  // #endif
+  try {
+    uni.vibrateShort({
+      type: "light",
+      fail: (_err) => {
+        // 个别机型没有震动器，忽略即可。
+      },
+    });
+  } catch (_error) {
+    // ignore
+  }
+}
+
+/** 右滑越过 30% 线时轻震一下；退回线内再震一下。左滑不震。 */
+function syncPartnerVoiceHaptic(): void {
+  if (!partnerVoiceDragging.value) {
+    return;
+  }
+  const passed = partnerVoiceReleaseOpens(partnerVoiceOffset.value);
+  if (passed == hapticPast) {
+    return;
+  }
+  hapticPast = passed;
+  if (startOffset <= partnerVoiceMaxOffset() * 0.5) {
+    pulsePartnerVoiceHaptic();
+  }
+}
+
+function applyPartnerVoiceOffset(next: number): void {
+  const max = partnerVoiceMaxOffset();
+  let clamped = next;
+  if (clamped < 0) {
+    clamped = 0;
+  }
+  if (clamped > max) {
+    clamped = max;
+  }
+  partnerVoiceOffset.value = clamped;
+  syncPartnerVoiceHaptic();
+}
+
+/**
+ * 跟手移动。返回 true 表示这次触摸已锁定为左右滑，调用方应阻止列表把它当成下拉。
+ * 坐标用屏幕坐标：页面自己在 translateX，用相对坐标会越滑越滞。
+ */
+export function movePartnerVoiceDrag(x: number, y: number): boolean {
+  if (!tracking) {
+    return false;
+  }
+  const dx = x - startX;
+  const dy = y - startY;
+  if (axis == "") {
+    const slop = gestureTouchSlop();
+    // 小于 18px 仍视为点击。过早 preventDefault 会把页面路由锁住，随后的 navigateTo 报 locked。
+    const decideAt = slop > 18 ? slop : 18;
+    if (Math.abs(dx) < decideAt && Math.abs(dy) < decideAt) {
+      return false;
+    }
+    const horizontal = Math.abs(dx) > Math.abs(dy);
+    const canOpen = dx > 0 && !partnerVoiceOpen.value;
+    const canClose = partnerVoiceOpen.value;
+    if (horizontal && (canOpen || canClose)) {
+      axis = "h";
+      partnerVoiceAlive.value = true;
+      partnerVoiceDragging.value = true;
+      partnerVoiceScrollLock.value = true;
+    } else {
+      axis = "v";
+      return false;
+    }
+  }
+  if (axis != "h") {
+    return false;
+  }
+  const now = Date.now();
+  const dt = now - lastTime;
+  if (dt > 0) {
+    velocity = (x - lastX) / dt;
+  }
+  lastX = x;
+  lastTime = now;
+  applyPartnerVoiceOffset(startOffset + dx);
+  return true;
+}
+
+/**
+ * 松手吸附。x/y 为抬手屏幕坐标，中间的 touchmove 被列表吃掉时仍按整段位移结算。
+ * 传负数表示没有坐标。轻点不关闭，避免误触录音按钮。
+ * 返回值保持 void：改成 boolean 后，未使用返回值的调用会按旧签名查找而报 NoSuchMethodError。
+ */
+export function endPartnerVoiceDrag(x: number, y: number): void {
+  if (!tracking) {
+    partnerVoiceClaimed = false;
+    return;
+  }
+  if (x >= 0 && y >= 0 && axis != "v") {
+    const dx = x - startX;
+    const dy = y - startY;
+    const slop = gestureTouchSlop();
+    const decideAt = slop > 18 ? slop : 18;
+    const horizontal = Math.abs(dx) > Math.abs(dy) && Math.abs(dx) >= decideAt;
+    const canOpen = dx > 0 && !partnerVoiceOpen.value;
+    const canClose = partnerVoiceOpen.value;
+    if (axis == "" && horizontal && (canOpen || canClose)) {
+      axis = "h";
+      partnerVoiceAlive.value = true;
+      partnerVoiceDragging.value = true;
+    }
+    if (axis == "h") {
+      const now = Date.now();
+      const span = now - beginTime;
+      if (span > 0) {
+        velocity = dx / span;
+      }
+      applyPartnerVoiceOffset(startOffset + dx);
+    }
+  }
+  const wasHorizontal = axis == "h";
+  if (wasHorizontal) {
+    syncPartnerVoiceHaptic();
+  }
+  tracking = false;
+  axis = "";
+  partnerVoiceDragging.value = false;
+  partnerVoiceScrollLock.value = false;
+  if (!wasHorizontal) {
+    velocity = 0;
+    partnerVoiceClaimed = false;
+    if (!partnerVoiceOpen.value && partnerVoiceOffset.value <= 0) {
+      schedulePartnerVoiceUnmount();
+    }
+    return;
+  }
+  const max = partnerVoiceMaxOffset();
+  const displacement = partnerVoiceOffset.value - startOffset;
+  const flicked = displacement * velocity > 0 && Math.abs(velocity) > 0.45 && Math.abs(displacement) >= max * 0.08;
+  let open = hapticPast;
+  const flickOpen = velocity > 0;
+  if (flicked && flickOpen != open) {
+    open = flickOpen;
+    hapticPast = open;
+    if (flickOpen) {
+      pulsePartnerVoiceHaptic();
+    }
+  }
+  velocity = 0;
+  const epoch = gestureEpoch;
+  nextTick(() => {
+    if (epoch != gestureEpoch) {
+      return;
+    }
+    partnerVoiceOffset.value = open ? max : 0;
+    partnerVoiceOpen.value = open;
+    if (!open) {
+      schedulePartnerVoiceUnmount();
+    }
+  });
+  partnerVoiceClaimed = true;
+}
+
+/** 取走最近一次松手是否为横滑，取走后清掉。 */
+export function takePartnerVoiceClaim(): boolean {
+  const claimed = partnerVoiceClaimed;
+  partnerVoiceClaimed = false;
+  return claimed;
+}

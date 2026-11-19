@@ -8,9 +8,9 @@ import { switchMainTab, resolveMainTabPagePath, mainTabBarCovered, MAIN_TAB_PAGE
  *
  * 仅被 APP-IOS 分支代码引用；非 App（H5 / 小程序）不使用本模块。
  *
- * 从搜索 / 智能体等非首页进入时会 switchTab 到首页开壳。各 Tab 有独立页面栈：
- * 源 Tab（如智能体）上的搜索页通常仍保留。关壳时应先 switchTab 回源 Tab；
- * 若栈顶已是来源页则直接卸壳，切勿再 navigateTo，否则会叠一层空页面（关键词/列表丢失，取消错乱）。
+ * 从搜索 / 智能体 / 终端详情等非任务页进入时，会 navigateTo 任务页再开壳，
+ * 来源页仍留在任务页下面。关壳时应退回栈里原来的那一页，切勿再 navigateTo 叠一层：
+ * 否则新页面的返回会先落到任务页，终端列表等中间页被跳过。
  * 仅当源页已被清掉时，才 navigateTo 重建。
  */
 import { buildQueryParams, getCurrentPageFullPath } from "@/utils/common";
@@ -30,6 +30,11 @@ let pendingPType: string = "";
 let hasPendingOpen: boolean = false;
 /** 壳是否可见（供首页 onBackPress / 其它原生逻辑查询） */
 let shellVisibleFlag: boolean = false;
+/**
+ * 正在执行关壳后的 navigateBack。
+ * 这次返回会再次进入首页 onBackPress；若仍拦截，系统会取消本次 pop，任务页就留在栈里。
+ */
+let acceptingResidentChatBack: boolean = false;
 /**
  * 打开聊天过渡遮罩：从点列表到壳揭开之间为 true。
  * 首页据此盖白底，避免先看到对话 Tab 内容。
@@ -92,6 +97,9 @@ export function setResidentChatBackHandler(
  * @returns true 表示已消费返回（拦截系统左滑/返回键）；false 走默认行为
  */
 export function handleResidentChatBackPress(): boolean {
+  if (acceptingResidentChatBack) {
+    return false;
+  }
   if (shellVisibleFlag != true) {
     return false;
   }
@@ -209,6 +217,45 @@ function buildFullPathFromPage(page: UniPage | null): string {
     // ignore
   }
   return url;
+}
+
+function pageUrlPath(url: string): string {
+  const q = url.indexOf("?");
+  let path = q >= 0 ? url.substring(0, q) : url;
+  if (path.length > 0 && path.charAt(0) != "/") {
+    path = `/${path}`;
+  }
+  return path;
+}
+
+/** 目标地址在当前栈中、且不在栈顶时，返回需要回退的层数；不在栈中则为 0。 */
+function findExistingReturnPageDelta(targetUrl: string): number {
+  const pages = getCurrentPages();
+  if (pages.length < 2 || targetUrl.length == 0) {
+    return 0;
+  }
+  const targetPath = pageUrlPath(targetUrl);
+  let pathMatchIndex = -1;
+  for (let i = pages.length - 2; i >= 0; i--) {
+    const page = pages[i];
+    if (page == null) {
+      continue;
+    }
+    const built = buildFullPathFromPage(page);
+    if (built.length == 0) {
+      continue;
+    }
+    if (built == targetUrl) {
+      return pages.length - 1 - i;
+    }
+    if (pathMatchIndex < 0 && pageUrlPath(built) == targetPath) {
+      pathMatchIndex = i;
+    }
+  }
+  if (pathMatchIndex < 0) {
+    return 0;
+  }
+  return pages.length - 1 - pathMatchIndex;
 }
 
 /** 取页面 route 的 path 部分（不含 query） */
@@ -361,6 +408,23 @@ function navigateToReturnSubpackage(url: string): void {
 }
 
 /**
+ * 任务页只是 iOS 会话的载体。关掉会话时用源页替换它，
+ * 否则源页会压在任务页上，侧滑先回到任务页。
+ */
+function replaceTaskPageWith(url: string): void {
+  setResidentChatVisibleFlag(false);
+  uni.redirectTo({
+    url: url,
+    success: (_res: any | null) => {
+      clearCoverSoon();
+    },
+    fail: (_err: any | null) => {
+      navigateToReturnSubpackage(url);
+    },
+  });
+}
+
+/**
  * 先跳回源页（壳仍盖住首页），成功后再卸壳 —— 避免左滑/返回先闪首页。
  */
 function navigateThenHideShell(): void {
@@ -388,6 +452,33 @@ function navigateThenHideShell(): void {
         setResidentChatCoverActive(false);
       },
     });
+    return;
+  }
+  // 从灵珠详情等页面打开会话时，任务页会留在来源页和列表之间。
+  // 关掉会话必须把任务页换掉或退掉，不能再 navigateTo 叠一层。
+  if (isCurrentPageIndex()) {
+    const delta = findExistingReturnPageDelta(url);
+    if (delta > 0) {
+      acceptingResidentChatBack = true;
+      uni.navigateBack({
+        delta: delta,
+        success: (_resBack: any | null) => {
+          setResidentChatVisibleFlag(false);
+          emitHideShell(false);
+          clearCoverSoon();
+        },
+        fail: (_eBack: any | null) => {
+          replaceTaskPageWith(url);
+        },
+        complete: (_resComplete: any | null) => {
+          setTimeout((): void => {
+            acceptingResidentChatBack = false;
+          }, 0);
+        },
+      });
+      return;
+    }
+    replaceTaskPageWith(url);
     return;
   }
   if (tabUrl.length > 0) {
@@ -472,8 +563,8 @@ export function openResidentChat(
   // 跨 Tab / 分包回首页：过渡期仍盖白底，避免露出对话 Tab
   setResidentChatCoverActive(true);
   captureReturnPageBeforeSwitch();
-  // 只 switchTab 一次；success 里 flush，避免仅依赖 onShow 时序
-  switchMainTab({
+  // 任务页已是普通页面。success 里 flush，避免仅依赖 onShow 时序。
+  uni.navigateTo({
     url: "/pages/index/index",
     success: (_res: any | null) => {
       flushPendingResidentChat();

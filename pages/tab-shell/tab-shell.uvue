@@ -1,129 +1,117 @@
 <template>
-  <uni-tab class="tab-shell" :style="safeAreaStyle" :active-index="activeIndex" @change="handleTabChange">
-    <uni-tab-content><MessageContent /></uni-tab-content>
-    <uni-tab-content><IndexContent /></uni-tab-content>
-    <uni-tab-content><DiscoverContent /></uni-tab-content>
-    <uni-tab-content><MineContent /></uni-tab-content>
-    <common-tab-bar :active-path="mainTabActivePath" :bottom-inset="safeArea.bottom" />
+  <view class="app-entry">
     <!-- #ifdef APP -->
-    <!-- 首帧揭幕蒙层：冷启动 window insets 未就绪，首帧 tab 栏偏低、onReady 校正时整栏上跳。
-         蒙层盖住首帧（白底与 launch 页/页面背景连续），与校正后的 inset 同一渲染帧揭幕，
-         用户只见终态。仅存在 1~2 帧，无可交互诉求。 -->
-    <view v-if="settleMaskVisible" class="tab-shell__settle-mask" />
+    <!-- #ifdef APP-ANDROID -->
+    <app-privacy-consent v-if="appEntryStage == 'privacy'" @accepted="acceptPrivacy" />
     <!-- #endif -->
-  </uni-tab>
+    <login-content v-if="appEntryStage == 'login'" :initial-redirect="appEntryLoginReturn" />
+    <main-tab-content v-if="appEntryStage == 'main'" ref="mainContentRef" :visible="pageVisible" :page-ready="pageReady" />
+    <!-- #endif -->
+    <!-- #ifndef APP -->
+    <main-tab-content ref="mainContentRef" :visible="pageVisible" :page-ready="pageReady" />
+    <!-- #endif -->
+  </view>
 </template>
 
 <script setup lang="uts">
-  import { computed, onUnmounted, ref, watch } from "vue";
-  import { onLoad, onShow, onHide, onReady, onBackPress, onResize } from "@dcloudio/uni-app";
-  import MessageContent from "@/pages/message/message-content.uvue";
-  import IndexContent from "@/pages/index/index-content.uvue";
-  import DiscoverContent from "@/pages/discover/discover-content.uvue";
-  import MineContent from "@/pages/mine/mine-content.uvue";
-  import { MAIN_TAB_PATHS, mainTabActivePath, mainTabPageVisible, isMainTabPath, selectMainTab, syncMainTabLocation } from "@/utils/mainTabNavigation";
-  import { dispatchMainTabBack, dispatchMainTabResize } from "@/hooks/useMainTabLifecycle";
-  import { syncNativeTabBarState } from "@/utils/commonBusiness";
-  import { readMainTabSafeArea, type MainTabSafeArea } from "@/utils/mainTabSafeArea";
-  import { maybePromptProfileSetup } from "@/utils/profileSetupPrompt";
+import { ref, nextTick, type ComponentPublicInstance } from "vue";
+import { onLoad, onShow, onHide, onReady, onUnload, onBackPress, onResize } from "@dcloudio/uni-app";
+import MainTabContent from "@/components/main-tab-content/main-tab-content.uvue";
+import { MAIN_TAB_PATHS, isMainTabPath, mainTabPathOnly, selectMainTab } from "@/utils/mainTabNavigation";
+// #ifdef APP
+import LoginContent from "@/subpackages/pages/login/login-content.uvue";
+import { appEntryStage, appEntryLoginReturn, attachAppEntry, detachAppEntry, resolveAppEntryStage, hasAppEntryToken, takeAppEntryColdStart } from "@/utils/appEntryState";
+import { hasAppPrivacyConsent, prepareAppPrivacyConsent } from "@/utils/appPrivacyConsent";
+import { routeIncomingQrLogin } from "@/utils/qrLoginNavigation";
+import { scheduleImPushAfterLogin } from "@/utils/im/imPushClient";
+// #endif
+// #ifdef APP-ANDROID
+import AppPrivacyConsent from "@/components/app-privacy-consent/app-privacy-consent.uvue";
+import { schedulePushBackgroundGuideAfterLogin } from "@/utils/push/pushBackgroundGuide";
+// #endif
 
-  const activeIndex = computed((): number => MAIN_TAB_PATHS.indexOf(mainTabActivePath.value));
-  const safeArea = ref<MainTabSafeArea>(readMainTabSafeArea());
-  /** 首帧揭幕闸（App）：insets 未就绪的首帧不上屏，onReady 校正后同帧揭幕，tab 栏不再「先偏下再弹回」。 */
-  const settleMaskVisible = ref<boolean>(true);
-  const safeAreaStyle = computed((): string => {
-    // #ifdef APP
-    return `padding-left: ${safeArea.value.left}px; padding-right: ${safeArea.value.right}px;`;
-    // #endif
-    // #ifndef APP
-    return "";
-    // #endif
-  });
+const pageVisible = ref<boolean>(false);
+const pageReady = ref<boolean>(false);
+const mainContentRef = ref<ComponentPublicInstance | null>(null);
+let disposed = false;
+// #ifdef APP
+// 首次渲染就选择有内容的界面，不创建空白中转页，也不等待业务网络请求。
+const entryOwner = attachAppEntry();
+let coldStartPending = true;
+let pushScheduled = false;
 
-  function handleTabChange(index: number): void {
-    selectMainTab(index);
+function continueEntry(): void {
+  if (disposed || !hasAppPrivacyConsent()) return;
+  if (!pushScheduled && hasAppEntryToken()) {
+    pushScheduled = true;
+    scheduleImPushAfterLogin();
+    // #ifdef APP-ANDROID
+    schedulePushBackgroundGuideAfterLogin();
+    // #endif
   }
+  if (!pageReady.value || !coldStartPending) return;
+  coldStartPending = false;
+  // 仅显式扫码意图可打开确认页；普通冷启动没有任何 reLaunch/switchTab。
+  nextTick((): void => {
+    if (disposed || !takeAppEntryColdStart()) return;
+    routeIncomingQrLogin(hasAppEntryToken(), "", true);
+  });
+}
+function acceptPrivacy(): void {
+  if (disposed) return;
+  appEntryStage.value = resolveAppEntryStage();
+  continueEntry();
+}
+// #endif
 
-  watch((): string => mainTabActivePath.value, () => {
-    if (mainTabPageVisible.value) syncMainTabLocation();
+onLoad((options: OnLoadOptions) => {
+  const tab = options["tab"];
+  if (tab != null) {
+    // 兼容旧入口传入的编码 Tab 地址。
+    let path = `${tab}`;
+    try { path = decodeURIComponent(path) ?? path; } catch (_error) {}
+    if (isMainTabPath(path)) selectMainTab(MAIN_TAB_PATHS.indexOf(mainTabPathOnly(path)));
+  }
+  // #ifdef APP
+  prepareAppPrivacyConsent((accepted: boolean) => {
+    if (disposed || !accepted) return;
+    // 只结束隐私准备，不因 Token 写入自动跳过登录表单的强制改密步骤。
+    if (appEntryStage.value == "privacy") appEntryStage.value = resolveAppEntryStage();
+    continueEntry();
   });
-
-  onLoad((options: OnLoadOptions) => {
-    const tab = options["tab"];
-    if (tab != null) {
-      const path = decodeURIComponent(`${tab}`) ?? `${tab}`;
-      if (isMainTabPath(path)) mainTabActivePath.value = path;
-    }
-  });
-  onShow(() => {
-    safeArea.value = readMainTabSafeArea();
-    syncNativeTabBarState();
-    mainTabPageVisible.value = true;
-    syncMainTabLocation();
-    // 新用户引导判定：未登录/拉取失败不 latch，下次 onShow 仍会重查（会话内至多一次）。
-    // 弹窗改独立页（2026-10-21）：键盘让位吃页面级默认行为，背景 tab-shell 不受键盘影响
-    maybePromptProfileSetup((_raw: UTSJSONObject): boolean => {
-      uni.navigateTo({
-        url: "/pages/profile-setup/profile-setup",
-      });
-      return true;
-    });
-  });
-  onReady(() => {
-    // 页面渲染完成后，窗口的手势条 Insets 才能准确取得。
-    safeArea.value = readMainTabSafeArea();
-    // 与上面的校正同批渲染（同一 tick 两次写入合并为一次重绘）：
-    // 揭幕帧即校正后布局，蒙层之下的「偏低首帧」永远不与用户见面。
-    settleMaskVisible.value = false;
-  });
-  onHide(() => { mainTabPageVisible.value = false; });
-  onUnmounted(() => { mainTabPageVisible.value = false; });
-  onBackPress((options: OnBackPressOptions): boolean => dispatchMainTabBack(mainTabActivePath.value, options));
-  onResize((options: OnResizeOptions) => {
-    safeArea.value = readMainTabSafeArea();
-    dispatchMainTabResize(mainTabActivePath.value, options);
-  });
+  // #endif
+});
+onShow(() => { pageVisible.value = true; });
+onHide(() => { pageVisible.value = false; });
+onReady(() => {
+  pageReady.value = true;
+  // #ifdef APP
+  continueEntry();
+  // #endif
+});
+onUnload(() => {
+  disposed = true;
+  pageVisible.value = false;
+  // #ifdef APP
+  detachAppEntry(entryOwner);
+  // #endif
+});
+onBackPress((options: OnBackPressOptions): boolean => {
+  const content = mainContentRef.value;
+  return content != null ? content.$callMethod("onPageBackPress", options) as boolean : false;
+});
+onResize((options: OnResizeOptions) => {
+  const content = mainContentRef.value;
+  if (content != null) content.$callMethod("onPageResize", options);
+});
 </script>
 
 <style>
-  /* #ifdef H5 || WEB */
-  page {
-    height: 100%;
-    overflow: hidden;
-  }
-  uni-page-body {
-    height: 100%;
-    overflow: hidden;
-    overscroll-behavior: none;
-  }
-  /* #endif */
+/* #ifdef H5 || WEB */
+page { height: 100%; overflow: hidden; }
+uni-page-body { height: 100%; overflow: hidden; overscroll-behavior: none; }
+/* #endif */
 </style>
-
 <style scoped>
-  /* #ifdef APP */
-  .tab-shell__settle-mask {
-    position: fixed;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    left: 0;
-    z-index: 9999;
-    background-color: #ffffff;
-  }
-  /* #endif */
-
-  .tab-shell {
-    flex: 1;
-    height: 100%;
-    box-sizing: border-box;
-    background-color: #ffffff;
-    /* #ifdef H5 || WEB */
-    padding-top: constant(safe-area-inset-top);
-    padding-top: env(safe-area-inset-top, 0px);
-    padding-left: constant(safe-area-inset-left);
-    padding-left: env(safe-area-inset-left, 0px);
-    padding-right: constant(safe-area-inset-right);
-    padding-right: env(safe-area-inset-right, 0px);
-    /* #endif */
-  }
+.app-entry { flex: 1; height: 100%; background-color: #ffffff; }
 </style>

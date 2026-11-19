@@ -15,10 +15,14 @@ const builders = source.slice(source.indexOf("class _ConversationChatSuggestPara
 const code = transformSync(`${builders}
 class Service {
   streamGeneration = 1;
+  subGeneration = 0;
+  streamResumePending = false;
   chatSuggestRequestVersion = 0;
   isSubscribed = false;
   subStreamRequest = null;
-  ${["handleStreamComplete", "refreshChatSuggest", "handleSubConversation", "abortSubConversation"].map(method).join("\n")}
+  ${["handleStreamComplete", "refreshChatSuggest", "handleSubConversation", "abortSubConversation",
+    "resumeConversationState", "isCurrentStream", "logStreamRecovery", "streamErrorReason",
+    "detachConversationStreams", "recoverStreamAfterBackground", "handleRemoteConversationTerminal"].map(method).join("\n")}
 }; Service;`, { loader: "ts" }).code;
 const ref = <T>(value: T) => ({ value });
 function deferred<T>() {
@@ -31,8 +35,10 @@ function setup(enabled = true) {
   const suggest = vi.fn().mockResolvedValue({ code: "0000", data: ["下一步做什么？"] });
   const configs: any[] = [];
   const warn = vi.fn();
+  const detail = vi.fn();
+  const chat = { isCurrentlyStreaming: false, abort: vi.fn(() => { chat.isCurrentlyStreaming = false; }) };
   const Service = runInNewContext(code, {
-    console: { warn, error: vi.fn() }, setTimeout,
+    console: { warn, info: vi.fn(), error: vi.fn() }, setTimeout, Date,
     MessageTypeEnum: { USER: "USER", ASSISTANT: "ASSISTANT" },
     MessageStatusEnum: { Loading: "Loading", Complete: "Complete" },
     MessageModeEnum: { CHAT: "CHAT" }, AssistantRoleEnum: { ASSISTANT: "ASSISTANT" },
@@ -46,19 +52,25 @@ function setup(enabled = true) {
       async request(config: unknown) { configs.push(config); }
     },
     apiResCode: (r: any) => r?.["code"], apiResData: (r: any) => r?.["data"],
+    apiAgentConversation: detail,
     ensureConversationTitleFromDetail: vi.fn(), isTurnUserReadyFromMessageInfoList: () => true,
     canReuseAssistantOnSubResume: () => false, createMessageInfoFromAny: (v: unknown) => v,
     generateUniqueId: () => "resumed-answer", getApiBaseUrl: () => "https://test.invalid",
     uni: { getStorageSync: () => "" }, applyBearerAuthorization: vi.fn(), applyXClientTypeHeader: vi.fn(),
-    chatService: { isCurrentlyStreaming: false }, readRawField: (v: any, key: string) => v?.[key],
+    chatService: chat, readRawField: (v: any, key: string) => v?.[key],
+    readBizEnumStr: (v: any, key: string) => v?.[key]?.value ?? v?.[key] ?? "",
     AgentDetailUtils: { utsObjToRecord: (v: unknown) => v },
     readMessageText: (v: any) => v.text ?? "", isAppInBackground: () => false,
     isAcpPermissionEvent: () => false, isMcpAskToolCallEvent: () => false,
     apiAgentConversationChatSuggest: suggest, extractTaskResult: () => ({ hasTaskResult: false }),
+    ConversationResumeResult: class {
+      constructor(public needResume: boolean, public response: unknown) {}
+    },
   });
   const service = new Service();
   const data = {
     isTempChat: ref(false), isSuggest: ref(enabled), chatSuggestList: ref<any[]>([]), isConversationActive: ref(true),
+    isStoppingConversation: ref(false), currentConversationRequestId: ref("request-1"),
     streamingAssistantMessageId: ref("answer"), streamingAssistantText: ref("回复内容"),
     messageList: ref<any[]>([{ id: "user", messageType: "USER", text: "你好" }, { id: "answer", messageType: "ASSISTANT", text: "回复内容" }]),
     conversationId: ref(9527), messageIdRef: ref("answer"),
@@ -69,6 +81,7 @@ function setup(enabled = true) {
   }
   service.hydrateCompletedOpenUiIfNeeded = vi.fn().mockResolvedValue(undefined);
   service.handleQueryConversation = vi.fn().mockResolvedValue(undefined);
+  service.fingerprintConversationData = vi.fn().mockReturnValue("changed");
   service.handleChangeMessageList = vi.fn((event: any) => {
     const last = data.messageList.value[data.messageList.value.length - 1];
     if (event.eventType == "FINAL_RESULT") last.finalResult = event.data;
@@ -80,11 +93,74 @@ function setup(enabled = true) {
     }, true);
     return configs[configs.length - 1];
   }
-  return { service, data, suggest, configs, subscribe, warn };
+  return { service, data, suggest, configs, subscribe, warn, detail, chat };
 }
 
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => vi.useRealTimers());
+
+describe("App 会话断流恢复", () => {
+  it("详情失败保留会话，旧轮次回包不重建消息", async () => {
+    const f = setup();
+    f.detail.mockResolvedValueOnce({ code: "5030" });
+    expect((await f.service.resumeConversationState()).response).toBeNull();
+    expect(f.data.isConversationActive.value).toBe(true);
+
+    const response = deferred<unknown>();
+    f.detail.mockReturnValueOnce(response.promise);
+    const recovery = f.service.resumeConversationState();
+    f.service.streamGeneration++;
+    response.resolve({ code: "0000", data: { taskStatus: "COMPLETE" } });
+    expect((await recovery).response).toBeNull();
+    expect(f.service.handleQueryConversation).not.toHaveBeenCalled();
+    expect(f.data.isConversationActive.value).toBe(true);
+  });
+
+  it("退后台三分钟后替换旧连接，订阅原会话且保留新连接", async () => {
+    const f = setup();
+    const hiddenAt = Date.now();
+    f.chat.isCurrentlyStreaming = true;
+    f.service.liveStreamStartedAt = hiddenAt - 1000;
+    vi.setSystemTime(hiddenAt + 180_000);
+
+    expect(f.service.recoverStreamAfterBackground(hiddenAt)).toBe(true);
+    expect(f.chat.abort).toHaveBeenCalledTimes(1);
+    expect(f.service.streamResumePending).toBe(true);
+
+    const config = await f.subscribe();
+    expect(config.method).toBe("GET");
+    expect(config.url).toContain("/chat/sub/9527");
+    expect(f.service.recoverStreamAfterBackground(hiddenAt)).toBe(false);
+    config.onChunk({ type: "content", data: JSON.stringify({ eventType: "MESSAGE", data: { text: "续接" } }) });
+    expect(f.service.streamResumePending).toBe(false);
+    expect(f.data.messageList.value.at(-1).text).toBe("续接后的完整回复");
+  });
+
+  it("续接没有回放时保留半截回复，随后由终态详情回补", async () => {
+    const f = setup();
+    f.service.streamResumePending = true;
+    const first = await f.subscribe();
+    first.onComplete();
+    expect(f.service.streamResumePending).toBe(true);
+    expect(f.data.messageList.value.at(-1).text).toBe("回复内容");
+    const terminal = { code: "0000", data: { taskStatus: "COMPLETE" } };
+    expect(f.service.handleRemoteConversationTerminal(terminal)).toBe(true);
+    expect(f.service.handleQueryConversation).toHaveBeenCalledWith(terminal);
+  });
+
+  it("旧续接的错误、正文和完成回调不改新连接", async () => {
+    const f = setup();
+    const first = await f.subscribe();
+    f.service.detachConversationStreams();
+    await f.subscribe();
+    first.onChunk({ type: "content", data: JSON.stringify({ eventType: "MESSAGE", data: { text: "旧输出" } }) });
+    first.onError(new Error("network"));
+    first.onComplete();
+    expect(f.service.isSubscribed).toBe(true);
+    expect(f.data.isConversationActive.value).toBe(true);
+    expect(f.service.handleChangeMessageList).not.toHaveBeenCalled();
+  });
+});
 
 describe("回复完成后的用户问题建议", () => {
   it("普通发送按开关请求建议，保留原始请求参数", async () => {

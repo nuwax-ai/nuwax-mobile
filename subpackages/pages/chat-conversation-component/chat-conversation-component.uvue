@@ -533,6 +533,9 @@
   // 分层架构
   import { nextTick, computed, ref, watch, type ComponentPublicInstance } from "vue";
   import { onLoad, onHide, onShow, onUnload } from "@dcloudio/uni-app";
+  // #ifdef H5
+  import { APP_FOREGROUND_EVENT } from "@/utils/appLifecycle.uts";
+  // #endif
   import {
     pauseEventPollingForChat,
     resumeEventPollingAfterChat,
@@ -2833,12 +2836,8 @@
     }
 
     service.handleSendMessage(params, props.isTempChat, () => {
-      // 软断流 / 超时收尾：只复位按钮态。会话态由 service 管理——
-      // 普通会话 fail 保持态（不关 loading，避免「消失→续接→又出现」翻转），
-      // 续接成功后继续；失败兜底 / 正常收尾才关态。
-      // 不要在这里 abort——streamRequest 软收尾前还要排空 MESSAGE 队列；
-      // abort 会 reset 队列，导致已收到但未派发的正文 delta 丢失（iOS 语音后常见只剩末尾几字）。
       data.isStoppingConversation.value = false;
+      resumePollingAfterStream();
     }, () => {
       const sendPromptRaw = params["messageInfo"];
       if (sendPromptRaw != null) triggerProjectNameBootstrap(`${sendPromptRaw}`);
@@ -2907,9 +2906,8 @@
     stopAllStreamSpeech(true);
     asrWebSocketClient.disableWarmupAndDisconnect();
     ttsWebSocketPlayer.disableWarmupAndDisconnect();
-    // 中止当前 SSE / sub 连接
-    chatService.abort();
-    service.abortSubConversation();
+    // 作废旧会话的流和在途恢复请求。
+    service.detachConversationStreams();
     stopConversationPolling();
     // 注意：创建新会话时不调用停止接口，只中止 SSE 连接
     // 停止接口只应该由用户手动点击停止按钮时调用
@@ -3321,7 +3319,6 @@
     }
     if (
       data.isConversationActive.value == true &&
-      service.needsBackgroundReconnect != true &&
       service.isStreamResumePending != true
     ) {
       return true;
@@ -3335,7 +3332,10 @@
    * - live/sub 仍在跑：掐断流、硬停播报、清会话态
    * - 仅残留 active 态：只清态，仍在播报则停（避免误伤正常结束后的尾句播报）
    */
-  function handleRemoteTaskFinished(finishedCid: number): void {
+  function handleRemoteTaskFinished(
+    finishedCid: number,
+    response: RequestResponse<ConversationInfo>,
+  ): void {
     const convId = conversationId.value;
     if (convId == null || convId != finishedCid) {
       return;
@@ -3347,8 +3347,8 @@
 
     // 收口前先过陈旧终态门禁：高频连续发送时，上一轮任务被打断后的陈旧终态
     // 回包会误杀刚启动的新一轮流，service 判定陈旧时直接忽略（不掐流、不停播报）。
-    const applied = service.handleRemoteConversationTerminal();
-    if (applied != true && stillReceiving == true) {
+    const applied = service.handleRemoteConversationTerminal(response);
+    if (applied != true) {
       return;
     }
 
@@ -3382,7 +3382,7 @@
         pollResponse: RequestResponse<ConversationInfo> | null,
       ) => {
         // 页面正在会话中：不续接，等结束后下一轮 poll 再判断
-        if (isLocalConversationBusy() == true) {
+        if (isLocalConversationBusy() == true || data.isStoppingConversation.value == true) {
           return;
         }
         // 复用轮询刚拉取的全量详情：跳过 sub 内部二次全量请求；
@@ -3390,7 +3390,7 @@
         service.handleSubConversation(
           executingCid,
           (): void => {
-            startResumePolling();
+            resumePollingAfterStream();
           },
           pollResponse,
           false,
@@ -3403,8 +3403,8 @@
       (): boolean => {
         return service.isSubConversationSubscribed;
       },
-      (finishedCid: number) => {
-        handleRemoteTaskFinished(finishedCid);
+      (finishedCid: number, response: RequestResponse<ConversationInfo>) => {
+        handleRemoteTaskFinished(finishedCid, response);
       },
       // 流代数 getter：轮询 await 期间用户新发送 → 代数 +1，旧响应作废，
       // 避免「发送后 loading 消失 → 续接又出现」的误收尾竞态
@@ -3418,137 +3418,68 @@
     );
   }
 
-  /**
-   * 处理会话恢复
-   * 当页面从后台恢复时，检测并恢复会话状态
-   */
+  function resumePollingAfterStream(): void {
+    if (chatPageDisposed || isPageHidden.value == true || props.isTempChat == true) return;
+    startResumePolling();
+  }
+
   async function handleSessionResume(): Promise<void> {
-    // 页面切回前台时，同步并更新最新的租户配置
+    const convId = conversationId.value;
+    const streamGen = service.currentStreamGeneration;
     await initTenantConfig();
-
-    // 检查会话ID是否存在
-    const convId = conversationId.value;
-    if (convId == null) {
-      return;
-    }
-    if (convId == 0) {
-      return;
-    }
-
-    // 本地已在会话中：不抢续接，只保持轮询（会话结束后可再续）；
-    // 仍同步订阅态（无复用响应，自拉一次详情）
-    if (isLocalConversationBusy() == true) {
+    if (chatPageDisposed || convId == null || convId == 0 || !service.isCurrentStream(convId, streamGen)) return;
+    if (service.isStreamResumePending) return;
+    if (isLocalConversationBusy()) {
       await service.handleCheckSubscriptionLimit();
-      startResumePolling();
       return;
     }
 
-    // 调用服务层的恢复方法（内部拉一次详情并视指纹决定是否整表重建）
     const resumeResult = await service.resumeConversationState();
-    const needResume = resumeResult.needResume;
+    if (chatPageDisposed || !service.isCurrentStream(convId, streamGen) ||
+      isLocalConversationBusy() || service.isStreamResumePending) return;
+    const response = resumeResult.response;
+    if (response == null) return;
+    service.handleCheckSubscriptionLimit(response);
+    if (resumeResult.needResume && isTurnUserReadyFromMessageInfoList(data.messageList.value)) {
+      service.handleSubConversation(convId, (): void => {
+        resumePollingAfterStream();
+      }, response, true);
+    }
+  }
 
-    // 复用 resume 刚拉取的详情响应同步订阅与限制状态，避免二次全量详情请求
-    await service.handleCheckSubscriptionLimit(resumeResult.response);
-
-    if (needResume) {
-      // await 期间可能已进入本地会话
-      if (isLocalConversationBusy() == true) {
-        startResumePolling();
-        return;
-      }
-      // EXECUTING：本轮用户已就绪才立刻开 sub；否则只靠轮询（四端同一门禁）
-      const resumeCid = data.conversationId.value;
-      if (
-        resumeCid != null &&
-        resumeCid != 0 &&
-        isTurnUserReadyFromMessageInfoList(data.messageList.value) == true
-      ) {
-        // 复用 resume 的详情响应并跳过 sub 内部整表重建（列表已由 resume 重建）
-        service.handleSubConversation(
-          resumeCid,
-          (): void => {
-            startResumePolling();
-          },
-          resumeResult.response,
-          true,
-        );
-      }
-      // 兜底轮询：与 handlePageLoad 同理，确保 live stream 结束后有轮询能续上 sub
+  function recoverAfterLongBackground(hiddenAt: number): void {
+    if (chatPageDisposed || hiddenAt <= 0) return;
+    if (Date.now() - hiddenAt >= CHAT_PAGE_LONG_HIDE_MS && service.recoverStreamAfterBackground(hiddenAt)) {
       startResumePolling();
-    } else {
-      // 非执行中：恢复轮询
+    } else if (service.isStreamResumePending) {
       resumeConversationPolling();
     }
   }
 
-  /**
-   * 后台掐断 SSE 后的轻量续接（任意真实回前台，不限长隐藏 30s）。
-   * 不做租户配置 / 订阅校验（留给长隐藏 onResume）。
-   */
-  async function handleBackgroundStreamReconnect(): Promise<void> {
-    const convId = conversationId.value;
-    if (convId == null || convId == 0) {
-      service.clearBackgroundReconnectPending();
-      return;
-    }
-    if (props.isTempChat == true) {
-      service.clearBackgroundReconnectPending();
-      return;
-    }
-    if (isLocalConversationBusy() == true) {
-      return;
-    }
-    const resumeResult = await service.resumeConversationState();
-    const needResume = resumeResult.needResume;
-    if (needResume) {
-      if (isLocalConversationBusy() == true) {
-        startResumePolling();
-        return;
-      }
-      const resumeCid = data.conversationId.value;
-      if (
-        resumeCid != null &&
-        resumeCid != 0 &&
-        isTurnUserReadyFromMessageInfoList(data.messageList.value) == true
-      ) {
-        // 复用 resume 的详情响应并跳过 sub 内部整表重建（列表已由 resume 重建）
-        service.handleSubConversation(
-          resumeCid,
-          (): void => {
-            startResumePolling();
-          },
-          resumeResult.response,
-          true,
-        );
-      }
-      startResumePolling();
-    } else {
-      service.clearBackgroundReconnectPending();
-      resumeConversationPolling();
-    }
+  // #ifdef H5
+  function onNativeAppForeground(event: any): void {
+    const hiddenAt = event.detail;
+    if (typeof hiddenAt == "number") recoverAfterLongBackground(hiddenAt as number);
   }
+  // #endif
 
-  // 使用页面唤醒检测 Hook
-  // H5: visibilitychange；App/小程序: 页面 onShow/onHide → triggerHide/Resume
-  // ASR/TTS 按需连接：前后台 / 相册不再做任何 socket 挂起、保活或重连
-  // pageSystemOverlay 仅过滤轮询暂停 / 长隐藏会话恢复
   function onChatPageResume(): void {
-    // 长隐藏后的会话恢复；系统相册/权限等触发的 hide 不跑
-    if (pageSystemOverlay.wasLastShowReal() == true) {
-      handleSessionResume();
-    }
+    if (pageSystemOverlay.wasLastShowReal() != true) return;
+    // #ifdef APP || H5
+    const hiddenAt = pageResumeResult.hiddenTimestamp.value as number;
+    // #ifdef H5
+    if (isAppWebView.value) recoverAfterLongBackground(hiddenAt);
+    // #endif
+    // #ifdef APP
+    recoverAfterLongBackground(hiddenAt);
+    // #endif
+    // #endif
+    handleSessionResume();
   }
+
   function onChatPageForeground(): void {
-    // 每次回前台重读自动播报缓存，图标与上次切换保持一致
     syncVoiceAutoPlayFromStorage();
-    const realShow = pageSystemOverlay.noteShow();
-    if (realShow == true) {
-      resumeConversationPolling();
-      // 短隐藏也续接：系统掐断 live/sub 后不限 CHAT_PAGE_LONG_HIDE_MS
-      if (service.needsBackgroundReconnect == true) {
-        handleBackgroundStreamReconnect();
-      }
-    }
+    if (pageSystemOverlay.noteShow()) resumeConversationPolling();
   }
   function onChatPageHide(): void {
     // 仅暂停会话状态轮询；不 abort SSE、不停 TTS（后台由系统决定连接是否存活）
@@ -3880,6 +3811,7 @@
     data.messageList.value = [];
     data.conversationInfo.value = null;
     data.conversationId.value = null;
+    data.currentConversationRequestId.value = "";
     captureProjectChatQuery(options as UTSJSONObject);
 
     // 智能体会话、常规项目：id 为 agentId。全栈应用：id 为应用 id，智能体从会话详情回填。
@@ -3906,9 +3838,10 @@
       if (props.isTempChat) return;
 
       // 查询历史会话信息(接口返回数据中包含智能体详情信息, 所以不在需要单独查询智能体详情信息了)
+      const streamGen = service.currentStreamGeneration;
       try {
         const res = await apiAgentConversation(id);
-        if (chatPageDisposed || chatPageBootFailed.value) return;
+        if (chatPageDisposed || chatPageBootFailed.value || !service.isCurrentStream(id, streamGen)) return;
         // Android：res 是 UTSJSONObject，res.code / res.data 点号访问失败 → 不会进 handleQueryConversation → messageList 空
         if (apiResCode(res) == SUCCESS_CODE && apiResData<any>(res) != null) {
           const resData = apiResData<any>(res);
@@ -3920,7 +3853,7 @@
             }
           }
           await handleQueryConversation(res);
-          if (chatPageDisposed || chatPageBootFailed.value) return;
+          if (chatPageDisposed || chatPageBootFailed.value || !service.isCurrentStream(id, streamGen)) return;
           // H5 storage 和原生桥注入统一从此刻起消费草稿，避免被上方默认组件初始化覆盖。
           if (data.conversationId.value == id) {
             pendingDraftReadyConversationId = id;
@@ -3949,11 +3882,10 @@
                 isTurnUserReadyFromRawMessageList(resDataObj["messageList"]) ==
                 true
               ) {
-                data.isConversationActive.value = true;
                 // 复用本函数刚拉取的详情响应：跳过 sub 内部重拉与整表重建
                 // （handleQueryConversation 已用同一响应重建过 messageList）
                 service.handleSubConversation(id, () => {
-                  startResumePolling();
+                  resumePollingAfterStream();
                 }, res, true);
               }
               // 兜底轮询：abortSub 不触发 onSubClose，需提前启动
@@ -3968,6 +3900,7 @@
           finishResidentChatBoot(data.agentId.value);
         }
       } catch (_eConv) {
+        if (chatPageDisposed || !service.isCurrentStream(id, streamGen)) return;
         failChatPageLoad();
         finishResidentChatBoot(data.agentId.value);
       }
@@ -4009,9 +3942,10 @@
 
   function stopInFlightChatForResidentSwitch(): void {
     stopAllStreamSpeech(true);
-    chatService.abort();
-    service.abortSubConversation();
+    service.detachConversationStreams();
     stopConversationPolling();
+    data.isConversationActive.value = false;
+    data.isStoppingConversation.value = false;
   }
 
   function applyResidentChatOpenFromNative(options: any): void {
@@ -4571,6 +4505,7 @@
     // 仅标记会话页活跃；ASR/TTS 改为按录音预热 / 合成时建连（不再进页预连）
     speechSocketWarmup.warmup();
     // #ifdef H5
+    window.addEventListener(APP_FOREGROUND_EVENT, onNativeAppForeground);
     // 键盘高度桥：滚到底 + 文档滚动锁；布局抬升由 conversation-input keyboard-cover 承担。
     // Android / iOS / 鸿蒙均由 agent-detail 原生壳注入。
     try {
@@ -4655,8 +4590,7 @@
     chatPageDisposed = true;
     clearChatPageBootTimer();
     stopAllStreamSpeech(true);
-    chatService.abort();
-    service.abortSubConversation();
+    service.detachConversationStreams();
     destroyConversationPolling();
     scrollManager.dispose();
 
@@ -4668,6 +4602,7 @@
 
     // #ifdef H5
     window.removeEventListener("wheel", handleH5Wheel);
+    window.removeEventListener(APP_FOREGROUND_EVENT, onNativeAppForeground);
     // 注销键盘高度桥并解除文档滚动锁
     try {
       (window as any).removeEventListener(
@@ -4714,8 +4649,7 @@
     service.invalidateContextFileRequest();
     speechSocketWarmup.teardown();
     stopAllStreamSpeech(true);
-    chatService.abort();
-    service.abortSubConversation();
+    service.detachConversationStreams();
     destroyConversationPolling();
     scrollManager.dispose();
 
@@ -4727,6 +4661,7 @@
 
     // #ifdef H5
     window.removeEventListener("wheel", handleH5Wheel);
+    window.removeEventListener(APP_FOREGROUND_EVENT, onNativeAppForeground);
     // 注销键盘高度桥并解除文档滚动锁
     try {
       (window as any).removeEventListener(

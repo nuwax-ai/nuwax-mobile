@@ -407,7 +407,21 @@ object VoipBridge {
             .put("expiresAt", deadline)
         current = next
         trace("meeting invitation accepted")
+        expiryJob?.cancel()
+        expiryJob = scope.launch {
+            delay((deadline - System.currentTimeMillis()).coerceIn(0L, 60_000L))
+            val active = current
+            if (active?.optString("callId") == inviteId && active.optString("scene") == "meeting") {
+                emitMeeting("timeout", active)
+                closeMeeting()
+            }
+        }
         publishCall()
+        val ctx = context
+        if (!hidden && ctx != null) {
+            try { ctx.startActivity(VoipIncomingActivity.intent(ctx, inviteId)) }
+            catch (_: Exception) { /* 通知的全屏 Intent 仍是兜底入口 */ }
+        }
     }
 
     private fun emitMeeting(action: String, meeting: JSONObject) {
@@ -855,7 +869,9 @@ object VoipBridge {
         context = ctx.applicationContext
         val invitation = runCatching { JSONObject(payload) }.getOrNull() ?: return false
         val native = VoipPushPayload.isNative(invitation)
-        if (native && source == "click") return true
+        // 会议没有 Telecom 会话兜底；进程被杀后点击通知必须重建来电状态，
+        // 否则 VoipIncomingActivity 拿不到 current 会立刻关闭。
+        if (native && source == "click" && invitation.optString("scene") != "meeting") return true
         // A persisted context exists only after privacy consent and an authenticated bootstrap.
         // Read it afresh: logout must not revive the previous account on a cold push.
         val saved = loadConfig() ?: return native

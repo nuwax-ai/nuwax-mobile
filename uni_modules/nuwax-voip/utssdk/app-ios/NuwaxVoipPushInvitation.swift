@@ -82,6 +82,7 @@ struct NuwaxVoipPushInvitation {
     private func matchesMeeting(_ message: [String: Any], now: Double) -> Bool {
         guard let body = message["body"] as? [String: Any],
               message["msgType"] as? String == "meeting_invite",
+              (message["senderType"] as? Int ?? 1) == 1, (message["msgStatus"] as? Int ?? 1) == 1,
               let expectedInvite = inviteId, body["inviteId"] as? String == expectedInvite,
               let expectedRoom = roomName, body["roomName"] as? String == expectedRoom,
               Self.responseId(message["convId"]) == convId, Self.responseId(message["msgId"]) == msgId,

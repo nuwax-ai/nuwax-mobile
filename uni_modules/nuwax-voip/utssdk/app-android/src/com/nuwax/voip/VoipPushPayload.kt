@@ -78,7 +78,8 @@ object VoipPushPayload {
         val sameLocator = id(message.opt("convId")) == invitation.opt("convId") &&
             id(message.opt("msgId")) == invitation.opt("msgId")
         if (invitation.optString("scene") == "meeting") {
-            return message.opt("msgType") == "meeting_invite" && sameLocator &&
+            return message.opt("msgType") == "meeting_invite" &&
+                message.optInt("senderType", 1) == 1 && message.optInt("msgStatus", 1) == 1 && sameLocator &&
                 body.opt("inviteId") == invitation.opt("inviteId") &&
                 body.opt("roomName") == invitation.opt("roomName") &&
                 sent > 0 && sent <= now + 5_000 && invitation.optLong("expiresAt") <= sent + 60_000

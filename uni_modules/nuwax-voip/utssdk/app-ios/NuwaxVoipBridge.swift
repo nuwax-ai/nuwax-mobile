@@ -40,6 +40,7 @@ import LiveKit
     private var pendingPushes: [UUID: PendingPush] = [:]
     /// Meeting ringing is a locator only: it never enters the 1:1 snapshot state machine.
     private var meetingPushUUIDs = Set<UUID>()
+    private var meetingValidatedUUIDs = Set<UUID>()
     private var meetingInvites: [UUID: NuwaxVoipPushInvitation] = [:]
     private var pendingPushExpiry: [UUID: Task<Void, Never>] = [:]
     private var pushWork: [UUID: NuwaxVoipPushWork] = [:]
@@ -135,7 +136,7 @@ import LiveKit
     }
     fileprivate func systemIncomingFailed(_ uuid: UUID, error: Error) {
         if meetingPushUUIDs.contains(uuid) {
-            meetingPushUUIDs.remove(uuid); meetingInvites.removeValue(forKey: uuid)
+            clearMeeting(uuid)
             return
         }
         guard validatedSystemUUID(uuid) else { return }
@@ -759,7 +760,7 @@ import LiveKit
         getuiBindingTask?.cancel(); getuiBindingTask = nil; getuiBinding = nil
         for work in Array(pushWork.values) { work.cancel() }; pushWork = [:]
         for task in pendingPushExpiry.values { task.cancel() }; pendingPushExpiry = [:]; pendingPushes = [:]
-        meetingPushUUIDs.removeAll(); meetingInvites.removeAll()
+        meetingPushUUIDs.removeAll(); meetingValidatedUUIDs.removeAll(); meetingInvites.removeAll()
         pushRegistry?.desiredPushTypes = []; pushRegistry = nil
         if #available(iOS 17.4, *), let system = systemBridge as? NuwaxSystemCalls { system.invalidate() }
         systemBridge = nil; configuration = [:]; events = []; terminal = []; terminalOrder = []; callUUIDs = [:]
@@ -780,8 +781,7 @@ import LiveKit
             // Meeting invites leave pendingPushes after validation; keep the ringing
             // window alive through meetingInvites and close it with a timeout event.
             if self.meetingInvites[uuid] != nil {
-                self.meetingInvites.removeValue(forKey: uuid)
-                self.meetingPushUUIDs.remove(uuid)
+                self.clearMeeting(uuid)
                 self.emit("meetingInvite", ["action": "timeout", "callId": invitation.callId,
                     "inviteId": invitation.inviteId ?? "", "roomName": invitation.roomName ?? "",
                     "title": invitation.title ?? "", "mediaType": invitation.mediaType,
@@ -800,16 +800,24 @@ import LiveKit
         meetingPushUUIDs.contains(uuid) || validatedSystemUUID(uuid) || (pendingPushes[uuid] != nil && pendingPushes[uuid]?.declined == false)
     }
     fileprivate func validatedSystemUUID(_ uuid: UUID) -> Bool {
-        if meetingPushUUIDs.contains(uuid) { return true }
+        // Meeting presence alone is not validation: only a verified meeting_invite message
+        // may enter the meeting flow. Ownership is tracked separately for system actions.
+        if meetingPushUUIDs.contains(uuid) { return meetingValidatedUUIDs.contains(uuid) }
         guard let id = snapshot?["callId"] as? String else { return false }; return callUUIDs[id] == uuid
     }
     fileprivate func isMeetingSystemCall(_ uuid: UUID) -> Bool { meetingInvites[uuid] != nil }
 
+    private func clearMeeting(_ uuid: UUID) {
+        meetingPushUUIDs.remove(uuid)
+        meetingValidatedUUIDs.remove(uuid)
+        meetingInvites.removeValue(forKey: uuid)
+    }
+
     /// Meeting answer/reject never enters the 1:1 call state machine. The JS layer
     /// opens the meeting room or reports `meeting-invite-handled`.
     fileprivate func meetingAccepted(_ uuid: UUID) {
-        guard let invitation = meetingInvites.removeValue(forKey: uuid) else { return }
-        meetingPushUUIDs.remove(uuid)
+        guard let invitation = meetingInvites[uuid] else { return }
+        clearMeeting(uuid)
         emit("meetingInvite", ["action": "accept", "callId": invitation.callId,
             "inviteId": invitation.inviteId ?? "", "roomName": invitation.roomName ?? "",
             "title": invitation.title ?? "", "mediaType": invitation.mediaType,
@@ -818,8 +826,8 @@ import LiveKit
     }
 
     fileprivate func endSystemCall(_ uuid: UUID) {
-        if let invitation = meetingInvites.removeValue(forKey: uuid) {
-            meetingPushUUIDs.remove(uuid)
+        if let invitation = meetingInvites[uuid] {
+            clearMeeting(uuid)
             emit("meetingInvite", ["action": "reject", "callId": invitation.callId,
                 "inviteId": invitation.inviteId ?? "", "roomName": invitation.roomName ?? "",
                 "title": invitation.title ?? "", "mediaType": invitation.mediaType,
@@ -838,7 +846,7 @@ import LiveKit
     fileprivate func systemReset() {
         for pending in pendingPushes.values { rememberTerminal(pending.invitation.callId) }
         for task in pendingPushExpiry.values { task.cancel() }; pendingPushExpiry = [:]; pendingPushes = [:]
-        meetingPushUUIDs.removeAll(); meetingInvites.removeAll()
+        meetingPushUUIDs.removeAll(); meetingValidatedUUIDs.removeAll(); meetingInvites.removeAll()
         finish("systemReset")
     }
     fileprivate func ownsSystemManager(_ manager: AnyObject) -> Bool { systemBridge === manager }
@@ -1199,22 +1207,23 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
             do {
                 guard let conv = invitation.convId, let msg = invitation.msgId,
                       let pending = pendingPushes[systemUUID] else {
-                    meetingPushUUIDs.remove(systemUUID); meetingInvites.removeValue(forKey: systemUUID)
+                    clearMeeting(systemUUID)
                     endIfUnverified(); return
                 }
                 let message = try await request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true)
                 guard !Task.isCancelled, run == generation, route == requiredPushRegistration,
                       invitation.matches(message, now: Date().timeIntervalSince1970 * 1000) else {
-                    meetingPushUUIDs.remove(systemUUID); meetingInvites.removeValue(forKey: systemUUID)
+                    clearMeeting(systemUUID)
                     endIfUnverified(); return
                 }
                 if pending.declined {
-                    meetingPushUUIDs.remove(systemUUID); meetingInvites.removeValue(forKey: systemUUID)
+                    clearMeeting(systemUUID)
                     system.end(uuid: systemUUID); return
                 }
+                meetingValidatedUUIDs.insert(systemUUID)
                 system.invitationReady(uuid: systemUUID)
             } catch {
-                meetingPushUUIDs.remove(systemUUID); meetingInvites.removeValue(forKey: systemUUID)
+                clearMeeting(systemUUID)
                 endIfUnverified()
             }
             return

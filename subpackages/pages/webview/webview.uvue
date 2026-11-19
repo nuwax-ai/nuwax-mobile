@@ -23,13 +23,10 @@
     <!-- #endif -->
 
     <view class="webview-content">
-      <view v-if="loadProgress > 0" class="webview-progress-track">
-        <view class="webview-progress-bar" :style="'width:' + loadProgress + '%'"></view>
-      </view>
       <web-view
         class="web-view"
-        :class="repoPageCover ? 'web-view--hidden' : ''"
-        v-if="webViewMounted && url.length != 0"
+        :class="repoBootstrapCover ? 'web-view--hidden' : ''"
+        v-if="url.length != 0"
         :src="url"
         id="webview"
         <!-- #ifndef APP -->
@@ -39,7 +36,7 @@
         @message="handleWebviewMessage"
       ></web-view>
       <!-- #ifdef APP -->
-      <!-- 不可见占位：Android 内容区只有 web-view 时会走全屏原生层，createWebviewContext 拿不到，token 注入会失效。 -->
+      <!-- 不可见占位：Android 内容区只有 web-view 时会走全屏原生层，createWebviewContext 拿不到。 -->
       <view class="webview-placeholder" />
       <!-- #endif -->
     </view>
@@ -59,12 +56,14 @@
   import { getApiBaseUrl } from "@/constants/config";
   // #endif
   import { apiUserTicketCreate } from "@/servers/agentDev";
+  // #ifdef APP || MP-WEIXIN
   import { ACCESS_TOKEN } from "@/constants/home.constants";
+  // #endif
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { onLoad, onUnload, onBackPress, onShareAppMessage, onAddToFavorites } from "@dcloudio/uni-app";
   import { isRepoLibraryPath } from "@/utils/repoLibraryLink";
-  import { prepareRepoPageShare, readRepoPageShareUrl } from "./repoPageShare";
-  import { filePreviewPath, prepareFilePageShare, readFilePageShareUrl } from "./filePageShare";
+  import { prepareRepoPageShare } from "./repoPageShare";
+  import { filePreviewPath, prepareFilePageShare } from "./filePageShare";
   import { isTabPage } from "@/utils/commonBusiness";
   // #ifdef APP-IOS
   // iOS：返回时须显式恢复 TabBar（常驻壳关壳可能 hide 过）
@@ -73,11 +72,17 @@
   import { useI18n, emptyI18nParams } from "@/utils/i18n";
   // App 端内嵌 H5 字体放大修复：Android 强制 webview textZoom = 100%（iOS 无此问题，自动跳过）
   import { fixAppWebviewTextZoom } from "@/subpackages/utils/webviewTextZoom";
+  // #ifdef APP-IOS
+  import { primeIosRepoAccessToken } from "@/uni_modules/nuwax-webview-document-start";
+  // #endif
   // #ifdef APP
   import {
     appWebViewGoBack,
     appWebViewPageTitle,
     appWebViewPageUrl,
+    buildRepoTokenHtml,
+    clearAndroidWebViewHistory,
+    primeAppWebViewAccessToken,
   } from "@/subpackages/utils/appWebViewHistory";
   // #endif
   // #ifdef APP-IOS
@@ -95,13 +100,8 @@
   // uvue 中直接调用 t() 会因缺少 params 形参报错，这里包一层单参版本
 
   const url = ref<string>("");
-  /** 为 false 时卸掉 web-view。资料库预写页不能留在历史栈里，写完 token 后重建。 */
-  const webViewMounted = ref<boolean>(true);
-  /** 0 表示不显示。进入页面和切换地址时从 8 爬到 90，加载完成清掉。 */
-  const loadProgress = ref<number>(0);
-  let loadProgressTimer: number = 0;
-  /** 资料库登录态还没写完时，先不把网页铺开，避免闪出预写页源码。 */
-  const repoPageCover = ref<boolean>(false);
+  /** 资料库写入 token 的引导页期间藏起 web-view，避免露出 about:blank。 */
+  const repoBootstrapCover = ref<boolean>(false);
   const method = ref<string>("");
   const data_type = ref<string>("");
   const request_id = ref<string>("");
@@ -113,19 +113,16 @@
   /** 内嵌页 document.title。读到之后才显示在域名上方。 */
   const embeddedTitle = ref<string>("");
   let navSyncTimer: number = 0;
-  // 资料库页要写入 localStorage 的登录 token。非资料库、未取到票据时为空。
-  // 小程序 web-view 不能 evalJS，票据只走地址上的 _ticket。
-  let repoPageTicket = "";
+
   // #ifdef APP
   const instance = getCurrentInstance();
   let webViewContext: WebviewContext | null = null;
-  let repoCookieTimer: number = 0;
-  let repoCookieAttempts = 0;
-  /** 正在同源页预写登录态，资料库地址先不打开。Android、iOS、鸿蒙同一时机。 */
-  const repoPriming = ref<boolean>(false);
-  let repoPrimeTarget = "";
-  let repoPrimeTimer: number = 0;
-  let repoPrimeAttempts = 0;
+  /** 先创建 WebView 并登记 document-start，再打开资料库。 */
+  let repoDocBootstrap = false;
+  let repoDocTarget = "";
+  let repoDocOrigin = "";
+  let repoDocTimer: number = 0;
+  let repoDocAttempts = 0;
   // #endif
   // #ifdef APP-IOS
   /** iOS 页面侧滑是否已按网页 canGoBack 锁住。-1 表示还没设置过。 */
@@ -231,7 +228,7 @@
   };
 
   /**
-   * 记下内嵌页当前地址。和上次不同时，资料库、文件预览重新取分享链接。
+   * 记下内嵌页当前地址。分享链接在用户打开分享弹窗时再取。
    */
   const rememberEmbeddedPage = (rawUrl: string): void => {
     if (rawUrl.indexOf("http://") != 0 && rawUrl.indexOf("https://") != 0) {
@@ -242,12 +239,11 @@
       return;
     }
     embeddedPageUrl.value = clean;
-    if (isRepoLibraryPath(clean)) {
-      prepareRepoPageShare(clean);
-    }
-    if (filePreviewPath(clean).length > 0) {
-      prepareFilePageShare(clean);
-    }
+  };
+
+  /** 引导页地址，不能拿来当资料库页面或导航标题。 */
+  const isBootstrapPageUrl = (raw: string): boolean => {
+    return raw.indexOf("about:blank") >= 0 || raw.indexOf("about://") == 0 || raw.indexOf("data:text/html") == 0;
   };
 
   /**
@@ -255,11 +251,6 @@
    * App 走原生 WebView；H5 只在同源 iframe 可读，跨域时保持域名单行。
    */
   const syncEmbeddedNav = (): void => {
-    // #ifdef APP
-    if (repoPriming.value == true) {
-      return;
-    }
-    // #endif
     let nextUrl = "";
     let nextTitle = "";
     // #ifdef APP
@@ -292,6 +283,9 @@
     }
     // #endif
     const hostSource = nextUrl.length > 0 ? nextUrl : url.value;
+    if (repoBootstrapCover.value == true || isBootstrapPageUrl(hostSource)) {
+      return;
+    }
     const host = hostOf(hostSource);
     if (host.length > 0) {
       pageHost.value = host;
@@ -378,9 +372,6 @@
       return;
     }
     iosUrlSyncTimer = setInterval((): void => {
-      if (repoPriming.value == true) {
-        return;
-      }
       if (isNeedCallApi.value == false) {
         requestWebViewDocumentTitle();
       }
@@ -458,38 +449,15 @@
   };
   // #endif
 
-  const stopLoadProgress = (): void => {
-    if (loadProgressTimer != 0) {
-      clearInterval(loadProgressTimer);
-      loadProgressTimer = 0;
-    }
-    loadProgress.value = 0;
-  };
-
-  /** 地址一开始加载就露出进度，避免停在 90 之前。 */
-  const startLoadProgress = (): void => {
-    if (loadProgress.value == 0) {
-      loadProgress.value = 8;
-    }
-    if (loadProgressTimer != 0) {
+  watch(url, (value: string): void => {
+    if (isBootstrapPageUrl(value)) {
       return;
     }
-    loadProgressTimer = setInterval((): void => {
-      if (loadProgress.value < 90) {
-        loadProgress.value = loadProgress.value + 7;
-      }
-    }, 200) as number;
-  };
-
-  watch(url, (value: string): void => {
     const host = hostOf(value);
     if (host.length > 0) {
       pageHost.value = host;
     }
     embeddedTitle.value = "";
-    if (value.length > 0) {
-      startLoadProgress();
-    }
   });
 
   /**
@@ -558,13 +526,6 @@
 
   // WebView 加载错误处理
   const handleWebviewError = (e: any) => {
-    // #ifdef APP
-    if (repoPriming.value == true) {
-      console.error("资料库登录态预写失败:", e);
-      finishRepoTokenPrime();
-      return;
-    }
-    // #endif
     console.error("WebView 加载错误:", e);
     uni.showToast({
       title: t("Mobile.Webview.loadFailed"),
@@ -573,138 +534,7 @@
     });
   };
 
-  /** 本地登录 token。鸿蒙清空时会写成空串。 */
-  const readCachedAccessToken = (): string => {
-    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
-    if (tokenRaw == null) {
-      return "";
-    }
-    return `${tokenRaw}`.trim();
-  };
-
-  /**
-   * 从地址里取出完整 `_ticket`。
-   * 通用查询解析按第一个 `=` 截断，票据里的填充符会被切掉。
-   */
-  const readQueryTicket = (raw: string): string => {
-    const hashIdx = raw.indexOf("#");
-    const withoutHash = hashIdx >= 0 ? raw.substring(0, hashIdx) : raw;
-    const marker = "_ticket=";
-    const idx = withoutHash.indexOf(marker);
-    if (idx < 0) {
-      return "";
-    }
-    const start = idx + marker.length;
-    const amp = withoutHash.indexOf("&", start);
-    const encoded = amp >= 0 ? withoutHash.substring(start, amp) : withoutHash.substring(start);
-    if (encoded.length == 0) {
-      return "";
-    }
-    try {
-      const decoded = decodeURIComponent(encoded);
-      return decoded != null ? `${decoded}` : encoded;
-    } catch (_e) {
-      return encoded;
-    }
-  };
-
-  /**
-   * 记下资料库页的 ticket，供打开后写入登录 token。
-   * 其它页面只把 _ticket 放在地址上。
-   */
-  const rememberRepoPageTicket = (pageUrl: string, ticket: string): void => {
-    let value = ticket.trim();
-    const hashIdx = value.indexOf("#");
-    if (hashIdx >= 0) {
-      value = value.substring(0, hashIdx).trim();
-    }
-    if (value.length == 0 || isRepoLibraryPath(pageUrl) == false) {
-      repoPageTicket = "";
-      return;
-    }
-    repoPageTicket = value;
-  };
-
-  // #ifdef APP
-  const stopRepoTicketCookieInject = (): void => {
-    if (repoCookieTimer != 0) {
-      clearInterval(repoCookieTimer);
-      repoCookieTimer = 0;
-    }
-  };
-
-  /**
-   * 在已打开的资料库文档上写入登录态：
-   * localStorage 的 ACCESS_TOKEN、内嵌标记。
-   * 地址还不是资料库页时跳过。
-   * 返回 true 只表示拿到 context 且 evalJS 没有抛错。
-   */
-  const injectRepoTicketCookieOnce = (): boolean => {
-    if (repoPageTicket.length == 0) {
-      return false;
-    }
-    let ctx: WebviewContext | null = webViewContext;
-    if (ctx == null) {
-      try {
-        ctx = uni.createWebviewContext(
-          "webview",
-          instance != null ? instance.proxy : null,
-        );
-        webViewContext = ctx;
-      } catch (_e) {
-        return false;
-      }
-      if (ctx == null) {
-        return false;
-      }
-    }
-    const cachedToken = readCachedAccessToken();
-    const tokenToInject = cachedToken.length > 0 ? cachedToken : repoPageTicket;
-    const ticketLiteral = JSON.stringify(tokenToInject);
-    // 资料库文档不在 /m/ 下，相对路径 ./static 会落到 /repo/doc/，改为站点 /m/ 下的 JSSDK。
-    const sdkLiteral = JSON.stringify(`${getApiBaseUrl()}/m/static/uni.webview.1.5.5.js`);
-    try {
-      ctx.evalJS(
-        `try{var h=location.pathname||'';if(h.indexOf('/repo/')!=0){return;}try{if(!window.uni||!uni.webView){var s=document.createElement('script');s.src=${sdkLiteral};document.head.appendChild(s);}}catch(e){}try{localStorage.setItem('ACCESS_TOKEN',${ticketLiteral});}catch(e){}window.__nuwaxSetAppEmbedded&&window.__nuwaxSetAppEmbedded();}catch(e){}`,
-      );
-    } catch (_e) {
-      return false;
-    }
-    return true;
-  };
-
-  /**
-   * 文档加载后短轮询写入登录态。
-   * 加载过程中的 evalJS 可能落在中间文档上，页面内跳转后需要再写一次。
-   */
-  const startRepoTicketCookieInject = (): void => {
-    stopRepoTicketCookieInject();
-    webViewContext = null;
-    if (repoPageTicket.length == 0) {
-      return;
-    }
-    repoCookieAttempts = 0;
-    injectRepoTicketCookieOnce();
-    repoCookieTimer = setInterval((): void => {
-      repoCookieAttempts++;
-      injectRepoTicketCookieOnce();
-      if (repoCookieAttempts >= 12) {
-        stopRepoTicketCookieInject();
-      }
-    }, 250) as number;
-  };
-  // #endif
-
-  const injectRepoTicketCookie = (): void => {
-    // #ifdef APP
-    startRepoTicketCookieInject();
-    // #endif
-  };
-
-  // #ifdef APP
-  const REPO_TOKEN_READY_TYPE = "nuwax-repo-token-ready";
-
-  /** 资料库地址的站点源。localStorage 按源隔离，预写页必须和资料库同域。 */
+  /** 资料库地址的站点源。localStorage 按这个源隔离。 */
   const originOfAbsolute = (raw: string): string => {
     const value = raw.trim();
     const proto = value.indexOf("://");
@@ -731,116 +561,111 @@
     return value.substring(0, proto + 3 + end);
   };
 
-  const stopRepoTokenPrimeTimer = (): void => {
-    if (repoPrimeTimer != 0) {
-      clearInterval(repoPrimeTimer);
-      repoPrimeTimer = 0;
+  // #ifdef APP
+  /** 本地登录 token。鸿蒙清空时会写成空串。 */
+  const readCachedAccessToken = (): string => {
+    const tokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+    if (tokenRaw == null) {
+      return "";
+    }
+    return `${tokenRaw}`.trim();
+  };
+
+  const stopRepoDocTimer = (): void => {
+    if (repoDocTimer != 0) {
+      clearInterval(repoDocTimer);
+      repoDocTimer = 0;
     }
   };
 
-  /** 登录态已经写入当前源，再打开真正的资料库地址。 */
-  const finishRepoTokenPrime = (): void => {
-    if (repoPriming.value != true) {
-      return;
-    }
-    const target = repoPrimeTarget;
-    repoPriming.value = false;
-    repoPrimeTarget = "";
-    stopRepoTokenPrimeTimer();
-    webViewContext = null;
-    if (target.length == 0) {
-      repoPageCover.value = false;
-      stopLoadProgress();
-      return;
-    }
-    // 预写页已经在 web-view 历史里。卸掉再打开资料库，左滑才不会先回到空白页。
-    repoPageCover.value = true;
-    webViewMounted.value = false;
-    url.value = "";
-    nextTick((): void => {
-      url.value = target;
-      webViewMounted.value = true;
-    });
-  };
-
-  /**
-   * 在同源静态文档上写入 ACCESS_TOKEN，并通知本页可以打开资料库。
-   * 不判断路径：这个文档不是 /repo/，判断会把写入跳过。
-   */
-  const writeRepoTokenBeforeNavigation = (): void => {
-    const cachedToken = readCachedAccessToken();
-    const tokenToInject = cachedToken.length > 0 ? cachedToken : repoPageTicket;
-    if (tokenToInject.length == 0) {
-      finishRepoTokenPrime();
-      return;
-    }
-    let ctx: WebviewContext | null = webViewContext;
-    if (ctx == null) {
-      try {
-        ctx = uni.createWebviewContext(
-          WEBVIEW_ELEMENT_ID,
-          instance != null ? instance.proxy : null,
-        );
-        webViewContext = ctx;
-      } catch (_e) {
-        return;
-      }
-      if (ctx == null) {
-        return;
-      }
-    }
-    const ticketLiteral = JSON.stringify(tokenToInject);
-    try {
-      ctx.evalJS(
-        "try{localStorage.setItem('ACCESS_TOKEN'," + ticketLiteral + ");" +
-          "var p={type:'" + REPO_TOKEN_READY_TYPE + "'};" +
-          "if(window.__uniapp_x_postMessage){window.__uniapp_x_postMessage({data:p});}" +
-          "else if(window.uni&&window.uni.webView&&window.uni.webView.postMessage){window.uni.webView.postMessage({data:p});}" +
-          "}catch(e){}",
-      );
-    } catch (_eEval) {
-      // 网页还没挂上时失败，下一轮再写
-    }
-  };
-
-  /**
-   * 先打开同域静态脚本，让 localStorage 落在资料库所在源上。
-   * 写完后再把 web-view 切到资料库，页面脚本才能读到 token。
-   */
-  const startRepoTokenPrime = (target: string): boolean => {
-    const origin = originOfAbsolute(target);
-    if (origin.length == 0) {
+  const primeRepoAccessToken = (): boolean => {
+    const tokenNow = readCachedAccessToken();
+    if (repoDocOrigin.length == 0 || tokenNow.length == 0 || repoDocTarget.length == 0) {
       return false;
     }
-    repoPrimeTarget = target;
-    repoPrimeAttempts = 0;
-    repoPriming.value = true;
-    repoPageCover.value = true;
-    stopRepoTokenPrimeTimer();
-    url.value = origin + "/m/static/uni.webview.1.5.5.js";
-    repoPrimeTimer = setInterval((): void => {
-      if (repoPriming.value != true) {
-        stopRepoTokenPrimeTimer();
-        return;
-      }
-      repoPrimeAttempts++;
-      writeRepoTokenBeforeNavigation();
-      if (repoPrimeAttempts >= 20) {
-        finishRepoTokenPrime();
-      }
-    }, 200) as number;
-    return true;
+    // #ifdef APP-IOS
+    try {
+      return primeIosRepoAccessToken(
+        WEBVIEW_ELEMENT_ID,
+        buildRepoTokenHtml(tokenNow, repoDocTarget),
+        repoDocOrigin + "/",
+      );
+    } catch (_eIos) {
+      return false;
+    }
+    // #endif
+    // #ifdef APP-ANDROID || APP-HARMONY
+    return primeAppWebViewAccessToken(WEBVIEW_ELEMENT_ID, repoDocOrigin, tokenNow, repoDocTarget);
+    // #endif
+    // #ifndef APP-IOS
+    // #ifndef APP-ANDROID
+    // #ifndef APP-HARMONY
+    return false;
+    // #endif
+    // #endif
+    // #endif
   };
 
-  const consumeRepoTokenReadyMessage = (messages: Array<UTSJSONObject>): boolean => {
-    for (let i = 0; i < messages.length; i++) {
-      const typeVal = messages[i]["type"];
-      if (typeVal != null && `${typeVal}` == REPO_TOKEN_READY_TYPE) {
-        finishRepoTokenPrime();
-        return true;
-      }
+  const openRepoAfterDocumentStart = (): void => {
+    const target = repoDocTarget;
+    repoDocBootstrap = false;
+    repoDocTarget = "";
+    repoDocOrigin = "";
+    stopRepoDocTimer();
+    if (target.length == 0) {
+      repoBootstrapCover.value = false;
+      return;
     }
-    return false;
+    repoBootstrapCover.value = false;
+    url.value = target;
+  };
+
+  /**
+   * 先让 WebView 挂上，在资料库文档脚本执行前写入本地 ACCESS_TOKEN，再打开资料库。
+   * 没有本地 token，或当前端登记不上时返回 false，调用方直接打开资料库。
+   */
+  const startRepoDocumentStart = (target: string): boolean => {
+    const origin = originOfAbsolute(target);
+    const tokenToInject = readCachedAccessToken();
+    if (origin.length == 0 || tokenToInject.length == 0) {
+      return false;
+    }
+    repoDocTarget = target;
+    repoDocOrigin = origin;
+    repoDocAttempts = 0;
+    repoDocBootstrap = true;
+    repoBootstrapCover.value = true;
+    stopRepoDocTimer();
+    url.value = "about:blank";
+    repoDocTimer = setInterval((): void => {
+      if (repoDocBootstrap != true) {
+        stopRepoDocTimer();
+        return;
+      }
+      repoDocAttempts++;
+      const tokenNow = readCachedAccessToken();
+      if (tokenNow.length == 0) {
+        return;
+      }
+      if (primeRepoAccessToken()) {
+        stopRepoDocTimer();
+        // 同源文档写入 token 后，再把组件地址换成资料库，避免停在 about:blank。
+        setTimeout((): void => {
+          openRepoAfterDocumentStart();
+        }, 150);
+        return;
+      }
+      if (repoDocAttempts >= 15) {
+        const fallback = repoDocTarget;
+        repoDocBootstrap = false;
+        repoBootstrapCover.value = false;
+        repoDocTarget = "";
+        repoDocOrigin = "";
+        stopRepoDocTimer();
+        url.value = fallback;
+      }
+    }, 100) as number;
+    return true;
   };
   // #endif
 
@@ -896,16 +721,24 @@
 
   // WebView 加载完成
   const handleWebviewLoad = (e: UniWebViewLoadEvent) => {
-    // #ifdef APP
-    // 预写页只负责把 token 放进同源 localStorage，不把它当成资料库页面。
-    if (repoPriming.value == true) {
-      writeRepoTokenBeforeNavigation();
+    let loadedSrc = "";
+    if (e.detail.src != null) {
+      loadedSrc = e.detail.src;
+    }
+    if (loadedSrc.indexOf("/m/static/repo-token-bridge.html") >= 0) {
       return;
     }
+    // #ifdef APP
+    if (repoDocBootstrap == true) {
+      if (isRepoLibraryPath(loadedSrc) == false) {
+        return;
+      }
+      repoDocBootstrap = false;
+      // #ifdef APP-ANDROID
+      clearAndroidWebViewHistory(WEBVIEW_ELEMENT_ID);
+      // #endif
+    }
     // #endif
-    repoPageCover.value = false;
-    stopLoadProgress();
-    const loadedSrc = e.detail.src;
     if (loadedSrc.length > 0) {
       rememberEmbeddedPage(loadedSrc);
     }
@@ -920,9 +753,6 @@
       startWebViewTitleRead();
     }
     // #endif
-    if (repoPageTicket.length > 0) {
-      injectRepoTicketCookie();
-    }
     // #ifdef MP-WEIXIN || APP
     if (isNeedCallApi.value) {
       uni.showLoading({
@@ -952,11 +782,6 @@
    * 3. 如果没有，检查网页端代码是否正确调用 wx.miniProgram.postMessage
    */
   const handleWebviewMessage = (e: UniWebViewMessageEvent): void => {
-    // #ifdef APP
-    if (consumeRepoTokenReadyMessage(e.detail.data)) {
-      return;
-    }
-    // #endif
     // #ifdef APP-IOS
     // 标题桥消息先消费掉，避免落进下面「取最后一条 html」的逻辑
     if (consumeWebViewTitleMessage(e.detail.data)) {
@@ -1032,29 +857,22 @@
     const target = new ShareTarget();
     target.title = displayPageTitle.value;
     const cleanUrl = buildCleanShareTargetUrl();
-    // 资料库：用进入页面时准备好的分享地址。那次失败或还没有地址时，点击分享再取一次。
+    // 资料库：打开分享弹窗时再取分享地址。
     if (isRepoLibraryPath(cleanUrl)) {
-      let repoShareUrl = readRepoPageShareUrl(cleanUrl);
-      if (repoShareUrl.length == 0) {
-        repoShareUrl = await prepareRepoPageShare(cleanUrl);
-      }
+      const repoShareUrl = await prepareRepoPageShare(cleanUrl);
       if (repoShareUrl.length > 0) {
         return repoShareUrl;
       }
     }
-    // 文件预览（路径含 /api/f/）：用进入页面时换好的 ak 直链。没有地址时再换一次。其它页面不走这里。
+    // 文件预览（路径含 /api/f/）：打开分享弹窗时再换成 ak 直链。其它页面不走这里。
     if (filePreviewPath(cleanUrl).length > 0) {
-      let fileShareUrl = readFilePageShareUrl(cleanUrl);
-      if (fileShareUrl.length == 0) {
-        fileShareUrl = await prepareFilePageShare(cleanUrl);
-      }
+      const fileShareUrl = await prepareFilePageShare(cleanUrl);
       if (fileShareUrl.length > 0) {
         return fileShareUrl;
       }
     }
     const shareKey = readQueryValue(cleanUrl, "sk");
     if (cleanUrl.indexOf("file-preview.html") >= 0 && shareKey.length > 0) {
-      target.kind = "file";
       target.sk = shareKey;
       const schemeIdx = cleanUrl.indexOf("://");
       const hostStart = schemeIdx >= 0 ? schemeIdx + 3 : -1;
@@ -1064,7 +882,6 @@
         target.pageUrl = origin + "/static/file-preview.html?sk=" + shareKey;
       }
     } else {
-      target.kind = "page";
       target.pageUrl = cleanUrl;
     }
     const shareUrl = buildOutgoingShareUrl(target);
@@ -1219,33 +1036,31 @@
     } else {
       url.value = window.location.origin + currentUrl;
     }
-    if (isRepoLibraryPath(url.value)) {
-      prepareRepoPageShare(url.value);
-    }
-    // 文件预览进入页面时先换成可分享的 ak 直链，避免点分享时才等待。
-    if (filePreviewPath(url.value).length > 0) {
-      prepareFilePageShare(url.value);
-    }
     // #endif
 
     // #ifdef MP-WEIXIN || APP
-    // 资料库（首页或某篇文档）不签发 _ticket，把本地登录 token 写入页面。
+    // 资料库不走 PageApp 的 _ticket。各端在资料库脚本执行前写入本地 token。
     if (isRepoLibraryPath(currentUrl)) {
-      prepareRepoPageShare(currentUrl);
-      const cachedToken = readCachedAccessToken();
-      if (cachedToken.length > 0) {
-        rememberRepoPageTicket(currentUrl, cachedToken);
-      }
       // #ifdef APP
-      // 先在同域静态页写入 token，再打开资料库，避免页面脚本读到空登录态后跳登录。
-      if (cachedToken.length > 0 && startRepoTokenPrime(currentUrl)) {
+      if (startRepoDocumentStart(currentUrl)) {
+        return;
+      }
+      // #endif
+      // #ifdef MP-WEIXIN
+      const mpTokenRaw = uni.getStorageSync(ACCESS_TOKEN);
+      const mpToken = mpTokenRaw != null ? `${mpTokenRaw}`.trim() : "";
+      const mpOrigin = originOfAbsolute(currentUrl);
+      if (mpToken.length > 0 && mpOrigin.length > 0) {
+        url.value =
+          mpOrigin +
+          "/m/static/repo-token-bridge.html?token=" +
+          encodeURIComponent(mpToken) +
+          "&next=" +
+          encodeURIComponent(currentUrl);
         return;
       }
       // #endif
       url.value = currentUrl;
-      if (cachedToken.length > 0) {
-        injectRepoTicketCookie();
-      }
       return;
     }
     const methodVal = queryParams["method"];
@@ -1264,9 +1079,6 @@
     // 只有跳转时带 pageApp=1 才签发票据，并拼到目标地址的 _ticket= 上。
     if (isPageApp != true) {
       url.value = currentUrl;
-      if (filePreviewPath(currentUrl).length > 0) {
-        prepareFilePageShare(currentUrl);
-      }
       return;
     }
 
@@ -1316,8 +1128,7 @@
 
   onUnload(() => {
     // #ifdef APP
-    stopRepoTicketCookieInject();
-    stopRepoTokenPrimeTimer();
+    stopRepoDocTimer();
     // #endif
     // #ifdef APP-IOS
     stopWebViewTitleRead();
@@ -1325,7 +1136,6 @@
     // #endif
     stopIosWebViewSwipeSync();
     stopEmbeddedNavSync();
-    stopLoadProgress();
   });
 
   // #ifdef MP-WEIXIN
@@ -1399,21 +1209,6 @@
     overflow: hidden;
     position: relative;
     background-color: #ffffff;
-  }
-
-  .webview-progress-track {
-    position: absolute;
-    left: 0;
-    top: 0;
-    width: 100%;
-    height: 2px;
-    z-index: 6;
-    background-color: #e8e8ee;
-  }
-
-  .webview-progress-bar {
-    height: 2px;
-    background-color: #4c6fff;
   }
 
   .web-view {

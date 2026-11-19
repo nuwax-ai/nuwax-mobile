@@ -274,7 +274,7 @@ public class MeetingRoomBridge: NSObject {
     if meetingMessages.count > 100 { meetingMessages.removeFirst(meetingMessages.count - 100) }
   }
 
-  public static func sendMeetingMessage(_ text: String, displayName: String, danmaku: Bool) {
+  public static func sendMeetingMessage(_ text: String, _ displayName: String, _ danmaku: Bool) {
     guard connectedFlag, let current = room else { return }
     let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !cleanText.isEmpty, cleanText.count <= 120 else { return }

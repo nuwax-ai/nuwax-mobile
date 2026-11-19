@@ -322,6 +322,13 @@ Android 按系统版本配置音视频前台服务、会议进行中通知、通
 
 本评估不包含单聊/群聊通话入口、呼叫状态机、来电页、CallKit/PushKit 或 Android 全屏来电；这些能力不作为会议 PoC 的通过条件。
 
+### 6.6 落地决策（2026-11-14）
+
+1. **接入顺序**：Android / iOS **先接 LiveKit**，桥接放在独立 UTS 插件 `uni_modules/nuwax-livekit`（Android 走 Maven/AAR，iOS 走 CocoaPods/XCFramework），业务侧只经 `utils/meeting/meetingMedia.uts` 调用，页面不持有 SDK 对象。
+2. **鸿蒙**：媒体层**先留逻辑占位**——插件的 `app-harmony` 是空实现、`isSupported()` 恒 false，会中页只提供会议信息与邀请复制，工具条如实提示「音视频能力接入中」，不显示假开关。后续在鸿蒙侧做自己的 **LiveKitClient**（ArkTS + 原生 RTC 连接/发布/订阅 + 原生视频渲染组件 + VOIP 长时任务 + AVScreenCapture 共享），再回来在插件里接同一套接口，业务层不用改。
+3. **当前进度（2026-11-16）**：插件已接线 SDK —— Android `io.livekit:livekit-android:2.28.2`（Maven），iOS CocoaPods `LiveKitClient 2.19.0`。Android/iOS 已使用自定义基座真机互通，可开启音视频；原生桥（`MeetingRoomBridge.kt` / `.swift`）负责连接、退房、设备控制与视频视图。App 会中页已接入远端视频与成员治理，并参照 PC 实现会议结束和成员状态轮询；屏幕共享与 DataChannel 聊天仍在后续迭代。此后修改原生插件需重打自定义基座，仅修改业务 `.uvue/.uts` 代码则可使用现有基座运行。
+4. **候选复用**：第三方 uni-app x 插件（DCloud 插件市场 28009 `XF-liveKitUTS`，声明支持 Android/iOS/鸿蒙 5.0.0）可作为鸿蒙 LiveKitClient 的来源之一再评估，但其鸿蒙端无屏幕共享、可维护性未知，不作为既定结论。
+
 ## 7. 接口复用与后端工作
 
 基础前缀：`/api/instant-message/meetings`。以下均已在本次 PC 分支找到对应 Controller；实际部署是否开启仍需联调检查。

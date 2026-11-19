@@ -135,6 +135,54 @@ describe('VoIP UniPush notice isolation', () => {
   });
 });
 
+describe('IM invitation scenes', () => {
+  const envelope = { push_clientid: ['fixture-cid-1', 'fixture-cid-2'], title: '张三', content: '邀请你通话' };
+  const callPayload = () => ({ ...locator, scene: 'call', convType: 1, callId: 'fixture-call', calleeId: '10002',
+    mediaType: 'video', expiresAt: Date.now() + 30_000, senderName: '张三' });
+  const meetingFields = { ...locator, scene: 'meeting', convType: 2, inviteId: 'fixture-invite', roomName: '123456789',
+    title: '周会', mediaType: 'audio', senderName: '张三', silent: true, groupCall: true, passcode: '1234' };
+
+  it('keeps the meeting on IM notifications even when the input has a VoIP category or route', async () => {
+    const { call, send } = load();
+    const { scene, ...expected } = meetingFields;
+    const result = await call({
+      ...envelope, category: { harmony: 'VOIP', huawei: 'VOIP' }, callRoute: { transport: 'ios-voip' },
+      payload: { ...meetingFields, expiresAt: 1, accessToken: 'fixture-extra' },
+    });
+    expect(result.errCode).toBe(0);
+    const args = send.mock.calls[0][0];
+    expect(args.payload).toEqual({ ...expected, type: 'meeting_invite' });
+    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args).not.toHaveProperty('settings');
+    expect(args).not.toHaveProperty('options');
+  });
+
+  it('passes the call deadline and recipient through the ordinary fallback pending a verified route', async () => {
+    const { call, send } = load(source, { NUWAX_VOIP_ANDROID_TRANSPORTS: 'android-huawei' });
+    const payload = callPayload();
+    expect((await call({
+      ...envelope, callRoute: { platform: 'android', transport: 'android-huawei', cid: envelope.push_clientid[0] },
+      payload,
+    })).errCode).toBe(0);
+    expect(send).toHaveBeenCalledTimes(1);
+    const args = send.mock.calls[0][0];
+    const { scene, senderName, ...fields } = payload;
+    expect(args).toMatchObject({ push_clientid: envelope.push_clientid, payload: { ...fields, displayName: senderName } });
+    expect(args.payload).not.toHaveProperty('delivery');
+    expect(args.settings).not.toHaveProperty('strategy');
+    expect(args.settings.ttl).toBeLessThanOrEqual(30_000);
+  });
+
+  it('rejects unknown scenes and incomplete calls and skips expired calls before sending', async () => {
+    const { call, send } = load();
+    for (const changes of [{ scene: 'unknown' }, { convType: 2 }, { calleeId: undefined }, { expiresAt: undefined }]) {
+      expect((await call({ ...envelope, payload: { ...callPayload(), ...changes } })).errCode).toBe(400);
+    }
+    expect((await call({ ...envelope, payload: { ...callPayload(), expiresAt: Date.now() - 1 } })).data.skipped).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+  });
+});
+
 describe('ordinary production notifications remain compatible', () => {
   it.each(ordinaryFixtures)('preserves existing send arguments and response: $label', async fixture => {
     const { call, send } = load();

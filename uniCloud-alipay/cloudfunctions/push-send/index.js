@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto')
-const { prepareVoip, prepareNativeVoip } = require('./voip')
+const { prepareVoip, prepareNativeVoip, prepareVoipScene } = require('./voip')
 
 const APP_ID = '__UNI__8BF05E4'          // 本项目的 DCloud AppID
 // 后端握手密钥：**只**从环境变量读（uniCloud 控制台 → 云函数 → 环境变量 PUSH_SIGN_KEY）。
@@ -232,7 +232,12 @@ exports.main = async (event) => {
   }
 
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { errCode: 400, errMsg: 'invalid request body' }
-  const nativeVoip = prepareNativeVoip(body)
+  const scene = prepareVoipScene(body)
+  if (scene?.error) return { errCode: 400, errMsg: scene.error }
+  if (scene?.meeting && JSON.stringify(scene.meeting).length > MAX_PAYLOAD) {
+    return { errCode: 400, errMsg: 'meeting invitation payload too large' }
+  }
+  const nativeVoip = scene ? null : prepareNativeVoip(body)
   if (nativeVoip) {
     if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
     if (nativeVoip.expired) return { errCode: 0, data: { skipped: true } }
@@ -275,7 +280,7 @@ exports.main = async (event) => {
   if (!ids.length || !ids[0]) return { errCode: 400, errMsg: 'push_clientid required' }
   if (!body.title || !body.content) return { errCode: 400, errMsg: 'title/content required' }
 
-  const voip = prepareVoip(body)
+  const voip = scene ? scene.call : prepareVoip(body)
   if (voip && voip.error) return { errCode: 400, errMsg: voip.error }
   if (voip && voip.expired) return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
 
@@ -283,8 +288,11 @@ exports.main = async (event) => {
   const title = clip(body.title, MAX_TITLE)
   const content = clip(body.content, MAX_CONTENT)
   // 先裁剪再塞角标：normalizePayload 超长时只保留 convId/convType，会把 badge 一起丢掉
-  const payload = attachBadgeToPayload(voip ? voip.payload : normalizePayload(body.payload), body.badge)
-  const category = body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
+  const payload = attachBadgeToPayload(voip?.payload ?? scene?.meeting ?? normalizePayload(body.payload), body.badge)
+  const category = scene?.meeting
+    ? { harmony: 'IM', huawei: 'IM' }
+    : body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
+  const privateInvitation = voip || payload.type === 'meeting_invite'
   // 厂商离线角标参数（App 进程不在时唯一能改桌面角标的途径）
   const vendorBadgeOptions = buildVendorBadgeOptions(body.badge)
 
@@ -294,19 +302,19 @@ exports.main = async (event) => {
   //   要核对"文案被截断/角标没生效"，看响应里的 applied 回显即可。
   console.log('[push-send] req', JSON.stringify({
     cidCount: ids.length,
-    cidSample: voip ? undefined : ids.slice(0, 2),
+    cidSample: privateInvitation ? undefined : ids.slice(0, 2),
     titleLength: title.length,
     contentLength: content.length,
-    convId: voip ? undefined : (payload && payload.convId ? payload.convId : null),
+    convId: privateInvitation ? undefined : (payload && payload.convId ? payload.convId : null),
     convType: payload && payload.convType ? payload.convType : null,
     payloadLength: JSON.stringify(payload || {}).length,
     badge: body.badge === undefined ? null : body.badge,
     // 保留 feat-2026.11 的在线通知策略，展示由客户端前后台状态决定。
     force_notification: false,
-    request_id: voip ? undefined : (body.request_id || null),
+    request_id: privateInvitation ? undefined : (body.request_id || null),
     ...(voip ? { kind: 'voip', ttl: voip.settings.ttl } : {})
   }))
-  if (DEBUG_MESSAGE_CONTENT && !voip) {
+  if (DEBUG_MESSAGE_CONTENT && !privateInvitation) {
     console.log('[push-send] message detail', JSON.stringify({
       push_clientid: ids,
       title,
@@ -350,7 +358,7 @@ exports.main = async (event) => {
       const res = await uniPush.sendMessage(args)
       console.log('[push-send] batch', chunk.length, 'errCode=', res && res.errCode, res && res.errMsg)
       // errCode=0 只代表 DCloud 受理，不代表送达；完整结果里可能有按端的任务 id / 失败明细
-      if (!voip) console.log('[push-send] batch res', JSON.stringify(res))
+      if (!privateInvitation) console.log('[push-send] batch res', JSON.stringify(res))
       results.push(res)
     } catch (err) {
       console.error('[push-send] batch threw:', (err && err.message) || String(err))

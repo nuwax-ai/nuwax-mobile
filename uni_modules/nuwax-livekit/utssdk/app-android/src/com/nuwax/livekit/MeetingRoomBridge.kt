@@ -322,7 +322,7 @@ class MeetingRoomBridge(context: Context) {
       val participant = target ?: return null
       // ★TrackPublication 上没有 videoTrack 便捷属性：统一 `track as? VideoTrack`
       val cameraPublication = participant.getTrackPublication(Track.Source.CAMERA)
-      var track = if (cameraPublication != null && !cameraPublication.isMuted) {
+      var track = if (cameraPublication != null && !cameraPublication.muted) {
         cameraPublication.track as? VideoTrack
       } else {
         null
@@ -383,7 +383,7 @@ class MeetingRoomBridge(context: Context) {
   private fun hasVideoTrack(p: io.livekit.android.room.participant.RemoteParticipant): Boolean {
     return try {
       val pub = p.getTrackPublication(Track.Source.CAMERA)
-      pub != null && !pub.isMuted && (pub.track as? VideoTrack) != null
+      pub != null && !pub.muted && (pub.track as? VideoTrack) != null
     } catch (e: Throwable) {
       false
     }

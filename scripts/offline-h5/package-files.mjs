@@ -18,7 +18,7 @@ export function sourceFingerprint(root) {
       if (['.git', 'node_modules', 'unpackage', '.hbuilderx', '.diag'].includes(name)) continue;
       const file = path.join(dir, name);
       const relative = path.relative(root, file).split(path.sep).join('/');
-      if (relative.startsWith('static/app/')) continue;
+      if (relative === 'out' || relative.startsWith('static/app/')) continue;
       const stat = fs.lstatSync(file);
       if (stat.isSymbolicLink()) continue;
       if (stat.isDirectory()) walk(file);

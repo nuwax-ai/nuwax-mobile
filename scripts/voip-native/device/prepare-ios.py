@@ -147,6 +147,14 @@ for p in sorted((RES/'uni_modules').iterdir()):
    deps.append({'framework':str(library),'embed':False})
    frameworks.append({'framework':str(library),'embed':True,'codeSign':True})
   if config.get('dependencies-pods'): pods[module]=config['dependencies-pods']
+ if p.name=='nuwax-bugly':
+  native=ROOT/'uni_modules'/p.name/'utssdk/app-ios'
+  library=native/'Frameworks/Bugly.xcframework'
+  assert library.is_dir(), 'Run python3 scripts/prepare-bugly-ios-sdk.py before packaging'
+  deps.append({'framework':str(library),'embed':False})
+  deps += [{'sdk':'SystemConfiguration.framework'},{'sdk':'Security.framework'}]
+  settings['OTHER_LDFLAGS']=['$(inherited)','-ObjC','-lc++','-lz']
+  shutil.copy2(native/'PrivacyInfo.xcprivacy',dest/'PrivacyInfo.xcprivacy')
  if p.name=='nuwax-voip':
   deps += [{'package':'LiveKit','product':'LiveKit'},{'sdk':'LiveCommunicationKit.framework','weak':True},{'sdk':'PushKit.framework'},{'sdk':'AVFoundation.framework'},{'sdk':'Security.framework'},{'sdk':'UserNotifications.framework'}]
  spec['targets'][module]={'type':'framework','platform':'iOS','sources':[str(dest)],'dependencies':deps,'settings':{'base':settings}}

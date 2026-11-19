@@ -27,6 +27,9 @@
 -keep class com.nuwax.** { *; }
 -dontwarn com.nuwax.**
 
+# Bugly expects stable SDK and JNI names when the optional R8 build is enabled.
+-keep class com.tencent.bugly.** { *; }
+
 # ---- appid 包：HX/构建期生成的 UniAppConfig / IndexKt 引导类（vapor 反射查找）----
 -keep class uni.** { *; }
 -dontwarn uni.**

@@ -1,0 +1,117 @@
+/** Android/iOS 实现，由 crashDiagnostics.uts 按平台引用。 */
+import { API_BASE_URL_CHANGED_EVENT, getApiBaseUrl, getDefaultApiBaseUrl } from "@/constants/config";
+import {
+  BUGLY_ANDROID_RELEASE_APP_ID, BUGLY_ANDROID_TEST_APP_ID,
+  BUGLY_IOS_RELEASE_APP_ID, BUGLY_IOS_TEST_APP_ID,
+  BUGLY_RELEASE_ORIGIN, BUGLY_TEST_ORIGIN, BUGLY_SERVICE_ENVIRONMENTS, type BuglyServiceEnvironment,
+} from "@/constants/bugly.config";
+import { hasAppPrivacyConsent } from "@/utils/appPrivacyConsent";
+import { CRASH_DIAGNOSTICS_CONSENT_KEY } from "@/utils/installScopedStorage";
+import { getBuglyPlatform, initializeBugly, stopBugly } from "@/uni_modules/nuwax-bugly";
+
+let startupChecked = false;
+let activeServiceHost = "";
+
+function getCurrentService(): BuglyServiceEnvironment | null {
+  const origin = getApiBaseUrl().toLowerCase();
+  const buildOrigin = getDefaultApiBaseUrl();
+  for (let i = 0; i < BUGLY_SERVICE_ENVIRONMENTS.length; i++) {
+    const service = BUGLY_SERVICE_ENVIRONMENTS[i];
+    const httpsOrigin = `https://${service.host}`;
+    if (origin != httpsOrigin && origin != `${httpsOrigin}:443`) continue;
+    // 试点项目仅承接测试流量。团队项目可按实际域名查看各环境。
+    if (buildOrigin == BUGLY_TEST_ORIGIN && service.environment != "test") return null;
+    return service;
+  }
+  return null;
+}
+
+function getAppId(): string {
+  const buildOrigin = getDefaultApiBaseUrl();
+  try {
+    const platform = getBuglyPlatform();
+    if (platform != "android" && platform != "ios") return "";
+    const android = platform == "android";
+    if (buildOrigin == BUGLY_TEST_ORIGIN) return android ? BUGLY_ANDROID_TEST_APP_ID : BUGLY_IOS_TEST_APP_ID;
+    if (buildOrigin == BUGLY_RELEASE_ORIGIN) return android ? BUGLY_ANDROID_RELEASE_APP_ID : BUGLY_IOS_RELEASE_APP_ID;
+  } catch (_error) {
+    // 标准基座可能没有该原生插件。
+  }
+  return "";
+}
+
+function hasConsent(appId: string): boolean {
+  if (appId.length == 0) return false;
+  try {
+    return uni.getStorageSync(CRASH_DIAGNOSTICS_CONSENT_KEY) == appId;
+  } catch (_error) {
+    return false;
+  }
+}
+
+export function isCrashDiagnosticsAvailable(): boolean {
+  return hasAppPrivacyConsent() && getCurrentService() != null && getAppId().length > 0;
+}
+
+export function isCrashDiagnosticsAllowed(): boolean {
+  return hasAppPrivacyConsent() && getCurrentService() != null && hasConsent(getAppId());
+}
+
+function stopCrashDiagnostics(): boolean {
+  if (activeServiceHost.length == 0) return true;
+  try {
+    stopBugly();
+    activeServiceHost = "";
+    return true;
+  } catch (_error) {
+    console.warn("[CrashDiagnostics] Failed to stop Bugly");
+    return false;
+  }
+}
+
+function onApiBaseUrlChanged(): void {
+  const service = getCurrentService();
+  if (service == null || service.host != activeServiceHost) stopCrashDiagnostics();
+}
+
+export function setCrashDiagnosticsAllowed(allowed: boolean): boolean {
+  if (!hasAppPrivacyConsent() || getCurrentService() == null) return false;
+  const appId = getAppId();
+  if (appId.length == 0) return false;
+  try {
+    if (allowed) {
+      uni.setStorageSync(CRASH_DIAGNOSTICS_CONSENT_KEY, appId);
+      return true;
+    }
+    uni.removeStorageSync(CRASH_DIAGNOSTICS_CONSENT_KEY);
+  } catch (_error) {
+    if (!allowed) stopCrashDiagnostics();
+    return false;
+  }
+  return stopCrashDiagnostics();
+}
+
+/** App 冷启动时检查一次。运行中撤回授权或切换服务域时，停止本进程的采集。 */
+export function startCrashDiagnostics(): void {
+  if (startupChecked || !hasAppPrivacyConsent()) return;
+  startupChecked = true;
+  const service = getCurrentService();
+  if (service == null) {
+    console.log("[CrashDiagnostics] init_skipped reason=service_not_enabled");
+    return;
+  }
+  const appId = getAppId();
+  if (!hasConsent(appId)) return;
+  try {
+    uni.$on(API_BASE_URL_CHANGED_EVENT, onApiBaseUrlChanged);
+    activeServiceHost = service.host;
+    if (!initializeBugly(appId, service.host, service.environment)) {
+      activeServiceHost = "";
+      return;
+    }
+    console.log(`[CrashDiagnostics] initialized environment=${service.environment} service_host=${service.host}`);
+  } catch (_error) {
+    stopCrashDiagnostics();
+    console.warn("[CrashDiagnostics] Failed to initialize Bugly");
+  }
+}

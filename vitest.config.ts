@@ -60,6 +60,8 @@ export default defineConfig({
     alias: [
       // HBuilderX resolves uni_modules by platform. Node tests use the H5 entry.
       { find: /^@\/uni_modules\/nuwax-voip$/, replacement: path.resolve(__dirname, "uni_modules/nuwax-voip/utssdk/web/index.uts") },
+      // Crash diagnostics tests mock the native bridge. Give Vite a real module path to resolve.
+      { find: /^@\/uni_modules\/nuwax-bugly$/, replacement: path.resolve(__dirname, "uni_modules/nuwax-bugly/utssdk/app-ios/index.uts") },
       { find: "@", replacement: path.resolve(__dirname) },
     ],
     // 依赖链里存在不带后缀的 `@/utils/xxx` import（.uts 文件间引用），

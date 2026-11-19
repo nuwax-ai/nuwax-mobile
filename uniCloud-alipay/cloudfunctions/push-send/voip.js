@@ -1,6 +1,7 @@
 'use strict'
 
 const { createHash } = require('crypto')
+const { isCallCid } = require('./device-routes')
 
 const matches = (value, pattern) => typeof value === 'string' && pattern.exec(value)?.[0] === value
 const locator = value => matches(value, /^[1-9][0-9]{0,18}$/) && BigInt(value) <= 9223372036854775807n
@@ -107,8 +108,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   if (strategy === null || strategy === 'hoshw') return { error: 'native call transport unavailable' }
   const ios = strategy === 'ios'
   if (route.platform !== (ios ? 'ios' : 'android') ||
-      typeof route.cid !== 'string' || !route.cid || route.cid.length > 128 || /[^A-Za-z0-9_-]/.test(route.cid) ||
-      body.push_clientid !== route.cid) return { error: 'one matching call device is required' }
+      !isCallCid(route.cid) || body.push_clientid !== route.cid) return { error: 'one matching call device is required' }
   if (ios && (!['development', 'production'].includes(route.environment) ||
       typeof route.registrationId !== 'string' || route.registrationId.length !== 36 || !registrationId.test(route.registrationId))) {
     return { error: 'signed environment and current iOS route registration are required' }

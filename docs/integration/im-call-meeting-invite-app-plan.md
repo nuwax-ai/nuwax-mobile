@@ -359,7 +359,22 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
 }
 ```
 
-云函数从当前目标取 `cid`，从设备信息识别 `platform`，并根据已确认的厂商来电能力选择 `transport`。Android 联调可先按已核实的测试 CID 映射 `android-huawei` 或 `android-honor`。UniPush 的 `getClientDetailByCid` 提供系统和机型信息，能否稳定区分华为安卓、荣耀的来电通道待真机验证。[DCloud 设备详情接口](https://doc.dcloud.net.cn/uniCloud/uni-cloud-push/api)
+云函数从当前服务空间的 `voip-device-routes` 按 CID 查询设备登记。集合以 CID 为 `_id`，由可信服务端按设备登记维护，客户端无读写权限。云函数逐台核对 `appId`、`calleeId` 和 `active`，再读取 `platform`、`transport`。Android 联调录入已核实的华为安卓和荣耀 CID，分别使用 `android-huawei` 和 `android-honor`。UniPush 设备详情可辅助核对机型。 [DCloud 设备详情接口](https://doc.dcloud.net.cn/uniCloud/uni-cloud-push/api)
+
+一条华为安卓测试设备登记示例
+
+```json
+{
+  "_id": "example-device-cid",
+  "appId": "__UNI__8BF05E4",
+  "calleeId": "10002",
+  "active": true,
+  "platform": "android",
+  "transport": "android-huawei"
+}
+```
+
+退出或解绑时保留 CID 记录并标记 `active=false`，换号后更新为当前有效归属。这样旧邀请在账号变更后能被拦下，回落到普通通知也不会投给已知撤销、换号或不属于本应用的 CID。
 
 接听时按 `convId + msgId` 回查原邀请的 `roomName`，沿用现有 RTC 凭据接口。云函数为 Android 原生投递附上 `payload.delivery="android-native"`。在线邀请与原生推送均按同一 `callId` 去重。
 
@@ -455,8 +470,8 @@ IM → 云函数使用 `payload.type="voip"` 和 `payload.scene="meeting"`。云
 #### 5.2.3 云函数连带改动
 
 1. 先按 `scene` 分流，会议走普通 IM 通知，下发兼容现有 App 的 `meeting_invite`。旧请求沿用原来的类型和投递分支。
-2. 通话校验 IM 提供的 `calleeId`、`expiresAt` 和邀请定位，再按已确认的 CID 登记组装 `callRoute`。复用现有原生字段校验和厂商投递。有效 CID 暂无可确认的来电通道时按普通通知处理。
-3. 本地代码已接入 `scene` 分流和字段校验。新通话请求当前走普通通知，逐 CID 的原生投递仍需接入可信设备登记查询。联调按同一 `callId` 跟踪每台设备的回执与原生回调。
+2. 测试空间通过 `NUWAX_VOIP_DEVICE_ROUTE_LOOKUP=1` 启用逐 CID 查询。通话校验 IM 提供的 `calleeId`、`expiresAt` 和邀请定位，再从登记组装 `callRoute`。Android 沿用 `NUWAX_VOIP_ANDROID_TRANSPORTS` 白名单，iOS 沿用 `NUWAX_VOIP_IOS_APNS_ENVIRONMENT`。未知或暂未开通原生通道的 CID 按普通通知处理。查询失败返回 503，已核对为撤销或归属不符的设备返回 403。
+3. 每个已处理的 CID 在 `data.results` 中返回 `clientid` 和 `errCode`。已发起送出的结果带 `delivery` 和 `requestId`，原生回执带可匹配的任务状态。联调按同一 `callId` 核对各设备回执与原生回调。逐 CID 查询关闭时，新通话沿用普通通知路径。
 
 ### 5.3 状态上报（App → 服务端）
 
@@ -556,7 +571,7 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 | 3007 事件下发 | ✅ 已有 | 无需改动 |
 | 推送 `payload.type`、`scene` | 通话和会议在 IM 内已有各自的消息类型 | IM 按 §5.2.2 统一向云函数发送 `voip`，用 `scene` 标识通话或会议 |
 | 单聊 VoIP 原生来电 | 普通推送已有目标 CID 和消息定位 | IM 后端补齐来电业务字段，包含最终新增的 `calleeId` 和 `expiresAt` |
-| 云函数原生来电分支 | 本地已接入场景分流和字段校验 | 移动端侧待接入可信设备登记，逐 CID 组装 `callRoute`，联调核对厂商通道与下行字段 |
+| 云函数原生来电分支 | 源码已支持按 CID 读取设备登记、组装 `callRoute` 与下发 | 测试空间录入已核实的设备登记，开启路由查询与相应通道后按 §5.2.3 验证 |
 | 单聊 VoIP 多设备接听 | `/calls/answered` 入房后广播停铃 | 补充评审项。按 §4.6 确认设备扇出、接听仲裁与 RTC 凭证检查 |
 | 推送文案 | 通用会话摘要 | `voip`：「张三邀请你语音通话」；会议：「会议邀请：周会」 |
 | 60 秒 TTL | ✅ 服务端常量 `CALL_RING_TTL_SEC` | 确认离线推送时的过期处理（过期推送到端后不应再响） |

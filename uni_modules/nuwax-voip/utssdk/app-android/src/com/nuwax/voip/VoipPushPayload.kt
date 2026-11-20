@@ -27,6 +27,11 @@ object VoipPushPayload {
             val meeting = value.optString("scene") == "meeting"
             // Do not forward tokens, URLs or unrelated notification fields to the call bridge.
             val locator = JSONObject().put("type", "voip").put("convId", conv).put("msgId", message)
+            if (value.has("pushEnvironment")) {
+                val environment = value.opt("pushEnvironment")
+                if (environment != "test" && environment != "production") return null
+                locator.put("pushEnvironment", environment)
+            }
             if (meeting) locator.put("scene", "meeting")
             if (!value.has("delivery")) return locator
             if (!isNative(value) || value.opt("convId") !is String || value.opt("msgId") !is String) return null

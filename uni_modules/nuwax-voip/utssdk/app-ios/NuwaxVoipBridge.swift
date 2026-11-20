@@ -1128,7 +1128,8 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
             let run = generation
             let route = requiredPushRegistration
             let invitation = NuwaxVoipPushInvitation(payload.dictionaryPayload, userId: configuration["userId"] as? String ?? "",
-                business: business, now: Date().timeIntervalSince1970 * 1000, requiredRegistrationId: route)
+                business: business, now: Date().timeIntervalSince1970 * 1000, requiredRegistrationId: route,
+                pushBusinessEnvironment: configuration["pushBusinessEnvironment"] as? String)
             let systemUUID = invitation.map { uuid($0.callId) } ?? UUID()
             trace("PushKit received callId=\(invitation?.callId ?? "invalid") systemUUID=\(systemUUID.uuidString)")
             let system = (systemBridge as? NuwaxSystemCalls) ?? NuwaxSystemCalls(owner: self)

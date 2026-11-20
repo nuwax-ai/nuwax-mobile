@@ -1,6 +1,7 @@
 import request from "./useRequest";
-import { getApiBaseUrl } from "@/constants/config";
+import { getApiBaseUrl, getImPushEnvironment } from "@/constants/config";
 import { getImSessionStamp } from "@/utils/im/imSessionScope";
+import { IM_DEVICE_BASE_ID_STORAGE_KEY, IM_PUSH_BINDING_KEY } from "@/utils/installScopedStorage";
 import { hasImPushPreferenceSession, hasImPushPreferenceUser, bindImPushPreferenceUser, readImPushEnabled } from "@/utils/im/imPushPreference";
 import { generateUUID } from "@/utils/common";
 import { apiResCode, apiResData } from "@/utils/apiResponse";
@@ -13,8 +14,6 @@ import { getStableDeviceBaseId } from "@/uni_modules/nuwax-device-identity";
 // 稳定的内部错误标识用于会话隔离/客户端注入检查，不能随界面语言改变。
 const IM_DEVICE_SESSION_CHANGED = "IM device session changed";
 const IM_PUSH_IDENTITY_UNAVAILABLE = "IM push identity unavailable";
-
-const IM_DEVICE_BASE_ID_STORAGE_KEY = "NUWAX_IM_DEVICE_BASE_ID";
 
 /**
  * 「定位到聊天位置」跳转事件（quote-detail 页 → 聊天页）：
@@ -161,6 +160,50 @@ export function imDevicePlatform(): string {
  * voipToken 移动端均不传。
  */
 let deviceRegistrationQueue: Promise<void> = Promise.resolve();
+let retiredPushSession = "";
+
+type ImPushBinding = {
+  origin: string;
+  registrationId: string;
+  active: boolean;
+};
+
+function readImPushBindings(): ImPushBinding[] {
+  const bindings: ImPushBinding[] = [];
+  try {
+    const stored = uni.getStorageSync(IM_PUSH_BINDING_KEY);
+    if (stored == null) return bindings;
+    const value = `${stored}`;
+    const lines = value.split("\n");
+    // 已安装版本使用三行存储一条回执，更新后按服务域保留各自的回执。
+    const records = value.includes("\t") ? lines : [lines.join("\t")];
+    for (const record of records) {
+      const fields = record.split("\t");
+      if (fields.length == 3 && fields[1].length == 36 && (fields[2] == "0" || fields[2] == "1")) {
+        bindings.push({ origin: fields[0].toLowerCase(), registrationId: fields[1], active: fields[2] == "1" });
+      }
+    }
+  } catch (_error) {
+    return bindings;
+  }
+  return bindings;
+}
+
+function saveImPushBinding(data: any | null, origin: string): ImPushBinding | null {
+  if (data == null || typeof data != "object" || Array.isArray(data)) return null;
+  const receipt = data as UTSJSONObject;
+  const version = receipt["registrationId"];
+  const active = receipt["active"];
+  if (typeof version != "string" || `${version}`.length != 36 ||
+      typeof active != "boolean" || receipt["environment"] != getImPushEnvironment(origin)) return null;
+  const key = origin.toLowerCase();
+  const binding: ImPushBinding = { origin: key, registrationId: `${version}`, active: active == true };
+  const bindings = readImPushBindings().filter((entry: ImPushBinding): boolean => entry.origin != key);
+  bindings.push(binding);
+  uni.setStorageSync(IM_PUSH_BINDING_KEY, bindings.map((entry: ImPushBinding): string =>
+    `${entry.origin}\t${entry.registrationId}\t${entry.active ? "1" : "0"}`).join("\n"));
+  return binding;
+}
 
 /** 只绑定当前服务端鉴权确认的用户；迟到响应不能把上一账号的偏好带进来。 */
 export async function ensureImPushPreferenceUser(): Promise<boolean> {
@@ -184,21 +227,30 @@ export async function apiImDeviceRegister(pushToken: string = ""): Promise<Reque
   const origin = getApiBaseUrl();
   // cid刷新、重连和用户开关共用一队列，防旧的开启请求晚到覆盖新关闭请求。
   const pending = deviceRegistrationQueue.then(async (): Promise<RequestResponse<any>> => {
-    if (stamp != getImSessionStamp() || origin != getApiBaseUrl()) throw new Error(IM_DEVICE_SESSION_CHANGED);
+    if (stamp == retiredPushSession || stamp != getImSessionStamp() || origin != getApiBaseUrl()) throw new Error(IM_DEVICE_SESSION_CHANGED);
     const preferenceReady = await ensureImPushPreferenceUser();
     if (stamp != getImSessionStamp() || origin != getApiBaseUrl()) throw new Error(IM_DEVICE_SESSION_CHANGED);
     if (hasImPushPreferenceSession() && !preferenceReady) throw new Error(IM_PUSH_IDENTITY_UNAVAILABLE);
-    return await registerImDeviceNow(pushToken);
+    return await registerImDeviceNow(pushToken, origin);
   });
   deviceRegistrationQueue = pending.then((): void => {}, (): void => {});
   return await pending;
 }
 
-async function registerImDeviceNow(pushToken: string): Promise<RequestResponse<any>> {
+async function registerImDeviceNow(pushToken: string, origin: string): Promise<RequestResponse<any>> {
   const body = new UTSJSONObject();
   body["deviceId"] = getImDeviceId();
   body["platform"] = imDevicePlatform();
   body["appName"] = "nuwax-mobile";
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+  const key = origin.toLowerCase();
+  const bindings = readImPushBindings();
+  if (bindings.some((entry: ImPushBinding): boolean => entry.active && entry.origin != key)) {
+    throw new Error(IM_PUSH_IDENTITY_UNAVAILABLE);
+  }
+  const binding = bindings.find((entry: ImPushBinding): boolean => entry.origin == key);
+  if (binding != null) body["pushPreviousRegistrationId"] = binding.registrationId;
+  // #endif
   if (pushToken.length > 0) {
     body["pushEnabled"] = readImPushEnabled();
     body["pushToken"] = pushToken;
@@ -212,11 +264,65 @@ async function registerImDeviceNow(pushToken: string): Promise<RequestResponse<a
   } catch (_error) {
     // 版本字段缺省不阻断注册
   }
-  return await request({
+  const result = await request({
     url: "/api/instant-message/devices",
     method: "POST",
     data: body,
   });
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+  if (apiResCode(result) == SUCCESS_CODE) {
+    const raw = apiResData<any>(result);
+    if (raw != null && typeof raw == "object") saveImPushBinding((raw as UTSJSONObject)["pushBinding"], origin);
+  }
+  // #endif
+  return result;
+}
+
+/** The IM service disables the old route and returns a release receipt for the next login. */
+export async function revokeManagedImPushBinding(origin: string, canAuthenticate: boolean, requireConfirmation: boolean = false): Promise<boolean | null> {
+  const stamp = getImSessionStamp();
+  const pending = deviceRegistrationQueue.then(async (): Promise<boolean | null> => {
+    if (stamp != getImSessionStamp() || origin != getApiBaseUrl()) return false;
+    const key = origin.toLowerCase();
+    const bindings = readImPushBindings();
+    if (bindings.some((entry: ImPushBinding): boolean => entry.active && entry.origin != key)) return false;
+    const binding = bindings.find((entry: ImPushBinding): boolean => entry.origin == key);
+    if (binding == null) {
+      if (!requireConfirmation) return null;
+      if (!canAuthenticate) return true;
+      try {
+        const result = await apiImDeviceUnregister(getImDeviceId());
+        if (apiResCode(result) != SUCCESS_CODE || typeof apiResData<any>(result) != "boolean") return false;
+        retiredPushSession = stamp;
+        return true;
+      } catch (_error) {
+        return false;
+      }
+    }
+    if (!binding.active) {
+      retiredPushSession = stamp;
+      return true;
+    }
+    if (!canAuthenticate) return false;
+    try {
+      const result = await request({
+        url: `/api/instant-message/devices/${encodeURIComponent(getImDeviceId())}/push-binding?registrationId=${encodeURIComponent(binding.registrationId)}`,
+        method: "DELETE",
+        suppressErrorToast: true,
+      });
+      if (apiResCode(result) != SUCCESS_CODE) return false;
+      const receipt = apiResData<any>(result);
+      if (receipt == null || typeof receipt != "object" || (receipt as UTSJSONObject)["active"] != false) return false;
+      const released = saveImPushBinding(receipt, origin);
+      if (released == null || released.active) return false;
+      retiredPushSession = stamp;
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  });
+  deviceRegistrationQueue = pending.then((): void => {}, (): void => {});
+  return await pending;
 }
 
 /**

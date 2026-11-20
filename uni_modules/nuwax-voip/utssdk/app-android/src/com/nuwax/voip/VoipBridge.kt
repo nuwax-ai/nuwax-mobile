@@ -875,6 +875,8 @@ object VoipBridge {
         // A persisted context exists only after privacy consent and an authenticated bootstrap.
         // Read it afresh: logout must not revive the previous account on a cold push.
         val saved = loadConfig() ?: return native
+        if (invitation.has("pushEnvironment") &&
+            invitation.optString("pushEnvironment") != saved.optString("pushBusinessEnvironment")) return true
         val debug = ctx.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
         if (saved.optString("protocol") != "im-voip-v1" || saved.optString("accessToken").isEmpty() ||
             !businessSessionAllowed(saved, debug)) return native

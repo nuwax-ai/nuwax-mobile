@@ -3313,7 +3313,7 @@ export default class AgentDetailService {
 
     const subRequest = new StreamRequest();
     this.subStreamRequest = subRequest;
-    let firstEventReceived = false;
+    let hasReplay = false;
     const requestConfig = new StreamRequestConfig();
     requestConfig.url = `${getApiBaseUrl()}/api/agent/conversation/chat/sub/${conversationId}`;
     requestConfig.method = "GET";
@@ -3326,14 +3326,17 @@ export default class AgentDetailService {
         // 干预事件可能没有顶层 data，仍需交给业务层。
         const isIntervention = isAcpPermissionEvent(result) || isMcpAskToolCallEvent(result);
         if (readRawField(result, "data") == null && !isIntervention) return;
+        const eventType = readBizEnumStr(result, "eventType");
+        // 只有终态帧时，保留已有回复，等详情回补落库正文。
+        if (eventType == `${ConversationEventTypeEnum.FINAL_RESULT}` && !hasReplay) return;
         ensurePlaceholder();
         this.handleChangeMessageList(result, targetMessageId);
-        if (!firstEventReceived) {
-          firstEventReceived = true;
+        if (!hasReplay) {
+          hasReplay = true;
           this.streamResumePending = false;
           this.logStreamRecovery("reconnected", "source=sub");
         }
-        if (readRawField(result, "eventType") == `${ConversationEventTypeEnum.ERROR}`) {
+        if (eventType == `${ConversationEventTypeEnum.ERROR}`) {
           cleanupSub(null);
         }
       } catch (_error) {
@@ -3341,7 +3344,7 @@ export default class AgentDetailService {
     };
     requestConfig.onComplete = () => {
       if (!isCurrentSub()) return;
-      if (!firstEventReceived && this.streamResumePending) {
+      if (!hasReplay) {
         cleanupSub("terminal_without_replay");
         return;
       }
@@ -3523,6 +3526,9 @@ export default class AgentDetailService {
    */
   handleRemoteConversationTerminal(response: RequestResponse<ConversationInfo>): boolean {
     const wasRecovering = this.streamResumePending;
+    const status = readBizEnumStr(apiResData<any>(response), "taskStatus");
+    const notStarted = status == `${TaskStatus.CREATE}`;
+    if (notStarted && (!wasRecovering || chatService.isCurrentlyStreaming || this.isSubscribed)) return false;
     if (chatService.isCurrentlyStreaming || wasRecovering) {
       const startedAt = this.liveStreamStartedAt;
       if (startedAt > 0) {
@@ -3537,9 +3543,17 @@ export default class AgentDetailService {
     this.data.isConversationActive.value = false;
     this.clearStreamingAssistantText();
     if (wasRecovering) {
-      const status = readBizEnumStr(apiResData<any>(response), "taskStatus");
       this.logStreamRecovery("recovery_finished", `source=detail status=${status}`);
-      this.handleQueryConversation(response);
+      // CREATE 没有本轮服务端回复，保留本地消息供用户重试。
+      if (!notStarted) {
+        this.handleQueryConversation(response);
+        const conversationId = this.data.conversationId.value;
+        if (status == `${TaskStatus.COMPLETE}` && conversationId != null) {
+          const suggestParams = buildConversationChatSuggestParams(null);
+          suggestParams.conversationId = conversationId;
+          this.refreshChatSuggest(suggestParams, this.streamGeneration);
+        }
+      }
     }
     return true;
   }

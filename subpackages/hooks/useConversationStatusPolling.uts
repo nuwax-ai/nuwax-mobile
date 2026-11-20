@@ -7,7 +7,7 @@
  * 本地忙(live 流式 / 已订阅 sub)时进入「静默终态轮询」:仍每 5s 探测,但只用于检测任务被
  * 他端结束/暂停(非 EXECUTING → onTerminalWhileBusy 强制收尾);不判用户门禁、不加速、
  * 不触发 sub,避免本地接管本轮时空转(语音刚发送、服务端本轮用户句尚未落库等)。
- * 高频连续发送保护：终态须「连续两轮」观察到才回调（详见 pendingTerminalObserved），
+ * 高频连续发送保护：终态须「连续两轮」观察到才回调，
  * 单轮终态可能是上一轮任务被打断后的陈旧回包，不能据此掐断新一轮流。
  * 语音播报不挡轮询（App 开会话后 H5 续接时，播报中也要能检出 EXECUTING）。
  * - H5:visibilitychange 自动暂停/恢复
@@ -91,8 +91,7 @@ let onTerminalWhileBusyCallback: ((id: number, response: RequestResponse<Convers
  * 而本轮 GET 可能早于新任务注册发出）。须连续两轮都观察到终态才回调，
  * 否则一轮陈旧终态就会误杀刚启动的新一轮流式。
  */
-let pendingTerminalObserved = false;
-let pendingTerminalCid = 0;
+let pendingCompletionStatus = '';
 
 function isTerminalTaskStatus(status: string): boolean {
   return status == `${TaskStatus.COMPLETE}` || status == `${TaskStatus.FAILED}` || status == `${TaskStatus.CANCEL}`;
@@ -106,8 +105,7 @@ export function bumpPollGeneration(): void {
   pollGeneration = pollGeneration + 1;
   // 新发送同时作废已武装的终态「两轮确认」：上一轮观察到的单次终态属于旧任务，
   // 不得计入新一轮的确认（genChanged 只覆盖 poll 在途窗口内的发送，间隙发送靠这里补）。
-  pendingTerminalObserved = false;
-  pendingTerminalCid = 0;
+  pendingCompletionStatus = '';
 }
 
 /**
@@ -159,6 +157,9 @@ async function pollOnce(): Promise<void> {
   // 标志即为补此缺口，消息页/IM 聊天页同款守卫）。定时器保留，回前台后下一拍
   // 自然恢复；回前台续接由页面 onShow 的 resume/后台重连链路负责。
   if (isAppInBackground()) return;
+  // #ifdef H5 || WEB
+  if (document.hidden) return;
+  // #endif
 
   // 先拷到局部再调用：UTS 可变属性不可 smart cast，且 ?.invoke 在 iOS 上可能调不到回调
   const activeGetter = isConversationActiveGetter;
@@ -186,7 +187,7 @@ async function pollOnce(): Promise<void> {
     }
     const code = apiResCode(response);
     if (code != SUCCESS_CODE) {
-      pendingTerminalObserved = false;
+      pendingCompletionStatus = '';
       if (resumePending == true) console.warn(`[ChatStream] detail_failed cid=${conversationId} gen=${genSnapshot} code=${code}`);
       return;
     }
@@ -198,7 +199,7 @@ async function pollOnce(): Promise<void> {
 
     const dataRaw = apiResData<any>(response);
     if (dataRaw == null) {
-      pendingTerminalObserved = false;
+      pendingCompletionStatus = '';
       if (resumePending == true) console.warn(`[ChatStream] detail_missing cid=${conversationId} gen=${genSnapshot}`);
       return;
     }
@@ -206,8 +207,7 @@ async function pollOnce(): Promise<void> {
     const taskStatusStr = readBizEnumStr(dataObj, 'taskStatus');
     if (taskStatusStr == `${TaskStatus.EXECUTING}`) {
       // 服务端已回到执行态：上一轮终态观察作废（可能是旧任务的陈旧回包）
-      pendingTerminalObserved = false;
-      pendingTerminalCid = 0;
+      pendingCompletionStatus = '';
       // await 期间本地已触发新一轮（用户新发送）：旧响应不得续接 / 加速 / 进 fast poll，
       // 等下一轮再按新状态判断。
       if (genChanged == true) {
@@ -245,19 +245,13 @@ async function pollOnce(): Promise<void> {
         // 透传刚拉取的全量详情响应：续接可直接复用，避免 sub 前二次全量请求
         cb(conversationId, response);
       }
-    } else if (isTerminalTaskStatus(taskStatusStr)) {
-      // 非 EXECUTING（终态：COMPLETE / FAILED / CANCEL）而本端仍认为在 live/sub 接收：
-      // 说明他端已结束 / 暂停任务，通知页面强制收尾。
-      // 空闲时不主动回调，避免旧轮询响应误中止刚开始的新会话。
-      //
-      // 陈旧回包防护（多套方案合并）：
-      // 1) await 期间本地已突变（代数增长 = 用户新发送 / 续接接管）→ 旧快照作废；
-      // 2) await 前空闲、await 后进入忙（本地刚接管）→ 旧快照作废；
-      // 3) 终态须连续两轮都观察到才回调（两轮确认），单轮陈旧终态不触发强制收尾。
+    } else if (isTerminalTaskStatus(taskStatusStr) ||
+      (taskStatusStr == `${TaskStatus.CREATE}` && resumePending && !busy && !subscribed)) {
+      // 正在等断流恢复且服务端仍为 CREATE 时，两次确认后也需要结束等待。
+      // 正常在收流期间，CREATE 可能是新任务注册前的快照，不参与收尾。
       if (genChanged == true) {
         // 本地已开新一轮：本轮终态观察作废（含上一轮已武装的确认态）
-        pendingTerminalObserved = false;
-        pendingTerminalCid = 0;
+        pendingCompletionStatus = '';
         return;
       }
       const activeAfterTerminal = isConversationActiveGetter;
@@ -272,46 +266,31 @@ async function pollOnce(): Promise<void> {
         (subscribed == false && subscribedAfterTerminal == true)
       ) {
         // await 前空闲、await 后进入忙：本地刚接管（发送/续接），响应是旧快照
-        pendingTerminalObserved = false;
-        pendingTerminalCid = 0;
+        pendingCompletionStatus = '';
         return;
       }
-      // 保持态（fail 后等待续接）也算「本地在收流」：读到终态同样需要收尾关态，
-      // 否则保持态失去出口（loading 一直转、后端已结束无人关态）。
-      const busyNow =
-        busyAfterTerminal ||
-        subscribedAfterTerminal ||
-        resumePending == true;
-      if (busyNow != true) {
-        // 本地已空闲：无需强制收尾，确认态作废
-        pendingTerminalObserved = false;
-        pendingTerminalCid = 0;
-      } else if (
-        pendingTerminalObserved == true &&
-        pendingTerminalCid == currentConversationId
-      ) {
-        // 连续第二轮终态：确认强制收尾
-        pendingTerminalObserved = false;
-        pendingTerminalCid = 0;
+      const pendingGetterNow = isResumePendingGetter;
+      const pendingNow = pendingGetterNow != null && pendingGetterNow() == true;
+      if (!busyAfterTerminal && !subscribedAfterTerminal && !pendingNow) {
+        pendingCompletionStatus = '';
+      } else if (pendingCompletionStatus == taskStatusStr) {
+        pendingCompletionStatus = '';
         const tcb = onTerminalWhileBusyCallback;
         if (tcb != null) {
           tcb(conversationId, response);
         }
       } else {
-        // 第一轮终态：仅记录，下一轮仍是终态才回调
-        pendingTerminalObserved = true;
-        pendingTerminalCid = currentConversationId;
+        pendingCompletionStatus = taskStatusStr;
       }
       resetWaitingUserFastPoll();
       ensurePollingInterval(POLLING_INTERVAL);
     } else {
-      pendingTerminalObserved = false;
-      pendingTerminalCid = 0;
+      pendingCompletionStatus = '';
       ensurePollingInterval(POLLING_INTERVAL);
     }
   } catch (error) {
     if (requestGeneration == pollGeneration) {
-      pendingTerminalObserved = false;
+      pendingCompletionStatus = '';
       console.warn(`[ChatStream] detail_failed cid=${conversationId} gen=${genSnapshot} reason=request_error`);
     }
   } finally {
@@ -324,7 +303,7 @@ function handleVisibilityChange(): void {
   if (document.hidden) {
     pauseConversationPolling();
   } else {
-    resumeConversationPolling();
+    resumeConversationPolling(currentConversationId);
   }
   // #endif
 }
@@ -351,6 +330,7 @@ export function startConversationPolling(
 ): void {
   stopConversationPolling();
 
+  if (conversationId != currentConversationId) lastOnExecutingTime = 0;
   currentConversationId = conversationId;
   onExecutingCallback = onExecuting;
   isConversationActiveGetter = isConversationActive;
@@ -394,9 +374,9 @@ export function stopConversationPolling(): void {
 /**
  * 恢复轮询(页面 onShow / H5 可见)
  */
-export function resumeConversationPolling(): void {
-  if (!currentConversationId) return;
-  if (pollingTimerId !== null) return;
+export function resumeConversationPolling(conversationId: number): boolean {
+  if (conversationId == 0 || currentConversationId != conversationId) return false;
+  if (pollingTimerId !== null) return true;
   // 与 startConversationPolling 同冷却：hide→show 恰逢 sub 刚失败时，避免立即 pollOnce 复燃循环
   const sinceLastExecuting = Date.now() - lastOnExecutingTime;
   if (sinceLastExecuting >= RESTART_COOLDOWN_MS) {
@@ -405,6 +385,7 @@ export function resumeConversationPolling(): void {
   pollingTimerId = setInterval((): void => {
     pollOnce();
   }, currentPollingInterval) as number;
+  return true;
 }
 
 /**

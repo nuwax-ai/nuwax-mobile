@@ -1,55 +1,52 @@
-# 自定义基座多版本并行方案
+# 业务 App 与自定义基座版本规范
 
-## 现状与缺口
+业务 App 和自定义基座各自使用 `X.Y.Z` 数字版本。修改原生能力、升级 HX / 离线 SDK 或补发平台包时，可以独立发布新基座。业务代码升级后，只要原生接口及运行时兼容，可以继续使用已验收的基座。
 
-截至 2026-11-20，S3 有 13 个历史版本目录。默认 `debug` 通道指向 `1.3.7`，`vapor` 指向 `1.0.2-vapor`，两个版本都可读取发布清单。
+| 版本 | 记录位置 | 什么时候更新 |
+| --- | --- | --- |
+| 业务 App 版本 | `manifest.json` 的 `versionName` 和 `versionCode` | 发布新的业务 App 时更新。 |
+| 基座版本 | 新基座发布时显式填写 `NUWAX_BASE_VERSION`，S3 清单记录基座、HX、源码 Git 提交和产物摘要 | 原生实现、运行时或基座产物有变更，需要分发新包时更新。已发布版本不覆盖。 |
+| 业务系列使用的基座 | [custom-base.lock.json](../../custom-base.lock.json) 的 `appVersionSeries` | 验收通过后更新对应系列的映射。每条分支维护自己的映射并随代码评审。 |
 
-原流程可以按版本下载，但默认把 App 的 `versionName` 作为基座版本，同一标识可覆盖。即使指定不同通道，发布也会更新全局 `latest.json`。各版本默认写到同一个 `unpackage/debug/`。同一个 App 版本的研发、联调和上线基座因此无法稳定地分别固定和回退。
+## 业务 App 正式发版
 
-## 版本和通道
+1. 确定该 App 同一升级路径上一次实际发布的 Git tag 或提交，核对应用商店及其他分发入口的最高已用构建号。并行发版使用同一包名时，发版负责人要协调编号。
+2. 更新根目录 `manifest.json`。兼容修复增加 PATCH，兼容新功能增加 MINOR，破坏性变更增加 MAJOR。正式发版使用大于上次的 `versionName`，`versionCode` 使用更大的正整数。两者分别维护，构建号从上次实际发行继续递增。
+3. 在正式出包前运行版本检查。以下 tag 是示例，换成本次上架路径实际使用的上一次正式版本。
 
-| 项目 | 约定 |
-| --- | --- |
-| 基座版本 ID | 每一批产物用一个独立 ID，例如 `1.3.8-zhuoda-r1`。同一 App 版本的新包、原生插件改版或 HX 升级，用新的 ID，例如 `1.3.8-zhuoda-r2`。 |
-| 通道 | 每条需要自定义基座的研发或交付路径有自己的通道。可采用 `zhuoda-dev`、`zhuoda-stable`、`voip-dev`，由各路径维护者认领。 |
-| 通道切换 | 可先上传固定版本，由同事验收后将通道指向它。回退时把该通道指回已验收的版本。 |
-| 本地并存 | 按版本或非默认通道拉取，保存到 `unpackage/debug/versions/<版本 ID>/`。在 HBuilderX 里选对应目录的文件。 |
-| 原入口 | 无参数下载沿用 `debug` 通道和 `unpackage/debug/`，`latest.json` 作为 `debug` 的兼容指针。 |
-| 适用范围 | 已采用自定义调试基座的研发与交付路径。官方通用基座和应用市场正式 APK/AAB 使用各自的流程。 |
+   ```bash
+   pnpm app:version:check v1.3.8
+   # 使用自定义基座联调时核对映射
+   make base-info
+   ```
 
-## 给同事的使用说明
+4. 按 [发布前清理清单](./pre-release-checklist.md) 出正式包，核对包内版本、构建号、签名和目标环境。发版记录保留源码提交或 tag、App 版本、构建号及验收时使用的基座版本。发版流程引用 [正式 Android 包分发说明](./android-apk-distribution-s3.md)。
 
-先切到带有新脚本的仓库分支。在对应的研发路径上，维护者会通知适用的通道、基座 ID、HX 版本和支持平台。
+业务版本若从 `1.3.8` 升为 `1.3.9`，仍命中 `1.3.x` 的映射。首次进入 `1.4.x` 等新系列前，在配置里添加相应条目，验收后随该系列代码提交。可以将新系列映射到经过验证的现有基座。
 
-```bash
-# 跟随通道。需要更新时执行同一条命令
-NUWAX_BASE_CHANNEL=zhuoda-dev make base-fetch
+## 基座发布与映射切换
 
-# 联调、缺陷复现或回退到固定版本
-NUWAX_BASE_VERSION=1.3.8-zhuoda-r1 make base-fetch
-```
+新基座也使用 `X.Y.Z`。兼容修复、重打包或补齐平台一般增加 PATCH，兼容原生能力增加 MINOR，改变基座兼容约定时评估 MAJOR。选定版本前用 `make base-list` 查已发布版本。S3 会拒绝覆盖已用或已占用的 ID。
 
-两个示例值需替换为维护者通知的实际通道或版本。下载后从命令输出的目录选包。验收记录填写实际下载的基座 ID，这样通道前进后仍可定位原包。
+1. 维护者在对应源码提交上用独立基座版本发布，示例 `2.1.0`，见 [S3 分发操作手册](./custom-base-distribution-s3.md)。
+2. 同事先用 `NUWAX_BASE_VERSION=2.1.0 make base-fetch` 下载候选基座，并在目标平台上运行需要支持的业务代码。
+3. 验收通过后，通过 PR 更新分支的 `custom-base.lock.json`。键为 App 的 `主版本.次版本`，值为已经发布的基座版本。下例展示两个系列各自选择基座。同一个已验收基座也可以分配给多个系列。
 
-## 维护者发布
+   ```json
+   {
+     "appVersionSeries": {
+       "1.3": "1.3.7",
+       "1.4": "2.1.0"
+     }
+   }
+   ```
 
-```bash
-# 上传已经打好的 Android + iOS 真机 + iOS 模拟器，先提供给验收
-NUWAX_BASE_CHANNEL=zhuoda-dev NUWAX_BASE_VERSION=1.3.8-zhuoda-r1 \
-  NUWAX_BASE_TARGETS=android,ios-device,ios-simulator NUWAX_BASE_NO_PROMOTE=1 \
-  make base-publish
+4. 用 `make base-info` 核对实际命中的 App 系列、基座版本、HX 版本和平台。需要回退时，把对应映射改回上一已验收基座。显式跟随通道的同事走 `base-promote` 切换通道指针。
 
-# 验收后切换研发通道。回退时把版本改为上一个已验证的 ID
-NUWAX_BASE_CHANNEL=zhuoda-dev NUWAX_BASE_VERSION=1.3.8-zhuoda-r1 make base-promote
-```
+## 同事和 Agent 怎样使用
 
-- 发布版本前采用 S3 条件写入占用 ID，所有包上传完毕后才写发布清单，下载以清单为准。重复 ID、上传中断留下的 ID 都不会被后续发布覆盖。 [S3 条件写入](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
-- 一个版本的清单列出这次上传的全部平台。通道如果需要三端，等三端准备齐再切换。单端适用的通道可以发布单端版本。
-- 多个通道可以指向同一组已验收的产物。切换研发通道只改自己的指针，稳定通道可继续留在原版本。
+在对应业务分支执行 `make base-info` 查看匹配关系、`make base-list` 查看 S3 上有发布清单的基座。运行 `make base-fetch` 会按当前 App 版本系列自动下载，兼容 HBuilderX CLI 使用的 `unpackage/debug/`。配置里缺少该系列时命令会报错，便于维护者补上映射。
 
-## 推广步骤
+临时验收其他基座时显式传 `NUWAX_BASE_VERSION`，下载进入独立版本目录。临时跟随 S3 通道时显式传 `NUWAX_BASE_CHANNEL`。维护者需要长期调整时提交映射修改，业务版本仍按自己的发版流程更新。
 
-1. 各路径维护者使用更新后的发布脚本，在独立通道先入库一个明确的平台组合。历史版本可直接按 ID 读取，原有通道继续使用。
-2. 由同事分别下载固定版本和通道版本，检查路径、HX 兼容性及目标设备上的调试启动。用两个版本演练一次通道回退。
-3. 把通道、推荐基座 ID、HX 版本、平台、对应代码分支发给本路径同事。稳定通道由对应维护者验收后切换。依赖 S3 单行下载入口的同事，在维护者刷新该入口前使用仓库脚本。
-4. 维护者按 [S3 分发操作手册](./custom-base-distribution-s3.md) 处理凭证、历史版本查找、手工产物上传和故障恢复。
+本次初始映射为 `1.3.x → 1.3.7`，沿用原有默认通道的基座。其发布清单记录 HX `5.34`，包含 Android、iOS 真机和 iOS 模拟器。

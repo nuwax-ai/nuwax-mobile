@@ -5,20 +5,23 @@ set -euo pipefail
 ENDPOINT="${NUWAX_S3_ENDPOINT:-https://s3.nuwax.com:9443}"
 BUCKET="${NUWAX_S3_BUCKET:-nuwax-packages}"
 PREFIX="${NUWAX_S3_PREFIX:-mobile-custom-bases}"
-CHANNEL="${NUWAX_BASE_CHANNEL:-debug}"
+CHANNEL="${NUWAX_BASE_CHANNEL:-}"
 VERSION="${NUWAX_BASE_VERSION:-}"
 TARGETS="${NUWAX_BASE_TARGETS:-}"
 DEST_DIR="${NUWAX_BASE_DEST:-}"
+MODE=fetch
 
 usage() {
   cat <<'HELP'
 Usage: bash scripts/fetch-custom-base-s3.sh [options]
 
   --version ID    固定基座版本；优先于通道
-  --channel NAME  跟随通道（默认 debug）
+  --channel NAME  显式跟随通道，覆盖仓库版本映射
   --targets LIST  android,ios-device,ios-simulator,harmony；默认下载清单中所有已发布平台
   --dest DIR      指定输出目录；默认固定版本/独立通道存入 unpackage/debug/versions/<ID>/
-                  默认 debug 通道使用 unpackage/debug/
+                  仓库映射版本和默认 debug 通道使用 unpackage/debug/
+  --info          只读取并显示本次匹配的基座及发布清单摘要
+  --list          列出 S3 上可用的已发布基座版本（需要 AWS CLI，无须凭证）
   -h, --help
 
 Environment:
@@ -42,12 +45,22 @@ while [[ $# -gt 0 ]]; do
       esac
       shift 2
       ;;
+    --info) MODE=info; shift ;;
+    --list) MODE=list; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "未知参数：$1" ;;
   esac
 done
 
-[[ "$CHANNEL" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "无效通道：$CHANNEL"
+if [[ "$MODE" == list ]]; then
+  command -v aws >/dev/null 2>&1 || fail "列出基座版本需要 AWS CLI"
+  aws_args=(--endpoint-url "$ENDPOINT" --region "${NUWAX_S3_REGION:-us-east-1}" --no-sign-request)
+  [[ "${NUWAX_S3_INSECURE:-0}" == 1 ]] && aws_args+=(--no-verify-ssl)
+  aws s3 ls "s3://$BUCKET/$PREFIX/versions/" --recursive "${aws_args[@]}" \
+    | awk '$4 ~ /\/artifacts\/manifest[.]json$/ { count = split($4, path, "/"); print path[count - 2] }'
+  exit 0
+fi
+
 for tool in curl node; do
   command -v "$tool" >/dev/null 2>&1 || fail "需要 $tool"
 done
@@ -66,10 +79,44 @@ fetch() {
   [[ "$status" == 60 ]] && curl "${opts[@]}" -k -o "$dest" "$url"
 }
 
+root="$PWD"
+if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+  script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [[ -f "$script_root/Makefile" || -d "$script_root/unpackage" ]]; then
+    root="$script_root"
+  fi
+fi
+
 versioned=1
 if [[ -n "$VERSION" ]]; then
   [[ "$VERSION" =~ ^v[0-9] ]] && VERSION="${VERSION#v}"
+elif [[ -z "$CHANNEL" && -f "$root/custom-base.lock.json" ]]; then
+  [[ -f "$root/manifest.json" ]] || fail "仓库缺少 manifest.json，无法确定 App 版本系列"
+  # 使用标准输入，兼容 Git Bash 调用 Windows 版 Node。
+  selection="$({
+    printf '{"app":'
+    cat "$root/manifest.json"
+    printf ',"lock":'
+    cat "$root/custom-base.lock.json"
+    printf '}'
+  } | node -e '
+    const {app, lock} = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    const appVersion = app?.versionName;
+    const match = typeof appVersion === "string" && appVersion.match(/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/);
+    if (!match) throw new Error("manifest.json 的 versionName 应为 X.Y.Z");
+    const series = match[1] + "." + match[2];
+    const version = lock?.appVersionSeries?.[series];
+    if (typeof version !== "string" || !version) {
+      throw new Error("custom-base.lock.json 缺少 App " + series + ".x 的基座映射，可执行 make base-list 查看已发布版本");
+    }
+    process.stdout.write([appVersion, series, version].join("\t"));
+  ')" || fail "无法匹配当前 App 的基座版本"
+  IFS=$'\t' read -r APP_VERSION SERIES VERSION <<< "$selection"
+  versioned=0
+  printf 'App %s（%s.x）→ 仓库基座 %s\n' "$APP_VERSION" "$SERIES" "$VERSION"
 else
+  CHANNEL="${CHANNEL:-debug}"
+  [[ "$CHANNEL" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "无效通道：$CHANNEL"
   if [[ "$CHANNEL" == debug ]]; then versioned=0; fi
   VERSION="$(fetch "$base/channels/$CHANNEL.json" - | node -e '
     const pointer = JSON.parse(require("fs").readFileSync(0, "utf8"));
@@ -80,15 +127,22 @@ fi
 [[ "$VERSION" =~ ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$ && "$VERSION" != *..* ]] || fail "无效基座版本：$VERSION"
 
 if [[ -z "$DEST_DIR" ]]; then
-  root="$PWD"
-  if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
-    script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    if [[ -f "$script_root/Makefile" || -d "$script_root/unpackage" ]]; then
-      root="$script_root"
-    fi
-  fi
   DEST_DIR="$root/unpackage/debug"
   if [[ "$versioned" == 1 ]]; then DEST_DIR="$DEST_DIR/versions/$VERSION"; fi
+fi
+
+art_base="$base/versions/$VERSION/artifacts"
+if [[ "$MODE" == info ]]; then
+  fetch "$art_base/manifest.json" - | VERSION="$VERSION" node -e '
+    const manifest = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    if (manifest.version !== process.env.VERSION || !Array.isArray(manifest.artifacts) || !manifest.artifacts.length) {
+      throw new Error("没有读取到有效的基座发布清单");
+    }
+    const { version, hxVersion, appVersionName, artifacts } = manifest;
+    console.log(JSON.stringify({ version, hxVersion, appVersionName, artifacts: artifacts.map(({ name }) => name) }, null, 2));
+  ' || fail "无法读取基座 $VERSION 的发布清单"
+  echo "下载目录：$DEST_DIR"
+  exit 0
 fi
 
 mkdir -p "$DEST_DIR"
@@ -102,7 +156,6 @@ cleanup() {
 trap cleanup EXIT
 stage="$(mktemp -d "$DEST_DIR/.base-fetch.XXXXXX")"
 
-art_base="$base/versions/$VERSION/artifacts"
 fetch "$art_base/manifest.json" "$stage/manifest.json" || fail "无法读取版本 $VERSION 的发布清单"
 # 用标准输入读取 JSON，兼容 Git Bash 调用 Windows 版 Node。
 VERSION="$VERSION" TARGETS="$TARGETS" node -e '

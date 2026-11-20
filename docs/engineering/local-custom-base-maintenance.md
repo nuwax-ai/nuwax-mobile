@@ -58,7 +58,7 @@ nuwax-mobile-offline-sdk/              # 本机统一入口
 ```bash
 cd <本仓根目录>  # nuwax-mobile
 # 需先打开 HBuilderX，且项目已导入；发 S3 需 NUWAX_S3_* 或 ~/.aws
-NUWAX_BASE_VERSION=1.3.8-zhuoda-r1 NUWAX_BASE_CHANNEL=zhuoda-dev make base-ship
+NUWAX_HX_VERSION=5.34 NUWAX_BASE_VERSION=2.1.0 NUWAX_BASE_NO_PROMOTE=1 make base-ship
 # 也可将 make base-ship 换成 pnpm base:ship
 ```
 
@@ -100,9 +100,9 @@ iOS 模拟器注意：官方 5.15 `DCloudUTSExtAPI` 无 arm64-simulator slice。
 每次出新包使用独立基座 ID。同一 App 版本可对应多个基座。维护者按通道切换当前版本，同事也可固定基座 ID。
 
 ```bash
-NUWAX_BASE_VERSION=1.3.8-zhuoda-r1 NUWAX_BASE_CHANNEL=zhuoda-dev make base-publish
-NUWAX_BASE_CHANNEL=zhuoda-dev make base-fetch   # 保存到版本目录
-make base-fetch                                # 默认 debug 通道，写入 unpackage/debug/
+NUWAX_BASE_VERSION=2.1.0 NUWAX_BASE_NO_PROMOTE=1 make base-publish
+make base-info
+make base-fetch   # 按 App 版本系列匹配并下载
 ```
 
 详见 [custom-base-distribution-s3.md](./custom-base-distribution-s3.md)。仅用自定义基座的同事不需要 iOS 开发证书。

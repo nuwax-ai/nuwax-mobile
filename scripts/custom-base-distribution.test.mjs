@@ -28,11 +28,19 @@ test('publishes immutable versions and downloads or switches each channel indepe
   mkdirSync(apkVersionDir, { recursive: true });
   mkdirSync(source);
   writeFileSync(join(apkVersionDir, 'version.json'), '{"hxVersion":"5.34"}');
+  function writeBundledManifest(basePath, version = { name: '1.3.9', code: 139 }) {
+    const directory = join(root, basePath, '__UNI__TEST/www');
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, 'manifest.json'), JSON.stringify({ version }));
+  }
+  writeBundledManifest('assets/apps');
+  writeBundledManifest('Payload/Test.app/uni-app-x/apps');
   execFileSync('zip', ['-qr', join(source, 'android_debug.apk'), 'assets'], { cwd: root });
-  writeFileSync(join(source, 'iOS_debug.ipa'), 'test iOS artifact');
+  execFileSync('zip', ['-qr', join(source, 'iOS_debug.ipa'), 'Payload'], { cwd: root });
   const simulator = join(source, 'Pandora_simulator_debug.app');
   mkdirSync(simulator);
   writeFileSync(join(simulator, 'Info.plist'), 'test simulator app');
+  writeBundledManifest('packages/Pandora_simulator_debug.app/uni-app-x/apps');
 
   const objects = new Map();
   const reservations = [];
@@ -42,9 +50,12 @@ test('publishes immutable versions and downloads or switches each channel indepe
     const key = decodeURIComponent(url.pathname.slice(1));
     if (request.method === 'GET' && url.searchParams.has('list-type')) {
       const s3Prefix = `${key.replace(/\/$/, '')}/${url.searchParams.get('prefix')}`;
-      const count = [...objects.keys()].some((name) => name.startsWith(s3Prefix)) ? 1 : 0;
-      const reply = () => response.end(`<ListBucketResult><KeyCount>${count}</KeyCount></ListBucketResult>`);
-      if (s3Prefix.endsWith('/1.3.9-race-r1/')) {
+      const keys = [...objects.keys()].filter((name) => name.startsWith(s3Prefix));
+      const contents = keys.map((name) =>
+        `<Contents><Key>${name.slice(key.replace(/\/$/, '').length + 1)}</Key><Size>1</Size><LastModified>2026-11-20T00:00:00Z</LastModified></Contents>`
+      ).join('');
+      const reply = () => response.end(`<ListBucketResult><KeyCount>${keys.length}</KeyCount><IsTruncated>false</IsTruncated>${contents}</ListBucketResult>`);
+      if (s3Prefix.endsWith('/2.1.8/')) {
         competingLists.push(reply);
         if (competingLists.length === 2) competingLists.forEach((fn) => fn());
       } else {
@@ -53,7 +64,7 @@ test('publishes immutable versions and downloads or switches each channel indepe
       return;
     }
     if (request.method === 'PUT') {
-      if (key === artifactKey('1.3.9-failed-r1', 'android_debug.apk')) {
+      if (key === artifactKey('2.1.9', 'android_debug.apk')) {
         response.writeHead(403).end('<Error><Code>AccessDenied</Code></Error>');
         return;
       }
@@ -99,10 +110,18 @@ test('publishes immutable versions and downloads or switches each channel indepe
   const pointAt = (channel, version) => make('base-promote', { NUWAX_BASE_CHANNEL: channel, NUWAX_BASE_VERSION: version });
   const pointerVersion = (key) => JSON.parse(objects.get(`${prefix}/${key}`)).version;
   const localDebug = join(root, 'unpackage/debug');
-  const v1 = '1.3.9-zhuoda-r1';
-  const v2 = '1.3.9-voip-r1';
-  const race = '1.3.9-race-r1';
+  const v1 = '2.1.0';
+  const v2 = '2.1.1';
+  const race = '2.1.8';
 
+  await assert.rejects(make('base-publish', { NUWAX_BASE_DRY_RUN: '1' }), /显式指定 X.Y.Z/);
+  await assert.rejects(publish('2.1.0-dev', { NUWAX_BASE_DRY_RUN: '1' }), /显式指定 X.Y.Z/);
+  await assert.rejects(make('base-ship'), /发布前须显式设置 NUWAX_BASE_VERSION/);
+  writeBundledManifest('assets/apps', { name: '1.3.8', code: 138 });
+  execFileSync('zip', ['-qr', join(source, 'android_debug.apk'), 'assets'], { cwd: root });
+  await assert.rejects(publish(v1, { NUWAX_BASE_DRY_RUN: '1' }), /内置 App 1.3.8\/138 与当前源码 1.3.9\/139 不一致/);
+  writeBundledManifest('assets/apps');
+  execFileSync('zip', ['-qr', join(source, 'android_debug.apk'), 'assets'], { cwd: root });
   await publish(v1, { NUWAX_BASE_DRY_RUN: '1' });
   assert.equal(objects.size, 0);
   const firstPublish = await publish(v1);
@@ -111,23 +130,27 @@ test('publishes immutable versions and downloads or switches each channel indepe
   assert.equal(pointerVersion('channels/debug.json'), v1);
   const baseline = objects.get(artifactKey(v1, 'manifest.json'));
   assert.equal(JSON.parse(baseline).appVersionName, '1.3.9');
+  for (const artifact of JSON.parse(baseline).artifacts) {
+    assert.equal(artifact.appVersionName, '1.3.9');
+    assert.equal(artifact.appVersionCode, '139');
+  }
   await assert.rejects(publish(v1), /已存在或已被占用/);
   assert.equal(objects.get(artifactKey(v1, 'manifest.json')), baseline);
 
-  await assert.rejects(publish('1.3.9-failed-r1', { NUWAX_BASE_TARGETS: 'android' }), /AccessDenied/);
-  assert.equal(objects.has(artifactKey('1.3.9-failed-r1', 'manifest.json')), false);
+  await assert.rejects(publish('2.1.9', { NUWAX_BASE_TARGETS: 'android' }), /AccessDenied/);
+  assert.equal(objects.has(artifactKey('2.1.9', 'manifest.json')), false);
   assert.equal(pointerVersion('channels/debug.json'), v1);
 
-  await publish(v2, { NUWAX_BASE_TARGETS: 'android', NUWAX_BASE_NO_PROMOTE: '1', NUWAX_BASE_CHANNEL: 'voip-dev' });
-  assert.equal(objects.has(`${prefix}/channels/voip-dev.json`), false);
-  await pointAt('voip-dev', v2);
-  assert.equal(pointerVersion('channels/voip-dev.json'), v2);
+  await publish(v2, { NUWAX_BASE_TARGETS: 'android', NUWAX_BASE_NO_PROMOTE: '1', NUWAX_BASE_CHANNEL: 'dev' });
+  assert.equal(objects.has(`${prefix}/channels/dev.json`), false);
+  await pointAt('dev', v2);
+  assert.equal(pointerVersion('channels/dev.json'), v2);
   assert.equal(pointerVersion('latest.json'), v1);
 
   // 通道版本和固定版本在同一工作区并存，旧默认入口仍写根目录。
   await make('base-fetch');
-  const channelDownload = await make('base-fetch', { NUWAX_BASE_CHANNEL: 'voip-dev' });
-  assert.match(channelDownload.stdout, /完成 → .*1\.3\.9-voip-r1/);
+  const channelDownload = await make('base-fetch', { NUWAX_BASE_CHANNEL: 'dev' });
+  assert.match(channelDownload.stdout, /完成 → .*2\.1\.1/);
   assert.equal(channelDownload.stderr, '');
   await make('base-fetch', { NUWAX_BASE_VERSION: v1, NUWAX_BASE_CHANNEL: 'absent' });
   assert.equal(readFileSync(join(localDebug, 'versions', v1, 'Pandora_simulator_debug.app/Info.plist'), 'utf8'), 'test simulator app');
@@ -144,11 +167,31 @@ test('publishes immutable versions and downloads or switches each channel indepe
   objects.set(artifactKey(v2, 'android_debug.apk'), apk);
   await make('base-fetch');
   assert.equal(existsSync(join(localDebug, 'iOS_debug.ipa')), false);
+  const lockFile = join(root, 'custom-base.lock.json');
+  writeFileSync(lockFile, JSON.stringify({ appVersionSeries: { '1.3': v1, '1.4': v2 } }));
+  const discovery = await make('base-list');
+  assert.deepEqual(new Set(discovery.stdout.trim().split('\n')), new Set([v1, v2]));
+  const info = await make('base-info', { NUWAX_BASE_DEST: join(root, 'info-only') });
+  assert.match(info.stdout, /App 1[.]3[.]9.*仓库基座 2[.]1[.]0/);
+  assert.match(info.stdout, /"hxVersion": "5.34"/);
+  assert.equal(existsSync(join(root, 'info-only')), false);
+  const lockedDownload = await make('base-fetch');
+  assert.match(lockedDownload.stdout, /仓库基座 2[.]1[.]0/);
+  assert.ok(existsSync(join(localDebug, 'iOS_debug.ipa')));
+  assert.equal(pointerVersion('channels/debug.json'), v2);
+  await make('base-fetch', { NUWAX_BASE_CHANNEL: 'debug' });
+  assert.equal(existsSync(join(localDebug, 'iOS_debug.ipa')), false);
+  writeFileSync(join(root, 'manifest.json'), '{"versionName":"1.4.0","versionCode":"140"}');
+  assert.match((await make('base-info')).stdout, /App 1[.]4[.]0.*仓库基座 2[.]1[.]1/);
+  writeFileSync(join(root, 'manifest.json'), '{"versionName":"1.5.0","versionCode":"150"}');
+  await assert.rejects(make('base-fetch'), /缺少 App 1[.]5[.]x 的基座映射/);
+  writeFileSync(join(root, 'manifest.json'), '{"versionName":"1.3.9","versionCode":"139"}');
+  await make('base-fetch', { NUWAX_BASE_VERSION: v1, NUWAX_BASE_CHANNEL: 'dev' });
   await pointAt('debug', v1);
   assert.equal(pointerVersion('latest.json'), v1);
-  assert.equal(pointerVersion('channels/voip-dev.json'), v2);
+  assert.equal(pointerVersion('channels/dev.json'), v2);
 
-  const shipVersion = '1.3.9-zhuoda-r2';
+  const shipVersion = '2.1.2';
   writeFileSync(join(root, 'scripts/package-custom-bases.sh'), [
     'set -eu',
     'test "$TARGETS" = android',
@@ -159,13 +202,13 @@ test('publishes immutable versions and downloads or switches each channel indepe
     SKIP_APP_RESOURCE: '1',
     TARGETS: 'android',
     NUWAX_BASE_VERSION: shipVersion,
-    NUWAX_BASE_CHANNEL: 'zhuoda-dev',
+    NUWAX_BASE_CHANNEL: 'stable',
     NUWAX_BASE_SOURCE: source,
     NUWAX_BASE_NO_PROMOTE: '1',
   });
   const shipManifest = JSON.parse(objects.get(artifactKey(shipVersion, 'manifest.json')));
   assert.deepEqual(shipManifest.artifacts.map(({ name }) => name), ['android_debug.apk']);
-  assert.equal(objects.has(`${prefix}/channels/zhuoda-dev.json`), false);
+  assert.equal(objects.has(`${prefix}/channels/stable.json`), false);
 
   const publishRace = () => publish(race, { NUWAX_BASE_TARGETS: 'android', NUWAX_BASE_NO_PROMOTE: '1' });
   const concurrent = await Promise.allSettled([publishRace(), publishRace()]);
@@ -173,4 +216,26 @@ test('publishes immutable versions and downloads or switches each channel indepe
   assert.match(concurrent.find(({ status }) => status === 'rejected').reason.stderr, /PreconditionFailed/);
   assert.ok(objects.has(artifactKey(race, 'manifest.json')));
   assert.deepEqual(reservations, Array(6).fill('*'));
+});
+
+test('business releases advance both versionName and versionCode compared to the last release', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'nuwax-app-release-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'scripts'));
+  copyFileSync(new URL('./check-app-release-version.mjs', import.meta.url), join(root, 'scripts/check-app-release-version.mjs'));
+  const manifest = join(root, 'manifest.json');
+  const saveVersion = (versionName, versionCode) => writeFileSync(manifest, JSON.stringify({ versionName, versionCode }));
+  const git = (...args) => execFileSync('git', args, { cwd: root });
+  git('init', '-q');
+  saveVersion('1.3.9', 139);
+  git('add', 'manifest.json');
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-qm', 'last release');
+  const check = (ref) => run(process.execPath, ['scripts/check-app-release-version.mjs', ref], { cwd: root });
+  saveVersion('1.3.10', '140');
+  assert.match((await check('HEAD')).stdout, /1\.3\.9 .*1\.3\.10/);
+  saveVersion('1.3.10', '139');
+  await assert.rejects(check('HEAD'), /versionCode 139 应大于 139/);
+  saveVersion('1.2.99', '150');
+  await assert.rejects(check('HEAD'), /versionName 1.2.99 应大于 1.3.9/);
+  await assert.rejects(check('unavailable'), /无法读取上次正式发版/);
 });

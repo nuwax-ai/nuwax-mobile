@@ -116,15 +116,18 @@ fi
 TARBALL="nuwax-mobile-offline-sdk-${VERSION}.tar.gz"
 VER_BASE="$base/versions/${VERSION}"
 
-# manifest（取 sha256 校验）
+# manifest（取 sha256 和该版本包含的平台）
 MANIFEST_SHA=""
+MANIFEST_PLATFORMS="android ios"
 if fetch_small "$VER_BASE/manifest.json" "$TMP/manifest.json"; then
   if command -v node >/dev/null 2>&1; then
     MANIFEST_SHA="$(node -p "require('$TMP/manifest.json').sha256 || ''" 2>/dev/null || true)"
+    platforms="$(node -p "(require('$TMP/manifest.json').platforms || []).filter(p => ['android', 'ios', 'harmony'].includes(p)).join(' ')" 2>/dev/null || true)"
+    MANIFEST_PLATFORMS="${platforms:-$MANIFEST_PLATFORMS}"
   fi
 fi
 
-info "下载 ${TARBALL}（约 1G+，请耐心）..."
+info "下载 ${TARBALL}（平台：${MANIFEST_PLATFORMS}）..."
 fetch_big "$VER_BASE/$TARBALL" "$TMP/$TARBALL" || fail "下载失败：$VER_BASE/$TARBALL"
 
 # sha256 校验
@@ -149,11 +152,13 @@ echo "{\"schema\":\"nuwax.mobile.offlineSdk.v1\",\"version\":\"$VERSION\",\"fetc
 
 # 自检还原结果（与 local-base-env.sh 期望对齐）
 miss=0
-[[ -d "$DEST_DIR/sdk/android/$VERSION" ]] || { warn "缺失 sdk/android/$VERSION"; miss=1; }
-[[ -d "$DEST_DIR/sdk/ios/$VERSION" ]]     || { warn "缺失 sdk/ios/$VERSION"; miss=1; }
+for platform in $MANIFEST_PLATFORMS; do
+  [[ -d "$DEST_DIR/sdk/$platform/$VERSION" ]] || { warn "缺失 sdk/$platform/$VERSION"; miss=1; }
+done
 [[ -d "$DEST_DIR/archives" ]]             || { warn "缺失 archives/"; miss=1; }
-# iOS ESP 源码（信息性：Android 用不到；缺失则 iOS 模拟器基座需另备 ESP 源码）
-[[ -d "$DEST_DIR/work/ios/src/SwiftProtobuf" ]] || warn "缺失 work/ios/src/SwiftProtobuf（iOS 模拟器基座需 ESP 源码）"
+if [[ " $MANIFEST_PLATFORMS " == *" ios "* ]]; then
+  [[ -d "$DEST_DIR/work/ios/src/SwiftProtobuf" ]] || warn "缺失 work/ios/src/SwiftProtobuf（iOS 模拟器基座需 ESP 源码）"
+fi
 
 echo
 if [[ "$miss" == "0" ]]; then

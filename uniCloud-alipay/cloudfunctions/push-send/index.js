@@ -331,18 +331,22 @@ async function sendNativeVoip(body, route, nativeVoip) {
 }
 
 async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting) {
-  const { calleeId, callId, expiresAt } = invitation.payload
+  const { callId, expiresAt } = invitation.payload
+  // 会议邀请可以不带 calleeId：用设备路由登记的账号补齐，原生端仍按 calleeId 校验归属。
+  const calleeId = invitation.payload.calleeId ?? binding?.calleeId
   const result = { clientid: cid }
   if (binding && (binding.active !== true || binding.appId !== APP_ID || binding.calleeId !== calleeId)) {
     return { ...result, errCode: 403, errMsg: 'device binding unavailable for callee' }
   }
 
   const now = Date.now()
-  if (expiresAt <= now) return { ...result, errCode: 0, skipped: true }
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= now) return { ...result, errCode: 0, skipped: true }
 
-  if (binding?.transport) {
+  if (binding?.transport && calleeId) {
     const route = routeForCid(binding, cid)
-    const nativeVoip = prepareNativeVoip({ ...body, push_clientid: cid, payload: invitation.payload, callRoute: route }, now)
+    const nativeVoip = prepareNativeVoip({
+      ...body, push_clientid: cid, payload: { ...invitation.payload, calleeId }, callRoute: route,
+    }, now)
     if (!nativeVoip.error && callTransportEnabled(route)) {
       const sent = await sendNativeVoip(body, route, nativeVoip)
       return { ...result, errCode: sent.errCode, errMsg: sent.errMsg, delivery: 'native', transport: route.transport, ...sent.data }

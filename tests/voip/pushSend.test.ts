@@ -379,6 +379,20 @@ describe('meeting ringing delivery', () => {
     expect(notice).not.toHaveProperty('settings');
   });
 
+  it('fills calleeId from the device route when the push request omits it', async () => {
+    const binding = { appId: '__UNI__8BF05E4', calleeId: '10002', active: true };
+    const route = { ...binding, _id: 'huawei-cid', platform: 'android', transport: 'android-huawei' };
+    const payload = ringPayload();
+    delete (payload as any).calleeId;
+    const { call, request } = load(latestEntry, { ...ringEnv, NUWAX_VOIP_DEVICE_ROUTE_LOOKUP: '1',
+      NUWAX_VOIP_ANDROID_TRANSPORTS: 'android-huawei' }, [route]);
+    const result = await call({ ...envelope, push_clientid: ['huawei-cid'], payload });
+    expect(result.data.results[0]).toMatchObject({ clientid: 'huawei-cid', delivery: 'native' });
+    const [native] = request.mock.calls.map(([args]) => args);
+    const transmission = JSON.parse(native.requestData.push_message.transmission);
+    expect(transmission.payload.calleeId).toBe('10002');
+  });
+
   it('never rings a silent group card and falls back for incomplete ringing invitations', async () => {
     const env = { ...ringEnv, NUWAX_VOIP_DEVICE_ROUTE_LOOKUP: '1' };
     const silent = load(latestEntry, env);

@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 
-const latestEntry = resolve(import.meta.dirname, '../../uniCloud-alipay/cloudfunctions/push-send/index.js');
+const latestEntry = resolve(import.meta.dirname, '../../uniCloud-alipay/cloudfunctions/push-send-test/index.js');
 const backupEntry = resolve(import.meta.dirname, '../../backups/unicloud/push-send/v1.3.7/index.js');
 const entries = [backupEntry, latestEntry] as const;
 const { prepareVoip } = createRequire(latestEntry)('./voip');

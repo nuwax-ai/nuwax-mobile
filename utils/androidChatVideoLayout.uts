@@ -1,0 +1,185 @@
+// #ifdef APP-ANDROID
+import { ref } from "vue";
+import View from "android.view.View";
+import ViewGroup from "android.view.ViewGroup";
+import TextureView from "android.view.TextureView";
+import ViewTreeObserver from "android.view.ViewTreeObserver";
+
+/** 按播放器区分全屏控制条，不能用请求时就置 true 的乐观全屏态。 */
+export const androidChatVideoControlsPlayerId = ref<string>("");
+/** 进入前隐藏自绘条，直到原位布局恢复；false 全屏事件可能早于布局完成。 */
+export const androidChatVideoHiddenBarPlayerId = ref<string>("");
+
+/** 找到实际视频纹理，只使用 Android 公共类型，不依赖框架私有类名/字段。 */
+function findVideoTexture(view: View): TextureView | null {
+  if (view instanceof TextureView) return view as TextureView;
+  if (view instanceof ViewGroup) {
+    const group = view as ViewGroup;
+    for (let i = 0; i < group.getChildCount(); i++) {
+      const child = group.getChildAt(i.toInt());
+      if (child == null) continue;
+      const texture = findVideoTexture(child);
+      if (texture != null) return texture;
+    }
+  }
+  return null;
+}
+
+/**
+ * 全屏前安装，监听原生容器「移出 → 移回」，在错误尺寸的返回帧提交前拦截绘制。
+ * getAndroidView() 在 video 上返回 TextureView，不能拿它的直接父级判断全屏搬移；
+ * 必须向上找到原位容器的直接子视图。整个过程不重建播放器、不 seek、不改播放态。
+ */
+class AndroidChatVideoDrawGuard implements ViewTreeObserver.OnPreDrawListener {
+  playerId: string;
+  element: UniVideoElement;
+  inlineElement: UniElement;
+  root: View;
+  inlineView: View;
+  texture: TextureView;
+  observer: ViewTreeObserver;
+  movedOut: boolean = false;
+  stopped: boolean = false;
+  repairStartedAt: number = 0;
+  requestedWidth: number = 0;
+  requestedHeight: number = 0;
+  entryTimer: number = 0;
+  repairTimer: number = 0;
+
+  constructor(playerId: string, element: UniVideoElement, inlineElement: UniElement,
+    root: View, inlineView: View, texture: TextureView, observer: ViewTreeObserver) {
+    this.playerId = playerId;
+    this.element = element;
+    this.inlineElement = inlineElement;
+    this.root = root;
+    this.inlineView = inlineView;
+    this.texture = texture;
+    this.observer = observer;
+  }
+
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (androidChatVideoControlsPlayerId.value == this.playerId) androidChatVideoControlsPlayerId.value = "";
+    if (androidChatVideoHiddenBarPlayerId.value == this.playerId) androidChatVideoHiddenBarPlayerId.value = "";
+    if (this.observer.isAlive()) this.observer.removeOnPreDrawListener(this);
+    if (this.entryTimer != 0) clearTimeout(this.entryTimer);
+    if (this.repairTimer != 0) clearTimeout(this.repairTimer);
+    this.entryTimer = 0;
+    this.repairTimer = 0;
+    this.inlineView.invalidate();
+  }
+
+  override onPreDraw(): boolean {
+    if (this.stopped) return true;
+    if (!this.inlineView.isAttachedToWindow() || !this.root.isAttachedToWindow()) {
+      this.stop();
+      return true;
+    }
+    if (this.root.getParent() != this.inlineView) {
+      this.movedOut = true;
+      // 系统控制条只在原生播放器已移入全屏容器后开启，避免在缩略视频上提前闪现。
+      androidChatVideoControlsPlayerId.value = this.playerId;
+      return true; // 全屏播放期间不拦帧、不改尺寸。
+    }
+    if (!this.movedOut) return true;
+    if (androidChatVideoControlsPlayerId.value == this.playerId) {
+      androidChatVideoControlsPlayerId.value = "";
+      // 先给响应式 controls=false 一次提交机会，不能让返回首帧携带全屏播放条。
+      this.inlineView.invalidate();
+      return false;
+    }
+
+    const width = this.inlineView.getWidth();
+    const height = this.inlineView.getHeight();
+    if (width > 0 && height > 0 && this.root.getWidth() == width && this.root.getHeight() == height
+      && this.texture.getWidth() == width && this.texture.getHeight() == height
+      && !this.root.isLayoutRequested() && !this.texture.isLayoutRequested()) {
+      this.stop();
+      return true; // 外层与纹理均已完成布局，才让会话返回帧显示出来。
+    }
+
+    // 正常只挡一帧（真机探针约 25ms）。异常路径最多等待 250ms，不能卡住整页绘制。
+    if (this.repairStartedAt == 0) {
+      this.repairStartedAt = Date.now();
+      this.repairTimer = setTimeout((): void => { this.stop(); }, 250);
+    }
+    if (Date.now() - this.repairStartedAt >= 250 || width <= 0 || height <= 0) {
+      this.stop();
+      return true;
+    }
+    try {
+      const rect = this.inlineElement.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        this.stop();
+        return true;
+      }
+      // onPreDraw 在 layout 完成后执行，避免在 onLayoutChange 遍历样式时直接改集合。
+      if (this.requestedWidth != rect.width || this.requestedHeight != rect.height) {
+        this.requestedWidth = rect.width;
+        this.requestedHeight = rect.height;
+        this.element.style.setProperty("width", `${rect.width}px`);
+        this.element.style.setProperty("height", `${rect.height}px`);
+        this.root.requestLayout();
+      }
+      this.inlineView.invalidate();
+      return false;
+    } catch (_error) {
+      this.stop();
+      return true;
+    }
+  }
+}
+
+let activeVideoDrawGuard: AndroidChatVideoDrawGuard | null = null;
+
+/** 原生视图不可探测时以真正的 fullscreenchange 兜底，不能让全屏失去退出控制条。 */
+export function confirmAndroidChatVideoControls(playerId: string, fullscreen: boolean): void {
+  const guard = activeVideoDrawGuard;
+  if (guard != null && !guard.stopped && guard.playerId == playerId) return;
+  if (fullscreen) androidChatVideoControlsPlayerId.value = playerId;
+  else if (androidChatVideoControlsPlayerId.value == playerId) androidChatVideoControlsPlayerId.value = "";
+}
+
+/** 控制条销毁只清自己的守卫；页面隐藏/卸载传空值统一释放。 */
+export function cancelAndroidChatVideoInlineLayout(playerId: string = ""): void {
+  if (playerId.length == 0 || androidChatVideoControlsPlayerId.value == playerId) androidChatVideoControlsPlayerId.value = "";
+  if (playerId.length == 0 || androidChatVideoHiddenBarPlayerId.value == playerId) androidChatVideoHiddenBarPlayerId.value = "";
+  const guard = activeVideoDrawGuard;
+  if (guard == null || (playerId.length > 0 && guard.playerId != playerId)) return;
+  activeVideoDrawGuard = null;
+  guard.stop();
+}
+
+/** 必须在 requestFullScreen 之前调用，原位的原生父容器此时才可确定。 */
+export function prepareAndroidChatVideoInlineLayout(playerId: string, element: UniVideoElement): void {
+  cancelAndroidChatVideoInlineLayout();
+  // 本次只处理会话详情的消息视频，不改变合并转发页等其他播放入口。
+  if (!playerId.startsWith("chatVideoPlayer-")) return;
+  const inlineElement = element.parentElement;
+  if (inlineElement == null) return;
+  const inlineView = inlineElement.getAndroidView();
+  const nativeView = element.getAndroidView();
+  if (inlineView == null || nativeView == null || nativeView == inlineView) return;
+  // 可变的 View? 在 UTS → Kotlin 循环中不能稳定收窄，遍历变量显式保持非空。
+  let root: View = nativeView as View;
+  // video.getAndroidView() 是内部纹理；向上找被全屏管理器搬动的整块 video。
+  while (root.getParent() != inlineView) {
+    const parent = root.getParent();
+    if (!(parent instanceof View)) return;
+    root = parent as View;
+  }
+  const texture = findVideoTexture(root);
+  const observer = inlineView.getViewTreeObserver();
+  if (texture == null || !observer.isAlive()) return;
+  const guard = new AndroidChatVideoDrawGuard(playerId, element, inlineElement, root, inlineView, texture, observer);
+  activeVideoDrawGuard = guard;
+  androidChatVideoHiddenBarPlayerId.value = playerId;
+  observer.addOnPreDrawListener(guard);
+  // 请求失败/没有真正进入全屏的路径不留下常驻监听。
+  guard.entryTimer = setTimeout((): void => {
+    guard.entryTimer = 0;
+    if (!guard.movedOut) guard.stop();
+  }, 1500);
+}
+// #endif

@@ -344,7 +344,6 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
 | --- | --- | --- |
 | 原样复用 | `payload.type`、`scene`、`convType`、`convId`、`msgId` | `"voip"`、`"call"`、整数 `1`、会话和消息 ID 的十进制字符串。用 `convId + msgId` 回查原邀请。 |
 | 原样复用 | `push_clientid`、`title`、`content` | IM 按现有格式传目标 CID 数组和字符串文案。云函数逐 CID 准备原生投递。 |
-| **环境隔离启用后必填** | `recipientUserId`、`push_bindings` | 从 IM 设备登记取得接收账号和各 CID 的设备、登记版本。普通通知、会议和来电共用这两个字段。 |
 | 必填，沿用同事稿 | `callId`、`mediaType` | 从原邀请正文复制。当前原生来电支持 1–128 位字母、数字、下划线或连字符组成的 `callId`，已有 UUID 可原样使用。`mediaType` 为小写字符串 `"audio"` 或 `"video"`。 |
 | **新增，必填** | `calleeId` | IM 从原通话的被叫账号取十进制字符串。端上据此核对当前登录账号。设备登录和重新绑定可沿用同一个 `deviceId`，因此应保留原通话的被叫身份。 |
 | **新增，联调必填** | `expiresAt` | IM 按原消息的服务端 `sendTime + 60000` 计算 Unix 毫秒截止时间。重试沿用原值，云函数校验是否过期并据此限制投递 TTL。云函数兼容只传原消息 `sendTime` 的请求。 |
@@ -359,8 +358,6 @@ IM 根据设备登记确定被叫 CID。云函数逐 CID 解析设备的原生�
   "cid": "example-device-cid"
 }
 ```
-
-启用环境隔离后，网关从 `push-device-bindings` 核对每个 CID 对应的设备、当前环境、账号和版本，再读取平台及已登记通道。Android 未登记专用通道时，单聊来电可在华为通道已开启的环境中向 UniPush 查询厂商类型和 token 是否有效。兼容期的旧 VoIP 路径继续使用 `voip-device-routes`。 [环境与设备登记契约](../engineering/im-push-environment-isolation.md) · [DCloud 设备详情接口](https://doc.dcloud.net.cn/uniCloud/uni-cloud-push/api)
 
 | 设备通道 | `transport` | 当前投递 |
 | --- | --- | --- |
@@ -487,11 +484,6 @@ IM → 云函数使用 `payload.type="voip"` 和 `payload.scene="meeting"`。云
 2. 现有入口通过 `NUWAX_VOIP_DEVICE_ROUTE_LOOKUP=1` 启用逐 CID 查询。通话校验 IM 提供的 `calleeId`、`expiresAt` 和邀请定位，再从登记组装 `callRoute`。华为安卓纯透传沿用 `NUWAX_VOIP_ANDROID_TRANSPORTS` 白名单，iOS 沿用 `NUWAX_VOIP_IOS_APNS_ENVIRONMENT`。未知或暂未开通原生通道的 CID 按普通通知处理。查询失败或 UPS 发送方法不可用时返回 503，已核对为撤销或归属不符的设备返回 403。
 3. 每个已处理的 CID 在 `data.results` 中返回 `clientid` 和 `errCode`。已发起送出的结果带 `delivery` 和 `requestId`，原生回执带可匹配的任务状态。联调按同一 `callId` 核对各设备回执与原生回调。逐 CID 查询启用时，以登记为准。查询关闭时，兼容带有效 `callRoute` 的已签名单设备请求，其余新通话走普通通知。普通通话通知按场景设置 VOIP 分类，并支持与角标配置合并华为 `VoipCall` 通知渠道。
 
-##### 独立测试 `push-send-test`
-
-App 仅在登录地址匹配 `https://testagent.xspaceagi.com` 时使用测试推送。测试 IM 调用独立云空间的 `push-send-test`，逐设备校验账号、CID 和登记版本。换域时 App 先等旧绑定撤销，再重新登录并登记。
-
-测试入口复用现有单聊和会议载荷校验。华为 Android 按 UniPush 返回的厂商类型和 token 状态选路，iOS 按登记的 PushKit 版本和 APNs 环境选路。会议响铃单独开启，缺少响铃条件时继续发送会议邀请卡片。荣耀和 vivo 先验证普通通知及角标，再接入对应的原生来电。 [配置清单、流程图、IM 接口及全部厂商核对项](../engineering/im-push-environment-isolation.md)
 
 ### 5.3 状态上报（App → 服务端）
 

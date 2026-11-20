@@ -1,10 +1,17 @@
 'use strict'
 
 const { createHash } = require('crypto')
-const { isCallCid } = require('./device-routes')
 
+const MAX_CALL_TARGETS = 1000
 const matches = (value, pattern) => typeof value === 'string' && pattern.exec(value)?.[0] === value
 const locator = value => matches(value, /^[1-9][0-9]{0,18}$/) && BigInt(value) <= 9223372036854775807n
+const isCallCid = value => matches(value, /^[A-Za-z0-9_-]{1,128}$/)
+
+exports.callTargetCids = value => {
+  const ids = Array.isArray(value) ? value : [value]
+  if (ids.length < 1 || ids.length > MAX_CALL_TARGETS || !ids.every(isCallCid)) return null
+  return [...new Set(ids)]
+}
 
 // Legacy invitation notices share the ordinary notification transport.
 exports.prepareVoip = (body, now = Date.now()) => {
@@ -86,7 +93,7 @@ function prepareMeetingRingInvitation(body, now = Date.now()) {
   if (source?.type !== 'voip' || source.scene !== 'meeting' ||
       !matches(callId, /^[A-Za-z0-9_-]{1,128}$/) ||
       !locator(source.convId) || !locator(source.msgId) ||
-      (source.calleeId !== undefined && !locator(source.calleeId)) ||
+      !locator(source.calleeId) ||
       !matches(source.inviteId, /^[A-Za-z0-9._-]{1,128}$/) ||
       !matches(source.roomName, /^[A-Za-z0-9._-]{1,128}$/) ||
       typeof source.title !== 'string' || !source.title.trim() ||
@@ -100,6 +107,7 @@ function prepareMeetingRingInvitation(body, now = Date.now()) {
     callId,
     convId: source.convId,
     msgId: source.msgId,
+    calleeId: source.calleeId,
     inviteId: source.inviteId,
     roomName: source.roomName,
     title: Array.from(source.title.trim()).slice(0, 80).join(''),
@@ -107,8 +115,6 @@ function prepareMeetingRingInvitation(body, now = Date.now()) {
     displayName: Array.from(senderName.trim()).slice(0, 80).join(''),
     groupCall: source.groupCall === true,
   }
-  // calleeId may be filled by the cloud function from the device route binding.
-  if (source.calleeId !== undefined) payload.calleeId = source.calleeId
   if (Number.isInteger(source.convType) && source.convType >= 1) payload.convType = source.convType
   if (source.passcode !== undefined) {
     if (!matches(source.passcode, /^[0-9]{4,6}$/)) return { error: 'invalid meeting passcode' }

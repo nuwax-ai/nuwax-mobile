@@ -18,6 +18,21 @@ App（Android / iOS / HarmonyOS）
 要点：**后端全程不接触华为服务账号密钥**，厂商通道由 DCloud 托管。华为侧配置（项目级服务账号、
 HMS / 鸿蒙 NEXT 厂商参数）已在 DCloud 开发者中心填好，只用于 DCloud 自己调华为接口。
 
+### 1.1 测试与生产的推送配置
+
+2026-11-20 确认采用以下配置。App 登录域名决定连接哪个 IM 实例。IM 按自身部署配置选择云函数地址与发送签名，普通通知、`push-test` 和补推都沿用本环境的映射。
+
+| 环境 | IM 入口 | 云空间与推送函数 | 发送签名 |
+| --- | --- | --- | --- |
+| 测试 | `https://testagent.xspaceagi.com` | `nuwax-push-test`（`env-00jy72x2l4nj`），`https://env-00jy72x2l4nj.dev-hz.cloudbasefunction.cn/push-send-test` | 测试空间的 `PUSH_SIGN_KEY` |
+| 生产 | 生产 IM 实例 | `push-nuwax`（`env-00jy6ydc5dxi`），现有 `push-send` | 生产空间的 `PUSH_SIGN_KEY` |
+
+测试 IM 分别通过 `IM_UNIPUSH_URL` 和 `IM_UNIPUSH_SIGN` 注入测试地址与密钥，由 `X-Push-Sign` 传给云函数。测试实例使用测试数据库、Redis 和消费队列，联调时确认 `IM_PUSH_OFFLINE_ENABLED` 已启用。两套实例复用已有 UniPush AppID 和厂商接入配置。
+
+当前普通推送使用测试 IM 自己的设备记录选出 CID。App 继续通过 `POST /api/instant-message/devices` 上报 `pushToken` 和推送偏好。旧版独立绑定表、`pushBinding` 回执和 `PUSH_TEST_ENABLED` 已退出本轮普通推送方案。测试云函数校验发送签名，设备归属和目标范围通过 IM 查询及测试记录核对。
+
+代码在同一仓库的 `uniCloud-alipay/cloudfunctions/push-send-test/` 和 `uniCloud-alipay/cloudfunctions/push-send/`。上传测试函数前，在 HBuilderX 核对关联空间为 `env-00jy72x2l4nj`，只上传 `push-send-test`。已回读的测试空间变量为 `PUSH_SIGN_KEY` 和 `PUSH_DEBUG_MESSAGE_CONTENT`。测试函数的云端版本待回读确认。[IM 后端转发稿](im-test-push-handoff.md) · [新链路验收清单](im-test-push-acceptance-checklist.md) · [历史验收记录](voip-acceptance.md#2026-11-20-按空间配置后的回归)
+
 ## 2. 后端要做的事（按优先级）
 
 | # | 事项 | 必要性 | 说明 |
@@ -87,12 +102,12 @@ POST /api/instant-message/devices
 
 ### 3.2 触发离线推送
 
-判定为离线（用户所有设备均无活跃 WS 连接）时，调云函数 URL：
+判定为离线（用户所有设备均无活跃 WS 连接）时，调用本实例的 `IM_UNIPUSH_URL`。以下为测试环境示例。
 
 ```http
-POST https://env-00jy6ydc5dxi.dev-hz.cloudbasefunction.cn/push-send
+POST https://env-00jy72x2l4nj.dev-hz.cloudbasefunction.cn/push-send-test
 Content-Type: application/json
-X-Push-Sign: <与云函数 SIGN_KEY 一致的共享密钥>
+X-Push-Sign: <测试空间的 PUSH_SIGN_KEY>
 ```
 
 ```json
@@ -318,7 +333,7 @@ options: {
 
 ### 6.3 华为真机闭环实测（2026-10-30，ABR-AL80 / Android 12 / EMUI 14.2）
 
-全链路已通（App 切后台 → 另一个账号发消息 → 通知栏收到）。三处证据留档，便于下次快速判「到底断在哪」：
+当时的链路已通（App 切后台 → 另一个账号发消息 → 通知栏收到）。这是 10 月 30 日的证据，后续在独立测试空间沿用同样的三段对账。
 
 | 环节 | 证据 |
 |---|---|
@@ -338,7 +353,7 @@ isNeedInterceptStart true, interceptionState:BACKGROUND   # 后台不弹横幅�
 
 ### 6.4 一次通话收到多条相同通知：怎么判是云函数还是后端
 
-云函数 `push-send` 每次调用都会打两行对账日志（2026-11-20 起）：
+当前仓库的测试函数 `push-send-test` 每次调用会记录两行对账日志。日志标签沿用 `[push-send]`，核对环境时以控制台的 Space ID 和函数名为准。
 
 | 日志行 | 内容 |
 |---|---|

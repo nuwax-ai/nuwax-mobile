@@ -1,8 +1,7 @@
 'use strict';
 
 const crypto = require('crypto')
-const { prepareVoip, prepareNativeVoip, prepareVoipScene, prepareMeetingRingInvitation } = require('./voip')
-const { callTargetCids, loadDeviceRoutes, routeForCid } = require('./device-routes')
+const { callTargetCids, prepareVoip, prepareNativeVoip, prepareVoipScene, prepareMeetingRingInvitation } = require('./voip')
 
 const APP_ID = '__UNI__8BF05E4'          // 本项目的 DCloud AppID
 // 后端握手密钥：**只**从环境变量读（uniCloud 控制台 → 云函数 → 环境变量 PUSH_SIGN_KEY）。
@@ -343,95 +342,6 @@ async function sendNativeVoip(body, route, nativeVoip, invocationId) {
   }
 }
 
-async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting, invocationId) {
-  const { callId, expiresAt } = invitation.payload
-  // 会议邀请可以不带 calleeId：用设备路由登记的账号补齐，原生端仍按 calleeId 校验归属。
-  const calleeId = invitation.payload.calleeId ?? binding?.calleeId
-  const result = { clientid: cid }
-  if (binding && (binding.active !== true || binding.appId !== APP_ID || binding.calleeId !== calleeId)) {
-    console.log('[push-send] call route rejected', JSON.stringify({
-      invocationId,
-      cid,
-      active: binding.active === true,
-      appIdMatch: binding.appId === APP_ID,
-      calleeMatch: binding.calleeId === calleeId,
-      transport: binding.transport ?? null,
-    }))
-    return { ...result, errCode: 403, errMsg: 'device binding unavailable for callee' }
-  }
-
-  const now = Date.now()
-  if (!Number.isSafeInteger(expiresAt) || expiresAt <= now) return { ...result, errCode: 0, skipped: true }
-
-  if (binding?.transport && calleeId) {
-    const route = routeForCid(binding, cid)
-    const nativeVoip = prepareNativeVoip({
-      ...body, push_clientid: cid, payload: { ...invitation.payload, calleeId }, callRoute: route,
-    }, now)
-    const enabled = callTransportEnabled(route)
-    console.log('[push-send] call route', JSON.stringify({
-      invocationId,
-      cid,
-      transport: route.transport,
-      environment: route.environment ?? null,
-      hasRegistration: typeof route.registrationId === 'string' && route.registrationId.length === 36,
-      enabled,
-      nativeError: nativeVoip?.error ?? null,
-    }))
-    if (!nativeVoip.error && enabled) {
-      const sent = await sendNativeVoip(body, route, nativeVoip, invocationId)
-      return { ...result, errCode: sent.errCode, errMsg: sent.errMsg, delivery: 'native', transport: route.transport, ...sent.data }
-    }
-  } else {
-    // 没有可用的原生路由 ⇒ 本设备回落普通通知。登记缺失时不要打 active/calleeMatch
-    // 这类对 null 求值的布尔（会打出「active=false、calleeMatch=true」的假象）。
-    console.log('[push-send] call route', JSON.stringify({
-      invocationId,
-      cid,
-      found: binding != null,
-      active: binding == null ? null : binding.active === true,
-      appIdMatch: binding == null ? null : binding.appId === APP_ID,
-      calleeMatch: binding == null ? null : binding.calleeId === calleeId,
-      transport: binding?.transport ?? null,
-    }))
-  }
-
-  // Each fallback has its own provider request ID, even if IM supplied a batch ID.
-  const requestId = crypto.createHash('sha256')
-    .update(JSON.stringify(['voip-notification', cid, callId]))
-    .digest('hex').slice(0, 32)
-  const sent = fallbackMeeting != null
-    // 会议响铃的原生通道不可用时，回退普通 IM 通知（保留会议邀请卡片）。
-    ? await sendOrdinaryPush({ ...body, request_id: requestId }, [cid], null, fallbackMeeting, invocationId)
-    : await sendOrdinaryPush({ ...body, request_id: requestId }, [cid],
-      prepareVoip({ ...body, payload: invitation.payload }, now), null, invocationId)
-  return { ...result, errCode: sent.data.results[0]?.errCode ?? -1, delivery: 'notification', requestId }
-}
-
-async function sendRegisteredCalls(body, ids, invitation, fallbackMeeting, invocationId) {
-  let bindings
-  try {
-    bindings = await loadDeviceRoutes(uniCloud.database(), ids)
-  } catch {
-    console.error('[push-send] voip device route lookup failed', JSON.stringify({ invocationId, callId: invitation.payload.callId }))
-    return { errCode: 503, errMsg: 'device route lookup unavailable' }
-  }
-
-  const results = []
-  const concurrency = 8
-  for (let i = 0; i < ids.length; i += concurrency) {
-    const chunk = ids.slice(i, i + concurrency)
-    results.push(...await Promise.all(chunk.map(cid =>
-      sendCallToDevice(body, invitation, cid, bindings.get(cid), fallbackMeeting, invocationId))))
-  }
-  const failed = results.find(entry => entry.errCode !== 0)
-  return {
-    errCode: failed?.errCode ?? 0,
-    errMsg: failed ? 'call delivery failed for some devices' : 'ok',
-    data: { total: ids.length, results }
-  }
-}
-
 // ==================== 请求体检日志（排查「一次通话收到多条推送」） ====================
 //
 // ★排查口径：后端每次调用 = 一次独立的推送意图。所以日志必须让「同一条推送被调了几次」
@@ -543,12 +453,11 @@ async function handle(event, invocationId) {
   }
   // 会议响铃：走原生来电通道（PushKit / 全屏 Intent / 前台服务），让熄屏和进程被杀时
   // 也能亮屏、响铃并出现来电卡片。端上原生能力就绪前用环境变量关闭，保持普通 IM 通知。
-  // silent=true 的群卡片、以及没有 callRoute/设备路由来源的请求，一律不响铃。
-  const lookupRoutes = process.env.NUWAX_VOIP_DEVICE_ROUTE_LOOKUP === '1'
+  // silent=true 的群卡片和未提供原生路由的请求使用普通通知。
   const meetingRequested = scene?.meeting != null &&
     body.payload?.silent !== true &&
     process.env.NUWAX_VOIP_MEETING_RING === '1' &&
-    (body.callRoute != null || lookupRoutes)
+    body.callRoute != null
   // 响铃字段不完整/已过期时回退普通 IM 通知，不能整条 400——否则用户连会议卡片都收不到。
   const ringAttempt = meetingRequested ? prepareMeetingRingInvitation(body) : null
   const meetingRinging = ringAttempt != null && ringAttempt.error == null && ringAttempt.expired !== true
@@ -557,7 +466,6 @@ async function handle(event, invocationId) {
   if (scene?.meeting != null) {
     console.log('[push-send] meeting decision', JSON.stringify({
       ringSwitch: process.env.NUWAX_VOIP_MEETING_RING === '1',
-      lookupRoutes,
       hasCallRoute: body.callRoute != null,
       silent: body.payload?.silent === true,
       inviteId: body.payload?.inviteId ?? null,
@@ -574,9 +482,7 @@ async function handle(event, invocationId) {
       meetingRinging
     }))
   }
-  // 通话/会议响铃开启 CID 查询时，以设备登记绑定为准，忽略调用方的 callRoute。
-  const useDeviceRoutes = strictCids && lookupRoutes
-  const nativeAttempt = (scene?.meeting && !meetingRinging) || useDeviceRoutes ? null : prepareNativeVoip(body)
+  const nativeAttempt = scene?.meeting && !meetingRinging ? null : prepareNativeVoip(body)
   const nativeVoip = nativeAttempt?.error && strictCids ? null : nativeAttempt
   if (nativeVoip) {
     if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
@@ -601,12 +507,6 @@ async function handle(event, invocationId) {
   if (voip && voip.error) return { errCode: 400, errMsg: voip.error }
   if (voip && voip.expired) return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
 
-  if (useDeviceRoutes) {
-    if (meetingRinging) {
-      return sendRegisteredCalls(body, ids, ringAttempt, scene.meeting, invocationId)
-    }
-    return sendRegisteredCalls(body, ids, scene.call, null, invocationId)
-  }
   return sendOrdinaryPush(body, ids, voip, scene?.meeting, invocationId)
 }
 

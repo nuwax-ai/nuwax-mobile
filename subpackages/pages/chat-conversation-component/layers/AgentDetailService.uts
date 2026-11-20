@@ -74,7 +74,6 @@ import {
   buildMockMessageList,
 } from "./mockStreamPerf.uts";
 import { StreamRequest } from "@/utils/streamRequest";
-import { isAppInBackground } from "@/utils/appLifecycle.uts";
 import { bumpPollGeneration } from "@/subpackages/hooks/useConversationStatusPolling.uts";
 import {
   StreamChunk,
@@ -157,6 +156,7 @@ import {
   isAssistantMessageInfo,
   canReuseAssistantOnSubResume,
   isTurnUserReadyFromMessageInfoList,
+  readBizEnumStr,
 } from "@/subpackages/utils/subResumeGate.uts";
 
 /** 超时回调类型 */
@@ -662,10 +662,6 @@ export default class AgentDetailService {
    * 续接成功 / 正常收尾 / 强制关态 / 用户停止 / 新发送时复位。
    */
   private streamResumePending: boolean = false;
-  /** 续接连续失败次数：达到阈值强制关态，避免保持态无限 loading */
-  private resumeFailStreak: number = 0;
-  /** 保持态下续接连续失败阈值 */
-  private readonly MAX_RESUME_FAIL_STREAK: number = 3;
   /**
    * SSE 流式期间的消息列表草稿：始终保存最新态，避免未 flush 时下一帧读到旧 list。
    * 对 messageList / updateMessageComponent 做短时合并，减轻主线程卡顿。
@@ -715,11 +711,8 @@ export default class AgentDetailService {
   private subStreamRequest: StreamRequest | null = null;
   /** sub 是否已订阅（执行中） */
   private isSubscribed: boolean = false;
-  /**
-   * 退后台被系统掐断 live/sub 后待回前台续接。
-   * 为 true 时不把本地 taskStatus 误标 COMPLETE/FAILED。
-   */
-  private pendingBackgroundReconnect: boolean = false;
+  private subGeneration: number = 0;
+  private subStreamStartedAt: number = 0;
   /**
    * 最近一轮 live 流启动时刻（handleConversation 开新流时刷新）。
    * 远端终态强制收尾的宽限期依据：新流启动后 REMOTE_TERMINAL_GRACE_MS 内
@@ -737,14 +730,45 @@ export default class AgentDetailService {
     this.data = data;
   }
 
-  /** 是否有待回前台的后台断流续接 */
-  get needsBackgroundReconnect(): boolean {
-    return this.pendingBackgroundReconnect == true;
+  isCurrentStream(conversationId: number | null, streamGen: number): boolean {
+    return this.data.conversationId.value == conversationId && this.streamGeneration == streamGen;
   }
 
-  /** 清除后台续接标记（续接成功 / 确认已结束 / 用户停会话） */
-  clearBackgroundReconnectPending(): void {
-    this.pendingBackgroundReconnect = false;
+  /** 切换或离开会话时，断开本地订阅并作废在途恢复请求。 */
+  detachConversationStreams(): void {
+    this.streamGeneration = this.streamGeneration + 1;
+    this.streamResumePending = false;
+    this.endStreamListDraft();
+    chatService.abort();
+    this.abortSubConversation();
+  }
+
+  recoverStreamAfterBackground(hiddenAt: number): boolean {
+    const cid = this.data.conversationId.value;
+    if (cid == null || cid == 0 || this.data.isTempChat.value || this.data.isStoppingConversation.value) return false;
+    const live = chatService.isCurrentlyStreaming;
+    if (!live && !this.isSubscribed) return false;
+    const startedAt = live ? this.liveStreamStartedAt : this.subStreamStartedAt;
+    // WebView visibilitychange 与原生 onShow 可能都到达，保留已在本次恢复后打开的订阅。
+    if (startedAt > hiddenAt) return false;
+    this.detachConversationStreams();
+    this.sealStreamingAssistantBeforeClear();
+    this.clearStreamingAssistantText();
+    this.streamResumePending = true;
+    this.logStreamRecovery("disconnected", `source=foreground reason=long_background hiddenMs=${Date.now() - hiddenAt}`);
+    return true;
+  }
+
+  private logStreamRecovery(event: string, reason: string): void {
+    const cid = this.data.conversationId.value;
+    const requestId = this.data.currentConversationRequestId.value;
+    console.info(`[ChatStream] ${event} cid=${cid} requestId=${requestId} gen=${this.streamGeneration} ${reason}`);
+  }
+
+  private streamErrorReason(error: any): string {
+    const message = readRawField(error, "message");
+    const reason = message != null ? `${message}` : "";
+    return /^http_[0-9]{3}$/.test(reason) || reason == "invalid_content_type" ? reason : "transport_error";
   }
 
   /** 取得流式草稿列表（首次从 messageList 拷贝） */
@@ -1760,7 +1784,7 @@ export default class AgentDetailService {
 
     const requestIdRaw = readRawField(res, "requestId");
     const requestIdStr = requestIdRaw != null ? `${requestIdRaw}` : "";
-    this.data.currentConversationRequestId.value = requestIdStr;
+    if (requestIdStr.length > 0) this.data.currentConversationRequestId.value = requestIdStr;
 
     if (this.data.messageList.value.length == 0) {
       // #ifdef APP
@@ -2439,7 +2463,6 @@ export default class AgentDetailService {
 
       // 本轮流代数；abort / 新开流后旧回调直接丢弃
       this.streamGeneration = this.streamGeneration + 1;
-      this.pendingBackgroundReconnect = false;
       this.endStreamListDraft();
       // 记录本轮流启动时刻：轮询远端终态强制收尾的宽限期依据
       // （防止上一轮任务被打断后的陈旧终态误杀本轮新流）
@@ -2597,19 +2620,15 @@ export default class AgentDetailService {
           if (streamGen != this.streamGeneration) {
             return;
           }
-          console.error(
-            "[AgentDetailService] Chat stream error callback:",
-            error,
-          );
-          this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout, true);
+          this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout, this.streamErrorReason(error));
         },
         isTempChat,
         // 超时 / 连接异常关闭回调（H5 onClose、App 无 SSE 终态的 HTTP complete）
-        () => {
+        (reason: string) => {
           if (streamGen != this.streamGeneration) {
             return;
           }
-          this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout, false);
+          this.finalizeStreamAbnormally(isTempChat, streamGen, onTimeout, reason);
         },
         () => {
           if (!isTempChat) {
@@ -2836,55 +2855,28 @@ export default class AgentDetailService {
     }
   }
 
-  /**
-   * 流式异常收尾：冲刷草稿 → 落盘打字机正文 → 清通道 → 强制会话终态（触发全量 KaTeX）→ 回补。
-   * Android 进后台杀 SSE 时：静默软收尾 + pendingBackgroundReconnect，不标本地 COMPLETE，
-   * 等回前台 / scheduleRecover 用 sub 续流。
-   */
+  /** 连接中断后保留当前回复，普通会话由状态轮询确认并续接。 */
   private finalizeStreamAbnormally(
     isTempChat: boolean,
     streamGen: number,
     onTimeout: NullableTimeoutCallback,
-    isRealError: boolean,
+    reason: string,
   ): void {
     this.endStreamListDraft();
     this.sealStreamingAssistantBeforeClear();
     this.clearStreamingAssistantText();
-
-    const fromBackground = isAppInBackground() == true;
-    if (fromBackground == true) {
-      this.pendingBackgroundReconnect = true;
-      // 保持「生成中」，便于回前台续接；不调 onTimeout（避免按钮态立刻变空闲）
-      this.scheduleRecoverIfAssistantLoading(isTempChat, streamGen);
-      return;
-    }
+    this.logStreamRecovery("disconnected", `source=live reason=${reason}`);
 
     if (isTempChat == true) {
-      // 临时会话无 conversationId，无法续接：与正常 complete 对齐，延后 inactive，
-      // 让 ai-msg 走 fallback_full + KaTeX 终态刷图
-      const genAtAbnormal = this.streamGeneration;
+      // 临时会话没有可续接的服务端会话。
+      const conversationId = this.data.conversationId.value;
       setTimeout(() => {
-        if (genAtAbnormal != this.streamGeneration) {
-          return;
-        }
+        if (!this.isCurrentStream(conversationId, streamGen)) return;
         this.data.isConversationActive.value = false;
-        this.markConversationTaskCompleteIfExecuting();
       }, 150);
-      if (onTimeout != null) {
-        (onTimeout as () => void)();
-      }
-      return;
+    } else {
+      this.streamResumePending = true;
     }
-
-    // 普通会话：fail 不关态（保持 loading 视觉，避免「消失→续接→又出现」翻转）。
-    // 标记「需恢复」并立即续接；能否续接由 scheduleRecoverIfAssistantLoading 判断
-    // （能 → sub 恢复；不能 / 后端已结束 → 收尾关态），连续失败达阈值强制关态并落 FAILED
-    // （cleanupSub 的 resumeFailStreak 阈值路径；taskStatus 终态在那里写，不在 fail 时刻写：
-    // 若立即落 FAILED，网络抖动后续接成功时会与「任务实际仍在执行」矛盾，且重引翻转）。
-    // isRealError 仅用于日志区分来源（真实网络 error vs timeout/异常关闭兜底）。
-    this.streamResumePending = true;
-    this.resumeFailStreak = this.resumeFailStreak + 1;
-    this.scheduleRecoverIfAssistantLoading(false, streamGen);
     if (onTimeout != null) {
       (onTimeout as () => void)();
     }
@@ -2929,10 +2921,8 @@ export default class AgentDetailService {
     params: ConversationChatParams | TempConversationChatParams,
     isTempChat: boolean,
   ): Promise<void> {
-    // 正常结束：清后台续接标记与保持态标记
-    this.pendingBackgroundReconnect = false;
+    // 正常结束后停止续接。
     this.streamResumePending = false;
-    this.resumeFailStreak = 0;
     // 完成回调里已同步 endStreamListDraft；此处再调一次幂等兜底（异常入口/竞态）
     this.endStreamListDraft();
 
@@ -2976,6 +2966,7 @@ export default class AgentDetailService {
     if (!isTempChat) {
       await this.refreshChatSuggest(buildConversationChatSuggestParams(params), genAtComplete);
     }
+    if (genAtComplete != this.streamGeneration) return;
     // 会话完成后根据消息列表中的最后一条消息 判断是否存在 <task-result> 标签
     const lastMessage =
       this.data.messageList.value[this.data.messageList.value.length - 1];
@@ -3043,6 +3034,7 @@ export default class AgentDetailService {
       return;
     }
     // RENDER_UI ref 由后端异步落库，实测可能晚于正文流结束数秒。
+    const streamGen = this.streamGeneration;
     const delays = [250, 750, 1500, 3000, 6000] as number[];
     for (let i = 0; i < delays.length; i++) {
       const currentList = this.data.messageList.value;
@@ -3052,11 +3044,13 @@ export default class AgentDetailService {
       }
       await waitForOpenUiHydrate(delays[i]);
       // 用户已发起下一轮时，禁止旧完成回调覆盖新消息。
-      if (this.data.isConversationActive.value || chatService.isCurrentlyStreaming) {
+      if (!this.isCurrentStream(conversationId, streamGen) ||
+        this.data.isConversationActive.value || chatService.isCurrentlyStreaming) {
         return;
       }
       try {
         const res = await apiAgentConversation(conversationId);
+        if (!this.isCurrentStream(conversationId, streamGen)) return;
         if (apiResCode(res) == SUCCESS_CODE) {
           await this.handleQueryConversation(res);
         }
@@ -3064,86 +3058,6 @@ export default class AgentDetailService {
         // 下一轮重试；最终失败时保留“界面生成中”，不阻断正常聊天完成流程。
       }
     }
-  }
-
-  /**
-   * App：流异常中断后拉一次会话详情补终态；
-   * 若后端仍为 EXECUTING，立刻开 sub 续流（不等页面轮询，避免「第一句后卡住、结束才整段出来」）。
-   */
-  private scheduleRecoverIfAssistantLoading(
-    isTempChat: boolean,
-    streamGenAtSchedule: number,
-  ): void {
-    if (isTempChat == true) {
-      return;
-    }
-    let needRecover = false;
-    const listForRecover = this.data.messageList.value;
-    if (listForRecover.length > 0) {
-      const lastForRecover = listForRecover[listForRecover.length - 1];
-      if (
-        lastForRecover != null &&
-        lastForRecover.messageType == MessageTypeEnum.ASSISTANT
-      ) {
-        const status = lastForRecover.status;
-        const textLen = readMessageText(lastForRecover).trim().length;
-        const noFinal = lastForRecover.finalResult == null;
-        if (
-          noFinal == true &&
-          (status == MessageStatusEnum.Loading ||
-            status == MessageStatusEnum.Incomplete ||
-            textLen == 0)
-        ) {
-          needRecover = true;
-        }
-      }
-    }
-    if (needRecover != true && this.pendingBackgroundReconnect != true) {
-      // 无需恢复（正文已生成完 / 已是终态）：结束保持态，收尾关态
-      this.streamResumePending = false;
-      const genAtNoRecover = this.streamGeneration;
-      setTimeout(() => {
-        if (genAtNoRecover != this.streamGeneration) {
-          return;
-        }
-        this.data.isConversationActive.value = false;
-        this.markConversationTaskCompleteIfExecuting();
-      }, 150);
-      return;
-    }
-    setTimeout(() => {
-      if (streamGenAtSchedule != this.streamGeneration) {
-        return;
-      }
-      // 已由 live/sub 接管则无需再拉
-      if (this.isSubscribed == true || chatService.isCurrentlyStreaming) {
-        return;
-      }
-      this.resumeConversationState().then(
-        (resumeResult: ConversationResumeResult) => {
-          if (resumeResult.needResume != true) {
-            // 后端已结束：清 pending，结束保持态，收尾关态（避免保持态无限 loading）
-            this.pendingBackgroundReconnect = false;
-            this.streamResumePending = false;
-            this.data.isConversationActive.value = false;
-            this.markConversationTaskCompleteIfExecuting();
-            return;
-          }
-          if (streamGenAtSchedule != this.streamGeneration) {
-            return;
-          }
-          if (this.isSubscribed == true || chatService.isCurrentlyStreaming) {
-            return;
-          }
-          const cid = this.data.conversationId.value;
-          if (cid == null || cid == 0) {
-            return;
-          }
-          // 复用 resume 刚拉取的详情响应：跳过 sub 内部重拉与整表重建（列表已由 resume 重建）
-          this.handleSubConversation(cid, null, resumeResult.response, true);
-        },
-      );
-    }, 400);
   }
 
   /**
@@ -3168,26 +3082,25 @@ export default class AgentDetailService {
     preloadedResponse: any | null = null,
     skipListRebuild: boolean = false,
   ): Promise<void> {
-    // 防重 / live SSE 在跑时不订阅
-    if (this.isSubscribed) {
-      return;
-    }
-    if (chatService.isCurrentlyStreaming) {
-      return;
-    }
+    if (this.data.conversationId.value != conversationId || this.isSubscribed ||
+      chatService.isCurrentlyStreaming || this.data.isStoppingConversation.value) return;
 
     // 先中断旧 sub，再标记订阅（abort 会置 isSubscribed=false，必须在标记前）
     this.abortSubConversation();
     this.isSubscribed = true;
+    this.subStreamStartedAt = Date.now();
     const streamGen = this.streamGeneration;
+    const subscriptionGen = this.subGeneration;
+    const isCurrentSub = (): boolean =>
+      this.isSubscribed && this.subGeneration == subscriptionGen &&
+      this.isCurrentStream(conversationId, streamGen);
     const suggestParams = buildConversationChatSuggestParams(null);
     suggestParams.conversationId = conversationId;
-    // 已接管续流：清 pending；若随后在后台再被掐断，softCleanup 会再置位
-    this.pendingBackgroundReconnect = false;
 
     // 可变：复用历史助手时会改成已有 id
     let targetMessageId = generateUniqueId();
     let hasBoundTarget = false;
+    let replayHistory: MessageInfo[] | null = null;
     /** 仅当新建了空占位时，cleanup 才允许删掉空泡 */
     let createdNewPlaceholder = false;
 
@@ -3224,59 +3137,20 @@ export default class AgentDetailService {
       this.data.messageList.value = next;
     };
 
-    let isCleanedUp = false;
-    const cleanupSub = (finalizeMessage: boolean, keepActive: boolean): void => {
-      if (isCleanedUp) {
-        return;
-      }
-      isCleanedUp = true;
+    const cleanupSub = (retryReason: string | null): void => {
+      if (!isCurrentSub()) return;
       this.endStreamListDraft();
-      if (this.subStreamRequest != null) {
-        this.subStreamRequest!.abort();
-        this.subStreamRequest = null;
-      }
-      this.isSubscribed = false;
-      if (finalizeMessage == true) {
-        this.finalizeTerminalAssistantMessage();
-      }
-      // 与 live SSE 完成对齐：先冲刷 TTS 终态，再关会话态（否则播报图标卡住）
-      this.sealStreamingAssistantBeforeClear();
-      if (keepActive == true) {
-        // 续接失败：保持进行中视觉（loading 不消失），标记待恢复由轮询再续接；
-        // 连续失败达阈值才强制关态，避免后端一直 EXECUTING 且 sub 一直失败时无限 loading。
-        this.streamResumePending = true;
-        this.resumeFailStreak = this.resumeFailStreak + 1;
-        if (this.resumeFailStreak >= this.MAX_RESUME_FAIL_STREAK) {
-          this.streamResumePending = false;
-          this.resumeFailStreak = 0;
-          this.data.isConversationActive.value = false;
-          this.markConversationTaskStatusIfExecuting(TaskStatus.FAILED);
-        }
+      this.abortSubConversation();
+      this.streamResumePending = retryReason != null;
+      if (retryReason != null) {
+        this.logStreamRecovery("disconnected", `source=sub reason=${retryReason}`);
       } else {
-        this.streamResumePending = false;
-        this.resumeFailStreak = 0;
+        this.finalizeTerminalAssistantMessage();
         this.data.isConversationActive.value = false;
       }
+      this.sealStreamingAssistantBeforeClear();
       this.clearStreamingAssistantText();
       removeEmptyPlaceholder();
-      if (onSubClose != null) {
-        (onSubClose as () => void)();
-      }
-    };
-
-    /** 后台被系统掐断 sub：清订阅、保留 pending，不标 FAILED / 不关生成中 */
-    const softCleanupSubWhileBackground = (): void => {
-      if (isCleanedUp) {
-        return;
-      }
-      isCleanedUp = true;
-      this.endStreamListDraft();
-      if (this.subStreamRequest != null) {
-        this.subStreamRequest!.abort();
-        this.subStreamRequest = null;
-      }
-      this.isSubscribed = false;
-      this.pendingBackgroundReconnect = true;
       if (onSubClose != null) {
         (onSubClose as () => void)();
       }
@@ -3292,50 +3166,35 @@ export default class AgentDetailService {
       } else {
         result = await apiAgentConversation(conversationId);
       }
-      // await 期间本地可能已接管（用户发消息 → live SSE / 新一轮发送 abort 本 sub）：
-      // 放弃续接，避免用 reload 的旧列表覆盖本地刚写入的用户+Loading 气泡（ai-msg 闪没），
-      // 或形成 live+sub 双流。此时 send 流程已 abort 本 sub（isSubscribed=false），无需 cleanupSub。
-      if (this.isSubscribed == false || chatService.isCurrentlyStreaming == true) {
-        // 确保不残留订阅标记，避免阻塞后续轮询续接
-        this.isSubscribed = false;
-        return;
-      }
-      if (apiResCode(result!) != SUCCESS_CODE) {
-        // reload 失败：保持态（不关 loading），等待轮询再续接
-        cleanupSub(false, true);
+      if (!isCurrentSub()) return;
+      const code = apiResCode(result!);
+      if (code != SUCCESS_CODE) {
+        cleanupSub(`detail_failed code=${code}`);
         return;
       }
       const dataRaw = apiResData<any>(result!);
       if (dataRaw == null) {
-        cleanupSub(false, true);
+        cleanupSub("detail_missing");
         return;
       }
       const dataObj = dataRaw as UTSJSONObject;
+      const taskStatus = readBizEnumStr(dataObj, "taskStatus");
+      if (taskStatus != `${TaskStatus.EXECUTING}`) {
+        const completed = taskStatus == `${TaskStatus.COMPLETE}`;
+        if (completed || taskStatus == `${TaskStatus.FAILED}` || taskStatus == `${TaskStatus.CANCEL}`) {
+          if (skipListRebuild != true) await this.handleQueryConversation(result!);
+          if (!isCurrentSub()) return;
+          cleanupSub(null);
+          if (completed) this.refreshChatSuggest(suggestParams, streamGen);
+        } else {
+          cleanupSub("detail_not_executing");
+        }
+        return;
+      }
       ensureConversationTitleFromDetail(dataObj);
       const agent = dataObj["agent"];
       if (agent != null) {
         this.data.isSuggest.value = readRawField(agent, "openSuggest") == OpenCloseEnum.Open;
-      }
-      const taskStatusRaw = dataObj["taskStatus"];
-      const taskStatusStr =
-        taskStatusRaw != null ? `${taskStatusRaw}` : "";
-      // 轮询与详情之间任务可能已结束；此时不可再建立 sub 或插入占位
-      if (taskStatusStr != `${TaskStatus.EXECUTING}`) {
-        // 仍刷新一次列表，避免界面停在半截字；复用响应且列表已由调用方整表重建时跳过
-        if (skipListRebuild != true) {
-          await this.handleQueryConversation(result!);
-          // 刷新期间本地可能已接管（用户新发送）：放弃收尾，避免覆盖新会话状态
-          if (this.isSubscribed == false || chatService.isCurrentlyStreaming == true) {
-            this.isSubscribed = false;
-            return;
-          }
-        }
-        // 后端已非执行中：正常收尾关态
-        cleanupSub(true, false);
-        if (taskStatusStr == `${TaskStatus.COMPLETE}`) {
-          await this.refreshChatSuggest(suggestParams, streamGen);
-        }
-        return;
       }
       // skipListRebuild=true：列表已由调用方（resume/进页的 handleQueryConversation）
       // 用同一响应重建过，此处不再重复 parse，仅复用其重建结果。
@@ -3361,38 +3220,22 @@ export default class AgentDetailService {
             processed.push(adaptedMessage);
           }
           // sub 重载的历史可能携带 pending 审批/提问：reconcile 后才进入可渲染队列（对齐 main）
-          this.data.messageList.value =
-            reconcileAcpPermissionStatusesInMessageList(processed);
+          replayHistory = reconcileAcpPermissionStatusesInMessageList(processed);
         }
       }
 
       // 与轮询门禁共用 subResumeGate：本轮用户未进列表则不开 sub（四端一致）
       if (
-        isTurnUserReadyFromMessageInfoList(this.data.messageList.value) !=
+        isTurnUserReadyFromMessageInfoList(replayHistory ?? this.data.messageList.value) !=
         true
       ) {
-        // 用户未就绪：保持态，等下一轮轮询门禁通过后再续接
-        cleanupSub(false, true);
+        cleanupSub("turn_user_pending");
         return;
       }
 
-      // 续接成功接管：清除保持态标记与失败计数
-      this.streamResumePending = false;
-      this.resumeFailStreak = 0;
       this.data.isConversationActive.value = true;
-    } catch (error) {
-      // await 期间本地已接管（用户发消息 → live SSE）：直接放弃续接，避免 cleanupSub 误关
-      // 本地刚置位的 isConversationActive；此时 send 已 abort 本 sub，无需清态
-      if (this.isSubscribed == false || chatService.isCurrentlyStreaming == true) {
-        this.isSubscribed = false;
-        return;
-      }
-      console.error(
-        "[AgentDetailService] handleSubConversation reload failed:",
-        error,
-      );
-      // reload 失败：保持态，等待轮询再续接
-      cleanupSub(false, true);
+    } catch (_error) {
+      cleanupSub("detail_request_error");
       return;
     }
 
@@ -3407,6 +3250,8 @@ export default class AgentDetailService {
         return;
       }
       hasBoundTarget = true;
+      // 看到实际回放前保留屏幕上的半截回复，避免连接失败或回放尚未到达时只剩用户提示词。
+      if (replayHistory != null) this.data.messageList.value = replayHistory as MessageInfo[];
       const list = this.data.messageList.value;
       if (list.length > 0) {
         const last = list[list.length - 1];
@@ -3466,80 +3311,60 @@ export default class AgentDetailService {
     applyBearerAuthorization(header, token != null ? `${token}` : null);
     applyXClientTypeHeader(header);
 
-    this.subStreamRequest = new StreamRequest();
+    const subRequest = new StreamRequest();
+    this.subStreamRequest = subRequest;
+    let hasReplay = false;
     const requestConfig = new StreamRequestConfig();
     requestConfig.url = `${getApiBaseUrl()}/api/agent/conversation/chat/sub/${conversationId}`;
     requestConfig.method = "GET";
     requestConfig.headers = header;
     requestConfig.onChunk = (chunk: StreamChunk) => {
-      if (chunk.type != "content") {
-        return;
-      }
+      if (!isCurrentSub() || chunk.type != "content") return;
       try {
         const result = JSON.parse(chunk.data);
-        if (result == null) {
-          return;
-        }
-        const resultObj = result;
-        // 干预事件字段常在 _intervention/result.data，顶层 data 可能为 null；先放行给事件识别
-        const isInterventionChunk =
-          isAcpPermissionEvent(resultObj) || isMcpAskToolCallEvent(resultObj);
-        if (readRawField(resultObj, "data") == null && !isInterventionChunk) {
-          if (shouldSkipSsePayloadWithoutData(resultObj)) {
-            return;
-          }
-          return;
-        }
+        if (result == null) return;
+        // 干预事件可能没有顶层 data，仍需交给业务层。
+        const isIntervention = isAcpPermissionEvent(result) || isMcpAskToolCallEvent(result);
+        if (readRawField(result, "data") == null && !isIntervention) return;
+        const eventType = readBizEnumStr(result, "eventType");
+        // 只有终态帧时，保留已有回复，等详情回补落库正文。
+        if (eventType == `${ConversationEventTypeEnum.FINAL_RESULT}` && !hasReplay) return;
         ensurePlaceholder();
-        this.handleChangeMessageList(resultObj, targetMessageId);
-        const eventTypeRaw = readRawField(resultObj, "eventType");
-        const eventTypeStr =
-          eventTypeRaw != null ? `${eventTypeRaw}` : "";
-        if (eventTypeStr == `${ConversationEventTypeEnum.ERROR}`) {
-          // 服务端明确报错：正常收尾关态
-          cleanupSub(true, false);
+        this.handleChangeMessageList(result, targetMessageId);
+        if (!hasReplay) {
+          hasReplay = true;
+          this.streamResumePending = false;
+          this.logStreamRecovery("reconnected", "source=sub");
         }
-      } catch (e) {
+        if (eventType == `${ConversationEventTypeEnum.ERROR}`) {
+          cleanupSub(null);
+        }
+      } catch (_error) {
       }
     };
     requestConfig.onComplete = () => {
-      if (isCleanedUp || !this.isSubscribed || streamGen != this.streamGeneration ||
-        this.data.conversationId.value != conversationId) return;
-      // sub SSE 正常结束：立刻关掉 Loading（不等 ChatFinished / 详情回拉）
-      this.pendingBackgroundReconnect = false;
+      if (!isCurrentSub()) return;
+      if (!hasReplay) {
+        cleanupSub("terminal_without_replay");
+        return;
+      }
+      this.logStreamRecovery("recovery_finished", "source=sub reason=terminal_frame");
       this.markConversationTaskCompleteIfExecuting();
-      // 正常完成：收尾关态
-      cleanupSub(true, false);
+      cleanupSub(null);
       this.refreshChatSuggest(suggestParams, streamGen);
     };
     requestConfig.onError = (error: any) => {
-      if (isAppInBackground() == true) {
-        softCleanupSubWhileBackground();
-        return;
-      }
-      this.pendingBackgroundReconnect = false;
-      // sub 流失败：保持态（不关 loading），由轮询再续接；连续失败达阈值才收尾
-      cleanupSub(false, true);
+      cleanupSub(this.streamErrorReason(error));
     };
-    requestConfig.onTimeout = () => {
-      if (isAppInBackground() == true) {
-        softCleanupSubWhileBackground();
-        return;
-      }
-      this.pendingBackgroundReconnect = false;
-      // sub 超时：保持态，等待轮询再续接
-      cleanupSub(false, true);
+    requestConfig.onTimeout = (reason: string) => {
+      cleanupSub(reason);
     };
 
+    this.logStreamRecovery("reconnect_attempt", "source=sub reason=executing");
     try {
-      await this.subStreamRequest!.request(requestConfig);
+      await subRequest.request(requestConfig);
     } catch (error) {
-      if (isAppInBackground() == true && isCleanedUp != true) {
-        softCleanupSubWhileBackground();
-      } else {
-        // sub 请求异常：保持态，等待轮询再续接
-        cleanupSub(false, true);
-      }
+      cleanupSub(this.streamErrorReason(error));
     }
   }
 
@@ -3547,6 +3372,7 @@ export default class AgentDetailService {
    * 中断 sub 流恢复连接
    */
   abortSubConversation(): void {
+    this.subGeneration = this.subGeneration + 1;
     this.chatSuggestRequestVersion = this.chatSuggestRequestVersion + 1;
     if (this.subStreamRequest != null) {
       this.subStreamRequest!.abort();
@@ -3698,8 +3524,12 @@ export default class AgentDetailService {
    *
    * @returns 是否执行了强制收尾（false = 判定为陈旧终态，已忽略）
    */
-  handleRemoteConversationTerminal(): boolean {
-    if (chatService.isCurrentlyStreaming) {
+  handleRemoteConversationTerminal(response: RequestResponse<ConversationInfo>): boolean {
+    const wasRecovering = this.streamResumePending;
+    const status = readBizEnumStr(apiResData<any>(response), "taskStatus");
+    const notStarted = status == `${TaskStatus.CREATE}`;
+    if (notStarted && (!wasRecovering || chatService.isCurrentlyStreaming || this.isSubscribed)) return false;
+    if (chatService.isCurrentlyStreaming || wasRecovering) {
       const startedAt = this.liveStreamStartedAt;
       if (startedAt > 0) {
         const streamAge = Date.now() - startedAt;
@@ -3708,16 +3538,23 @@ export default class AgentDetailService {
         }
       }
     }
-    this.pendingBackgroundReconnect = false;
-    this.streamResumePending = false;
-    this.resumeFailStreak = 0;
-    this.streamGeneration = this.streamGeneration + 1;
-    this.endStreamListDraft();
-    chatService.abort();
-    this.abortSubConversation();
+    this.detachConversationStreams();
     this.finalizeTerminalAssistantMessage();
     this.data.isConversationActive.value = false;
     this.clearStreamingAssistantText();
+    if (wasRecovering) {
+      this.logStreamRecovery("recovery_finished", `source=detail status=${status}`);
+      // CREATE 没有本轮服务端回复，保留本地消息供用户重试。
+      if (!notStarted) {
+        this.handleQueryConversation(response);
+        const conversationId = this.data.conversationId.value;
+        if (status == `${TaskStatus.COMPLETE}` && conversationId != null) {
+          const suggestParams = buildConversationChatSuggestParams(null);
+          suggestParams.conversationId = conversationId;
+          this.refreshChatSuggest(suggestParams, this.streamGeneration);
+        }
+      }
+    }
     return true;
   }
 
@@ -3729,18 +3566,9 @@ export default class AgentDetailService {
     // 停止会话后，清空问题建议列表（对齐 PC handleClearSideEffect：停止即清空，防止旧建议残留）
     this.data.chatSuggestList.value = [];
 
-    // 用户主动停止：取消后台续接与保持态
-    this.pendingBackgroundReconnect = false;
-    this.streamResumePending = false;
-    this.resumeFailStreak = 0;
-
     const wasConversationActive = this.data.isConversationActive.value;
 
-    // 无论 UI 是否已标为结束，都先中止本地 SSE / sub，避免 chunk 回调继续跑
-    this.streamGeneration = this.streamGeneration + 1;
-    this.endStreamListDraft();
-    chatService.abort();
-    this.abortSubConversation();
+    this.detachConversationStreams();
 
     // 断流后不会再收到消息/工具终态，必须在本地同步收口。
     // 即使 active 已被其他回调提前清掉，也要先清理可能残留的 Loading/EXECUTING。
@@ -3992,67 +3820,38 @@ export default class AgentDetailService {
    * @returns 是否需要订阅 sub（后端 EXECUTING）
    */
   async resumeConversationState(): Promise<ConversationResumeResult> {
-    // 1. 检查会话ID
     const conversationId = this.data.conversationId.value;
-    if ((conversationId == null || conversationId == 0) || this.data.isTempChat.value) {
-      return new ConversationResumeResult(false, null);
-    }
-
-    // 2. 用户正在主动停止 / 本地 live 或 sub 已在跑 → 不抢
-    if (this.data.isStoppingConversation.value) {
-      return new ConversationResumeResult(false, null);
-    }
-    if (chatService.isCurrentlyStreaming || this.isSubscribed) {
+    const streamGen = this.streamGeneration;
+    if (conversationId == null || conversationId == 0 || this.data.isTempChat.value ||
+      this.data.isStoppingConversation.value || this.streamResumePending ||
+      chatService.isCurrentlyStreaming || this.isSubscribed) {
       return new ConversationResumeResult(false, null);
     }
 
     try {
-      // 3. 始终拉一次详情：跨端时本地气泡可能已是 Complete，不能只靠「异常中断」判断
       const res = await apiAgentConversation(conversationId);
-      if (apiResCode(res) != SUCCESS_CODE) {
+      if (!this.isCurrentStream(conversationId, streamGen) ||
+        this.streamResumePending || chatService.isCurrentlyStreaming || this.isSubscribed) {
         return new ConversationResumeResult(false, null);
       }
-      const convData = apiResData<ConversationInfo>(res);
-      const convObj = convData != null ? (convData as UTSJSONObject) : null;
-      ensureConversationTitleFromDetail(convObj);
-      let taskStatusStr = "";
-      if (convObj != null) {
-        const taskStatusRaw = convObj["taskStatus"];
-        if (taskStatusRaw != null) {
-          // App：可能是字符串或带 value 的对象
-          try {
-            const nested = (taskStatusRaw as UTSJSONObject)["value"];
-            if (nested != null) {
-              taskStatusStr = `${nested}`;
-            } else {
-              taskStatusStr = `${taskStatusRaw}`;
-            }
-          } catch (_e) {
-            taskStatusStr = `${taskStatusRaw}`;
-          }
-        }
+      const code = apiResCode(res);
+      const convObj = apiResData<any>(res);
+      if (code != SUCCESS_CODE || convObj == null) {
+        this.logStreamRecovery("detail_failed", `source=foreground code=${code}`);
+        return new ConversationResumeResult(false, null);
       }
-
-      // 刷新消息列表（其它端新消息 / 半截字终态）。
-      // 指纹与本地一致说明会话未变化（空闲回前台常见），跳过整表重建，
-      // 长历史会话可省整份 parseMessageList + adaptHistoryMessage。
-      if (this.fingerprintConversationData(convObj) != this.lastListFingerprint) {
+      const taskStatus = readBizEnumStr(convObj, "taskStatus");
+      ensureConversationTitleFromDetail(convObj);
+      if (this.fingerprintConversationData(convObj as UTSJSONObject) != this.lastListFingerprint) {
         await this.handleQueryConversation(res);
       }
 
-      if (taskStatusStr == `${TaskStatus.EXECUTING}`) {
-        // 恢复检查确认后端仍在执行：清除保持态标记（正式接管由 handleSubConversation 完成）
-        this.streamResumePending = false;
-        this.resumeFailStreak = 0;
-        this.data.isConversationActive.value = true;
-        return new ConversationResumeResult(true, res);
+      // 只有建立 sub 后才置生成态。否则页面会把这次详情检查误当作已在收流。
+      return new ConversationResumeResult(taskStatus == `${TaskStatus.EXECUTING}`, res);
+    } catch (_error) {
+      if (this.isCurrentStream(conversationId, streamGen)) {
+        this.logStreamRecovery("detail_failed", "source=foreground reason=request_error");
       }
-      this.pendingBackgroundReconnect = false;
-      this.data.isConversationActive.value = false;
-      return new ConversationResumeResult(false, res);
-    } catch (error) {
-      console.error("[SessionResume] 恢复会话状态失败:", error);
-      this.data.isConversationActive.value = false;
       return new ConversationResumeResult(false, null);
     }
   }
@@ -4230,9 +4029,8 @@ export default class AgentDetailService {
       newMessageList = [...newMessageList, currentMsgInfo];
     }
     // AgentDetailUtils.checkConversationActive(newMessageList, this.data)
-    // 新发送接管：清除保持态标记与失败计数
+    // 新发送接管：清除上一轮的待恢复标记。
     this.streamResumePending = false;
-    this.resumeFailStreak = 0;
     this.data.isConversationActive.value = true;
     this.data.messageList.value = newMessageList;
     // 会话一开始就绑定流式播报目标（不等首包正文），H5/App 均可立刻 begin
@@ -4918,6 +4716,7 @@ export default class AgentDetailService {
     preloadedResponse: RequestResponse<ConversationInfo> | null = null,
   ): Promise<void> {
     const id = this.data.conversationId.value;
+    const streamGen = this.streamGeneration;
     if (id != null && id != 0) {
       // 续接链已拉过新鲜详情时复用，跳过二次全量请求；
       // 购买成功回调等「必须最新」的场景不传 preloadedResponse，走自拉。
@@ -4925,6 +4724,7 @@ export default class AgentDetailService {
         preloadedResponse != null
           ? preloadedResponse
           : await apiAgentConversation(id);
+      if (!this.isCurrentStream(id, streamGen)) return;
       const convRaw = apiResData<any>(res);
       if (apiResCode(res) == SUCCESS_CODE && convRaw != null) {
         // Android Gson 不能实例化 ConversationInfo interface，直接按 JSON 对象读取。

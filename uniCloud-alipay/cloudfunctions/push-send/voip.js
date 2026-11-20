@@ -85,7 +85,8 @@ function prepareMeetingRingInvitation(body, now = Date.now()) {
   const senderName = source?.senderName ?? source?.displayName
   if (source?.type !== 'voip' || source.scene !== 'meeting' ||
       !matches(callId, /^[A-Za-z0-9_-]{1,128}$/) ||
-      !locator(source.convId) || !locator(source.msgId) || !locator(source.calleeId) ||
+      !locator(source.convId) || !locator(source.msgId) ||
+      (source.calleeId !== undefined && !locator(source.calleeId)) ||
       !matches(source.inviteId, /^[A-Za-z0-9._-]{1,128}$/) ||
       !matches(source.roomName, /^[A-Za-z0-9._-]{1,128}$/) ||
       typeof source.title !== 'string' || !source.title.trim() ||
@@ -97,7 +98,6 @@ function prepareMeetingRingInvitation(body, now = Date.now()) {
     type: 'voip',
     scene: 'meeting',
     callId,
-    calleeId: source.calleeId,
     convId: source.convId,
     msgId: source.msgId,
     inviteId: source.inviteId,
@@ -107,6 +107,8 @@ function prepareMeetingRingInvitation(body, now = Date.now()) {
     displayName: Array.from(senderName.trim()).slice(0, 80).join(''),
     groupCall: source.groupCall === true,
   }
+  // calleeId may be filled by the cloud function from the device route binding.
+  if (source.calleeId !== undefined) payload.calleeId = source.calleeId
   if (Number.isInteger(source.convType) && source.convType >= 1) payload.convType = source.convType
   if (source.passcode !== undefined) {
     if (!matches(source.passcode, /^[0-9]{4,6}$/)) return { error: 'invalid meeting passcode' }

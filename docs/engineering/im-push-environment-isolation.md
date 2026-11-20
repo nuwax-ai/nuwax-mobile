@@ -76,7 +76,7 @@ pnpm push:test:upload
 
 | 环节 | 完成条件 | 当前缺口 |
 | --- | --- | --- |
-| 云函数与部署目标 | 测试函数校验实际 Space ID，配置缺失或空间不符时拒绝请求。单独部署测试函数、设备表和 HTTPS 入口。 | 测试函数、设备表、HTTPS 入口和隔离凭据已部署，发送开关关闭。HTTPS 已验证无签名和跨环境拒绝、测试设备登记与撤销。实际厂商直发待验证。 |
+| 云函数与部署目标 | 测试函数校验实际 Space ID，配置缺失或空间不符时拒绝请求。单独部署测试函数、设备表和 HTTPS 入口。 | 2026-11-20 回读确认 `PUSH_TEST_ENABLED=1`、两把密钥独立、设备表已建 CID 唯一索引。HTTPS 已验证动态登记、按版本校验和撤销后拒发。厂商实际投递待真机验收。 |
 | App 动态域名 | App 的 HTTP、IM WebSocket 和原生通话使用同一个已验证登录地址。命中测试域名使用测试，其他域名默认生产。切域先撤销旧绑定，再清理旧会话、通知和角标，在新环境登录及登记。 | App 按登录地址保存登记回执，首次进入目标环境使用该域自己的登记上下文。还需核对同一安装包的原生 VoIP 域名闸门及 iOS 签名环境。 |
 | IM 服务配置 | 每个 IM 实例按自身部署选定环境，使用对应的数据库、Redis、推送队列和 UniPush URL／密钥。普通通知、角标、会议、VoIP、`push-test` 与补推共用同一环境和设备校验。 | IM 已有 `IM_UNIPUSH_URL`、`IM_UNIPUSH_SIGN` 和 `IM_PUSH_OFFLINE_ENABLED`，还需接通登记／撤销密钥和发送版本契约。单改 URL 无法满足严格模式。 |
 | 发送及回归 | 测试只发送给本空间已登记且有效的目标。失效设备逐台拒绝，其他有效设备继续收取。核对发送空间、函数版本、目标登记版本和厂商回执。 | 逐设备校验已由本地用例覆盖。生产仍使用现有链路，同一安装的生产 → 测试 → 生产完整互斥待接通各环境后验证。 |
@@ -107,7 +107,11 @@ pnpm push:test:upload
 - **DCloud UniPush。** 记录 AppID `__UNI__8BF05E4` 的两个空间关联。核对实际发送日志的 Space ID、AppID、测试目标范围及回执，分别记录普通通知、角标、Android 原生来电和 iOS PushKit 的结果。
 - **各手机厂商。** 对照当前应用标识、发布签名和通道权益，逐项核对普通通知、角标和原生来电。荣耀、vivo 分别核对锁屏无进程时的厂商投递及系统来电。iOS 核对签名对应的 APNs 环境和 PushKit 回调。
 
-2026-11-20 在支付宝云测试空间 `nuwax-push-test`（`env-00jy72x2l4nj`）部署正式测试入口 `push-send-test`。生产空间 `push-nuwax` 使用单独的 `env-00jy6ydc5dxi`。UniPush 2.0 应用控制台列出这两个空间。旧入口 `huawei-call-pilot` 仍有独立试拨凭据，退役前须核对调用方。新增联调统一使用 `push-send-test`。 [测试空间云函数](https://unicloud.dcloud.net.cn/pages/cloud-function/cloud-function?pageid=env-00jy72x2l4nj)
+2026-11-20 在 UniPush 2.0 控制台核实，同一应用已关联支付宝云测试空间 `nuwax-push-test`（`env-00jy72x2l4nj`）和生产空间 `push-nuwax`（`env-00jy6ydc5dxi`）。测试 IM 应统一调用测试空间的 `push-send-test`。测试人员换机或加入联调时，登录测试域名后由 IM 动态登记 CID 和设备版本。旧函数 `huawei-call-pilot` 仍配置固定 CID 和被叫账号，须在确认旧调用方迁出后退役。[测试空间云函数](https://unicloud.dcloud.net.cn/pages/cloud-function/cloud-function?pageid=env-00jy72x2l4nj)
+
+同日核对 UniPush 厂商页，vivo、荣耀、华为、鸿蒙 next、小米、OPPO、FCM 的通道开关均显示开启，魅族页未见已填凭据。iOS 页显示已上传证书。真机回执、签名和原生来电权益仍按上表分别验收。[UniPush 厂商推送设置](https://dev.dcloud.net.cn/pages/app/push2/thirdparty)
+
+这次联调用模拟设备验证了测试入口。HTTP 状态均为 200，后端应读响应体的 `errCode`，批量发送另读 `data.results`。发送签名正确时，空信封返回 400，未登记设备的完整信封返回 403。新登记的设备带有效登记版本提交已过期邀请，返回 0 并标记 `skipped: true`。撤销后重试同一请求返回 403。该探针不会发起厂商投递。
 
 ## 切换与验收
 

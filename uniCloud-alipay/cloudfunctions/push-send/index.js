@@ -418,6 +418,23 @@ exports.main = async (event) => {
     process.env.NUWAX_VOIP_MEETING_RING === '1' &&
     (body.callRoute != null || lookupRoutes)
   const strictCids = scene?.call != null || meetingRinging
+  // 会议响铃排查：只记决策相关的布尔与会议定位字段，不落邀请正文或用户身份。
+  if (scene?.meeting != null) {
+    console.log('[push-send] meeting decision', JSON.stringify({
+      ringSwitch: process.env.NUWAX_VOIP_MEETING_RING === '1',
+      lookupRoutes,
+      hasCallRoute: body.callRoute != null,
+      silent: body.payload?.silent === true,
+      inviteId: body.payload?.inviteId ?? null,
+      roomName: body.payload?.roomName ?? null,
+      mediaType: body.payload?.mediaType ?? null,
+      convType: body.payload?.convType ?? null,
+      hasCallId: typeof body.payload?.callId === 'string',
+      hasCalleeId: typeof body.payload?.calleeId === 'string',
+      hasExpiresAt: Number.isSafeInteger(body.payload?.expiresAt),
+      meetingRinging
+    }))
+  }
   // 通话/会议响铃开启 CID 查询时，以设备登记绑定为准，忽略调用方的 callRoute。
   const useDeviceRoutes = strictCids && lookupRoutes
   const nativeAttempt = (scene?.meeting && !meetingRinging) || useDeviceRoutes ? null : prepareNativeVoip(body)

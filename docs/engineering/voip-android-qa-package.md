@@ -4,19 +4,23 @@
 
 ## 本地准备与安装
 
-先启动 HBuilderX 5.34，在仓库根目录执行以下命令。
+日常使用标准 Android 打包入口。在 macOS 上启动 HBuilderX 5.34 并导入项目，再在仓库根目录执行命令。
 
 ```bash
 pnpm install --frozen-lockfile
-NUWAX_HX_VERSION=5.34 make sdk-fetch
-bash scripts/voip-native/package-business-qa-android.sh
-# 手机接上并允许 USB 调试后；只有一台 Android 时不需要指定序列号
-python3 scripts/voip-native/android-qa-device.py install
+make android-tester   # 生成可直接安装的 unpackage/debug/android_release.apk
+
+make app-resource    # 自己重打可供 HBuilderX 调试的基座时使用
+make base-android     # 生成 unpackage/debug/android_debug.apk
 ```
 
-SDK 5.34 固定版本包含 Android 官方 SDK 与源 ZIP。首次出包时，脚本从 SDK 生成当前工作区的 `out/voip-native-work/android/`。跨机器交付使用 SDK 和仓库源码，工作副本由各自的机器生成。
+标准入口读取资源的 HBuilderX 版本，按需下载 SDK 并生成本机工作副本。团队的 Android 签名和 DCloud 离线 AppKey 沿用现有签名配置。个推、华为、荣耀、vivo 和小米使用现有客户端配置。vivo 和小米的厂商适配用于普通推送，专用来电按独立的厂商验收结果交付。
 
-HBuilderX 的普通云打包不会执行本仓的 `configure_unipush.py`。S3 基座 `1.4.0` 包含华为 SDK 和接听页，使用 DCloud 默认 UniPush 接收器，该包还缺少悬浮窗权限声明。本地 VoIP QA 入口会注册 `VoipUniPushIntentService`，由它把华为收到的通话邀请送进原生流程。团队联调用这条入口生成的 APK。云包若要覆盖同一场景，须在云构建入口集成原生适配，重新验证实际装机包。
+先前发布的 `1.4.0` 云基座包含华为 SDK 和接听页，使用 DCloud 默认 UniPush 接收器。标准本地入口打出的基座和 APK 都会注册 `VoipUniPushIntentService`，由它把华为收到的通话邀请送进原生流程。HBuilderX 云端产物覆盖同一场景仍需集成该接收器并重新验收。
+
+## 专用诊断包
+
+VoIP 原生排查可用 `bash scripts/voip-native/package-business-qa-android.sh`。它保留原生阶段日志和专用验包证据，供下文的设备测试工具使用。
 
 签名配置从 `${NUWAX_SIGNING_HOME:-$HOME/workspace/nuwax-signing}/local-secrets.env` 加载；UniPush 客户端配置为同目录下 `android/unipush-client.json`，也可用 `NUWAX_ANDROID_UNIPUSH_CONFIG` 指向受控文件。结构为：
 

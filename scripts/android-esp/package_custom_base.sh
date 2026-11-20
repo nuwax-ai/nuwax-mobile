@@ -14,6 +14,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+export APP_RESOURCES_DIR="${APP_RESOURCES_DIR:-$WT_ROOT/unpackage/resources/app-android}"
+RESOURCE_MANIFEST="$APP_RESOURCES_DIR/${APPID:-${NUWAX_APPID:-__UNI__8BF05E4}}/www/manifest.json"
+[[ -f "$RESOURCE_MANIFEST" ]] || {
+  echo '✗ 缺少 Android App 资源，请先在 HBuilderX 生成本地打包 App 资源，或执行 make app-resource。' >&2
+  exit 1
+}
+RESOURCE_COMPILER_VERSION="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["uni-app-x"]["compilerVersion"])' "$RESOURCE_MANIFEST")"
+[[ "$RESOURCE_COMPILER_VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || { echo '✗ 无法确定 Android App 资源的 HBuilderX 版本' >&2; exit 1; }
+if [[ -n "${NUWAX_HX_VERSION:-}" && "$NUWAX_HX_VERSION" != "$RESOURCE_COMPILER_VERSION" ]]; then
+  echo "✗ Android App 资源由 HBuilderX $RESOURCE_COMPILER_VERSION 导出，离线 SDK 选的是 $NUWAX_HX_VERSION。请使用匹配的版本。" >&2
+  exit 1
+fi
+export NUWAX_HX_VERSION="$RESOURCE_COMPILER_VERSION"
 # shellcheck source=../local-base-env.sh
 source "$SCRIPT_DIR/../local-base-env.sh"
 # 三条 Android 构建链默认统一使用团队正式证书；需要临时排障时可显式覆盖为 debug。
@@ -40,19 +53,34 @@ else
 fi
 OUT_NAME="android_${BUILD_TYPE}"
 
-export APP_RESOURCES_DIR="${APP_RESOURCES_DIR:-$WT_ROOT/unpackage/resources/app-android}"
 export SKIP_INSTALL=1
+if [[ "$ANDROID_BUNDLE_ID" == com.nuwax.app ]]; then
+  export NUWAX_ANDROID_UNIPUSH_CONFIG="${NUWAX_ANDROID_UNIPUSH_CONFIG:-$WT_ROOT/config/android/unipush-client.json}"
+  if [[ "$BUILD_TYPE" == debug && -z "${NUWAX_ANDROID_QA_PROJECT:-}" && "${NUWAX_VOIP_DEVICE_TEST:-0}" != 1 ]]; then
+    export NUWAX_ANDROID_VOIP_RELEASE_ORIGIN="${NUWAX_ANDROID_VOIP_RELEASE_ORIGIN:-https://testagent.xspaceagi.com}"
+  fi
+fi
 
 mkdir -p "$OUT_DIR"
 
 # shellcheck source=ensure_env.sh
 source "$SCRIPT_DIR/ensure_env.sh"
 
-# 自动引导：project 未就绪（如 sdk-fetch 后 work/ 为空）时跑 setup_sdk，让 fetch → base-android 一键成立
-if [[ ! -e "$PROJ/settings.gradle" ]]; then
+# 自动引导：从 App 资源选择同版本 SDK，旧 project 链接不能指向另一版。
+work_matches_app_resources() {
+  [[ -f "$PROJ/settings.gradle" ]] || return 1
+  local project_root
+  project_root="$(cd -P "$PROJ" && pwd)"
+  [[ "$(basename "$(dirname "$project_root")")" == Android-uni-app-x-SDK@*-"$NUWAX_HX_VERSION" ]]
+}
+if ! work_matches_app_resources; then
   echo "==== 0) 自动引导工作副本（official/setup_sdk.sh）===="
+  if [[ "$NUWAX_HX_VERSION" == 5.34 && -z "${UNIAPPX_ANDROID_SDK_ROOT:-}" && ! -f "${ANDROID_SDK_ZIP:-$NUWAX_SDK_ARCHIVES/UniAppX-Android-$NUWAX_HX_VERSION.zip}" ]]; then
+    bash "$WT_ROOT/scripts/fetch-offline-sdk-s3.sh" --version "$NUWAX_HX_VERSION"
+  fi
   bash "$SCRIPT_DIR/official/setup_sdk.sh"
 fi
+work_matches_app_resources || { echo "✗ Android SDK 工作副本与 HBuilderX $NUWAX_HX_VERSION 不匹配：$PROJ" >&2; exit 1; }
 
 ensure_gradle_wrapper_jar "$PROJ"
 write_local_properties "$PROJ"

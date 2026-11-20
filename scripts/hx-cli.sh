@@ -66,7 +66,7 @@ case "${1:-}:${2:-}" in
     ;;
 esac
 case "${1:-}:${2:-}" in
-  launch:app-*|publish:app|pack:app*)
+  launch:app-*|publish:app|publish:app-android|pack:app*)
     hx_run "$SCRIPT_DIR/generate-app-privacy-policy.mjs"
     hx_run "$SCRIPT_DIR/prepare-offline-h5.mjs"
     hx_run "$SCRIPT_DIR/prepare-voip-media.mjs"
@@ -99,9 +99,10 @@ if [[ -n "$cli_kind" && $cli_status -eq 0 ]]; then
         exit 1
       fi
       ;;
-    publish:app)
-      # appResource 发行产物在 unpackage/resources/app-*（iOS/Android 各一份）
-      for d in "$ROOT_DIR"/unpackage/resources/app-*/static/app/offline-h5; do
+    publish:app|publish:app-android)
+      resource_platform=app-android
+      [[ "$cli_kind" != publish:app ]] || resource_platform='app-*'
+      for d in "$ROOT_DIR"/unpackage/resources/$resource_platform/*/www/static/app/offline-h5; do
         [[ -d "$d" ]] && verify_targets+=("$d")
       done
       ;;

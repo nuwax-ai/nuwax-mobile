@@ -9,8 +9,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-# shellcheck source=local-base-env.sh
-source "$SCRIPT_DIR/local-base-env.sh"
 
 TARGETS="${TARGETS:-all}"
 
@@ -19,7 +17,7 @@ want() {
   [[ "$TARGETS" == "all" ]] || [[ ",$TARGETS," == *",$name,"* ]]
 }
 
-echo "NUWAX_OFFLINE_SDK_HOME=$NUWAX_OFFLINE_SDK_HOME"
+echo "NUWAX_OFFLINE_SDK_HOME=${NUWAX_OFFLINE_SDK_HOME:-${NUWAX_WORKSPACE_ROOT:-$HOME/workspace}/nuwax-mobile-offline-sdk}"
 echo "TARGETS=$TARGETS"
 echo "模式: 仅出包（SKIP_INSTALL / 不启动设备）"
 echo ""

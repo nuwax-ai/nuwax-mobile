@@ -72,22 +72,13 @@ else
   echo "✓ HBuilderX 已在运行"
 fi
 
-# shellcheck source=../local-base-env.sh
-source "$SCRIPT_DIR/../local-base-env.sh"
 # shellcheck source=ensure_env.sh
 source "$SCRIPT_DIR/ensure_env.sh"
-echo "✓ NUWAX_OFFLINE_SDK_HOME=${NUWAX_OFFLINE_SDK_HOME}"
-echo "✓ ANDROID_ESP_WORK=${ANDROID_ESP_WORK}"
 echo "✓ ANDROID_HOME=${ANDROID_HOME:-}"
 echo "✓ ENABLE_HX_DEBUG=${ENABLE_HX_DEBUG}  ANDROID_BUILD_TYPE=${ANDROID_BUILD_TYPE}"
 
 if [[ -z "${ANDROID_HOME:-}" || ! -d "${ANDROID_HOME}/platforms" ]]; then
   fail "ANDROID_HOME 无效（无 platforms/）: ${ANDROID_HOME:-unset}"
-fi
-
-# 离线 Android SDK 目录粗检（具体 work 由 package_custom_base 自动 bootstrap）
-if [[ ! -d "${NUWAX_SDK_ROOT}/android" ]] && [[ ! -d "${NUWAX_OFFLINE_SDK_HOME}/sdk/android" ]]; then
-  echo "⚠ 未发现离线 Android SDK，若出包失败请先：make sdk-fetch"
 fi
 
 echo ""
@@ -106,8 +97,7 @@ if [[ "$SKIP_APP_RESOURCE" == "1" ]]; then
 else
   step 1 4 "HX：生成本地打包 App 资源（含当前业务代码）"
   echo "提示：等价菜单「发行 → 原生App-本地打包 → 生成本地打包App资源」"
-  bash "$SCRIPT_DIR/../hx-cli.sh" publish app \
-    --platform APP \
+  bash "$SCRIPT_DIR/../hx-cli.sh" publish app-android \
     --type appResource \
     --project "$ROOT_DIR" \
     ${CLEAN_CACHE:+--cleanCache true}
@@ -116,9 +106,13 @@ else
   echo "✓ 资源已导出"
 fi
 
-# HBuilderX 的 publish app 固定按 production 编译；Android tester 明确改为测试接口。
-python3 "$SCRIPT_DIR/set_app_resource_api_env.py" \
-  test "$ROOT_DIR/unpackage/resources/app-android"
+# 测试包使用独立资源副本，后续基座和正式包仍可以使用 HBuilderX 原始导出目录。
+TESTER_RESOURCES="$(mktemp -d "${TMPDIR:-/tmp}/nuwax-android-tester.XXXXXX")"
+trap 'rm -rf "$TESTER_RESOURCES"' EXIT
+cp -R "$ROOT_DIR/unpackage/resources/app-android" "$TESTER_RESOURCES/"
+export APP_RESOURCES_DIR="$TESTER_RESOURCES/app-android"
+python3 "$SCRIPT_DIR/set_app_resource_api_env.py" test "$APP_RESOURCES_DIR"
+export NUWAX_ANDROID_VOIP_RELEASE_ORIGIN=https://testagent.xspaceagi.com
 
 # ---------- [2/4] Release 出包 ----------
 step 2 4 "出 Release 包（无 HX debug-server，assembleRelease）"

@@ -29,6 +29,8 @@ export NUWAX_APPID="${NUWAX_APPID:-__UNI__8BF05E4}"
 # 本机敏感配置（gitignore）：AppKey / Android 正式签名 / iOS 签名。存在则 source，绝不入库。
 if [[ -f "$_NUWAX_LB_ENV_DIR/local-secrets.env" ]]; then
   source "$_NUWAX_LB_ENV_DIR/local-secrets.env"
+elif [[ -f "${NUWAX_SIGNING_ENV:-${NUWAX_SIGNING_HOME:-$NUWAX_WORKSPACE_ROOT/nuwax-signing}/local-secrets.env}" ]]; then
+  source "${NUWAX_SIGNING_ENV:-${NUWAX_SIGNING_HOME:-$NUWAX_WORKSPACE_ROOT/nuwax-signing}/local-secrets.env}"
 fi
 
 # ---------- iOS ----------

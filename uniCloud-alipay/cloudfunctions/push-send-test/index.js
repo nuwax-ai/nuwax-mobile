@@ -452,12 +452,10 @@ async function handle(event, invocationId) {
     return { errCode: 400, errMsg: 'meeting invitation payload too large' }
   }
   // 会议响铃：走原生来电通道（PushKit / 全屏 Intent / 前台服务），让熄屏和进程被杀时
-  // 也能亮屏、响铃并出现来电卡片。端上原生能力就绪前用环境变量关闭，保持普通 IM 通知。
-  // silent=true 的群卡片和未提供原生路由的请求使用普通通知。
+  // 也能亮屏、响铃并出现来电卡片。测试空间不再用环境变量总闸，也不以 callRoute 是否存在
+  // 作为决策条件：后端给了路由就原生投递，没给就回退普通通知。
   const meetingRequested = scene?.meeting != null &&
-    body.payload?.silent !== true &&
-    process.env.NUWAX_VOIP_MEETING_RING === '1' &&
-    body.callRoute != null
+    body.payload?.silent !== true
   // 响铃字段不完整/已过期时回退普通 IM 通知，不能整条 400——否则用户连会议卡片都收不到。
   const ringAttempt = meetingRequested ? prepareMeetingRingInvitation(body) : null
   const meetingRinging = ringAttempt != null && ringAttempt.error == null && ringAttempt.expired !== true
@@ -465,7 +463,6 @@ async function handle(event, invocationId) {
   // 会议响铃排查：只记决策相关的布尔与会议定位字段，不落邀请正文或用户身份。
   if (scene?.meeting != null) {
     console.log('[push-send] meeting decision', JSON.stringify({
-      ringSwitch: process.env.NUWAX_VOIP_MEETING_RING === '1',
       hasCallRoute: body.callRoute != null,
       silent: body.payload?.silent === true,
       inviteId: body.payload?.inviteId ?? null,

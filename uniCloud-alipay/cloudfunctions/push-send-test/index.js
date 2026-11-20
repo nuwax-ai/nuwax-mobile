@@ -21,8 +21,9 @@ const DEBUG_MESSAGE_CONTENT = process.env.PUSH_DEBUG_MESSAGE_CONTENT === '1'
 //   未申请就传可能被拒或降级 —— 所以我们只默认给 harmony，其余通道留给后端按需显式覆盖。
 const DEFAULT_CATEGORY = { harmony: 'IM' }
 // 通知分类/渠道只看后端信封 type：
-//   type="voip" → VOIP（华为需已申请自分类权益）+ 华为 VoipCall 渠道
-//   其余（IM/未传）→ 保持原 IM 逻辑，不传 channelId
+//   type="voip" → VOIP（华为需已申请自分类权益）；仅 scene="call" 使用华为 VoipCall 渠道
+//   type="im" → IM；其它/未传保持原逻辑
+const IM_CATEGORY = { harmony: 'IM', huawei: 'IM' }
 const CALL_CATEGORY = { harmony: 'VOIP', huawei: 'VOIP' }
 // ★uni-push sendMessage 没有顶层 channelId 字段，Android 通知渠道只能走 options 厂商透传。
 //   官方 options.md 明确给出的是华为 /message/android/notification/channel_id；
@@ -30,15 +31,16 @@ const CALL_CATEGORY = { harmony: 'VOIP', huawei: 'VOIP' }
 //   未确认前不下发，避免整批被厂商拒。
 const VOIP_CHANNEL = 'VoipCall'
 
-/** 分类只看后端信封 type：voip → VOIP；其余保持 IM 原逻辑，避免破坏普通消息。 */
+/** 分类优先看后端信封 type：voip → VOIP，im → IM；其它类型保持原逻辑。 */
 function notificationCategory(body) {
   if (body.type === 'voip') return CALL_CATEGORY
+  if (body.type === 'im') return IM_CATEGORY
   return body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
 }
 
-/** 只有 voip 信封才下发 VoipCall 渠道；IM 消息不传 channelId。 */
+/** 只有一对一通话才下发 VoipCall 渠道；会议邀请和 IM 消息都不传 channelId。 */
 function notificationChannel(body) {
-  return body.type === 'voip' ? VOIP_CHANNEL : ''
+  return body.type === 'voip' && body.payload?.scene === 'call' ? VOIP_CHANNEL : ''
 }
 
 /**
@@ -281,9 +283,9 @@ function attachBadgeToPayload(payload, badge) {
 }
 
 function callTransportEnabled(route) {
-  return route.transport === 'ios-voip'
-    ? process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT === route.environment
-    : (process.env.NUWAX_VOIP_ANDROID_TRANSPORTS || '').split(',').includes(route.transport)
+  // 测试空间只配置 PUSH_SIGN_KEY / PUSH_DEBUG_MESSAGE_CONTENT：
+  // 后端给了 transport 就按该通道投递，不再校验 APNs 环境或厂商白名单。
+  return route != null && typeof route.transport === 'string' && route.transport.length > 0
 }
 
 async function sendNativeVoip(body, route, nativeVoip, invocationId) {
@@ -348,9 +350,8 @@ async function sendNativeVoip(body, route, nativeVoip, invocationId) {
 //   一眼可数 —— 每个请求打一行 `[push-send] in` 摘要，收尾再打一行 `[push-send] done` 耗时。
 //   ★摘要常开、且不含用户文案：cid 数/去重后数量、信封字段、通话/会议定位字段、路由与耗时
 //     已经足够定性「云函数发了多次」还是「后端触发了多次」。
-//   ★完整信封（含 title/content 原文与 payload 全文）由环境变量 PUSH_DEBUG_REQUEST=1 打开，
-//     只在需要逐字段比对时临时开启，避免生产日志长期留存用户私聊内容。签名头永不打印。
-const DEBUG_REQUEST = process.env.PUSH_DEBUG_REQUEST === '1'
+//   ★完整信封不再由环境变量打开：测试空间只配置 PUSH_SIGN_KEY / PUSH_DEBUG_MESSAGE_CONTENT，
+//     摘要本身不含正文，逐字段排查看摘要即可。签名头永不打印。
 const CID_LOG_LIMIT = 20            // 摘要里最多列出的 cid（足以看出重复/多设备）
 const TEXT_HASH_LEN = 8             // 文案指纹长度：比对「是不是同一条」而不落原文
 
@@ -408,7 +409,7 @@ function describeEnvelope(body, event, rawBodyLength) {
       environment: route.environment ?? null,
       hasRegistrationId: typeof route.registrationId === 'string' && route.registrationId.length > 0,
     },
-    // 文案只留长度与指纹；要正文就开 PUSH_DEBUG_REQUEST
+    // 文案只留长度与指纹
     titleLength: body.title == null ? 0 : Array.from(String(body.title)).length,
     contentLength: body.content == null ? 0 : Array.from(String(body.content)).length,
     textFingerprint: textFingerprint(body.title, body.content),
@@ -438,10 +439,6 @@ async function handle(event, invocationId) {
   // ★每个请求一行摘要：数 `[push-send] in` 的行数 = 后端/网关实际调了几次。
   try {
     console.log('[push-send] in', JSON.stringify({ invocationId, ...describeEnvelope(body, event, rawBody.length) }))
-    if (DEBUG_REQUEST) {
-      // 完整信封原文（不含签名头）：对照字段口径时用，排查完请关掉开关。
-      console.log('[push-send] in raw', JSON.stringify({ invocationId, body }))
-    }
   } catch (e) {
     // 日志异常绝不能影响投递
     console.error('[push-send] in log failed', invocationId)
@@ -541,7 +538,7 @@ async function sendOrdinaryPush(body, ids, voip, meeting, invocationId) {
   const privateInvitation = voip || payload.type === 'meeting_invite'
   // 厂商离线角标参数（App 进程不在时唯一能改桌面角标的途径）
   const vendorBadgeOptions = buildVendorBadgeOptions(body.badge)
-  // 只有 voip 信封才下发 VoipCall 渠道；IM 消息不传 channelId。
+  // 只有一对一通话才下发 VoipCall 渠道；会议邀请和 IM 消息都不传 channelId。
   const channelOptions = buildChannelOptions(notificationChannel(body))
   const sendOptions = mergeOptions(vendorBadgeOptions, channelOptions)
 
@@ -559,6 +556,8 @@ async function sendOrdinaryPush(body, ids, voip, meeting, invocationId) {
     convType: payload && payload.convType ? payload.convType : null,
     payloadLength: JSON.stringify(payload || {}).length,
     badge: body.badge === undefined ? null : body.badge,
+    inputCategory: body.category ?? null,
+    category,
     // 保留 feat-2026.11 的在线通知策略，展示由客户端前后台状态决定。
     force_notification: false,
     // ★幂等键照打：回退路径的 request_id 是云函数按 (cid, callId) 派生的哈希，

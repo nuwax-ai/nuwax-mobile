@@ -8,19 +8,48 @@
       <text class="vh-nav__title">历史记录</text>
       <view class="vh-nav__side"></view>
     </view>
-    <scroll-view class="vh-list" scroll-y="true" @scrolltolower="loadMore">
+    <scroll-view
+      class="vh-list"
+      scroll-y="true"
+      :refresher-enabled="true"
+      :refresher-triggered="refreshing"
+      @refresherrefresh="handleRefresh"
+      @scrolltolower="loadMore"
+    >
       <view v-for="item in records" :key="item.id" class="vh-card">
         <view class="vh-card__head">
           <text class="vh-card__title">{{ item.title }}</text>
-          <view class="vh-card__download" @click="handleDownload(item)">
-            <svg-icon name="icon-msg-download" size="20" unit="px" color="#5b4dff" />
-          </view>
         </view>
         <text class="vh-card__meta">时长 {{ item.duration }} · {{ item.recordedAt }}</text>
         <view class="vh-card__file">
           <svg-icon name="icon-a-Filetext" size="16" unit="px" color="#7a78e6" />
           <text class="vh-card__path">{{ item.detail }}</text>
         </view>
+        <view class="vh-card__actions">
+          <view v-if="item.status == 'SUCCESS'" class="vh-card__btn" @click="handlePlay(item)">
+            <view v-if="playingId == item.id" class="vh-card__stop"></view>
+            <svg-icon v-else name="icon-video-play" size="16" unit="px" color="#5b4dff" />
+            <text class="vh-card__btn-text">{{ playingId == item.id ? '停止' : '播放' }}</text>
+          </view>
+          <view v-if="item.status == 'SUCCESS'" class="vh-card__btn" @click="handleDownload(item)">
+            <svg-icon name="icon-msg-download" size="16" unit="px" color="#5b4dff" />
+            <text class="vh-card__btn-text">文档</text>
+          </view>
+          <view v-if="item.status == 'ASR_PARTIAL_FAILED' || item.status == 'DOC_FAILED'" class="vh-card__btn" @click="handleReprocess(item)">
+            <svg-icon name="icon-restart" size="16" unit="px" color="#5b4dff" />
+            <text class="vh-card__btn-text">重试</text>
+          </view>
+          <view v-if="item.status == 'DOC_REMOVED'" class="vh-card__btn" @click="handleReprocess(item)">
+            <svg-icon name="icon-restart" size="16" unit="px" color="#5b4dff" />
+            <text class="vh-card__btn-text">重建文档</text>
+          </view>
+          <view class="vh-card__btn" @click="handleDelete(item)">
+            <text class="vh-card__btn-text vh-card__btn-text--danger">删除</text>
+          </view>
+        </view>
+      </view>
+      <view v-if="records.length > 0" class="vh-footer">
+        <text class="vh-footer__text">{{ footerText }}</text>
       </view>
     </scroll-view>
   </view>
@@ -31,7 +60,7 @@
  * 录音历史。列表来自 POST /api/voice/note/list。
  * 转写成功后点下载，再查详情拿到 docUrl 打开文稿。
  */
-import { apiVoiceNoteDetail, apiVoiceNoteList } from "@/servers/voiceNote.uts";
+import { apiVoiceNoteAudioFiles, apiVoiceNoteDelete, apiVoiceNoteDetail, apiVoiceNoteList, apiVoiceNoteReprocess } from "@/servers/voiceNote.uts";
 
 type VoiceRecordHistoryItem = {
   id: string;
@@ -40,14 +69,27 @@ type VoiceRecordHistoryItem = {
   recordedAt: string;
   detail: string;
   status: string;
+  segmentCount: number;
   docUrl: string;
 };
 
 const records = ref<VoiceRecordHistoryItem[]>([]);
 const loading = ref<boolean>(false);
+const refreshing = ref<boolean>(false);
 const hasMore = ref<boolean>(true);
 const lastId = ref<string>("");
+const playingId = ref<string>("");
 const pageSize = 20;
+const footerText = computed((): string => {
+  if (loading.value) return "加载中";
+  if (!hasMore.value) return "没有更多了";
+  return "上拉加载更多";
+});
+
+let player: InnerAudioContext | null = null;
+let playToken = 0;
+let playUrls: string[] = [];
+let playIndex = 0;
 
 function pad2(n: number): string {
   if (n < 10) return "0" + n.toString();
@@ -127,13 +169,22 @@ function mapHistoryItem(row: UTSJSONObject): VoiceRecordHistoryItem {
     recordedAt: created,
     detail: statusLabel(status) + " · " + segmentCount.toString() + " 段",
     status: status,
+    segmentCount: segmentCount,
     docUrl: "",
   };
   return item;
 }
 
+function applyStatus(item: VoiceRecordHistoryItem, status: string): void {
+  item.status = status;
+  item.detail = statusLabel(status) + " · " + item.segmentCount.toString() + " 段";
+}
+
 async function loadRecords(reset: boolean): Promise<void> {
-  if (loading.value) return;
+  if (loading.value) {
+    refreshing.value = false;
+    return;
+  }
   if (!reset && !hasMore.value) return;
   loading.value = true;
   const cursor = reset ? "" : lastId.value;
@@ -162,11 +213,17 @@ async function loadRecords(reset: boolean): Promise<void> {
     uni.showToast({ title: "历史记录加载失败", icon: "none" });
   } finally {
     loading.value = false;
+    refreshing.value = false;
   }
 }
 
 function loadMore(): void {
   void loadRecords(false);
+}
+
+function handleRefresh(): void {
+  refreshing.value = true;
+  void loadRecords(true);
 }
 
 function handleBack(): void {
@@ -202,8 +259,139 @@ async function handleDownload(item: VoiceRecordHistoryItem): Promise<void> {
   }
 }
 
+function stopPlayback(): void {
+  playToken = playToken + 1;
+  playingId.value = "";
+  playUrls = [];
+  playIndex = 0;
+  const current = player;
+  player = null;
+  if (current != null) {
+    current.stop();
+    current.destroy();
+  }
+}
+
+function playClipAt(noteId: string, index: number, token: number): void {
+  if (token != playToken || index < 0 || index >= playUrls.length) {
+    stopPlayback();
+    return;
+  }
+  const previous = player;
+  player = null;
+  if (previous != null) {
+    previous.stop();
+    previous.destroy();
+  }
+  const audio = uni.createInnerAudioContext();
+  player = audio;
+  playIndex = index;
+  audio.src = playUrls[index];
+  audio.onEnded(() => {
+    if (token != playToken) return;
+    playClipAt(noteId, index + 1, token);
+  });
+  audio.onError((_err) => {
+    if (token != playToken) return;
+    stopPlayback();
+    uni.showToast({ title: "播放失败", icon: "none" });
+  });
+  audio.play();
+}
+
+async function loadAudioUrls(noteId: string): Promise<string[]> {
+  const urls: string[] = [];
+  let page = 1;
+  let total = 0;
+  while (page < 20) {
+    const data = await apiVoiceNoteAudioFiles(noteId, page, 50);
+    if (data == null) break;
+    total = readItemNumber(data, "total");
+    const raw = data["items"];
+    if (raw == null || !Array.isArray(raw)) break;
+    const items = raw as UTSJSONObject[];
+    for (let i = 0; i < items.length; i++) {
+      const url = readItemString(items[i], "audioUrl");
+      if (url.length > 0) urls.push(url);
+    }
+    if (items.length < 50 || (total > 0 && urls.length >= total)) break;
+    page = page + 1;
+  }
+  return urls;
+}
+
+async function handlePlay(item: VoiceRecordHistoryItem): Promise<void> {
+  if (playingId.value == item.id) {
+    stopPlayback();
+    return;
+  }
+  stopPlayback();
+  try {
+    const urls = await loadAudioUrls(item.id);
+    if (urls.length == 0) {
+      uni.showToast({ title: "没有可播放的录音", icon: "none" });
+      return;
+    }
+    playUrls = urls;
+    playingId.value = item.id;
+    const token = playToken + 1;
+    playToken = token;
+    playClipAt(item.id, 0, token);
+  } catch (_error) {
+    stopPlayback();
+    uni.showToast({ title: "播放失败", icon: "none" });
+  }
+}
+
+async function handleReprocess(item: VoiceRecordHistoryItem): Promise<void> {
+  try {
+    const status = await apiVoiceNoteReprocess(item.id);
+    applyStatus(item, status);
+    uni.showToast({ title: "已开始重试", icon: "none" });
+  } catch (error) {
+    const message = `${error}`;
+    uni.showToast({ title: message.length > 0 ? message : "重试失败", icon: "none" });
+  }
+}
+
+function removeRecord(noteId: string): void {
+  const next: VoiceRecordHistoryItem[] = [];
+  for (let i = 0; i < records.value.length; i++) {
+    if (records.value[i].id != noteId) next.push(records.value[i]);
+  }
+  records.value = next;
+}
+
+async function confirmDelete(item: VoiceRecordHistoryItem): Promise<void> {
+  try {
+    await apiVoiceNoteDelete(item.id);
+    if (playingId.value == item.id) stopPlayback();
+    removeRecord(item.id);
+    uni.showToast({ title: "已删除", icon: "none" });
+  } catch (_error) {
+    uni.showToast({ title: "删除失败", icon: "none" });
+  }
+}
+
+function handleDelete(item: VoiceRecordHistoryItem): void {
+  uni.showModal({
+    title: "删除录音",
+    content: "删除后列表里不再显示，30 天后无法恢复。确定删除？",
+    confirmText: "删除",
+    cancelText: "取消",
+    success: (res) => {
+      if (res.confirm != true) return;
+      confirmDelete(item);
+    },
+  });
+}
+
 onShow(() => {
   void loadRecords(true);
+});
+
+onUnload(() => {
+  stopPlayback();
 });
 </script>
 
@@ -260,12 +448,49 @@ onShow(() => {
   lines: 2;
 }
 
-.vh-card__download {
-  width: 56rpx;
-  height: 56rpx;
+.vh-card__actions {
+  margin-top: 20rpx;
+  flex-direction: row;
+  flex-wrap: wrap;
+}
+
+.vh-card__btn {
+  flex-direction: row;
   align-items: center;
-  justify-content: center;
-  margin-left: 16rpx;
+  height: 56rpx;
+  padding: 0 18rpx;
+  margin-right: 16rpx;
+  margin-bottom: 8rpx;
+  border-radius: 28rpx;
+  background-color: #f3f2fb;
+}
+
+.vh-card__stop {
+  width: 14rpx;
+  height: 14rpx;
+  border-radius: 3rpx;
+  background-color: #5b4dff;
+}
+
+.vh-card__btn-text {
+  margin-left: 8rpx;
+  font-size: 24rpx;
+  color: #5b4dff;
+}
+
+.vh-card__btn-text--danger {
+  margin-left: 0;
+  color: #e24b4b;
+}
+
+.vh-footer {
+  padding: 8rpx 0 24rpx 0;
+  align-items: center;
+}
+
+.vh-footer__text {
+  font-size: 24rpx;
+  color: #9a9aa2;
 }
 
 .vh-card__meta {

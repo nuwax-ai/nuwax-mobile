@@ -2,7 +2,7 @@
 
 更新日期为 2026-11-20。11 月 17 日的基线工作树 `mobile-voip`，分支 `feat/nuwa-basic-2026.11-voip-calls`；从双远程一致的 `feat-2026.11@5c71314ca028c580098623ba4f214d19d0cb206e` 派生。该轮未替换主 checkout 与已有调试基座。
 
-**当前状态。** vivo 锁屏、App 无进程时，独立测试空间已送达真实单聊和一对一语音邀请。此前同一测试包已通过单聊点击跳转和业务推送开关停发、恢复。语音实拨收到普通厂商通知，屏幕持续熄灭，未出现原生接听页。
+**当前状态。** 11 月 20 日 19:42，华为 ABR-AL80 无进程、熄屏锁屏状态下，测试 Web 真实发起的一对一语音邀请经测试 IM（不带 callRoute）→ 测试空间云函数按 `brand` 动态路由华为透传 → 冷启动 → Telecom 登记 → App 直开接听页 → 自动亮屏，主叫挂断后收尾（详见 11-20 晚间复盘）。被叫接听、双向音频与铃声听感待验。vivo 锁屏无进程单聊通知此前已通过；语音在 vivo 回退普通通知，厂商来电权益待申请。
 
 ## 2026-11-20 按空间配置后的回归
 
@@ -58,12 +58,30 @@
 2. **主分支仅有的开页路径在无进程场景失效。** `VoipBridge.apply` 里的 `startActivity` 以 `!hidden` 为前提，冷启动无 Activity 时 `hidden = activity.get() == null` 恒为真，该分支不执行。
 3. **全屏 Intent 被 EMUI 降级拦截。** 渠道保存值为 4，但系统把该条通知的有效重要度算成 3，SystemUI 以 `Not important enough` 拒绝全屏展示；11-19 同样被拒绝，靠第 1 条的直接 `startActivity`（Telecom 后台启动豁免 + 悬浮窗权限）才点亮屏幕，铃声同理受全机静音影响。
 
+另有两处隐藏帮凶当日排除：重装 QA 包后 EMUI 把悬浮窗 appop 重置回 default（`requestLockedCallUi` 的门控必挡），且该 APK 清单未声明 `SYSTEM_ALERT_WINDOW` 时系统会隐藏悬浮窗开关、adb appops 写入也不生效（11-19 隔离包是手工在打包工程 app 清单里声明的，未进任何分支）。已在 nuwax-voip 插件清单正式声明。
+
 据此在 `feat-2026.11` 落两处修改（本轮只针对 Android，iOS 不动）：
 
 - **`VoipBridge.requestLockedCallUi`（正式化 11-19 补丁、放宽为通用门控）。** 在 `addCall` 成功回调内调用；条件为业务来电、被叫、ringing、audio、未过期、未展示过、锁屏、悬浮窗已授、通知启用、来电渠道保存重要度 ≥ HIGH、勿扰关闭，不再限定华为／API 31。渠道保存值（本机为 4）满足门控，EMUI 对单条通知的有效重要度降级不再阻断开页。
-- **`push-send-test` 按 CID 动态判定厂商通道自动路由。** 后端未带 `callRoute` 且为单 CID 语音邀请时，云函数经 `uniPush.getClientDetailByCid(cid)` 查个推云端设备档案：`device_token` 非空且 `phoneModel` 命中华为则自动按 `android-huawei` 原生路由投递；查询失败或多 CID 一律回退普通通知。档案存于服务端、由设备上次在线注册写入，不依赖接收端 App 存活，与「无进程来电」场景匹配；机型原文每次落日志以便校准真实格式。显式 `callRoute` 仍优先。
+- **`push-send-test` 按 CID 动态判定厂商通道自动路由。** 后端未带 `callRoute` 且为单 CID 语音邀请时，云函数经 `uniPush.getClientDetailByCid(cid)` 查个推云端设备档案动态判定；显式 `callRoute` 仍优先，多 CID 扇出不自动判定。
 
-vivo 侧结论不变：厂商离线通话链路需先完成权益申请（见[厂商接入记录](voip-cn-provider-onboarding.md)），本轮不展开。
+#### 19:17 首轮真实链路失败与两层云函数缺陷
+
+QA 1.4.0（140，含上述原生补丁与清单声明）装机后首测：测试 Web 实拨到达华为普通通知渠道（pushagent 渠道、有效重要度 3），女娲无进程未唤醒。回读同请求云函数日志与本地复现，证实两层缺陷：
+
+1. **字段名与格式双重错位。** DCloud `getClientDetailByCid` 文档写驼峰 `phoneModel`，实测返回为下划线 `phone_model` 且取值是内部型号码（本机 `ABR-AL80`，不含品牌词）；首版按文档字段+品牌正则判空失败。按个推 REST v2 官方用户信息接口改为 **`brand` 代码判定**（华为-hw、小米-xm、vivo-vv、OPPO-op、魅族-mz、苹果-iphone），实测 `brand:"hw"` 直接命中。
+2. **IM 单 CID 数组形态。** 测试 IM `UniPushChannel.buildBody` 用 `putArray("push_clientid")`，单目标也是 `[cid]`；`prepareNativeVoip` 严格要求 `body.push_clientid === route.cid`（字符串），自动路由设置 `callRoute` 后仍会被拒并静默回退普通通知。已在「已校验单目标且自动命中」分支归一为字符串，多目标与显式路由契约不变，并补 `[cid]` 数组走真实发送分支的回归用例。
+
+#### 19:42 第二轮真实链路通过（无进程、锁屏、自动路由）
+
+前置状态（均有回读证据）：QA 1.4.0（140，`5980d2c03`+`7ff5d0f71` 等价产物 191511）、熄屏锁屏、主进程与推送进程经 run-as 同 UID 受控退出全部不存在（自然回收与 am kill 均被最近任务残留 + UniPushService sticky 自启阻挡，run-as kill 后 stopped=false 仍成立）、悬浮窗 allow、后台弹窗允许、渠道 v2 保存重要度 4、勿扰关、铃声音量 9/15 未静音。测试空间函数为 `b3b5c2f27`。
+
+- **云函数（19:42:18，141ms）。** `in`：scene=call、单 CID、`callRoute=null`、callId `call-mwowszcg-8s6pwl`。`call route auto`：`brand:"hw"`、`device_token` 长度 114、`phone_model:"ABR-AL80"`、`transport:"android-huawei"`。`call transport`：requestId `fe042bb3d266867d721e91e63bec1e77`、errCode 0。
+- **设备（19:42:19–26）。** 19.924 推送进程为 `com.igexin.sdk.HmsPushMessageService` 启动（透传接收，非 pushagent 通知）；21.064 主进程为 `VoipUniPushIntentService` 启动；25.370 Telecom 登记；25.478 发布 ID 9090 的 CallStyle 通知（`nuwax-voip-incoming-v2`、**有效重要度 4**、category=call、带接听/拒接）；25.501 `START VoipIncomingActivity from uid 10437`——**App 自身直开接听页（`requestLockedCallUi` 路径）而非 SystemUI 全屏 Intent**；25.501 系统 `buzzBeepBlinkLocked hasValidSound=true,hasValidVibrate=true`；25.532 屏幕唤醒；19:42:40 主叫挂断后页面收尾。callId 云端与设备 `nuwax-voip://call/call-mwowszcg-8s6pwl` 一致。
+
+证据：`out/voip-android-qa-20261120/real-web-retest/`（设备阶段与进程时间线）、`out/voip-android-qa-20261120/cloud-1942/function-logs.md`（云函数日志）、`controlled-exit-before-retest2.json`（受控退出基线）。
+
+**结果与局限。** 通过：无进程、锁屏、熄屏状态下，真实测试 Web 发起的一对一语音邀请经测试 IM（不带路由）→ 云函数动态判 brand → 华为透传 → 冷启动 → Telecom 登记 → App 直开接听页 → 自动亮屏，主叫挂断后收尾。未通过/未验证：**被叫侧接听、双向音频、可听铃声听感**（系统已判定通知声音有效，听感未采集）；未接听/拒接/超时路径未单独跑；vivo（brand=vv 将回退普通通知，厂商来电权益另见接入记录）、荣耀（brand 取值与 ho 通道未实测）未覆盖；多设备扇出仍要求后端逐台带显式 `callRoute`；`brand` 判定依赖个推云端档案，App 长期不在线时档案的时效性未单独验证。
 
 ## 2026-11-19 华为无进程锁屏来电成功，荣耀后续复测按此流程
 

@@ -518,6 +518,39 @@ describe('automatic vendor route resolution', () => {
     expect(send).toHaveBeenCalledOnce();
     expect(send.mock.calls[0][0].settings).toMatchObject({ strategy: { ios: 2 } });
   });
+
+  it('routes through the vendor probe when the registry model is empty', async () => {
+    const cid = 'empty-model-huawei-cid';
+    const { call, send, request, manager } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', phoneModel: '' },
+    });
+    request.mockResolvedValueOnce({ errCode: 0, data: { hw_token: 'hms-token', phone_type: 1 } });
+    expect((await call(makeCall(cid))).errCode).toBe(0);
+    expect(request.mock.calls.find(args => args[0]?.module === `/device/detail/${cid}`)).toBeTruthy();
+    expect(send).not.toHaveBeenCalled();
+    const [{ requestData }] = request.mock.calls.at(-1)!;
+    expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({ delivery: 'android-native' });
+  });
+
+  it('keeps the ordinary notification when the vendor probe finds no Huawei token', async () => {
+    const cid = 'empty-model-vendor-cid';
+    const { call, send, request, manager } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', phoneModel: '' },
+    });
+    request.mockResolvedValueOnce({ errCode: 0, data: { vv_token: 'vivo-token', phone_type: 1 } });
+    expect((await call(makeCall(cid))).errCode).toBe(0);
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the ordinary notification when the vendor probe fails', async () => {
+    const cid = 'empty-model-probe-error-cid';
+    const { call, send, request, manager } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', phoneModel: '' },
+    });
+    request.mockRejectedValueOnce(new Error('rest module unavailable'));
+    expect((await call(makeCall(cid))).errCode).toBe(0);
+    expect(send).toHaveBeenCalledOnce();
+  });
 });
 
 describe('ordinary production notifications remain compatible', () => {

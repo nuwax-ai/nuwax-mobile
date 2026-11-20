@@ -329,13 +329,49 @@ async function resolveAutoCallRoute(pushClientId, invocationId) {
   }
   const token = typeof detail?.device_token === 'string' ? detail.device_token : ''
   const model = typeof detail?.phoneModel === 'string' ? detail.phoneModel : ''
-  const routed = token.length > 0 && HUAWEI_MODEL_RE.test(model)
+  // phoneModel 实测可为空（2026-11-20 华为真机：hasVendorToken=true、phoneModel=""）。
+  // 全量键名+安全值形态落日志，用于校准 DCloud 封装的真实返回结构。
+  const shape = detail && typeof detail === 'object'
+    ? Object.fromEntries(Object.entries(detail).map(([k, v]) =>
+        [k, typeof v === 'string' ? (/token/i.test(k) ? `len:${v.length}` : v.slice(0, 24)) : v]))
+    : null
+  let routed = token.length > 0 && HUAWEI_MODEL_RE.test(model)
+  // 档案机型缺失但有厂商 token 时，用个推设备详情的华为 token 判定；
+  // hw_token 非空 = 该 cid 实际注册在华为通道，仍是动态判定、不写死设备。
+  let vendorProbe = null
+  if (!routed && token.length > 0 && model === '') {
+    vendorProbe = await probeHuaweiVendorToken(cid, invocationId)
+    routed = vendorProbe === true
+  }
   console.log('[push-send] call route auto', JSON.stringify({
     invocationId, hasVendorToken: token.length > 0,
-    phoneModel: model.slice(0, 40),
+    phoneModel: model.slice(0, 40), detailShape: shape,
+    ...(vendorProbe !== null ? { vendorProbe } : {}),
     transport: routed ? 'android-huawei' : null
   }))
   return routed ? { transport: 'android-huawei', platform: 'android', cid } : null
+}
+
+// 个推 REST 设备详情探测：返回 true=确认华为通道 / false=查到详情但无华为 token / null=探测不可用。
+async function probeHuaweiVendorToken(cid, invocationId) {
+  if (typeof uniPush.request !== 'function') return null
+  try {
+    const result = await uniPush.request({ method: 'GET', module: '/device/detail/' + cid, requestData: {} })
+    const data = result?.data
+    if (data == null || typeof data !== 'object' || Array.isArray(data)) return false
+    const hw = data.hw_token ?? data.hwToken ?? null
+    console.log('[push-send] vendor probe', JSON.stringify({
+      invocationId, errCode: result?.errCode ?? null,
+      keys: Object.keys(data).slice(0, 20),
+      hasHwToken: typeof hw === 'string' && hw.length > 0
+    }))
+    return typeof hw === 'string' && hw.length > 0
+  } catch (e) {
+    console.error('[push-send] vendor probe failed', JSON.stringify({
+      invocationId, error: String((e && e.message) || e).slice(0, 160)
+    }))
+    return null
+  }
 }
 
 async function sendNativeVoip(body, route, nativeVoip, invocationId) {

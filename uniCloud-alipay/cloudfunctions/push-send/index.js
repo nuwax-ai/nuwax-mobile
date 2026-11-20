@@ -346,6 +346,13 @@ async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting)
   const calleeId = invitation.payload.calleeId ?? binding?.calleeId
   const result = { clientid: cid }
   if (binding && (binding.active !== true || binding.appId !== APP_ID || binding.calleeId !== calleeId)) {
+    console.log('[push-send] call route rejected', JSON.stringify({
+      cid,
+      active: binding.active === true,
+      appIdMatch: binding.appId === APP_ID,
+      calleeMatch: binding.calleeId === calleeId,
+      transport: binding.transport ?? null,
+    }))
     return { ...result, errCode: 403, errMsg: 'device binding unavailable for callee' }
   }
 
@@ -357,10 +364,28 @@ async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting)
     const nativeVoip = prepareNativeVoip({
       ...body, push_clientid: cid, payload: { ...invitation.payload, calleeId }, callRoute: route,
     }, now)
-    if (!nativeVoip.error && callTransportEnabled(route)) {
+    const enabled = callTransportEnabled(route)
+    console.log('[push-send] call route', JSON.stringify({
+      cid,
+      transport: route.transport,
+      environment: route.environment ?? null,
+      hasRegistration: typeof route.registrationId === 'string' && route.registrationId.length === 36,
+      enabled,
+      nativeError: nativeVoip?.error ?? null,
+    }))
+    if (!nativeVoip.error && enabled) {
       const sent = await sendNativeVoip(body, route, nativeVoip)
       return { ...result, errCode: sent.errCode, errMsg: sent.errMsg, delivery: 'native', transport: route.transport, ...sent.data }
     }
+  } else {
+    console.log('[push-send] call route', JSON.stringify({
+      cid,
+      found: binding != null,
+      active: binding?.active === true,
+      appIdMatch: binding?.appId === APP_ID,
+      calleeMatch: binding?.calleeId === calleeId,
+      transport: binding?.transport ?? null,
+    }))
   }
 
   // Each fallback has its own provider request ID, even if IM supplied a batch ID.

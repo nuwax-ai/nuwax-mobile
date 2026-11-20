@@ -178,32 +178,27 @@ describe('VoIP UniPush notice isolation', () => {
 });
 
 describe('IM invitation scenes', () => {
-  const envelope = { push_clientid: ['fixture-cid-1', 'fixture-cid-2'], title: '张三', content: '邀请你通话' };
+  const envelope = { push_clientid: ['fixture-cid-1', 'fixture-cid-2'], title: '张三', content: '邀请你通话', type: 'voip' };
   const callPayload = () => ({ ...locator, scene: 'call', convType: 1, callId: 'fixture-call', calleeId: '10002',
     mediaType: 'video', expiresAt: Date.now() + 30_000, senderName: '张三' });
   const meetingFields = { ...locator, scene: 'meeting', convType: 2, inviteId: 'fixture-invite', roomName: '123456789',
     title: '周会', mediaType: 'audio', senderName: '张三', silent: true, groupCall: true, passcode: '1234' };
 
-  it('keeps the meeting on IM notifications even when the input has a VoIP category or route', async () => {
+  it('keeps a meeting with an IM envelope on the IM category', async () => {
     const { call, send, database } = load(latestEntry, { NUWAX_VOIP_DEVICE_ROUTE_LOOKUP: '1' });
-    const backup = load(backupEntry);
     const { scene, ...expected } = meetingFields;
     const request = {
-      ...envelope, category: { harmony: 'VOIP', huawei: 'VOIP' }, callRoute: { transport: 'ios-voip' },
+      ...envelope, type: 'im',
       payload: { ...meetingFields, expiresAt: 1, accessToken: 'fixture-extra' },
     };
     const result = await call(request);
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
     expect(args.payload).toEqual({ ...expected, type: 'meeting_invite' });
-    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args.category).toEqual({ harmony: 'IM' });
     expect(args).not.toHaveProperty('settings');
     expect(args).not.toHaveProperty('options');
     expect(database).not.toHaveBeenCalled();
-    expect((await backup.call(request)).errCode).toBe(0);
-    expect(backup.send.mock.calls[0][0]).toMatchObject({
-      payload: { type: 'voip', scene: 'meeting' }, category: request.category,
-    });
   });
 
   it('passes the call deadline and recipient through the ordinary fallback pending a verified route', async () => {
@@ -236,10 +231,10 @@ describe('IM invitation scenes', () => {
 });
 
 describe('envelope type and scene-driven notification config', () => {
-  const envelope = { push_clientid: ['fixture-cid-1', 'fixture-cid-2'], title: '张三', content: '邀请你通话' };
+  const envelope = { push_clientid: ['fixture-cid-1', 'fixture-cid-2'], title: '张三', content: '邀请你通话', type: 'voip' };
   const callFields = () => ({ convId: '245475557381246976', msgId: '245475557381246977', scene: 'call', convType: 1,
     callId: 'fixture-call', calleeId: '10002', mediaType: 'audio', roomName: 'im-90001-live', senderName: '张三' });
-  const meetingFields = () => ({ convId: '245475557381246976', msgId: '245475557381246977', scene: 'meeting', convType: 2,
+  const meetingFields = () => ({ convId: '245475557381246976', msgId: '245475557381246977', type: 'voip', scene: 'meeting', convType: 2,
     inviteId: 'mi-fixture', roomName: '123456789', title: '周会', mediaType: 'video', senderName: '张三',
     silent: false, groupCall: false });
 
@@ -269,10 +264,9 @@ describe('envelope type and scene-driven notification config', () => {
     expect(send.mock.calls[0][0].options.harmony.HW['/payload/notification/badge']).toEqual({ setNum: 99 });
   });
 
-  it('keeps meeting invitations on IM classification without a VoIP channel', async () => {
+  it('keeps a meeting with an IM envelope on the IM category', async () => {
     const { call, send } = load();
-    await call({ ...envelope, type: 'voip', channelId: 'VoipCall',
-      category: { harmony: 'VOIP', huawei: 'VOIP' }, payload: meetingFields() });
+    await call({ ...envelope, type: 'im', category: { harmony: 'IM', huawei: 'IM' }, payload: meetingFields() });
     const args = send.mock.calls[0][0];
     expect(args.payload.type).toBe('meeting_invite');
     expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
@@ -290,15 +284,15 @@ describe('envelope type and scene-driven notification config', () => {
     expect(args).not.toHaveProperty('settings');
   });
 
-  it('does not treat an IM wire type at the envelope level as a call envelope', async () => {
+  it('applies the envelope type even when the payload is not a call envelope', async () => {
     const { call, send } = load();
     const payload = { convId: '123', convType: 1 };
     await call({ ...envelope, type: 'voip', payload });
     const args = send.mock.calls[0][0];
     expect(args.payload).toEqual(payload);
-    expect(args.category).toEqual({ harmony: 'IM' });
+    expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
     expect(args).not.toHaveProperty('settings');
-    expect(args).not.toHaveProperty('options');
+    expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
   });
 
   it('skips a scene=call invitation whose sendTime window has elapsed', async () => {
@@ -313,18 +307,18 @@ describe('meeting ringing delivery', () => {
   const ringPayload = () => ({ ...locator, scene: 'meeting', convType: 1, inviteId: 'mi-ring', roomName: '123456789',
     title: '周会', mediaType: 'video', senderName: '张三', silent: false, groupCall: true,
     callId: 'mi-ring', calleeId: '10002', expiresAt: Date.now() + 30_000 });
-  const envelope = { title: '张三', content: '会议邀请：周会' };
+  const envelope = { title: '张三', content: '会议邀请：周会', type: 'voip' };
   const registrationId = 'cb67ff9e-54ee-44ef-a6c0-601fd536cdf5';
   const ringEnv = { NUWAX_VOIP_MEETING_RING: '1' };
 
-  it('keeps meetings on ordinary IM notifications while the ringing switch is off', async () => {
+  it('keeps meetings on the ordinary channel while the ringing switch is off', async () => {
     const { call, send } = load();
-    await call({ ...envelope, push_clientid: 'fixture-cid', channelId: 'VoipCall', payload: ringPayload() });
+    await call({ ...envelope, push_clientid: 'fixture-cid', payload: ringPayload() });
     const args = send.mock.calls[0][0];
     expect(args.payload.type).toBe('meeting_invite');
-    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
     expect(args).not.toHaveProperty('settings');
-    expect(args).not.toHaveProperty('options');
+    expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
   });
 
   it('rings through the iOS VoIP route with the meeting payload and VoipCall channel', async () => {
@@ -375,7 +369,8 @@ describe('meeting ringing delivery', () => {
     expect(transmission.payload).toMatchObject({ type: 'voip', scene: 'meeting', delivery: 'android-native' });
     const notice = send.mock.calls[0][0];
     expect(notice.payload.type).toBe('meeting_invite');
-    expect(notice.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(notice.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
+    expect(notice.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
     expect(notice).not.toHaveProperty('settings');
   });
 

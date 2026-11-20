@@ -21,16 +21,26 @@ const DEBUG_MESSAGE_CONTENT = process.env.PUSH_DEBUG_MESSAGE_CONTENT === '1'
 // ★华为/小米等 Android 通道的 category 是「自分类权益」，必须先在厂商后台申请到该分类才能传，
 //   未申请就传可能被拒或降级 —— 所以我们只默认给 harmony，其余通道留给后端按需显式覆盖。
 const DEFAULT_CATEGORY = { harmony: 'IM' }
-// 通话与会议的通知分类/渠道由场景决定，不再沿用调用方传入值：
-//   通话 → VOIP（华为需已申请自分类权益）+ 华为 VoipCall 通知渠道
-//   会议 → IM（会议邀请是普通消息，不能用 VOIP）
-const IM_CATEGORY = { harmony: 'IM', huawei: 'IM' }
+// 通知分类/渠道只看后端信封 type：
+//   type="voip" → VOIP（华为需已申请自分类权益）+ 华为 VoipCall 渠道
+//   其余（IM/未传）→ 保持原 IM 逻辑，不传 channelId
 const CALL_CATEGORY = { harmony: 'VOIP', huawei: 'VOIP' }
 // ★uni-push sendMessage 没有顶层 channelId 字段，Android 通知渠道只能走 options 厂商透传。
 //   官方 options.md 明确给出的是华为 /message/android/notification/channel_id；
 //   小米 /extra.channel_id 是「小米后台申请的通知类别 id」，与端上渠道名不是一回事，
 //   未确认前不下发，避免整批被厂商拒。
 const VOIP_CHANNEL = 'VoipCall'
+
+/** 分类只看后端信封 type：voip → VOIP；其余保持 IM 原逻辑，避免破坏普通消息。 */
+function notificationCategory(body) {
+  if (body.type === 'voip') return CALL_CATEGORY
+  return body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
+}
+
+/** 只有 voip 信封才下发 VoipCall 渠道；IM 消息不传 channelId。 */
+function notificationChannel(body) {
+  return body.type === 'voip' ? VOIP_CHANNEL : ''
+}
 
 /**
  * 新契约允许后端只传顶层 type="voip"，payload.type 由云函数回填。
@@ -299,14 +309,14 @@ async function sendNativeVoip(body, route, nativeVoip) {
         }
       })
     } else {
-      const nativeOptions = mergeOptions(nativeVoip.options, buildChannelOptions(body.channelId))
+      const nativeOptions = mergeOptions(nativeVoip.options, buildChannelOptions(notificationChannel(body)))
       result = await uniPush.sendMessage({
         push_clientid: [route.cid],
         title: clip(body.title, MAX_TITLE),
         content: clip(body.content, MAX_CONTENT),
         payload: nativeVoip.payload,
         settings: nativeVoip.settings,
-        category: CALL_CATEGORY,
+        category: notificationCategory(body),
         force_notification: false,
         request_id: nativeVoip.requestId,
         ...(nativeOptions ? { options: nativeOptions } : {})
@@ -358,10 +368,10 @@ async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting)
     .update(JSON.stringify(['voip-notification', cid, callId]))
     .digest('hex').slice(0, 32)
   const sent = fallbackMeeting != null
-    // 会议响铃的原生通道不可用时，回退普通 IM 通知（保留会议邀请卡片），不占用 VOIP 分类。
-    ? await sendOrdinaryPush({ ...body, request_id: requestId }, [cid], null, fallbackMeeting, false)
+    // 会议响铃的原生通道不可用时，回退普通 IM 通知（保留会议邀请卡片）。
+    ? await sendOrdinaryPush({ ...body, request_id: requestId }, [cid], null, fallbackMeeting)
     : await sendOrdinaryPush({ ...body, request_id: requestId }, [cid],
-      prepareVoip({ ...body, payload: invitation.payload }, now), null, true)
+      prepareVoip({ ...body, payload: invitation.payload }, now), null)
   return { ...result, errCode: sent.data.results[0]?.errCode ?? -1, delivery: 'notification', requestId }
 }
 
@@ -479,26 +489,22 @@ exports.main = async (event) => {
     }
     return sendRegisteredCalls(body, ids, scene.call, null)
   }
-  return sendOrdinaryPush(body, ids, voip, scene?.meeting, scene?.call != null)
+  return sendOrdinaryPush(body, ids, voip, scene?.meeting)
 }
 
-async function sendOrdinaryPush(body, ids, voip, meeting, callScene) {
+async function sendOrdinaryPush(body, ids, voip, meeting) {
   // 长度限制：厂商通道会静默截断甚至拒绝，这里先按官方上限裁好（按码点裁，不切坏 emoji）
   const title = clip(body.title, MAX_TITLE)
   const content = clip(body.content, MAX_CONTENT)
   // 先裁剪再塞角标：normalizePayload 超长时只保留 convId/convType，会把 badge 一起丢掉
   const payload = attachBadgeToPayload(voip?.payload ?? meeting ?? normalizePayload(body.payload), body.badge)
-  // 分类按场景定：会议强制 IM、通话强制 VOIP；普通 IM 消息保持后端传入/默认值不变。
-  const category = meeting
-    ? IM_CATEGORY
-    : callScene
-      ? CALL_CATEGORY
-      : body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
+  // 分类只看信封 type：voip → VOIP；IM 消息保持后端传入/默认值不变。
+  const category = notificationCategory(body)
   const privateInvitation = voip || payload.type === 'meeting_invite'
   // 厂商离线角标参数（App 进程不在时唯一能改桌面角标的途径）
   const vendorBadgeOptions = buildVendorBadgeOptions(body.badge)
-  // 通话才下发华为 VoipCall 渠道；会议与普通消息不传 channelId。
-  const channelOptions = callScene ? buildChannelOptions(body.channelId) : null
+  // 只有 voip 信封才下发 VoipCall 渠道；IM 消息不传 channelId。
+  const channelOptions = buildChannelOptions(notificationChannel(body))
   const sendOptions = mergeOptions(vendorBadgeOptions, channelOptions)
 
   // 运维日志：证明「后端确实调了云函数」，并回显本次下发的关键参数

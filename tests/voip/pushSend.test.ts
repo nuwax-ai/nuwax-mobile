@@ -101,6 +101,7 @@ describe('native call delivery', () => {
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
     expect(args.settings.strategy).toEqual({ ios: 2 });
+    expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
     expect(args.options.ios.type).toBe('voip');
     expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
   });
@@ -172,7 +173,7 @@ describe('IM invitation scenes', () => {
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
     expect(args.payload).toEqual({ ...expected, type: 'meeting_invite' });
-    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM', vivo: 'IM' });
     expect(args).not.toHaveProperty('settings');
     expect(args).not.toHaveProperty('options');
     expect(database).not.toHaveBeenCalled();
@@ -223,7 +224,7 @@ describe('envelope type and scene-driven notification config', () => {
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
     expect(args.payload).toEqual({ ...expected, type: 'voip', displayName: '张三', sendTime, expiresAt: sendTime + 60_000 });
-    expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
+    expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP', vivo: 'IM' });
     expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
     expect(args.settings.ttl).toBeLessThanOrEqual(60_000);
   });
@@ -246,8 +247,15 @@ describe('envelope type and scene-driven notification config', () => {
     await call({ ...envelope, type: 'im', category: { harmony: 'IM', huawei: 'IM' }, payload: meetingFields() });
     const args = send.mock.calls[0][0];
     expect(args.payload.type).toBe('meeting_invite');
-    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM', vivo: 'IM' });
     expect(args).not.toHaveProperty('options');
+  });
+
+  it('adds the vivo IM category for a chat sent without an envelope type', async () => {
+    const { call, send } = load();
+    const payload = { convId: '123', msgId: '456', convType: 1, type: 'text' };
+    await call({ push_clientid: 'fixture-cid', payload, title: '张三', content: '你好', category: { harmony: 'IM', huawei: 'IM' } });
+    expect(send.mock.calls[0][0].category).toEqual({ harmony: 'IM', huawei: 'IM', vivo: 'IM' });
   });
 
   it('leaves ordinary IM message envelopes untouched by the VoIP channel and type fields', async () => {
@@ -278,7 +286,7 @@ describe('envelope type and scene-driven notification config', () => {
     await call({ ...envelope, type: 'im', category: { harmony: 'VOIP', huawei: 'VOIP' }, payload });
     const args = send.mock.calls[0][0];
     expect(args.payload).toEqual(payload);
-    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM', vivo: 'IM' });
     expect(args).not.toHaveProperty('options');
     expect(args).not.toHaveProperty('settings');
   });

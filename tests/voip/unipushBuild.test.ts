@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     (root / 'app/build.gradle').write_text('android { defaultConfig { } }\\ndependencies { }\\n')
     (root / 'settings.gradle').write_text('repositories { }\\n')
     manifest = root / 'app/src/main/AndroidManifest.xml'
-    manifest.write_text('<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application><service android:name="example.OrdinaryService"/></application></manifest>')
+    manifest.write_text('<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application><meta-data android:name="com.vivo.push.app_id" android:value="111"/><meta-data android:name="com.vivo.push.api_key" android:value="111"/><service android:name="example.OrdinaryService"/></application></manifest>')
     config = root / 'config.json'
     config.write_text(json.dumps({'packageName':'com.nuwax.app','getuiAppId':'fixtureGetuiAppId',
         'huawei':{'appId':'123456789'}, 'honor':{'appId':'987654321'},
@@ -43,6 +43,8 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     metadata = {n.get(ANDROID+'name'):n.get(ANDROID+'value') for n in app.findall('meta-data')}
     assert metadata['com.huawei.hms.client.appid'] == 'appid=123456789'
     assert metadata['com.hihonor.push.app_id'] == '987654321'
+    assert metadata['com.vivo.push.app_id'] == '\${VIVO_APP_ID}'
+    assert metadata['com.vivo.push.api_key'] == '\${VIVO_APP_KEY}'
     configure(root, None)
     app = ET.parse(manifest).getroot().find('application')
     assert [s.get(ANDROID+'name') for s in app.findall('service')] == ['example.OrdinaryService']
@@ -51,7 +53,7 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     assert 'com.getui.opt:honor' not in (root / 'app/build.gradle').read_text()
     assert 'com.assist-v3:vivo' not in (root / 'app/build.gradle').read_text()
     assert 'VIVO_APP_' not in (root / 'app/build.gradle').read_text()
-    assert not any(n.get(ANDROID+'name') in ['com.huawei.hms.client.appid','com.hihonor.push.app_id'] for n in app.findall('meta-data'))
+    assert not any(n.get(ANDROID+'name') in ['com.huawei.hms.client.appid','com.hihonor.push.app_id','com.vivo.push.app_id','com.vivo.push.api_key'] for n in app.findall('meta-data'))
     (root / 'uts-nuwax-voip').rmdir()
     configure(root, config)
     app = ET.parse(manifest).getroot().find('application')

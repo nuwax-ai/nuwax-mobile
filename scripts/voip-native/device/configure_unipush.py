@@ -31,7 +31,7 @@ def clear_previous_configuration(project: Path) -> None:
         node.get(ANDROID + "name") == CALL_RECEIVER for node in application.findall("service")
     )
     if owned:
-        names = {"GETUI_APPID", "PUSH_APPID", "GETUI_APP_ID", "MIPUSH_APPID", "MIPUSH_APPKEY", "com.huawei.hms.client.appid", "com.hihonor.push.app_id", "dcloud_unipush_auto_notification", "nuwax.voip.uniPush"}
+        names = {"GETUI_APPID", "PUSH_APPID", "GETUI_APP_ID", "MIPUSH_APPID", "MIPUSH_APPKEY", "com.huawei.hms.client.appid", "com.hihonor.push.app_id", "dcloud_unipush_auto_notification", "nuwax.voip.uniPush", "com.vivo.push.app_id", "com.vivo.push.api_key"}
         for node in list(application.findall("meta-data")):
             if node.get(ANDROID + "name") in names:
                 application.remove(node)
@@ -89,6 +89,8 @@ def configure(project: Path, config_file: Path | None) -> None:
         if not isinstance(app_key_vivo, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", app_key_vivo):
             raise SystemExit("A valid vivo client AppKey is required")
         dependencies.append("implementation 'com.assist-v3:vivo:3.1.2'")
+        # The vivo SDK reads these before the adapter's app_id and api_key aliases.
+        metadata.update({"com.vivo.push.app_id": "${VIVO_APP_ID}", "com.vivo.push.api_key": "${VIVO_APP_KEY}"})
 
     gradle = project / "app/build.gradle"
     text = re.sub(r"\n\s*// BEGIN NUWAX UNIPUSH.*?// END NUWAX UNIPUSH\n", "\n", gradle.read_text(), flags=re.S)

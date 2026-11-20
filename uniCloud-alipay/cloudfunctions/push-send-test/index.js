@@ -38,6 +38,16 @@ function notificationCategory(body) {
   return body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
 }
 
+// vivo 用 IM 分类展示聊天及一对一来电回退通知。原生投递沿用各自的分类。
+function ordinaryNotificationCategory(body) {
+  const category = notificationCategory(body)
+  const peerCall = body.type === 'voip' && body.payload?.scene === 'call'
+  // 已部署的 IM 也会省略顶层 type，并携带会话、消息 ID 和 IM 分类。
+  const legacyChat = body.type == null && body.payload?.convId && body.payload?.msgId && body.category?.harmony === 'IM'
+  if (body.type === 'im' || peerCall || legacyChat) return { vivo: 'IM', ...category }
+  return category
+}
+
 /** 只有一对一通话才下发 VoipCall 渠道；会议邀请和 IM 消息都不传 channelId。 */
 function notificationChannel(body) {
   return body.type === 'voip' && body.payload?.scene === 'call' ? VOIP_CHANNEL : ''
@@ -533,8 +543,7 @@ async function sendOrdinaryPush(body, ids, voip, meeting, invocationId) {
   const content = clip(body.content, MAX_CONTENT)
   // 先裁剪再塞角标：normalizePayload 超长时只保留 convId/convType，会把 badge 一起丢掉
   const payload = attachBadgeToPayload(voip?.payload ?? meeting ?? normalizePayload(body.payload), body.badge)
-  // 分类只看信封 type：voip → VOIP；IM 消息保持后端传入/默认值不变。
-  const category = notificationCategory(body)
+  const category = ordinaryNotificationCategory(body)
   const privateInvitation = voip || payload.type === 'meeting_invite'
   // 厂商离线角标参数（App 进程不在时唯一能改桌面角标的途径）
   const vendorBadgeOptions = buildVendorBadgeOptions(body.badge)

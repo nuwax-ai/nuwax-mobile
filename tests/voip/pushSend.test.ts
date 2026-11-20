@@ -379,7 +379,7 @@ describe('meeting ringing delivery', () => {
     expect(notice).not.toHaveProperty('settings');
   });
 
-  it('never rings a silent group card and rejects incomplete ringing invitations', async () => {
+  it('never rings a silent group card and falls back for incomplete ringing invitations', async () => {
     const env = { ...ringEnv, NUWAX_VOIP_DEVICE_ROUTE_LOOKUP: '1' };
     const silent = load(latestEntry, env);
     await silent.call({ ...envelope, push_clientid: 'fixture-cid', payload: { ...ringPayload(), silent: true } });
@@ -389,8 +389,11 @@ describe('meeting ringing delivery', () => {
     const incomplete = ringPayload();
     delete (incomplete as any).calleeId;
     const { call, send } = load(latestEntry, env);
-    expect((await call({ ...envelope, push_clientid: 'fixture-cid', payload: incomplete })).errCode).toBe(400);
-    expect(send).not.toHaveBeenCalled();
+    const result = await call({ ...envelope, push_clientid: 'fixture-cid', payload: incomplete });
+    expect(result.errCode).toBe(0);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].payload.type).toBe('meeting_invite');
+    expect(send.mock.calls[0][0]).not.toHaveProperty('settings');
   });
 });
 

@@ -413,10 +413,13 @@ exports.main = async (event) => {
   // 也能亮屏、响铃并出现来电卡片。端上原生能力就绪前用环境变量关闭，保持普通 IM 通知。
   // silent=true 的群卡片、以及没有 callRoute/设备路由来源的请求，一律不响铃。
   const lookupRoutes = process.env.NUWAX_VOIP_DEVICE_ROUTE_LOOKUP === '1'
-  const meetingRinging = scene?.meeting != null &&
+  const meetingRequested = scene?.meeting != null &&
     body.payload?.silent !== true &&
     process.env.NUWAX_VOIP_MEETING_RING === '1' &&
     (body.callRoute != null || lookupRoutes)
+  // 响铃字段不完整/已过期时回退普通 IM 通知，不能整条 400——否则用户连会议卡片都收不到。
+  const ringAttempt = meetingRequested ? prepareMeetingRingInvitation(body) : null
+  const meetingRinging = ringAttempt != null && ringAttempt.error == null && ringAttempt.expired !== true
   const strictCids = scene?.call != null || meetingRinging
   // 会议响铃排查：只记决策相关的布尔与会议定位字段，不落邀请正文或用户身份。
   if (scene?.meeting != null) {
@@ -432,6 +435,10 @@ exports.main = async (event) => {
       hasCallId: typeof body.payload?.callId === 'string',
       hasCalleeId: typeof body.payload?.calleeId === 'string',
       hasExpiresAt: Number.isSafeInteger(body.payload?.expiresAt),
+      hasSendTime: Number.isSafeInteger(body.payload?.sendTime),
+      ringRequested: meetingRequested,
+      ringError: ringAttempt?.error ?? null,
+      ringExpired: ringAttempt?.expired === true,
       meetingRinging
     }))
   }
@@ -464,12 +471,7 @@ exports.main = async (event) => {
 
   if (useDeviceRoutes) {
     if (meetingRinging) {
-      const ringInvitation = prepareMeetingRingInvitation(body)
-      if (ringInvitation.error) return { errCode: 400, errMsg: ringInvitation.error }
-      if (ringInvitation.expired) {
-        return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
-      }
-      return sendRegisteredCalls(body, ids, ringInvitation, scene.meeting)
+      return sendRegisteredCalls(body, ids, ringAttempt, scene.meeting)
     }
     return sendRegisteredCalls(body, ids, scene.call, null)
   }

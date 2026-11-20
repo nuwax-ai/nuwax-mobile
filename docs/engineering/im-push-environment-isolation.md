@@ -38,25 +38,9 @@ flowchart LR
 
 ### 测试模块与上传命令
 
-测试模块位于 `cloud/test-push`，沿用生产模块的 `uniCloud-alipay/cloudfunctions` 和 `uniCloud-alipay/database` 目录结构。测试函数、设备表和空间配置都在这里维护。
+截至 2026-11-20 提交 `153efc922`，测试函数源码在 `uniCloud-alipay/cloudfunctions/push-send-test/`。本次从测试空间下载的入口文件与该提交一致。正式函数位于同级 `push-send/`。
 
-```text
-cloud/test-push/
-├── deployment.json
-└── uniCloud-alipay/
-    ├── cloudfunctions/push-send-test/
-    └── database/
-```
-
-在 `cloud/test-push/uniCloud-alipay/cloudfunctions/push-send-test/` 修改测试函数。入口、设备路由和 VoIP 等业务依赖都在这个目录。保存后在项目根目录运行一条命令：
-
-```sh
-pnpm push:test:upload
-```
-
-脚本通过已登录的 HBuilderX CLI 核对 `deployment.json` 中的支付宝云测试空间 `nuwax-push-test`（`env-00jy72x2l4nj`），在系统临时目录组装函数，上传后回读函数列表并清理副本。无需切换主项目在编辑器里的空间关联。测试验收通过后，团队自行选择业务文件复制到正式目录。
-
-常规函数更新会复用测试设备表和索引。首次建表中断且索引尚未安装时，使用 `node scripts/deploy-test-push-cloud.mjs --init-index` 补齐。在已使用的表上调整结构或索引时，单独进行测试库迁移。若只需要查看上传包，运行 `node scripts/prepare-test-push-cloud.mjs` 获取工作区外的临时预览路径。
+一键命令 `pnpm push:test:upload` 曾通过“本地修改 → 上传 → 云端下载比对 → 恢复”的实测。目录调整后，命令仍读取已移除的 `cloud/test-push/deployment.json`，在调用 HBuilderX 前报 `ENOENT`。恢复这条命令需要适配新的测试目录，继续限定支付宝云 `nuwax-push-test`（`env-00jy72x2l4nj`），并核对下面的设备归属校验。
 
 测试 IM 将 `IM_UNIPUSH_URL` 指向测试函数 HTTPS 入口。发送和登记凭据分别通过受控方式配置。 [测试 push-send-test 入口](https://env-00jy72x2l4nj.dev-hz.cloudbasefunction.cn/push-send-test)
 
@@ -76,7 +60,7 @@ pnpm push:test:upload
 
 | 环节 | 完成条件 | 当前缺口 |
 | --- | --- | --- |
-| 云函数与部署目标 | 测试函数校验实际 Space ID，配置缺失或空间不符时拒绝请求。单独部署测试函数、设备表和 HTTPS 入口。 | 2026-11-20 回读确认 `PUSH_TEST_ENABLED=1`、两把密钥独立、设备表已建 CID 唯一索引。HTTPS 已验证动态登记、按版本校验和撤销后拒发。厂商实际投递待真机验收。 |
+| 云函数与部署目标 | 测试函数校验实际 Space ID，配置缺失或空间不符时拒绝请求。单独部署测试函数、设备表和 HTTPS 入口。 | 2026-11-20 回读确认 `PUSH_TEST_ENABLED=1`、两把密钥独立、设备表有 CID 唯一索引。换版前的网关已通过登记和撤销验证。当前部署的 `153efc922` 入口只校验发送签名，缺少测试发送开关、空间及设备登记版本校验。 |
 | App 动态域名 | App 的 HTTP、IM WebSocket 和原生通话使用同一个已验证登录地址。命中测试域名使用测试，其他域名默认生产。切域先撤销旧绑定，再清理旧会话、通知和角标，在新环境登录及登记。 | App 按登录地址保存登记回执，首次进入目标环境使用该域自己的登记上下文。还需核对同一安装包的原生 VoIP 域名闸门及 iOS 签名环境。 |
 | IM 服务配置 | 每个 IM 实例按自身部署选定环境，使用对应的数据库、Redis、推送队列和 UniPush URL／密钥。普通通知、角标、会议、VoIP、`push-test` 与补推共用同一环境和设备校验。 | IM 已有 `IM_UNIPUSH_URL`、`IM_UNIPUSH_SIGN` 和 `IM_PUSH_OFFLINE_ENABLED`，还需接通登记／撤销密钥和发送版本契约。单改 URL 无法满足严格模式。 |
 | 发送及回归 | 测试只发送给本空间已登记且有效的目标。失效设备逐台拒绝，其他有效设备继续收取。核对发送空间、函数版本、目标登记版本和厂商回执。 | 逐设备校验已由本地用例覆盖。生产仍使用现有链路，同一安装的生产 → 测试 → 生产完整互斥待接通各环境后验证。 |
@@ -111,7 +95,9 @@ pnpm push:test:upload
 
 同日核对 UniPush 厂商页，vivo、荣耀、华为、鸿蒙 next、小米、OPPO、FCM 的通道开关均显示开启，魅族页未见已填凭据。iOS 页显示已上传证书。真机回执、签名和原生来电权益仍按上表分别验收。[UniPush 厂商推送设置](https://dev.dcloud.net.cn/pages/app/push2/thirdparty)
 
-这次联调用模拟设备验证了测试入口。HTTP 状态均为 200，后端应读响应体的 `errCode`，批量发送另读 `data.results`。发送签名正确时，空信封返回 400，未登记设备的完整信封返回 403。新登记的设备带有效登记版本提交已过期邀请，返回 0 并标记 `skipped: true`。撤销后重试同一请求返回 403。该探针不会发起厂商投递。
+换版前用模拟设备验证了测试入口。HTTP 状态均为 200，后端应读响应体的 `errCode`，批量发送另读 `data.results`。发送签名正确时，空信封返回 400，未登记设备的完整信封返回 403。新登记的设备带有效登记版本提交已过期邀请，返回 0 并标记 `skipped: true`。撤销后重试同一请求返回 403。该探针不会发起厂商投递。
+
+换版后，以同一 HTTPS 入口复测。带测试发送签名的空信封返回业务码 400，声明生产环境但不含目标的信封也返回 400（缺少 CID）。使用测试登记密钥调用登记操作返回 401。此次下载的入口没有 `registerBinding`、`revokeBinding` 或 `push_bindings` 校验。真实 CID 拨测前，需要在新入口补齐这些校验，并由测试 IM 完成一次真实登录登记。
 
 ## 切换与验收
 

@@ -20,7 +20,8 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     manifest.write_text('<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application><service android:name="example.OrdinaryService"/></application></manifest>')
     config = root / 'config.json'
     config.write_text(json.dumps({'packageName':'com.nuwax.app','getuiAppId':'fixtureGetuiAppId',
-        'huawei':{'appId':'123456789'}, 'honor':{'appId':'987654321'}}))
+        'huawei':{'appId':'123456789'}, 'honor':{'appId':'987654321'},
+        'vivo':{'appId':'567891234', 'appKey':'fixtureVivoAppKey'}}))
     os.environ['ANDROID_BUNDLE_ID'] = 'com.nuwax.app'
     configure(root, config)
     configure(root, config)
@@ -33,8 +34,11 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     gradle = (root / 'app/build.gradle').read_text()
     assert gradle.count('com.getui.opt:hwp:3.1.4') == 1
     assert gradle.count('com.getui.opt:honor:3.6.0') == 1
+    assert gradle.count('com.assist-v3:vivo:3.1.2') == 1
     assert '"HUAWEI_APP_ID": "appid=123456789"' in gradle
     assert '"HONOR_APP_ID": "987654321"' in gradle
+    assert '"VIVO_APP_ID": "567891234"' in gradle
+    assert '"VIVO_APP_KEY": "fixtureVivoAppKey"' in gradle
     assert 'https://developer.hihonor.com/repo/' in (root / 'settings.gradle').read_text()
     metadata = {n.get(ANDROID+'name'):n.get(ANDROID+'value') for n in app.findall('meta-data')}
     assert metadata['com.huawei.hms.client.appid'] == 'appid=123456789'
@@ -45,6 +49,8 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     assert not (root / CALL_RECEIVER_FILE).exists()
     assert 'com.getui:gtsdk' not in (root / 'app/build.gradle').read_text()
     assert 'com.getui.opt:honor' not in (root / 'app/build.gradle').read_text()
+    assert 'com.assist-v3:vivo' not in (root / 'app/build.gradle').read_text()
+    assert 'VIVO_APP_' not in (root / 'app/build.gradle').read_text()
     assert not any(n.get(ANDROID+'name') in ['com.huawei.hms.client.appid','com.hihonor.push.app_id'] for n in app.findall('meta-data'))
     (root / 'uts-nuwax-voip').rmdir()
     configure(root, config)

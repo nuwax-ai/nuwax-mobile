@@ -36,7 +36,7 @@ def command(*values, check=True):
 devices = [line.split()[0] for line in command("devices").splitlines()[1:] if len(line.split()) >= 2 and line.split()[1] == "device"]
 device = args.device or (devices[0] if len(devices) == 1 else None)
 if device is None or device not in devices:
-    raise SystemExit("Connect and authorize the Honor/Huawei Android phone; specify --device when multiple devices are connected.")
+    raise SystemExit("Connect and authorize the Android QA phone; specify --device when multiple devices are connected.")
 
 
 def shell(*values, check=True):
@@ -44,8 +44,8 @@ def shell(*values, check=True):
 
 
 manufacturer = shell("getprop", "ro.product.manufacturer")
-if manufacturer.lower() not in ["honor", "huawei"]:
-    raise SystemExit("This handoff targets Honor/Huawei Android; detected manufacturer: " + manufacturer)
+if manufacturer.lower() not in ["honor", "huawei", "vivo"]:
+    raise SystemExit("This handoff targets Honor, Huawei and vivo Android; detected manufacturer: " + manufacturer)
 evidence = ROOT / "out" / ("voip-android-qa-" + time.strftime("%Y%m%d"))
 evidence.mkdir(exist_ok=True)
 
@@ -79,6 +79,8 @@ if args.action == "install":
     artifact = APK.resolve(strict=True)
     meta = json.loads(Path(str(artifact) + ".json").read_text())
     assert meta["packageName"] == PACKAGE and meta["apiOrigin"] == "https://testagent.xspaceagi.com"
+    if manufacturer.lower() == "vivo" and "vivo" not in meta.get("uniPushVendorAdapters", []):
+        raise SystemExit("The selected APK has not been verified with the vivo push SDK")
     assert hashlib.sha256(artifact.read_bytes()).hexdigest() == meta["sha256"], "APK changed since verification"
     build_tools = Path.home() / "workspace/Android/sdk/build-tools/35.0.0"
     env = {**os.environ, "JAVA_HOME": os.environ.get("JAVA_HOME", "/opt/homebrew/opt/openjdk@17")}

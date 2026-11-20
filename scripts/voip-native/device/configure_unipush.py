@@ -80,6 +80,16 @@ def configure(project: Path, config_file: Path | None) -> None:
             "MIPUSH_APPKEY": xiaomi["appKey"],
         })
 
+    vivo = config.get("vivo")
+    if vivo is not None:
+        app_id_vivo = vivo.get("appId") if isinstance(vivo, dict) else None
+        app_key_vivo = vivo.get("appKey") if isinstance(vivo, dict) else None
+        if not isinstance(app_id_vivo, str) or not re.fullmatch(r"[0-9]{5,20}", app_id_vivo):
+            raise SystemExit("A valid vivo client AppID is required")
+        if not isinstance(app_key_vivo, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", app_key_vivo):
+            raise SystemExit("A valid vivo client AppKey is required")
+        dependencies.append("implementation 'com.assist-v3:vivo:3.1.2'")
+
     gradle = project / "app/build.gradle"
     text = re.sub(r"\n\s*// BEGIN NUWAX UNIPUSH.*?// END NUWAX UNIPUSH\n", "\n", gradle.read_text(), flags=re.S)
     if "dependencies {" not in text:
@@ -87,6 +97,8 @@ def configure(project: Path, config_file: Path | None) -> None:
     # Vendor AAR manifests consume placeholders as well as app-level metadata.
     placeholders = {"GETUI_APPID": app_id, "PUSH_APPID": app_id, "GETUI_APP_ID": app_id,
                     "dcloud_unipush_auto_notification": "false"}
+    if vivo is not None:
+        placeholders.update({"VIVO_APP_ID": app_id_vivo, "VIVO_APP_KEY": app_key_vivo})
     # Existing UniPush vendor channels; client AppIDs are supplied locally, never server secrets.
     vendor_repositories = []
     for vendor, placeholder, name, libraries, repository in [
@@ -144,7 +156,7 @@ def configure(project: Path, config_file: Path | None) -> None:
         ET.SubElement(application, "service", {ANDROID + "name": STOCK_RECEIVER, TOOLS + "node": "remove"})
         ET.SubElement(application, "service", {ANDROID + "name": CALL_RECEIVER, ANDROID + "exported": "false"})
     tree.write(manifest, encoding="utf-8", xml_declaration=True)
-    print("✓ uni-push client configured; vendor adapters: " + ", ".join(vendor for vendor in ["huawei", "honor", "xiaomi"] if config.get(vendor)))
+    print("✓ uni-push client configured; vendor adapters: " + ", ".join(vendor for vendor in ["huawei", "honor", "xiaomi", "vivo"] if config.get(vendor)))
 
 
 if __name__ == "__main__":

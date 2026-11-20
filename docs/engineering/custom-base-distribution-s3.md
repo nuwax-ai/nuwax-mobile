@@ -98,6 +98,26 @@ TARGETS=android NUWAX_HX_VERSION=5.34 NUWAX_BASE_VERSION=2.1.1 \
 
 `base-ship` 的 `TARGETS` 同时控制出包和上传。流水线使用当前工作区的 `unpackage/debug/`，多份产物建议用不同工作区出包；共享同一份离线 SDK 工作副本时，错开打包。三个 Make 目标也对应 `pnpm base:publish`、`pnpm base:ship`、`pnpm base:promote`。
 
+### Android 云打包后入库
+
+1. 在打包分支确认 `manifest.json` 的 App 版本和构建号，记录实际参与打包的源码版本。在 HBuilderX 的「发行 → App-Android/iOS-云打包」中只选 Android，勾选「制作自定义调试基座」，使用项目的包名和联调签名。若要保留已有的 `unpackage/debug/android_debug.apk`，提交云打包前先另存一份。参见 [DCloud 云打包说明](https://doc.dcloud.net.cn/uni-app-x/tutorial/app-package.html)。
+2. 云包下载完成后，将本次生成的 `android_debug.apk` 放到独立目录，例如 `out/android-cloud-base/`。在仓库根目录运行 `make base-list`，选一个尚未使用的数字基座版本。下面的 `1.4.0` 是示例基座 ID。
+
+   ```bash
+   BASE_VERSION=1.4.0
+   NUWAX_BASE_VERSION="$BASE_VERSION" NUWAX_BASE_SOURCE=out/android-cloud-base \
+     NUWAX_BASE_TARGETS=android NUWAX_BASE_NO_PROMOTE=1 NUWAX_BASE_DRY_RUN=1 make base-publish
+   ```
+
+   预演会读取 APK 内的 HX 运行时版本及 App 版本与构建号。确认生成的清单对应本次产物后，在相同源码下去掉 `NUWAX_BASE_DRY_RUN=1` 入库。
+3. 用固定版本重新下载，在 HBuilderX 选择下载目录中的 APK，验证自定义基座可以启动，并检查本次变更涉及的原生功能。
+
+   ```bash
+   NUWAX_BASE_VERSION="$BASE_VERSION" NUWAX_BASE_TARGETS=android make base-fetch
+   ```
+
+4. 验收后提交对应的业务和原生插件改动、`manifest.json` 及 `custom-base.lock.json` 的新系列映射。仓库保存源码和映射，S3 保存 APK，离线 SDK 仅供本地重打包使用。版本映射按 App 系列生效。若同一系列要默认支持 iOS，先准备包含所需平台的基座版本再更新映射。锁定版本生效后，同事更新对应分支并运行 `make base-info`、`make base-fetch`。
+
 ### 版本重发、失败和回退
 
 | 场景 | 操作 |

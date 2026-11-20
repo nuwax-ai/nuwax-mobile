@@ -12,8 +12,19 @@ node scripts/prepare-offline-h5.mjs
 node scripts/prepare-voip-media.mjs
 node scripts/voip-native/prepare-business-qa.mjs
 export NUWAX_ANDROID_QA_PROJECT="$VOIP_ROOT/out/voip-business-qa-project"
-/Applications/HBuilderX.app/Contents/MacOS/cli project open --path "$NUWAX_ANDROID_QA_PROJECT"
-python3 scripts/voip-native/run-hx-local-build.py publish app --type appResource --project "$NUWAX_ANDROID_QA_PROJECT"
+HX_CLI=/Applications/HBuilderX.app/Contents/MacOS/cli
+# HBuilderX can resolve a nested project path to its registered parent project.
+HX_QA_PROJECT="$(mktemp -d "${TMPDIR:-/tmp}/nuwax-android-qa.XXXXXX")"
+cleanup_hx_project() {
+  "$HX_CLI" project close --path "$HX_QA_PROJECT" || true
+  rm -rf "$HX_QA_PROJECT"
+}
+trap cleanup_hx_project EXIT
+cp -cR "$NUWAX_ANDROID_QA_PROJECT/." "$HX_QA_PROJECT/"
+"$HX_CLI" project open --path "$HX_QA_PROJECT"
+python3 scripts/voip-native/run-hx-local-build.py publish app-android --type appResource --project "$HX_QA_PROJECT"
+mkdir -p "$NUWAX_ANDROID_QA_PROJECT/unpackage/resources"
+mv "$HX_QA_PROJECT/unpackage/resources/app-android" "$NUWAX_ANDROID_QA_PROJECT/unpackage/resources/app-android"
 bash scripts/voip-native/package-business-android.sh
 VOIP_OUT="$VOIP_ROOT/out/voip-business-packages"
 VOIP_APK="$VOIP_OUT/Nuwax-VoIP-Test-$(date +%Y%m%d-%H%M%S).apk"

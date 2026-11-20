@@ -43,6 +43,13 @@ assert f"versionCode='{manifest['versionCode']}'" in badging
 assert f"versionName='{manifest['versionName']}'" in badging
 assert f"application-label:'{manifest['name']}'" in badging
 xml = run(tools / "aapt", "dump", "xmltree", APK, "AndroidManifest.xml")
+vendor_adapters = ["huawei", "honor"]
+client_config_path = os.environ.get("NUWAX_ANDROID_UNIPUSH_CONFIG")
+client_config = json.loads(Path(client_config_path).read_text()) if client_config_path else {}
+if "vivo" in client_config:
+    for component in ["com.igexin.sdk.VivoPushMessageReceiver", "com.vivo.push.sdk.service.CommandClientService"]:
+        assert component in xml, f"Missing vivo push component: {component}"
+    vendor_adapters.append("vivo")
 resources = run(tools / "aapt", "dump", "--values", "resources", APK)
 for label in ["nuwax_voip_incoming_channel", "nuwax_voip_ongoing_channel", "音视频通话邀请通知", "通话状态",
               "Audio and video call invitations", "音視訊通話邀請通知", "音視像通話邀請通知"]:
@@ -70,15 +77,17 @@ with zipfile.ZipFile(APK) as archive:
     assets = QA / "unpackage/resources/app-android/__UNI__8BF05E4/www"
     count = 0
     for path in assets.rglob("*"):
-        if path.is_file():
+        if path.is_file() and path.name != ".DS_Store":
             name = "assets/apps/__UNI__8BF05E4/www/" + path.relative_to(assets).as_posix()
             assert archive.read(name) == path.read_bytes(), f"Stale or missing bundled resource: {name}"
             count += 1
     assert count > 100
     dex = b"".join(archive.read(name) for name in archive.namelist() if re.fullmatch(r"classes[0-9]*\.dex", name))
     for value in [ORIGIN, "Lcom/nuwax/voip/VoipBridge;", "Lcom/nuwax/voip/VoipNativeCallView;", "Lcom/igexin/sdk/HonorPushMessageService;", "Lcom/igexin/sdk/HmsPushMessageService;",
-                  "nuwax-voip-incoming-v2", "nuwax-voip-ongoing-v1"]:
+                  "nuwax-voip-incoming-v2", "nuwax-voip-ongoing-v1", "pushPreviousRegistrationId", "/push-binding"]:
         assert value.encode() in dex, f"Missing compiled implementation: {value}"
+    if "vivo" in vendor_adapters:
+        assert b"Lcom/igexin/sdk/VivoPushMessageReceiver;" in dex and b"Lcom/vivo/push/" in dex, "vivo push SDK is missing"
     assert b"Lio/dcloud/debug/" not in dex, "HX debug server is bundled"
 
 native = ROOT / "uni_modules/nuwax-voip/utssdk/app-android/src/com/nuwax/voip"
@@ -93,7 +102,7 @@ variant = json.loads((QA / "nuwax-local-qa.json").read_text())
 result = {**variant, "platform": "android", "packageName": "com.nuwax.app", "versionName": manifest["versionName"],
           "versionCode": str(manifest["versionCode"]), "apk": str(APK), "sha256": sha(APK.read_bytes()),
           "certificateSha256": cert, "bundledResourceCount": count, "hxDebugServer": False,
-          "developmentListener": False, "uniPushVendorAdapters": ["huawei", "honor"], "installed": False,
+          "developmentListener": False, "uniPushVendorAdapters": vendor_adapters, "installed": False,
           "incomingNotificationChannel": "nuwax-voip-incoming-v2", "incomingNotificationLabel": "音视频通话邀请通知",
           "ongoingNotificationChannel": "nuwax-voip-ongoing-v1", "bundledRingtone": "res/raw/nuwax_voip_ring.wav",
           "notificationFixes": ["bundledRingtoneAudioAttributes", "preservedUserSoundChoices", "insistentIncomingOnly", "deduplicatedIncomingPublication", "silentCallProgress", "ringingWithoutOwnForegroundServiceOnAndroid12Plus", "presentationDiagnostics"],

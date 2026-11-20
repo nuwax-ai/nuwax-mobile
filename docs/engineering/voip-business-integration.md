@@ -8,7 +8,7 @@
 
 使用完整“女娲Nuwax”App：同意隐私政策 → 登录测试环境 → 消息 → 真人联系人单聊 → 加号 → 语音/视频通话。安装身份仍为 `com.nuwax.app` / `__UNI__8BF05E4`。无需测试页面、Alice/Bob 身份或本地开发呼叫服务。真实 App 忽略专用测试宿主留下的开发身份。
 
-当前仅在 **HBuilderX development 运行模式、测试地址 `https://testagent.xspaceagi.com`、Android/iOS** 开放入口。`isVoipPlatformAccepted()` 仍为 false；生产发行和鸿蒙入口未开放，不表示三端验收完成。能力由单聊详情及联系人 `subjectType=1` 判断；未知主体、群聊和智能体暂不开放。同账号的两台设备不作为主被叫，能力查询和创建均拦截呼叫自己。此判断是客户端联调范围，不代替后端能力声明。
+鸿蒙仅在 **HBuilderX development 运行模式、测试地址 `https://testagent.xspaceagi.com`** 开放入口，生产入口以真机验收为前置。能力由单聊详情及联系人 `subjectType=1` 判断。未知主体、群聊和智能体暂不开放。同账号的两台设备不作为主被叫，能力查询和创建均拦截呼叫自己。此判断是客户端联调范围，服务端应按同一权限校验。
 
 ## 协议与代码归属
 
@@ -21,6 +21,23 @@
 | UniPush 原生邀请 | 完整 Android 基座中的接收器先识别 `{type:"voip",convId,msgId}` 并交给原生桥；查询消息详情校验会话、时效及主体。普通消息与 CID 回调沿用 SDK，UTS 分发器保留前台兼容 |
 
 主叫生成 callId/roomName → 创建 RTC 房间 → 原生获取本账号 RTC token → 连接并发布媒体 → 发送 `msgType=voip` 消息并保存 msgId。被叫接收邀请时不采集；点击接听并获得权限后入房，成功连接后调用 `/calls/answered`。主叫取消/超时调用 `/calls/ended`，被叫拒接调用 `/calls/declined`。通话中离房通过 LiveKit 对端离开事件结束另一端。
+
+### 鸿蒙测试环境推送交接
+
+IM 在测试环境按被叫当前账号的 `platform=harmonyos` 设备记录选取已绑定华为通道的 UniPush CID。单聊来电每台设备向现有签名认证的 `push-send-test` 入口发送一条定向请求，沿用现有 `title`、`content` 和邀请字段，并设置以下路由。
+
+```json
+{
+  "push_clientid": "harmony-cid",
+  "callRoute": {"platform": "harmonyos", "transport": "harmony-huawei", "cid": "harmony-cid"}
+}
+```
+
+邀请使用 `payload.type=voip`、`scene=call`、`convType=1`，携带业务 `callId`、字符串 `convId/msgId/calleeId`、`mediaType` 和 `sendTime` 或 `expiresAt`，时间单位为毫秒。云函数按同一通话和 CID 生成固定请求 ID，投递 `harmony.custom.HW.type=voip_call`。测试需要对应 HAP 的华为应用内通话消息权益和真实 CID 绑定。原生端收到后先上报系统来电，再校验消息详情、会话参与方和有效期。RTC 房间从已校验的 IM 消息读取，RTC 凭据在接听后获取。 [个推厂商通道](https://docs.getui.com/getui/server/rest_v2/common_args/) · [华为推送权益](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-apply-right)
+
+签名测试 HAP 首次登录后回读设备登记。确认被叫已锁屏且拨号前无进程，按一个业务 `callId` 关联发送任务、`[NuwaxVoip] received/systemRinging/verified`、系统接听、双向媒体及挂断。聚合投递没有原生回调时，用同一 HAP 的华为 Push Token 直发 `push-type: 10`，并按华为调测要求设置 `testMessage`，用于对照。通过首通后再测 30 分钟锁屏音频、解锁视频、取消和切账号，并分开记录最近任务划除与设置强停。 [华为应用内通话指南](https://developer.huawei.com/consumer/en/doc/harmonyos-guides/push-voip/)
+
+若 App 仍在后台运行且只收到 IM WS 邀请，ArkTS 在验真后也会用本地系统 UUID 上报系统来电，日志为 `onlineInvitation`。同一邀请后到的华为推送按忙线回报，避免重复响铃。冷启动仍需华为专用推送。真机联调分别覆盖后台 WS 和无进程推送两条路径。
 
 凭据映射为 `wsUrl → serverUrl`、`token → participantToken`。RTC 的 ISO expiresAt 不作为数字呼叫时效使用。邀请按消息 sendTime 加 60 秒过期；本地连接超时 30 秒。业务显示 active、开始计时必须同时有媒体连接与对端音频订阅。
 
@@ -144,7 +161,7 @@ VoIP 入口组件同时修正了 iOS 异步能力返回后的根节点占位，�
 - 电话房间绑定主被叫/获胜设备并收紧 token 授权；当前同租户房间授权及 platform 级 identity 尚不满足该目标。
 - 普通设备刷新不能清空 voipToken；PushKit token 的环境和精确撤销；鸿蒙原生 Push Token 的独立契约。
 - 实际 PushKit、鸿蒙 VoIP、安卓厂商来电推送发送与冷启动原生接收。当前原生 WS 仅在进程有执行机会时工作，不能替代系统唤醒；普通 UniPush 回调不证明系统回收后可来电。
-- 鸿蒙系统来电需要专用推送 native callId 和系统报告流程，当前入口保持关闭，不能用前台 ArkWeb 演示替代验收。
+- 鸿蒙冷启动来电使用推送回调的系统 callId。鸿蒙生产入口待签名包、真实投递和锁屏双向音频通过后开放。
 - 智能体真实媒体参与者、上下文及双向语音；当前真人 RTC 不声明模型视频能力。
 
 后端逐项源码依据见[实际接口核对](voip-im-backend-review.md)。原[目标契约](voip-client-contract.md)保留作后端增强目标，不是当前已部署接口清单。

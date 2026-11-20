@@ -344,13 +344,20 @@ async function resolveAutoCallRoute(pushClientId, invocationId) {
 
 async function sendNativeVoip(body, route, nativeVoip, invocationId) {
   const android = route.platform === 'android'
-  if (android && typeof uniPush.request !== 'function') {
+  const harmony = route.transport === 'harmony-huawei'
+  if ((android || harmony) && typeof uniPush.request !== 'function') {
     return { errCode: 503, errMsg: 'UniPush transmission adapter unavailable', data: { requestId: nativeVoip.requestId } }
   }
   try {
     let result
-    if (android) {
+    if (android || harmony) {
       const transmission = JSON.stringify({ unipush_version: '2.0', payload: nativeVoip.payload })
+      const pushChannel = harmony
+        ? { harmony: { custom: { HW: {
+            type: 'voip_call',
+            payload: JSON.stringify({ extraData: JSON.stringify(nativeVoip.payload) })
+          } } } }
+        : { android: { ups: { transmission } } }
       // sendMessage builds ups.notification even when force_notification is false.
       result = await uniPush.request({
         method: 'POST',
@@ -360,7 +367,7 @@ async function sendNativeVoip(body, route, nativeVoip, invocationId) {
           audience: { cid: [route.cid] },
           settings: nativeVoip.settings,
           push_message: { transmission },
-          push_channel: { android: { ups: { transmission } } }
+          push_channel: pushChannel
         }
       })
     } else {
@@ -535,8 +542,9 @@ async function handle(event, invocationId) {
       meetingRinging
     }))
   }
-  const nativeAttempt = scene?.meeting && !meetingRinging ? null : prepareNativeVoip(body)
-  const nativeVoip = nativeAttempt?.error && strictCids ? null : nativeAttempt
+  const harmonyRoute = body.callRoute?.transport === 'harmony-huawei'
+  const nativeAttempt = scene?.meeting && (!meetingRinging || harmonyRoute) ? null : prepareNativeVoip(body)
+  const nativeVoip = nativeAttempt?.error && strictCids && !harmonyRoute ? null : nativeAttempt
   if (nativeVoip) {
     if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
     if (nativeVoip.expired) return { errCode: 0, data: { skipped: true } }

@@ -186,8 +186,7 @@ const strategies = {
   // Samsung devices with Google Play services can register for FCM, a separate transport.
   'android-fcm': null,
 }
-// The UniPush UPS pure-transmission request is documented for Huawei Android.
-const nativeStrategies = new Set(['ios', 'hw'])
+const nativePlatforms = { ios: 'ios', hw: 'android', hoshw: 'harmonyos' }
 const registrationId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 
 function validIosRegistration(registration) {
@@ -210,26 +209,35 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   const route = body.callRoute
   if (!route || typeof route.transport !== 'string' || !Object.prototype.hasOwnProperty.call(strategies, route.transport)) return { error: 'unsupported call route' }
   const strategy = strategies[route.transport]
-  if (!nativeStrategies.has(strategy)) return { error: 'native call transport unavailable' }
+  const platform = nativePlatforms[strategy]
+  if (!platform) return { error: 'native call transport unavailable' }
   const ios = strategy === 'ios'
-  if (route.platform !== (ios ? 'ios' : 'android') ||
-      !isCallCid(route.cid) || body.push_clientid !== route.cid) return { error: 'one matching call device is required' }
+  const harmony = strategy === 'hoshw'
+  const target = harmony && Array.isArray(body.push_clientid) && body.push_clientid.length === 1
+    ? body.push_clientid[0] : body.push_clientid
+  if (route.platform !== platform ||
+      !isCallCid(route.cid) || target !== route.cid) return { error: 'one matching call device is required' }
   if (ios && !validIosRegistration(route)) {
     return { error: 'signed environment and current iOS route registration are required' }
+  }
+  if (harmony && (body.payload?.scene === 'meeting' || !locator(body.payload?.calleeId))) {
+    return { error: 'Harmony native push requires a single-chat call' }
   }
   const invitation = body.payload?.scene === 'meeting'
     ? prepareMeetingRingInvitation(body, now)
     : prepareCallInvitation(body, now)
   if (invitation.error || invitation.expired) return invitation
-  const payload = ios
-    ? { ...invitation.payload, routeRegistrationId: route.registrationId }
-    : { ...invitation.payload, delivery: 'android-native' }
+  const payload = { ...invitation.payload }
+  if (ios) payload.routeRegistrationId = route.registrationId
+  if (platform === 'android') payload.delivery = 'android-native'
+  // Harmony retrieves the authorized room through IM after waking.
+  if (harmony) delete payload.roomName
   const requestId = createHash('sha256')
     .update(JSON.stringify([route.transport, route.cid, ios ? route.registrationId : '', payload.callId]))
     .digest('hex').slice(0, 32)
   return {
     payload, requestId,
-    settings: { ttl: Math.min(5_000, invitation.settings.ttl), strategy: { [strategy]: 2 } },
+    settings: { ttl: harmony ? invitation.settings.ttl : Math.min(5_000, invitation.settings.ttl), strategy: { [strategy]: 2 } },
     ...(ios ? { options: { ios: { type: 'voip', payload: JSON.stringify(payload) } } } : {})
   }
 }

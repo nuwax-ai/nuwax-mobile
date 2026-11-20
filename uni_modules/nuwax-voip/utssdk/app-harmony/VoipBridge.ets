@@ -39,7 +39,7 @@ export class VoipBusinessPolicy {
 interface Configuration {
   scope: string; apiBaseUrl: string; accessToken: string; deviceId: string; userId: string;
   development: boolean; qaAccepted: boolean; businessEnabled?: boolean; protocol?: string; callLabel: string; labels?: Record<string, string>;
-  pushEnvironment?: string;
+  pushEnvironment?: string; background?: boolean;
 }
 interface Command {
   op: string; convId?: string; msgId?: string; route?: string; scope?: string; callId?: string; snapshot?: CallData; action?: string;
@@ -47,7 +47,15 @@ interface Command {
 }
 interface Envelope { code: string; data: CallData }
 interface MediaEvent { type: string; callId?: string; code?: string; enabled?: boolean; fatal?: boolean }
-interface CallEvent extends MediaEvent { scope: string; snapshot?: CallData; reason?: string }
+interface CallEvent extends MediaEvent { scope: string; snapshot?: CallData; reason?: string; nativeIncomingUI?: boolean }
+interface PushInvitation {
+  type?: string; scene?: string; callId: string; convId: string; msgId: string;
+  calleeId: string; expiresAt: number; mediaType: string; displayName?: string;
+}
+interface PushDelivery { callId: string; data: string; header?: string }
+interface PendingIncoming {
+  invite: PushInvitation; nativeId: string; timer: number; action: string; answerMediaType: string;
+}
 
 /** This module owns the media Ability and control stream; neither belongs to a UTS page. */
 export class VoipBridge {
@@ -56,6 +64,7 @@ export class VoipBridge {
   static configuration: Configuration | null = null
   static current: CallData | null = null
   static controller: webview.WebviewController | null = null
+  static background = true
   static mediaReady = false
   static connected = false
   static peerReady = false
@@ -64,7 +73,10 @@ export class VoipBridge {
   static generation = 0
   static mediaId = ''
   static nativeId = ''
+  static answeredNativeId = ''
+  static pendingIncoming: PendingIncoming | null = null
   static terminal: Set<string> = new Set()
+  static reportedInvitations: Set<string> = new Set()
   static queue: CallEvent[] = []
   static commands: string[] = []
   static socket: webSocket.WebSocket | null = null
@@ -81,7 +93,6 @@ export class VoipBridge {
   static answering = ''
   static taskRunning = false
   static systemRegistered = false
-  static pushBound = false
   static ability: UIAbility | null = null
   static listeners: Array<() => void> = []
   static readonly prefix = '/api/instant-message/calls'
@@ -89,7 +100,8 @@ export class VoipBridge {
 
   static emit(type: string, code: string = '', snapshot?: CallData, reason: string = '', enabled?: boolean): void {
     const event: CallEvent = { type, code, scope: VoipBridge.configuration?.scope ?? '',
-      callId: VoipBridge.current?.callId ?? '', snapshot, reason, enabled }
+      callId: VoipBridge.current?.callId ?? '', snapshot, reason, enabled,
+      nativeIncomingUI: !!VoipBridge.nativeId && snapshot !== undefined && snapshot.calleeId === VoipBridge.configuration?.userId }
     VoipBridge.queue.push(event)
     if (VoipBridge.queue.length > 256) VoipBridge.queue.shift()
     VoipBridge.listeners.forEach(callback => callback())
@@ -113,6 +125,7 @@ export class VoipBridge {
       else if (command.op === 'showMedia') VoipBridge.showMedia()
       else if (command.op === 'camera') VoipBridge.setCamera(command.enabled === true)
       else if (command.op === 'background') {
+        VoipBridge.background = command.hidden === true
         // EntryAbility hiding while the call Ability opens is not a camera-background event.
         if (VoipBridge.mediaContext == null) VoipBridge.media(raw)
       }
@@ -124,13 +137,14 @@ export class VoipBridge {
       }
     } catch (_) { VoipBridge.emit('error', 'CALL_NATIVE_FAILED') }
   }
-  static initialize(config: Configuration): void {
+  static initialize(config: Configuration, restoring: boolean = false): void {
     if ((!config.development && !config.qaAccepted && !config.businessEnabled) || !config.accessToken || !config.userId ||
       (!config.apiBaseUrl.startsWith('https://') && !(config.development && config.apiBaseUrl.startsWith('http://')))) return
     if ((config.development || (config.businessEnabled && !config.qaAccepted)) && !BuildProfile.DEBUG) return
     const previous = VoipBridge.configuration
     if (previous && (previous.userId !== config.userId || previous.apiBaseUrl !== config.apiBaseUrl || previous.deviceId !== config.deviceId)) VoipBridge.reset()
     VoipBridge.configuration = config
+    VoipBridge.background = restoring || config.background === true
     try {
       const attributes: asset.AssetMap = new Map()
       attributes.set(asset.Tag.ALIAS, VoipBridge.alias)
@@ -144,7 +158,6 @@ export class VoipBridge {
       voipCall.on('voipCallUiEvent', info => VoipBridge.systemEvent(info))
       VoipBridge.systemRegistered = true
     }
-    if (VoipBridge.ability) VoipBridge.registerPush(VoipBridge.ability)
     VoipBridge.startStream()
     const run = VoipBridge.generation
     if (!VoipBridge.business()) pushService.getToken().then(async token => {
@@ -166,23 +179,21 @@ export class VoipBridge {
       query.set(asset.Tag.ALIAS, VoipBridge.alias); query.set(asset.Tag.RETURN_TYPE, asset.ReturnType.ALL)
       const items = asset.querySync(query)
       const secret = items[0]?.get(asset.Tag.SECRET) as Uint8Array
-      if (secret) VoipBridge.initialize(JSON.parse(new util.TextDecoder().decodeWithStream(secret)) as Configuration)
+      if (secret) VoipBridge.initialize(JSON.parse(new util.TextDecoder().decodeWithStream(secret)) as Configuration, true)
     } catch (_) { /* No login context is the normal first-launch state. */ }
   }
   /** Called synchronously at EntryAbility.onCreate, before any await or other push receiver. */
   static bindPush(ability: UIAbility): void {
-    VoipBridge.ability = ability
+    if (VoipBridge.ability === ability) return
     VoipBridge.context = ability.context
+    try {
+      pushService.receiveMessage('VoIP', ability, payload => {
+        const info = payload as pushCommon.VoIPInfo
+        VoipBridge.incoming(info).catch(() => VoipBridge.emit('error', 'CALL_INVITATION_FAILED'))
+      })
+      VoipBridge.ability = ability
+    } catch (_) { VoipBridge.emit('error', 'CALL_PUSH_REGISTRATION_FAILED') }
     VoipBridge.restore()
-    if (VoipBridge.configuration) VoipBridge.registerPush(ability)
-  }
-  static registerPush(ability: UIAbility): void {
-    if (VoipBridge.pushBound) return
-    VoipBridge.pushBound = true
-    pushService.receiveMessage('VoIP', ability, payload => {
-      const info = payload as pushCommon.VoIPInfo
-      VoipBridge.incoming(info).catch(() => VoipBridge.emit('error', 'CALL_INVITATION_FAILED'))
-    })
   }
   static async request(path: string, body: string = '', absolute: boolean = false, captured: Configuration | null = null): Promise<CallData> {
     const run = VoipBridge.generation, config = captured ?? VoipBridge.configuration
@@ -285,21 +296,43 @@ export class VoipBridge {
     socket.connect(config.apiBaseUrl.replace('https://', 'wss://').replace('http://', 'ws://') + '/instant-message/ws', { protocol: 'im-v1' }).catch(retry)
     setTimeout(() => { if (!acknowledged) retry() }, 10000)
   }
-  static async receiveInvitation(message: CallData): Promise<void> {
+  static async verifiedInvitation(message: CallData): Promise<CallData | null> {
     const config = VoipBridge.configuration, body = message.body
     const run = VoipBridge.generation
-    if (!config || message.msgType !== 'voip' || (message.senderType ?? 1) !== 1 || (message.msgStatus ?? 1) !== 1 || !body || !body.callId || !body.roomName || !['audio', 'video'].includes(body.mediaType)) return
-    const sent = message.sendTime ?? 0, id = body.callId
-    if (message.senderId === config.userId || sent <= 0 || sent + 60000 <= Date.now() || VoipBridge.terminal.has(id) || VoipBridge.current?.callId === id) return
-    const detail = await VoipBridge.request(`/api/instant-message/conversations/${message.convId}`, '', true)
-    if (VoipBridge.generation !== run || detail.convType !== 1 || detail.peerUserId !== message.senderId) return
-    const next: CallData = { protocol: 'im-voip-v1', callId: id, roomName: body.roomName, msgId: message.msgId, convId: message.convId, version: 1, state: 'ringing', callerId: message.senderId ?? '', calleeId: config.userId, callerDeviceId: '', acceptedDeviceId: '', mediaType: body.mediaType, displayName: detail.peerName ?? '', callerDisplayName: detail.peerName, expiresAt: sent + 60000, connectedAt: 0, reason: '' }
-    if (VoipBridge.current && VoipBridge.current.callId !== id) { VoipBridge.notifyBusinessEnd(next, 'busy'); VoipBridge.terminal.add(id); return }
-    VoipBridge.adopt(next)
+    if (!config || message.msgType !== 'voip' || (message.senderType ?? 1) !== 1 || (message.msgStatus ?? 1) !== 1 ||
+      !body || !body.callId || !body.roomName || !['audio', 'video'].includes(body.mediaType)) return null
+    const sent = message.sendTime ?? 0, id = body.callId, now = Date.now()
+    const senderId = `${message.senderId ?? ''}`, convId = `${message.convId ?? ''}`, msgId = `${message.msgId ?? ''}`
+    if (!senderId || !convId || !msgId || senderId === config.userId || !Number.isSafeInteger(sent) ||
+      sent <= 0 || sent > now + 5000 || sent + 60000 <= now || VoipBridge.terminal.has(id)) return null
+    const detail = await VoipBridge.request(`/api/instant-message/conversations/${encodeURIComponent(convId)}`, '', true)
+    if (VoipBridge.generation !== run || detail.convType !== 1 || `${detail.peerUserId ?? ''}` !== senderId ||
+      sent + 60000 <= Date.now() || VoipBridge.terminal.has(id)) return null
+    return { protocol: 'im-voip-v1', callId: id, roomName: body.roomName, msgId, convId, version: 1, state: 'ringing', callerId: senderId, calleeId: config.userId, callerDeviceId: '', acceptedDeviceId: '', mediaType: body.mediaType, displayName: detail.peerName ?? '', callerDisplayName: detail.peerName, expiresAt: sent + 60000, connectedAt: 0, reason: '' }
+  }
+  static async receiveInvitation(message: CallData): Promise<void> {
+    const id = message.body?.callId
+    if (id === VoipBridge.current?.callId || id === VoipBridge.pendingIncoming?.invite.callId) return
+    const next = await VoipBridge.verifiedInvitation(message)
+    if (!next || next.callId === VoipBridge.current?.callId || next.callId === VoipBridge.pendingIncoming?.invite.callId) return
+    if (VoipBridge.current || VoipBridge.pendingIncoming) {
+      VoipBridge.notifyBusinessEnd(next, 'busy')
+      VoipBridge.rememberCallId(VoipBridge.terminal, next.callId)
+      return
+    }
+    if (VoipBridge.background && !VoipBridge.reportedInvitations.has(next.callId)) {
+      const invitation: PushInvitation = {
+        callId: next.callId, convId: next.convId, msgId: next.msgId ?? '',
+        calleeId: next.calleeId, mediaType: next.mediaType, expiresAt: next.expiresAt, displayName: next.displayName,
+      }
+      await VoipBridge.presentIncoming(invitation, util.generateRandomUUID(), next)
+    } else VoipBridge.adopt(next)
   }
   static receiveSignal(event: CallData): void {
     const payload = event.payload, call = VoipBridge.current, type = event.eventType ?? ''
     if (!payload?.convId) return
+    const terminalSignal = ['voip:cancel', 'voip:timeout', 'voip:decline'].includes(type) ||
+      (type === 'voip:answered' && payload.userId === VoipBridge.configuration?.userId)
     const matches = call && payload.convId === call.convId && (payload.callId ? payload.callId === call.callId : !!payload.msgId && !!call.msgId && payload.msgId === call.msgId)
     if (matches && call) {
       if (type === 'voip:answered') {
@@ -311,9 +344,13 @@ export class VoipBridge {
       else if (call.state === 'ringing' && (type === 'voip:decline' || type === 'voip:timeout')) VoipBridge.finish(type === 'voip:decline' ? 'rejected' : 'timeout', false)
       return
     }
-    if (payload.callId && payload.callId !== call?.callId && (['voip:cancel', 'voip:timeout', 'voip:decline'].includes(type) || (type === 'voip:answered' && payload.userId === VoipBridge.configuration?.userId))) {
-      VoipBridge.terminal.add(payload.callId); if (VoipBridge.terminal.size > 128) VoipBridge.terminal.delete(VoipBridge.terminal.values().next().value)
-    }
+    if (!terminalSignal) return
+    const invite = VoipBridge.pendingIncoming?.invite
+    if (invite && invite.convId === payload.convId &&
+      (payload.callId ? payload.callId === invite.callId : !!payload.msgId && payload.msgId === invite.msgId)) {
+      VoipBridge.rememberCallId(VoipBridge.terminal, invite.callId)
+      VoipBridge.dismissPendingIncoming()
+    } else if (payload.callId && payload.callId !== call?.callId) VoipBridge.rememberCallId(VoipBridge.terminal, payload.callId)
   }
   static businessAction(action: string, media: string): void {
     const current = VoipBridge.current
@@ -360,6 +397,7 @@ export class VoipBridge {
     if (previous && previous.callId === value.callId && (value.version <= previous.version || rank < ranks.indexOf(previous.state))) return
     if (previous && previous.callId !== value.callId && previous.state !== 'ended') return
     if (value.state === 'ringing' && value.expiresAt <= Date.now()) return
+    if (VoipBridge.pendingIncoming && VoipBridge.pendingIncoming.invite.callId !== value.callId) VoipBridge.dismissPendingIncoming()
     if (!previous || previous.callId !== value.callId) { VoipBridge.microphone = true; VoipBridge.camera = value.mediaType === 'video' }
     VoipBridge.current = value; VoipBridge.emit('snapshot', '', value)
     if (value.state === 'ended') { VoipBridge.finish(); return }
@@ -382,7 +420,7 @@ export class VoipBridge {
       if (owner && VoipBridge.mediaId !== value.callId) VoipBridge.startMedia(value)
     }
   }
-  static async action(action: string, mediaType: string = 'audio'): Promise<void> {
+  static async action(action: string, mediaType: string = 'audio', systemAnswer: boolean = false): Promise<void> {
     const call = VoipBridge.current, run = VoipBridge.generation, token = VoipBridge.configuration?.accessToken; if (!call) return
     if (action === 'accept') {
       if (call.state !== 'ringing' || call.calleeId !== VoipBridge.configuration?.userId || VoipBridge.answering === call.callId || !['audio', 'video'].includes(mediaType) || (mediaType === 'video' && call.mediaType !== 'video')) return
@@ -390,7 +428,11 @@ export class VoipBridge {
       try {
         const allowed = await VoipBridge.ensurePermissions(mediaType)
         if (run !== VoipBridge.generation || VoipBridge.current?.callId !== call.callId || VoipBridge.current.state !== 'ringing') return
-        if (!allowed) { VoipBridge.emit('error', 'CALL_PERMISSION_REQUIRED'); return }
+        if (!allowed) {
+          VoipBridge.emit('error', 'CALL_PERMISSION_REQUIRED')
+          if (systemAnswer) VoipBridge.finish('permissionRequired', false)
+          return
+        }
       } finally { if (run === VoipBridge.generation && VoipBridge.answering === call.callId) VoipBridge.answering = '' }
     }
     if (VoipBridge.business()) { VoipBridge.businessAction(action, mediaType); return }
@@ -408,7 +450,10 @@ export class VoipBridge {
     const permissions: Permissions[] = ['ohos.permission.MICROPHONE']
     if (mediaType === 'video') permissions.push('ohos.permission.CAMERA')
     try {
-      const result = await abilityAccessCtrl.createAtManager().requestPermissionsFromUser(context, permissions)
+      const manager = abilityAccessCtrl.createAtManager()
+      const token = context.applicationInfo.accessTokenId
+      if (permissions.every(permission => manager.checkAccessTokenSync(token, permission) === 0)) return true
+      const result = await manager.requestPermissionsFromUser(context, permissions)
       return result.authResults.length === permissions.length && result.authResults.every(value => value === 0)
     } catch (_) { return false }
   }
@@ -453,18 +498,23 @@ export class VoipBridge {
         VoipBridge.mediaReady = true; const pending = VoipBridge.commands; VoipBridge.commands = []
         pending.forEach(command => VoipBridge.media(command)); return
       }
-      if (!VoipBridge.current || event.callId !== VoipBridge.current.callId) return
+      const call = VoipBridge.current
+      if (!call || event.callId !== call.callId) return
       if (event.type === 'connected') {
         const firstConnection = !VoipBridge.connected
         VoipBridge.connected = true; VoipBridge.startTask()
-        const id = VoipBridge.current.callId, run = VoipBridge.generation
+        const id = call.callId, run = VoipBridge.generation
         if (firstConnection && VoipBridge.business()) VoipBridge.mediaJoined().catch(() => { if (run === VoipBridge.generation && VoipBridge.current?.callId === id) VoipBridge.finish('mediaFailed') })
       }
       if (event.type === 'peerMediaReady') VoipBridge.peerReady = true
       if (event.type === 'remoteEnded') { VoipBridge.finish('remoteEnded', false); return }
       if (event.type === 'disconnected' || (event.type === 'error' && event.fatal !== false)) { VoipBridge.finish('disconnected'); return }
       VoipBridge.emit(event.type, event.code)
-      if (VoipBridge.connected && VoipBridge.peerReady && !VoipBridge.readySent) { VoipBridge.readySent = true; VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_ACTIVE); VoipBridge.action('ready') }
+      if (VoipBridge.current?.callId === call.callId && VoipBridge.connected && VoipBridge.peerReady && !VoipBridge.readySent) {
+        VoipBridge.readySent = true
+        VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_ACTIVE, VoipBridge.nativeId, call.mediaType)
+        VoipBridge.action('ready')
+      }
     } catch (_) { VoipBridge.emit('error', 'CALL_INVALID_MEDIA_EVENT') }
   }
   static async outgoing(call: CallData): Promise<void> {
@@ -483,51 +533,152 @@ export class VoipBridge {
     } catch (_) { if (run === VoipBridge.generation && VoipBridge.current?.callId === call.callId) VoipBridge.finish('systemFailed') }
     finally { picture.release() }
   }
+  static pushDelivery(info: pushCommon.VoIPInfo): PushDelivery | null {
+    // Push Kit documents both a typed callId and a VoIP envelope inside PushPayload.data.
+    let envelope: PushDelivery | null = null
+    try { envelope = JSON.parse(info.data) as PushDelivery } catch (_) {}
+    if (envelope && typeof envelope.header === 'string' && typeof envelope.data === 'string' &&
+      typeof envelope.callId === 'string' && envelope.callId) {
+      if (!info.callId || info.callId === envelope.callId) return envelope
+      return { callId: info.callId, data: '' }
+    }
+    return info.callId ? { callId: info.callId, data: info.data } : null
+  }
+  static pushInvitation(raw: string): PushInvitation | null {
+    let invite: PushInvitation
+    try { invite = JSON.parse(raw) as PushInvitation } catch (_) { return null }
+    const userId = VoipBridge.configuration?.userId, now = Date.now()
+    if (!invite || !userId || invite.calleeId !== userId || typeof invite.callId !== 'string' ||
+      !/^[A-Za-z0-9_-]{1,128}$/.test(invite.callId) || !['audio', 'video'].includes(invite.mediaType) ||
+      !Number.isSafeInteger(invite.expiresAt) || invite.expiresAt <= now || VoipBridge.terminal.has(invite.callId)) return null
+    if (VoipBridge.business() && (invite.type !== 'voip' || (invite.scene !== undefined && invite.scene !== 'call') ||
+      invite.expiresAt > now + 65000 || typeof invite.convId !== 'string' || !/^[1-9][0-9]{0,18}$/.test(invite.convId) ||
+      typeof invite.msgId !== 'string' || !/^[1-9][0-9]{0,18}$/.test(invite.msgId))) return null
+    return invite
+  }
+  static async resolvePushInvitation(pending: PendingIncoming): Promise<CallData | null> {
+    const invite = pending.invite
+    if (!VoipBridge.business()) {
+      const call = await VoipBridge.request(`/${encodeURIComponent(invite.callId)}`)
+      return call.callId === invite.callId && call.calleeId === invite.calleeId ? call : null
+    }
+    const msg = await VoipBridge.request(`/api/instant-message/messages/${encodeURIComponent(invite.msgId)}?convId=${encodeURIComponent(invite.convId)}`, '', true)
+    if (VoipBridge.pendingIncoming !== pending || `${msg.convId ?? ''}` !== invite.convId || `${msg.msgId ?? ''}` !== invite.msgId ||
+      msg.body?.callId !== invite.callId || msg.body?.mediaType !== invite.mediaType) return null
+    const call = await VoipBridge.verifiedInvitation(msg)
+    if (!call || invite.expiresAt > call.expiresAt) return null
+    call.expiresAt = invite.expiresAt
+    return call
+  }
+  static clearPendingIncoming(): void {
+    const pending = VoipBridge.pendingIncoming
+    if (pending) clearTimeout(pending.timer)
+    VoipBridge.pendingIncoming = null
+  }
+  static dismissPendingIncoming(): void {
+    const pending = VoipBridge.pendingIncoming
+    if (pending && VoipBridge.nativeId === pending.nativeId) {
+      VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_DISCONNECTED)
+      VoipBridge.nativeId = ''
+    }
+    VoipBridge.clearPendingIncoming()
+  }
   static async incoming(info: pushCommon.VoIPInfo): Promise<void> {
     VoipBridge.restore()
-    if (!info.callId) return
-    if (!VoipBridge.configuration) { await voipCall.reportIncomingCallError(info.callId, voipCall.VoipCallFailureCause.OTHER); return }
-    const run = VoipBridge.generation
-    let call: CallData
-    try { call = JSON.parse(info.data) as CallData } catch (_) { await voipCall.reportIncomingCallError(info.callId, voipCall.VoipCallFailureCause.OTHER); return }
-    if (!/^[A-Za-z0-9_-]{1,128}$/.test(call.callId) || call.calleeId !== VoipBridge.configuration.userId || call.expiresAt <= Date.now() || VoipBridge.terminal.has(call.callId)) {
-      await voipCall.reportIncomingCallError(info.callId, voipCall.VoipCallFailureCause.OTHER); return
+    const delivery = VoipBridge.pushDelivery(info)
+    if (!delivery || delivery.callId === VoipBridge.nativeId || delivery.callId === VoipBridge.pendingIncoming?.nativeId) return
+    const id = delivery.callId
+    const invite = VoipBridge.pushInvitation(delivery.data)
+    if (!invite) { await voipCall.reportIncomingCallError(id, voipCall.VoipCallFailureCause.OTHER); return }
+    const current = VoipBridge.current
+    if (VoipBridge.pendingIncoming || VoipBridge.nativeId || VoipBridge.reportedInvitations.has(invite.callId) ||
+      (current && (current.callId !== invite.callId || current.state !== 'ringing'))) {
+      await voipCall.reportIncomingCallError(id, voipCall.VoipCallFailureCause.ROUTE_BUSY); return
     }
-    if (VoipBridge.current && VoipBridge.current.callId !== call.callId) {
-      await voipCall.reportIncomingCallError(info.callId, voipCall.VoipCallFailureCause.ROUTE_BUSY); return
-    }
-    if (VoipBridge.current && VoipBridge.nativeId) {
-      if (VoipBridge.current.callId === call.callId && VoipBridge.nativeId === info.callId) return
-      await voipCall.reportIncomingCallError(info.callId, voipCall.VoipCallFailureCause.ROUTE_BUSY); return
-    }
-    VoipBridge.nativeId = info.callId // Never substitute the business id for the native push id.
-    const picture = await image.createPixelMap(new Uint8Array([61, 89, 139, 255]).buffer, { size: { width: 1, height: 1 }, pixelFormat: image.PixelMapFormat.RGBA_8888 })
+    await VoipBridge.presentIncoming(invite, id)
+  }
+  static async presentIncoming(invite: PushInvitation, id: string, verifiedCall: CallData | null = null): Promise<void> {
+    const pending: PendingIncoming = { invite, nativeId: id, action: '', answerMediaType: 'audio',
+      timer: setTimeout(() => VoipBridge.dismissPendingIncoming(), invite.expiresAt - Date.now()) }
+    VoipBridge.pendingIncoming = pending
+    VoipBridge.traceIncoming(verifiedCall ? 'onlineInvitation' : 'received', invite.callId)
     try {
-      if (run !== VoipBridge.generation) return
-      const result = await voipCall.reportIncomingCall({ callId: info.callId, voipCallType: call.mediaType === 'video' ? voipCall.VoipCallType.VOIP_CALL_VIDEO : voipCall.VoipCallType.VOIP_CALL_VOICE,
-        userName: call.displayName || call.callerId, userProfile: picture, abilityName: 'NuwaxVoipMediaAbility',
-        voipCallState: voipCall.VoipCallState.VOIP_CALL_STATE_RINGING, isConferenceCall: false, isVoiceAnswerSupported: true })
-      if (result !== voipCall.ErrorReason.ERROR_NONE) throw new Error('CALL_SYSTEM_UNAVAILABLE')
-      if (run !== VoipBridge.generation) { await voipCall.reportCallStateChange(info.callId, voipCall.VoipCallState.VOIP_CALL_STATE_DISCONNECTED); return }
-      VoipBridge.adopt(await VoipBridge.request(`/${call.callId}`))
+      const picture = await image.createPixelMap(new Uint8Array([61, 89, 139, 255]).buffer, { size: { width: 1, height: 1 }, pixelFormat: image.PixelMapFormat.RGBA_8888 })
+      try {
+        if (VoipBridge.pendingIncoming !== pending) {
+          if (!verifiedCall) await voipCall.reportIncomingCallError(id, voipCall.VoipCallFailureCause.OTHER)
+          return
+        }
+        const displayName = typeof invite.displayName === 'string' ? invite.displayName.trim().slice(0, 80) : ''
+        const result = await voipCall.reportIncomingCall({ callId: id, voipCallType: invite.mediaType === 'video' ? voipCall.VoipCallType.VOIP_CALL_VIDEO : voipCall.VoipCallType.VOIP_CALL_VOICE,
+          userName: displayName || VoipBridge.configuration?.callLabel || 'Nuwax', userProfile: picture, abilityName: 'NuwaxVoipMediaAbility',
+          voipCallState: voipCall.VoipCallState.VOIP_CALL_STATE_RINGING, showBannerForIncomingCall: true, isConferenceCall: false, isVoiceAnswerSupported: true })
+        if (result !== voipCall.ErrorReason.ERROR_NONE) throw new Error('CALL_SYSTEM_UNAVAILABLE')
+      } finally { picture.release() }
+      if (VoipBridge.pendingIncoming !== pending) {
+        VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_DISCONNECTED, id)
+        return
+      }
+      // The system identifier and business identifier represent the same call in different APIs.
+      VoipBridge.nativeId = id
+      VoipBridge.rememberCallId(VoipBridge.reportedInvitations, invite.callId)
+      VoipBridge.traceIncoming('systemRinging', invite.callId)
+      const call = verifiedCall ?? await VoipBridge.resolvePushInvitation(pending)
+      if (VoipBridge.pendingIncoming !== pending) return
+      if (!call || invite.expiresAt <= Date.now() || VoipBridge.terminal.has(invite.callId)) {
+        VoipBridge.dismissPendingIncoming()
+        return
+      }
+      VoipBridge.clearPendingIncoming()
+      VoipBridge.traceIncoming('verified', invite.callId)
+      VoipBridge.adopt(call)
+      if (VoipBridge.current?.callId !== call.callId) {
+        VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_DISCONNECTED)
+        VoipBridge.nativeId = ''
+      } else if (pending.action) {
+        VoipBridge.action(pending.action, pending.answerMediaType, pending.action === 'accept')
+      }
     } catch (_) {
-      if (run === VoipBridge.generation && VoipBridge.nativeId === info.callId) VoipBridge.finish('invitationFailed')
-    } finally { picture.release() }
+      if (VoipBridge.pendingIncoming !== pending) return
+      if (!verifiedCall && VoipBridge.nativeId !== id) voipCall.reportIncomingCallError(id, voipCall.VoipCallFailureCause.OTHER).catch(() => {})
+      VoipBridge.dismissPendingIncoming()
+      if (verifiedCall) VoipBridge.adopt(verifiedCall)
+      VoipBridge.emit('error', 'CALL_INVITATION_FAILED')
+    }
   }
   static systemEvent(info: voipCall.VoipCallUiEventInfo): void {
-    if (info.callId !== VoipBridge.nativeId) return
+    const pending = VoipBridge.pendingIncoming?.nativeId === info.callId ? VoipBridge.pendingIncoming : null
+    if (!pending && info.callId !== VoipBridge.nativeId) return
     const event = info.voipCallUiEvent
     if (event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_VOICE_ANSWER || event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_VIDEO_ANSWER) {
-      VoipBridge.action('accept', event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_VIDEO_ANSWER ? 'video' : 'audio')
-    } else if (event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_REJECT) VoipBridge.action('reject')
-    else if (event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_HANGUP) VoipBridge.action('end')
+      const media = event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_VIDEO_ANSWER ? 'video' : 'audio'
+      if (pending && pending.action) return
+      VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_ANSWERED, info.callId)
+      if (pending) { pending.action = 'accept'; pending.answerMediaType = media }
+      else VoipBridge.action('accept', media, true)
+    } else if (event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_REJECT || event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_HANGUP) {
+      if (pending) pending.action = 'reject'
+      else VoipBridge.action(event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_REJECT ? 'reject' : 'end')
+    }
     else if (event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_MUTED || event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_UNMUTED) {
       VoipBridge.microphone = event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_UNMUTED
       VoipBridge.media(JSON.stringify({ op: 'microphone', enabled: VoipBridge.microphone })); VoipBridge.emit('microphone', '', undefined, '', VoipBridge.microphone)
     } else if (event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_SPEAKER_ON || event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_SPEAKER_OFF) VoipBridge.speaker(event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_SPEAKER_ON)
   }
-  static reportState(state: voipCall.VoipCallState): void {
-    if (VoipBridge.nativeId) voipCall.reportCallStateChange(VoipBridge.nativeId, state).catch(() => {})
+  static reportState(state: voipCall.VoipCallState, id: string = VoipBridge.nativeId, mediaType: string = ''): void {
+    if (!id) return
+    if (state === voipCall.VoipCallState.VOIP_CALL_STATE_ANSWERED) {
+      if (VoipBridge.answeredNativeId === id) return
+      VoipBridge.answeredNativeId = id
+    }
+    const pending = VoipBridge.pendingIncoming
+    const callId = pending?.nativeId === id ? pending.invite.callId : id === VoipBridge.nativeId ? VoipBridge.current?.callId : undefined
+    const report = mediaType
+      ? voipCall.reportCallStateChange(id, state, mediaType === 'video' ? voipCall.VoipCallType.VOIP_CALL_VIDEO : voipCall.VoipCallType.VOIP_CALL_VOICE)
+      : voipCall.reportCallStateChange(id, state)
+    report.then(() => {
+      if (callId) VoipBridge.traceIncoming(`systemState=${state}`, callId)
+    }).catch(() => {})
   }
   static speaker(enabled: boolean): void {
     const id = VoipBridge.current?.callId, run = VoipBridge.generation
@@ -545,6 +696,7 @@ export class VoipBridge {
     } catch (_) { if (run === VoipBridge.generation && VoipBridge.current?.callId === id) { VoipBridge.emit('error', 'CALL_BACKGROUND_UNAVAILABLE'); VoipBridge.action('end') } }
   }
   static finish(reason: string = '', notifyRemote: boolean = true): void {
+    VoipBridge.clearPendingIncoming()
     const call = VoipBridge.current
     if (notifyRemote && call && VoipBridge.business()) VoipBridge.notifyBusinessEnd(call, reason)
     if (notifyRemote && !VoipBridge.business() && call && reason && reason !== 'answeredElsewhere' && reason !== 'sessionChanged') {
@@ -552,7 +704,7 @@ export class VoipBridge {
       VoipBridge.request(`/${call.callId}/actions`, JSON.stringify({ action, actionId: util.generateRandomUUID() })).catch(() => {})
     }
     const id = call?.callId
-    if (id) { VoipBridge.terminal.add(id); if (VoipBridge.terminal.size > 128) VoipBridge.terminal.delete(VoipBridge.terminal.values().next().value) }
+    if (id) VoipBridge.rememberCallId(VoipBridge.terminal, id)
     if (VoipBridge.expiry >= 0) clearTimeout(VoipBridge.expiry)
     VoipBridge.media(JSON.stringify({ op: 'disconnect', callId: id })); VoipBridge.commands = []
     VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_DISCONNECTED); VoipBridge.nativeId = ''
@@ -562,11 +714,19 @@ export class VoipBridge {
     VoipBridge.current = null; VoipBridge.mediaId = ''; VoipBridge.connected = false; VoipBridge.peerReady = false; VoipBridge.answering = ''
     VoipBridge.listeners.forEach(callback => callback())
   }
+  static traceIncoming(stage: string, callId: string): void {
+    if (BuildProfile.DEBUG) console.info(`[NuwaxVoip] ${stage} callId=${callId}`)
+  }
+  static rememberCallId(ids: Set<string>, id: string): void {
+    ids.add(id)
+    if (ids.size > 128) ids.delete(ids.values().next().value)
+  }
   static reset(): void {
     if (VoipBridge.current) VoipBridge.action(VoipBridge.current.state === 'ringing' && VoipBridge.current.calleeId === VoipBridge.configuration?.userId ? 'reject' : 'end')
     VoipBridge.generation++; VoipBridge.stopSocket(); VoipBridge.stream?.destroy(); VoipBridge.stream = null
     if (VoipBridge.retry >= 0) clearTimeout(VoipBridge.retry)
-    VoipBridge.finish('sessionChanged'); VoipBridge.configuration = null; VoipBridge.terminal.clear(); VoipBridge.queue = []; VoipBridge.cursor = ''
+    VoipBridge.finish('sessionChanged'); VoipBridge.configuration = null; VoipBridge.terminal.clear(); VoipBridge.reportedInvitations.clear(); VoipBridge.queue = []; VoipBridge.cursor = ''
+    VoipBridge.background = true
     const query: asset.AssetMap = new Map(); query.set(asset.Tag.ALIAS, VoipBridge.alias)
     try { asset.removeSync(query) } catch (_) {}
   }

@@ -21,7 +21,6 @@ const notificationOnlyTransports = [
   ['android-meizu', 'android'],
   ['android-smartisan', 'android'],
   ['android-fcm', 'android'],
-  ['harmony-huawei', 'harmonyos'],
 ] as const;
 
 function load(entry = latestEntry, env: Record<string, string> = {}) {
@@ -110,6 +109,43 @@ describe('native call delivery', () => {
 
     Object.assign(manager, { request: undefined });
     expect(await call(invitation)).toMatchObject({ errCode: 503, errMsg: 'UniPush transmission adapter unavailable' });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('sends one Huawei HarmonyOS VoIP request through the dedicated vendor channel', async () => {
+    const { call, send, request } = load();
+    const { payload, ...body } = makeBody();
+    const invitation = { ...body, push_clientid: [cid],
+      callRoute: { cid, platform: 'harmonyos', transport: 'harmony-huawei' },
+      payload: { ...payload, scene: 'call', calleeId: '10002', roomName: 'call-same-call', token: 'omitted' },
+      options: { ios: { type: 'voip' } }, settings: { ttl: 30000 },
+    };
+    expect((await call(invitation)).errCode).toBe(0);
+    expect(send).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledOnce();
+    const args = request.mock.calls[0][0];
+    expect(args).toMatchObject({
+      method: 'POST', module: '/push/single/cid',
+      requestData: { audience: { cid: [cid] }, settings: { ttl: 30000, strategy: { hoshw: 2 } } },
+    });
+    const channel = args.requestData.push_channel.harmony.custom.HW;
+    expect(channel.type).toBe('voip_call');
+    expect(JSON.parse(JSON.parse(channel.payload).extraData)).toEqual({ ...payload, calleeId: '10002' });
+    expect(Object.keys(args.requestData.push_channel)).toEqual(['harmony']);
+    await call({ ...invitation, push_clientid: cid });
+    expect(request.mock.calls[1][0].requestData.request_id).toBe(args.requestData.request_id);
+  });
+
+  it('rejects malformed HarmonyOS routes and skips expired calls without falling back to a notification', async () => {
+    const { call, send, request } = load();
+    const { payload, ...body } = makeBody();
+    const route = { cid, platform: 'harmonyos', transport: 'harmony-huawei' };
+    const invitation = { ...body, callRoute: route, payload: { ...payload, scene: 'call', calleeId: '10002' } };
+    expect((await call({ ...invitation, push_clientid: [cid, 'other-cid'] })).errCode).toBe(400);
+    expect((await call({ ...invitation, callRoute: { ...route, platform: 'android' } })).errCode).toBe(400);
+    expect(await call({ ...invitation, payload: { ...invitation.payload, expiresAt: Date.now() - 1 } }))
+      .toEqual({ errCode: 0, data: { skipped: true } });
+    expect(request).not.toHaveBeenCalled();
     expect(send).not.toHaveBeenCalled();
   });
 

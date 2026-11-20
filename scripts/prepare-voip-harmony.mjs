@@ -2,6 +2,38 @@ import { readFile, writeFile, mkdir, copyFile, cp, realpath } from 'node:fs/prom
 import { resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSON5 from 'json5';
+
+function prepareEntryAbility(source) {
+  const marker = '// nuwax-voip-entry-hook';
+  const hook = 'VoipBridge.bindPush(this)';
+  const entryClass = /^[ \t]*export\s+default\s+class\s+EntryAbility\s+extends\s+\w+\s*\{/m;
+  const lifecycle = /^[ \t]*(?:(?:public|protected|override)\s+)*onCreate\s*\([^)]*\)\s*(?::\s*void\s*)?\{/m;
+  const lifecycleDeclaration = /^[ \t]*(?:(?:public|protected|override|async)\s+)*onCreate\s*\(/m;
+  const entry = entryClass.exec(source);
+  if (!entry) throw new Error('Cannot locate the generated EntryAbility class for the VoIP hook');
+  const bodyStart = entry.index + entry[0].length;
+  const body = source.slice(bodyStart);
+  const onCreate = lifecycle.exec(body);
+  if (source.includes(marker)) {
+    if (!onCreate || !body.slice(onCreate.index + onCreate[0].length).trimStart().startsWith(hook)) {
+      throw new Error('VoIP hook marker exists but EntryAbility.onCreate does not register push first');
+    }
+    return source;
+  }
+  if (!onCreate && lifecycleDeclaration.test(body)) {
+    throw new Error('EntryAbility.onCreate must be synchronous to register VoIP push');
+  }
+  const imports = `${marker}\nimport { VoipBridge } from '@uni_modules/nuwax-voip'\n`;
+  if (onCreate) {
+    return imports + source.slice(0, bodyStart) + body.replace(lifecycle, `$&\n    ${hook}`);
+  }
+  return imports + "import { Want as VoipWant, AbilityConstant as VoipAbilityConstant } from '@kit.AbilityKit'\n" +
+    source.slice(0, bodyStart) + `\n  onCreate(want: VoipWant, launchParam: VoipAbilityConstant.LaunchParam): void {
+    ${hook}
+    super.onCreate(want, launchParam)
+  }` + body;
+}
+
 const root = await realpath(fileURLToPath(new URL('../', import.meta.url)));
 const project = await realpath(resolve(process.argv[2] ?? `${root}/unpackage/dist/dev/app-harmony`));
 if (!['out/', 'unpackage/'].some(prefix => relative(root, project).startsWith(prefix))) throw new Error('Refusing to modify a project outside this worktree ignored output');
@@ -10,6 +42,11 @@ const modulePath = `${entry}/module.json5`;
 const config = JSON5.parse(await readFile(modulePath, 'utf8'));
 const main = config.module.abilities.find(value => value.name === 'EntryAbility');
 if (!main) throw new Error('EntryAbility not found');
+const abilityPath = await realpath(resolve(entry, main.srcEntry ?? './ets/entryability/EntryAbility.ets'));
+if (!relative(entry, abilityPath).startsWith('ets/')) throw new Error('EntryAbility must be inside the generated entry source directory');
+const abilitySource = (await readFile(abilityPath, 'utf8')).replace(
+  "from '../../../../../uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge'", "from '@uni_modules/nuwax-voip'");
+const preparedAbility = prepareEntryAbility(abilitySource);
 const receiverOwners = config.module.abilities.filter(value => value.name !== 'EntryAbility' && value.skills?.some(skill => skill.actions?.includes('action.ohos.push.listener')));
 if (receiverOwners.length) throw new Error('Native push listener already belongs to another Ability; reconcile it before building');
 main.skills ??= [];
@@ -38,6 +75,7 @@ for (const permission of permissions) {
 await writeFile(modulePath, JSON.stringify(config, null, 2) + '\n');
 const source = `${root}/scripts/voip-native/harmony`;
 await mkdir(`${entry}/ets/voip`, { recursive: true });
+await mkdir(`${entry}/ets/pages`, { recursive: true });
 await copyFile(`${source}/NuwaxVoipMediaAbility.ets`, `${entry}/ets/voip/NuwaxVoipMediaAbility.ets`);
 await copyFile(`${source}/NuwaxVoipMedia.ets`, `${entry}/ets/pages/NuwaxVoipMedia.ets`);
 await cp(`${root}/static/app/voip`, `${entry}/resources/rawfile/voip`, { recursive: true });
@@ -54,13 +92,5 @@ for (const locale of ['base', 'en_US', 'zh_CN', 'zh_TW', 'zh_HK']) {
   for (const [name, value] of Object.entries(values)) { const old = strings.string.find(item => item.name === name); if (old) old.value = value; else strings.string.push({ name, value }); }
   await writeFile(path, JSON.stringify(strings, null, 2) + '\n');
 }
-const ability = `${entry}/ets/entryability/EntryAbility.ets`;
-let text = await readFile(ability, 'utf8');
-text = text.replace("from '../../../../../uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge'", "from '@uni_modules/nuwax-voip'");
-if (!text.includes('// nuwax-voip-entry-hook')) {
-  text = `// nuwax-voip-entry-hook\nimport { VoipBridge } from '@uni_modules/nuwax-voip'\nimport { Want as VoipWant, AbilityConstant as VoipAbilityConstant } from '@kit.AbilityKit'\n` + text;
-  if (/\bonCreate\s*\(/.test(text)) text = text.replace(/(\bonCreate\s*\([^)]*\)[^{]*\{)/, '$1\n    VoipBridge.bindPush(this)');
-  else text = text.replace(/(export default class \w+ extends \w+\s*\{)/, '$1\n  onCreate(want: VoipWant, launchParam: VoipAbilityConstant.LaunchParam): void {\n    VoipBridge.bindPush(this)\n    super.onCreate(want, launchParam)\n  }');
-}
-await writeFile(ability, text);
+await writeFile(abilityPath, preparedAbility);
 console.log('[voip] Harmony native call host / push / background configuration regenerated');

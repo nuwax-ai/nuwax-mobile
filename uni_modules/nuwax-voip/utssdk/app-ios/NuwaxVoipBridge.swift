@@ -267,6 +267,9 @@ import LiveKit
         let restored = (settings["apnsRegistration"] as? [String: Any]).flatMap { NuwaxVoipApnsDevice(stored: $0) }
         let transport: NuwaxVoipApnsRegistration.Transport = { [weak self] body in
             guard let self else { throw VoipError.invalid }
+            if body["iosVoip"] != nil {
+                return try await self.request("/api/instant-message/devices", body: body, absolute: true, captured: settings)
+            }
             return try await self.request("/devices", body: body, captured: settings)
         }
         if let restored, restored.provider != provider {

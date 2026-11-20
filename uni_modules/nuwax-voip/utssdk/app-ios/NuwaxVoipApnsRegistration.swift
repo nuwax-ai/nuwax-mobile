@@ -64,23 +64,39 @@ struct NuwaxVoipApnsDevice: Equatable {
     }
 
     func body(_ action: String) -> [String: Any] {
-        var result: [String: Any] = ["provider": provider, "channel": "pushKit", "platform": "ios", "deviceId": deviceId,
-         "bundleId": bundleId, "environment": environment, "registrationId": registrationId,
-         "previousRegistrationId": previousRegistrationId, "action": action]
-        if let cid { result["cid"] = cid } else { result["token"] = token }
+        if let cid {
+            return ["deviceId": deviceId, "platform": "ios", "pushToken": cid,
+                    "iosVoip": ["registrationId": registrationId, "previousRegistrationId": previousRegistrationId,
+                                "action": action]]
+        }
+        var result = stored
+        result["action"] = action
         return result
     }
 
     var stored: [String: Any] {
-        var result = body("register")
-        result["token"] = token
+        var result: [String: Any] = ["provider": provider, "channel": "pushKit", "platform": "ios", "deviceId": deviceId,
+         "bundleId": bundleId, "environment": environment, "registrationId": registrationId,
+         "previousRegistrationId": previousRegistrationId, "action": "register", "token": token]
+        if let cid { result["cid"] = cid }
         return result
     }
+
+    func acknowledgement(_ response: [String: Any]) -> [String: Any]? {
+        guard response["deviceId"] as? String == deviceId else { return nil }
+        if cid != nil {
+            guard response["platform"] as? String == "ios" else { return nil }
+            return response["iosVoip"] as? [String: Any]
+        }
+        guard response["provider"] as? String == "apns", response["channel"] as? String == "pushKit",
+              response["bundleId"] as? String == bundleId, response["environment"] as? String == environment else { return nil }
+        return response
+    }
+
     func acknowledges(_ response: [String: Any], registered: Bool = true) -> Bool {
-        response["provider"] as? String == provider && response["channel"] as? String == "pushKit"
-            && response["bundleId"] as? String == bundleId && response["environment"] as? String == environment
-            && response["deviceId"] as? String == deviceId && (response["registrationId"] as? String)?.lowercased() == registrationId
-            && response["registered"] as? Bool == registered && (cid == nil || response["cid"] as? String == cid)
+        guard let acknowledgement = acknowledgement(response) else { return false }
+        return (acknowledgement["registrationId"] as? String)?.lowercased() == registrationId
+            && acknowledgement["registered"] as? Bool == registered
     }
 }
 
@@ -122,7 +138,7 @@ struct NuwaxVoipApnsDevice: Equatable {
                     guard !Task.isCancelled, run == self.generation else { return }
                     if device.acknowledges(result) {
                         // registered is storage acknowledgement; nativePush is the sender's declared readiness, not delivery.
-                        self.changed("registered", result["nativePush"] as? Bool == true); return
+                        self.changed("registered", device.acknowledgement(result)?["nativePush"] as? Bool == true); return
                     }
                 } catch { if Task.isCancelled || run != self.generation { return } }
             }

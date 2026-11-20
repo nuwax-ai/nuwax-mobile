@@ -23,7 +23,7 @@
 
 | 改动位置 | PR 内容 |
 | --- | --- |
-| 设备接口与持久化 | 接通当前客户端使用的 `POST /api/instant-message/calls/devices`。从鉴权上下文取租户和被叫，校验设备与 CID，保存当前有效的 `registrationId` 及其 CID 绑定。结合 `ImDeviceServiceImpl` 的普通设备生命周期处理注销、换号、轮换。存储实现由 IM 同学按现有设备模型选择。 |
+| 设备接口与持久化 | 扩展现有 `POST /api/instant-message/devices` 的可选 `iosVoip` 字段。从鉴权上下文取租户和被叫，校验设备与 CID，保存当前有效的 `registrationId` 及其 CID 绑定。结合 `ImDeviceServiceImpl` 的普通设备生命周期处理注销、换号、轮换。存储实现由 IM 同学按现有设备模型选择。 |
 | `OfflinePushConsumer`、`UniPushChannel.buildBody` | 复用已选出的收件人与目标设备。在本批次可响铃的 iPhone 中查有效登记，只向签名请求的 `payload.iosVoip` 写入匹配 CID 的登记版本。IM 继续传现有 `push_clientid` 数组。 |
 | `CallPushInfo` 与会议序列化 | 实时会议按当前受邀人补齐响铃定位和截止时间，普通会议卡片和静默邀请走既有路径。后文有完整请求示例。 |
 
@@ -61,59 +61,56 @@
 - **个推应用配置。** 原 QA 包的 `getui` 三项仍是模板文字，个推将旧 CID 列为无效。改用同包名基座中与目标个推应用匹配的客户端配置并重新签名后，生成的新 CID 被个推识别为有效 iPhone。SDK 接受 token 参数之后，仍要核对 CID 归属。
 - **专注模式。** 23:11 的上一通已经到达苹果系统并上报来电，但 iOS 日志明确记录 `call did not pass DND filter`。关闭专注后才完成上述锁屏接听。联调记录应区分厂商受理、设备收到、系统是否展示、用户是否接听。
 
-测试站已登录探测中，用户接口返回 200，设备登记 `POST /api/instant-message/calls/devices` 返回 `404 / IM_90001`。部署 IM PR 后应使用同一签名包复验登记和自动出站。
+测试登记沿用普通设备注册接口。iPhone 先正常上报本机 CID，PushKit 取得登记版本后调用同一接口更新 `iosVoip`。
 
 [苹果开发文档 · PushKit 如何接收来电并唤醒 App](https://developer.apple.com/documentation/pushkit/responding-to-voip-notifications-from-pushkit)
 
 ## iPhone 向测试 IM 登记什么
 
-入口为 `POST /api/instant-message/calls/devices`。现有 App 在请求头发送 `Authorization: Bearer <登录令牌>`、`X-Call-Device-Id` 和 `Content-Type: application/json`。普通设备登记 `/devices` 已提供账号、设备和 CID 的关联，本接口在此基础上确认来电能力。
+通过现有 `POST /api/instant-message/devices` 登记。使用已登录会话，提交当前 iOS 设备的 `deviceId`、`platform`、`pushToken` 和可选 `iosVoip`。普通设备注册先完成 CID 关联。带 `iosVoip` 的更新只修改来电登记。
 
-### 首次登记请求示例
+### 登记请求示例
 
 ```json
 {
-  "provider": "unipush",
-  "channel": "pushKit",
-  "platform": "ios",
   "deviceId": "qa-iphone-16",
-  "bundleId": "com.nuwax.app",
-  "environment": "development",
-  "cid": "exampleCidA",
-  "registrationId": "7adf48c0-492f-4f23-8405-4e98f9e155e6",
-  "previousRegistrationId": "",
-  "action": "register"
+  "platform": "ios",
+  "pushToken": "exampleCidA",
+  "iosVoip": {
+    "registrationId": "7adf48c0-492f-4f23-8405-4e98f9e155e6",
+    "previousRegistrationId": "",
+    "action": "register"
+  }
 }
 ```
 
-| 字段 | 来源和后端处理 |
+| 字段 | 用途 |
 | --- | --- |
-| `deviceId`、`cid` | App 设备标识和个推 CID。使用登录上下文确定租户与账号，核对请求头、普通设备记录、推送开关和 CID 所有者。`deviceId` 取自 App 的 IM 设备记录。 |
-| `provider`、`channel`、`platform` | 按示例大小写匹配。Apple 的 PushKit token 由 App 交给个推 SDK 绑定 CID，IM 只保存路由所需信息。 |
-| `bundleId`、`environment` | 本次为 `com.nuwax.app` 和 `development`。登记请求和回执保留现有 App 的环境校验字段，IM 的持久化和出站只使用 CID 与登记版本。`com.nuwax.app.voip` 是 APNs topic。 |
-| `registrationId`、 `previousRegistrationId` | 当前／上一版登记 UUID。首次前驱为空，轮换时带上前驱。服务端原子比较更新，重复登记幂等，旧版本的迟到撤销只作用于自身。 |
-| action | `register` 登记或轮换，`revoke` 按版本撤销。退出、换号或 CID 归属变更时使旧路由失效。 |
+| `deviceId`、`pushToken` | 核对当前登录账号、租户、iOS 设备和已登记 CID。 |
+| `registrationId`、`previousRegistrationId` | 当前和上一版登记 UUID。首次登记前驱为空，轮换时携带前驱。比较更新确保旧版本撤销只影响自身。 |
+| `action` | `register` 登记或轮换，`revoke` 按版本撤销。现有设备注销同时清除来电登记。 |
 
-### 客户端认可的成功回执
+### 成功回执示例
 
 ```json
 {
   "code": "0000",
   "data": {
-    "provider": "unipush",
-    "channel": "pushKit",
     "deviceId": "qa-iphone-16",
-    "bundleId": "com.nuwax.app",
-    "environment": "development",
-    "cid": "exampleCidA",
-    "registrationId": "7adf48c0-492f-4f23-8405-4e98f9e155e6",
-    "registered": true,
-    "nativePush": true
+    "platform": "ios",
+    "status": 1,
+    "pushEnabled": true,
+    "pushSubscriptionSaved": false,
+    "iosVoip": {
+      "registrationId": "7adf48c0-492f-4f23-8405-4e98f9e155e6",
+      "registered": true,
+      "nativePush": true
+    }
   }
 }
 ```
 
-HTTP 200。data 回显本次登记，`registered` 表示已保存，`nativePush` 表示服务端已具备发送配置。撤销成功时两者为 `false`。归属错误、环境错误或前驱冲突应给出可定位的失败结果。
+`registered` 表示当前版本已保存，`nativePush` 表示部署已开启来电推送。撤销回执中两项为 `false`。环境由云函数在选路时补齐。
 
 ## IM 调推送云函数要扩展哪些字段
 

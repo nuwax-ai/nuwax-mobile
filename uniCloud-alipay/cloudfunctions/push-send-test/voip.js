@@ -135,6 +135,7 @@ function prepareMeetingRingInvitation(body, now = Date.now()) {
     ? Math.min(now + 60_000, payload.sendTime + 60_000)
     : now + 60_000
   payload.expiresAt = Math.min(deadline, cap)
+  if (payload.expiresAt <= now) return { expired: true }
   return { payload, settings: { ttl: Math.min(60_000, payload.expiresAt - now) } }
 }
 
@@ -189,6 +190,20 @@ const strategies = {
 const nativeStrategies = new Set(['ios', 'hw'])
 const registrationId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 
+function validIosRegistration(registration) {
+  return ['development', 'production'].includes(registration?.environment) &&
+    matches(registration?.registrationId, registrationId)
+}
+
+exports.iosCallRouteForCid = (cid, registrations, environment) => {
+  if (!isCallCid(cid) || !registrations || typeof registrations !== 'object' ||
+      Array.isArray(registrations) || !Object.prototype.hasOwnProperty.call(registrations, cid)) return null
+  const registration = registrations[cid]
+  const route = { cid, platform: 'ios', transport: 'ios-voip',
+    environment, registrationId: registration?.registrationId }
+  return validIosRegistration(route) ? route : null
+}
+
 // One authenticated IM route per request. No caller-controlled vendor options or broadcast target.
 exports.prepareNativeVoip = (body, now = Date.now()) => {
   if (!Object.prototype.hasOwnProperty.call(body, 'callRoute')) return null
@@ -199,8 +214,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   const ios = strategy === 'ios'
   if (route.platform !== (ios ? 'ios' : 'android') ||
       !isCallCid(route.cid) || body.push_clientid !== route.cid) return { error: 'one matching call device is required' }
-  if (ios && (!['development', 'production'].includes(route.environment) ||
-      typeof route.registrationId !== 'string' || route.registrationId.length !== 36 || !registrationId.test(route.registrationId))) {
+  if (ios && !validIosRegistration(route)) {
     return { error: 'signed environment and current iOS route registration are required' }
   }
   const invitation = body.payload?.scene === 'meeting'

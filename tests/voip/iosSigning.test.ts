@@ -4,7 +4,7 @@ import { expect, it } from 'vitest';
 
 it('derives APNs environment from the selected profile and rejects signed-host mismatches', () => {
   const result = execFileSync('python3', ['-c', `
-import os, sys, tempfile, plistlib
+import os, sys, tempfile, plistlib, zipfile
 from pathlib import Path
 from types import SimpleNamespace
 sys.path.insert(0, sys.argv[1])
@@ -20,7 +20,7 @@ for env in ['development', 'production']:
     rejects(lambda: config.verify_signed_push(dict(info, CFBundleIdentifier='com.nuwax.app'), {'aps-environment':'wrong'}))
     aggregate_info, aggregate_entitlements = config.push_configuration({'aps-environment':env,'application-identifier':'TEAM.com.nuwax.app'}, 'com.nuwax.app','TEAM','unipush')
     assert aggregate_info['NuwaxVoipPushProvider'] == 'unipush' and aggregate_entitlements == entitlements
-    config.verify_signed_push(dict(aggregate_info, CFBundleIdentifier='com.nuwax.app'), dict(aggregate_entitlements, **{'application-identifier':'TEAM.com.nuwax.app'}))
+    rejects(lambda: config.verify_signed_push(dict(aggregate_info, CFBundleIdentifier='com.nuwax.app'), dict(aggregate_entitlements, **{'application-identifier':'TEAM.com.nuwax.app'})))
 rejects(lambda: config.push_configuration({'aps-environment':'development','application-identifier':'TEAM.com.other'}, 'com.nuwax.app','TEAM'))
 rejects(lambda: config.push_configuration({'application-identifier':'TEAM.com.nuwax.app'}, 'com.nuwax.app','TEAM'))
 with tempfile.TemporaryDirectory() as directory:
@@ -30,6 +30,17 @@ with tempfile.TemporaryDirectory() as directory:
     os.environ['IOS_DEVELOPMENT_TEAM'] = 'TEAM'
     config.subprocess.run = lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=plistlib.dumps({'UUID':'fixture-id', 'Entitlements':{'aps-environment':'production','application-identifier':'TEAM.com.nuwax.app'}}))
     assert config.selected_push_configuration('com.nuwax.app')[0]['NuwaxVoipAPNSEnvironment'] == 'production'
+    base = Path(directory)/'fixture.ipa'
+    getui = {'appid':'FixtureGetuiAppId','appKey':'FixtureAppKey','appSecret':'FixtureAppSecret'}
+    with zipfile.ZipFile(base, 'w') as archive:
+        archive.writestr('Payload/UniAppX.app/Info.plist', plistlib.dumps({'CFBundleIdentifier':'com.nuwax.app','getui':dict(getui, masterSecret='never-export')}))
+    os.environ['NUWAX_IOS_UNIPUSH_CLIENT_IPA'] = str(base)
+    os.environ['NUWAX_IOS_VOIP_PUSH_PROVIDER'] = 'unipush'
+    signed, entitlements = config.selected_push_configuration('com.nuwax.app')
+    assert signed['getui'] == getui
+    signed['CFBundleIdentifier'] = 'com.nuwax.app'
+    config.verify_signed_push(signed, dict(entitlements, **{'application-identifier':'TEAM.com.nuwax.app'}))
+    rejects(lambda: config.verify_signed_push(dict(signed, getui=dict(getui, appid='AnotherApp')), dict(entitlements, **{'application-identifier':'TEAM.com.nuwax.app'})))
     os.environ['IOS_PROVISIONING_PROFILE_UUID'] = 'different-id'
     rejects(lambda: config.selected_push_configuration('com.nuwax.app'))
 print('APNs signing metadata verified without signing or installing')

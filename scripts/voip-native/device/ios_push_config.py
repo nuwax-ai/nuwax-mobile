@@ -1,8 +1,35 @@
 """APNs metadata comes from the selected signing profile; no private material is printed."""
 import os
 import plistlib
+import re
 import subprocess
+import zipfile
 from pathlib import Path
+
+
+def validate_getui(config):
+    keys = ('appid', 'appKey', 'appSecret')
+    if not isinstance(config, dict) or any(
+        not isinstance(config.get(key), str) or not re.fullmatch(r'[A-Za-z0-9]+', config[key])
+        or config[key].lower() in ('appid', 'appkey', 'appsecret', 'placeholder')
+        for key in keys
+    ):
+        raise ValueError('Missing valid Getui SDK credentials in the iOS base')
+    return {key: config[key] for key in keys}
+
+
+def getui_client_configuration(bundle_id):
+    source = os.environ.get('NUWAX_IOS_UNIPUSH_CLIENT_IPA')
+    if not source:
+        raise ValueError('Set NUWAX_IOS_UNIPUSH_CLIENT_IPA to a trusted iOS base for this UniPush app')
+    with zipfile.ZipFile(Path(source).expanduser()) as ipa:
+        plists = [name for name in ipa.namelist() if re.fullmatch(r'Payload/[^/]+\.app/Info\.plist', name)]
+        if len(plists) != 1:
+            raise ValueError('Expected one App Info.plist in the iOS base')
+        info = plistlib.loads(ipa.read(plists[0]))
+    if info.get('CFBundleIdentifier') != bundle_id:
+        raise ValueError('Getui credentials must come from a base for the same bundle ID')
+    return validate_getui(info.get('getui'))
 
 
 def push_configuration(entitlements, bundle_id, team_id, provider='apns'):
@@ -37,8 +64,12 @@ def selected_profile():
 
 def selected_push_configuration(bundle_id):
     decoded = selected_profile()
-    return push_configuration(decoded.get('Entitlements', {}), bundle_id, os.environ['IOS_DEVELOPMENT_TEAM'],
-                              os.environ.get('NUWAX_IOS_VOIP_PUSH_PROVIDER', 'apns'))
+    provider = os.environ.get('NUWAX_IOS_VOIP_PUSH_PROVIDER', 'apns')
+    info, entitlements = push_configuration(decoded.get('Entitlements', {}), bundle_id,
+                                           os.environ['IOS_DEVELOPMENT_TEAM'], provider)
+    if provider == 'unipush':
+        info['getui'] = getui_client_configuration(bundle_id)
+    return info, entitlements
 
 
 def verify_signed_push(info, entitlements):
@@ -51,6 +82,10 @@ def verify_signed_push(info, entitlements):
     identifier = entitlements.get('application-identifier', '')
     if not bundle or not identifier.endswith('.' + bundle):
         raise ValueError('Signed App identifier differs from its bundle ID')
+    if info['NuwaxVoipPushProvider'] == 'unipush':
+        getui = validate_getui(info.get('getui'))
+        if os.environ.get('NUWAX_IOS_UNIPUSH_CLIENT_IPA') and getui != getui_client_configuration(bundle):
+            raise ValueError('Signed Getui configuration differs from the selected iOS base')
 
 
 def has_native_launch_restore(disassembly):

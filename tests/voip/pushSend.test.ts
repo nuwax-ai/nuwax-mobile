@@ -47,6 +47,34 @@ describe('native call delivery', () => {
     payload: { ...locator, callId: 'same-call', calleeId: 'bob', convType: 1, mediaType: 'audio', expiresAt },
   });
 
+  it('uses each iOS registration from the IM batch and keeps other recipients on their existing routes', async () => {
+    const { call, send } = load();
+    const nextRegistrationId = '2872678e-3315-4a30-b20f-12200b5f74ed';
+    const { callRoute, ...body } = makeBody();
+    const iosVoip = {
+      [cid]: { registrationId },
+      'second-ios': { registrationId: nextRegistrationId },
+      'invalid-ios': { registrationId: 'not-a-version' },
+      'outside-batch': { registrationId },
+    };
+    const result = await call({
+      ...body, push_clientid: [cid, 'second-ios', 'android-cid', 'invalid-ios', cid],
+      payload: { ...body.payload, scene: 'call', calleeId: '1234', iosVoip },
+    });
+    expect(result.errCode).toBe(0);
+    expect(send).toHaveBeenCalledTimes(3);
+    expect(result.data.results.slice(0, 2)).toMatchObject([
+      { cid, transport: 'ios-voip' }, { cid: 'second-ios', transport: 'ios-voip' },
+    ]);
+    for (const [index, expected] of [registrationId, nextRegistrationId].entries()) {
+      const args = send.mock.calls[index][0];
+      expect(JSON.parse(args.options.ios.payload)).toMatchObject({ routeRegistrationId: expected, calleeId: '1234' });
+      expect(args.payload).not.toHaveProperty('iosVoip');
+    }
+    expect(send.mock.calls[2][0].push_clientid).toEqual(['android-cid', 'invalid-ios']);
+    expect(send.mock.calls[2][0].payload).not.toHaveProperty('iosVoip');
+  });
+
   it('sends the real iOS VoIP options to one device and returns only its provider task status', async () => {
     const { call, send } = load(latestEntry, env);
     const body = makeBody();
@@ -335,6 +363,20 @@ describe('meeting ringing delivery', () => {
     expect(pushed).toMatchObject({ type: 'voip', scene: 'meeting', callId: 'mi-ring', calleeId: '10002',
       inviteId: 'mi-ring', roomName: '123456789', title: '周会', mediaType: 'video', displayName: '张三' });
     expect(pushed.expiresAt).toBeLessThanOrEqual(Date.now() + 61_000);
+  });
+
+  it('rings a meeting from IM registration metadata and preserves silent meetings', async () => {
+    const cid = 'fixture-ios';
+    const { call, send } = load();
+    const payload = { ...ringPayload(), iosVoip: { [cid]: { registrationId } } };
+    await call({ ...envelope, push_clientid: [cid], payload });
+    expect(send.mock.calls[0][0]).toMatchObject({
+      options: { ios: { type: 'voip' } }, payload: { scene: 'meeting', routeRegistrationId: registrationId },
+    });
+    await call({ ...envelope, push_clientid: [cid], payload: { ...payload, silent: true } });
+    expect(send.mock.calls[1][0].payload).toMatchObject({ type: 'meeting_invite', silent: true });
+    expect(send.mock.calls[1][0].payload).not.toHaveProperty('iosVoip');
+    expect(send.mock.calls[1][0].options?.ios?.type).not.toBe('voip');
   });
 
   it('clamps a long meeting deadline to the 60 second ringing window', async () => {

@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto')
-const { callTargetCids, prepareVoip, prepareNativeVoip, prepareVoipScene, prepareMeetingRingInvitation } = require('./voip')
+const { callTargetCids, iosCallRouteForCid, prepareVoip, prepareNativeVoip, prepareVoipScene, prepareMeetingRingInvitation } = require('./voip')
 
 const APP_ID = '__UNI__8BF05E4'          // 本项目的 DCloud AppID
 // 后端握手密钥：**只**从环境变量读（uniCloud 控制台 → 云函数 → 环境变量 PUSH_SIGN_KEY）。
@@ -490,6 +490,11 @@ async function handle(event, invocationId) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { errCode: 400, errMsg: 'invalid request body' }
   // 顶层 type="voip" 是通话/会议的显式声明；payload.type 缺失时由云函数回填。
   body = withEnvelopeType(body)
+  const iosRegistrations = body.payload?.iosVoip
+  if (body.payload && Object.prototype.hasOwnProperty.call(body.payload, 'iosVoip')) {
+    const { iosVoip, ...deliveryPayload } = body.payload
+    body = { ...body, payload: deliveryPayload }
+  }
   // ★每个请求一行摘要：数 `[push-send] in` 的行数 = 后端/网关实际调了几次。
   try {
     console.log('[push-send] in', JSON.stringify({ invocationId, ...describeEnvelope(body, event, rawBody.length) }))
@@ -555,22 +560,24 @@ async function handle(event, invocationId) {
   if (voip && voip.error) return { errCode: 400, errMsg: voip.error }
   if (voip && voip.expired) return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
 
-  // 未显式带 callRoute 的通话/会议：逐 CID 查个推设备档案，能判定厂商通道的走原生，
-  // 其余合并成一次普通通知。iOS PushKit 路由不在设备档案里，仍回退普通通知。
-  const invitation = scene?.call ?? ringAttempt
+  // iOS 读 IM 登记，其他设备继续按个推档案选路。普通通知合并发送。
+  const invitation = scene?.call ?? (meetingRinging ? ringAttempt : null)
   if (body.callRoute == null && invitation != null) {
     const results = []
     const notificationCids = []
     for (let i = 0; i < ids.length; i++) {
       const cid = ids[i]
-      const route = await resolveAutoCallRoute([cid], invocationId)
+      const iosRoute = iosCallRouteForCid(cid, iosRegistrations,
+        process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT || 'development')
+      const route = iosRoute ?? await resolveAutoCallRoute([cid], invocationId)
       if (route != null) {
         const native = prepareNativeVoip({
           ...body, push_clientid: cid, payload: invitation.payload, callRoute: route,
         }, Date.now())
         if (native != null && native.error == null && native.expired !== true && callTransportEnabled(route)) {
           const sent = await sendNativeVoip(body, route, native, invocationId)
-          results.push({ cid, delivery: 'native', errCode: sent.errCode, ...sent.data })
+          results.push({ cid, delivery: 'native', ...(iosRoute ? { transport: iosRoute.transport } : {}),
+            errCode: sent.errCode, ...sent.data })
           continue
         }
       }

@@ -45,14 +45,21 @@ function harness() {
     getAndroidView: () => texture, // 真实 video API 返回纹理，非被全屏搬动的 root。
     style: { setProperty },
   };
-  const api = new Function("View", "ViewGroup", "TextureView", `${code};return {prepareAndroidChatVideoInlineLayout,cancelAndroidChatVideoInlineLayout};`)(View, ViewGroup, TextureView);
+  const api = new Function("View", "ViewGroup", "TextureView", "ref", `${code};return {prepareAndroidChatVideoInlineLayout,cancelAndroidChatVideoInlineLayout,confirmAndroidChatVideoControls,androidChatVideoControlsPlayerId,androidChatVideoHiddenBarPlayerId};`)(View, ViewGroup, TextureView, (value: unknown) => ({ value }));
   return {
     inline, root, texture, element, setProperty, observer, listeners,
+    confirm: (fullscreen: boolean) => api.confirmAndroidChatVideoControls("chatVideoPlayer-42", fullscreen),
+    controls: api.androidChatVideoControlsPlayerId, hiddenBar: api.androidChatVideoHiddenBarPlayerId,
     arm: (id = "chatVideoPlayer-42") => api.prepareAndroidChatVideoInlineLayout(id, element),
     cancel: (id = "") => api.cancelAndroidChatVideoInlineLayout(id),
     draw: () => [...listeners].map(guard => guard.onPreDraw()),
     enter: () => { root.parent = fullscreenHost; root.width = texture.width = 1200; root.height = texture.height = 2640; },
-    exit: () => { root.parent = inline; root.height = texture.height = 497; },
+    exit: () => {
+      root.parent = inline; root.height = texture.height = 497;
+      // 返回首拍先关闭系统条并拒绝绘制，下一拍再评估布局。
+      expect([...listeners].map(guard => guard.onPreDraw())).toEqual([false]);
+      expect(api.androidChatVideoControlsPlayerId.value).toBe("");
+    },
     layout: () => { root.width = texture.width = inline.width; root.height = texture.height = inline.height; root.layoutRequested = false; },
   };
 }
@@ -131,4 +138,40 @@ it("fails open if the platform rejects a style write", () => {
   expect(h.draw()).toEqual([true]);
   expect(h.listeners.size).toBe(0);
   expect(vi.getTimerCount()).toBe(0);
+});
+
+
+it("hides inline controls before entry and keeps them hidden until the return layout is ready", () => {
+  const h = harness(); h.arm();
+  expect(h.hiddenBar.value).toBe("chatVideoPlayer-42");
+  expect(h.controls.value).toBe("");
+  h.draw();
+  expect(h.controls.value).toBe("");
+  h.enter(); h.draw();
+  expect(h.controls.value).toBe("chatVideoPlayer-42");
+  h.exit();
+  expect(h.hiddenBar.value).toBe("chatVideoPlayer-42");
+  expect(h.draw()).toEqual([false]);
+  h.layout(); h.draw();
+  expect(h.controls.value).toBe("");
+  expect(h.hiddenBar.value).toBe("");
+});
+
+it("restores the inline bar after cancelled or unsuccessful entry", () => {
+  const h = harness(); h.arm(); h.cancel();
+  expect(h.hiddenBar.value).toBe("");
+  expect(h.controls.value).toBe("");
+  h.arm(); vi.advanceTimersByTime(1500);
+  expect(h.hiddenBar.value).toBe("");
+  expect(h.controls.value).toBe("");
+});
+
+it("keeps native fullscreen controls available when no layout guard could be installed", () => {
+  const h = harness();
+  h.confirm(true);
+  expect(h.controls.value).toBe("chatVideoPlayer-42");
+  h.confirm(false);
+  expect(h.controls.value).toBe("");
+  h.confirm(true); h.cancel();
+  expect(h.controls.value).toBe("");
 });

@@ -34,9 +34,10 @@ function harness(platform = "android", disabled = false) {
   const source = platformCode(readFileSync("utils/chatVideoControl.uts", "utf8"), platform)
     .replace(/^import .+;$/gm, "").replace(/\bexport /g, "");
   const js = transformSync(source, { loader: "ts" }).code;
+  const confirmedControlsState = ["ios", "harmony"].includes(platform) ? ",confirmedChatVideoControlsPlayerId,fullscreenChatVideoHiddenBarPlayerId" : "";
   const control = new Function("scope", `with(scope){${js};return {
     beginChatVideoFullscreen,confirmChatVideoFullscreen,setChatVideoFullscreen,isChatVideoFullscreen,
-    exitChatVideoFullscreenOnBack,startChatVideoBackSwipe,finishChatVideoBackSwipe
+    exitChatVideoFullscreenOnBack,startChatVideoBackSwipe,finishChatVideoBackSwipe${confirmedControlsState}
   };}`)(scope);
   Object.assign(scope, control, {
     fullscreenRequestPending: false, barDisposed: false,
@@ -214,5 +215,44 @@ describe("back gestures stay on the chat page while fullscreen", () => {
     expect(h.back()).toBe(false);
     expect(h.page.setPageStyle).not.toHaveBeenCalled();
     expect(h.player.exitFullScreen).not.toHaveBeenCalled();
+  });
+});
+
+
+describe.each(["ios", "harmony"])("%s chat video control visibility", platform => {
+  it("does not expose system controls on the thumbnail before native fullscreen confirms", async () => {
+    const h = harness(platform);
+    await h.toggle();
+    expect(h.control.confirmedChatVideoControlsPlayerId.value).toBe("");
+    expect(h.control.fullscreenChatVideoHiddenBarPlayerId.value).toBe("chatVideoPlayer-42");
+    h.control.confirmChatVideoFullscreen(true, "chatVideoPlayer-42");
+    expect(h.control.confirmedChatVideoControlsPlayerId.value).toBe("chatVideoPlayer-42");
+    expect(h.control.fullscreenChatVideoHiddenBarPlayerId.value).toBe("chatVideoPlayer-42");
+    h.back();
+    // 自绘条要等原生退出完成，不能按下返回就先露出来。
+    expect(h.control.fullscreenChatVideoHiddenBarPlayerId.value).toBe("chatVideoPlayer-42");
+    h.control.confirmChatVideoFullscreen(false, "chatVideoPlayer-42");
+    expect(h.control.confirmedChatVideoControlsPlayerId.value).toBe("");
+    expect(h.control.fullscreenChatVideoHiddenBarPlayerId.value).toBe("");
+  });
+
+  it.each(["failure", "timeout", "page-hide"])("restores the inline bar after %s", async reason => {
+    const h = harness(platform);
+    if (reason == "failure") h.player.requestFullScreen.mockImplementation(() => { throw new Error("failed"); });
+    await h.toggle();
+    if (reason == "timeout") vi.advanceTimersByTime(1500);
+    if (reason == "page-hide") h.control.setChatVideoFullscreen(false);
+    expect(h.control.confirmedChatVideoControlsPlayerId.value).toBe("");
+    expect(h.control.fullscreenChatVideoHiddenBarPlayerId.value).toBe("");
+    expect(h.style.disableSwipeBack).toBe(false);
+  });
+
+  it("does not change the controls of merged-forward videos", () => {
+    const h = harness(platform);
+    h.control.beginChatVideoFullscreen("mfdVideoPlayer-42");
+    h.control.confirmChatVideoFullscreen(true);
+    expect(h.control.confirmedChatVideoControlsPlayerId.value).toBe("");
+    expect(h.control.fullscreenChatVideoHiddenBarPlayerId.value).toBe("");
+    expect(h.control.isChatVideoFullscreen()).toBe(true);
   });
 });

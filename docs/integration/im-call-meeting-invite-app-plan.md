@@ -343,13 +343,13 @@ IM 根据其设备登记确定被叫 CID 和可用通道。云函数从已验签
 | 变化 | 字段 | 格式与来源 |
 | --- | --- | --- |
 | 原样复用 | `payload.type`、`scene`、`convType`、`convId`、`msgId` | `"voip"`、`"call"`、整数 `1`、会话和消息 ID 的十进制字符串。用 `convId + msgId` 回查原邀请。 |
-| 原样复用 | `push_clientid`、`title`、`content` | 普通通知沿用 CID 数组和字符串文案。原生请求传单个 CID 字符串，与 `callRoute.cid` 一致。 |
+| 原样复用 | `push_clientid`、`title`、`content` | 普通通知沿用 CID 数组和字符串文案。显式 `callRoute` 指定一个与 `callRoute.cid` 一致的目标，Android 也接受只含该 CID 的数组。 |
 | 必填，沿用同事稿 | `callId`、`mediaType` | 从原邀请正文复制。当前原生来电支持 1–128 位字母、数字、下划线或连字符组成的 `callId`，已有 UUID 可原样使用。`mediaType` 为小写字符串 `"audio"` 或 `"video"`。 |
 | **新增，必填** | `calleeId` | IM 从原通话的被叫账号取十进制字符串。端上据此核对当前登录账号。设备登录和重新绑定可沿用同一个 `deviceId`，因此应保留原通话的被叫身份。 |
 | **新增，联调必填** | `expiresAt` | IM 按原消息的服务端 `sendTime + 60000` 计算 Unix 毫秒截止时间。重试沿用原值，云函数校验是否过期并据此限制投递 TTL。云函数兼容只传原消息 `sendTime` 的请求。 |
 | 可选 | `sendTime`、`senderName`、`roomName` | `sendTime` 为原消息服务端时间，`roomName` 可透传原邀请中的房间名。云函数将 `senderName` 映射为端上的 `displayName`，最多保留 80 个字符。 |
 
-**原生来电参数。** IM 从当前被叫设备的有效登记生成 `callRoute`，随签名请求发给云函数。下面以华为安卓通道为例。
+**设备来电路由。** IM 可以从被叫设备的有效登记生成 `callRoute`，随签名请求发给云函数。测试云函数也会按目标 CID 查询个推档案，根据已登记的厂商 token 和 `brand` 选择 Android 路由。下面是华为安卓的显式路由。
 
 ```json
 {
@@ -359,14 +359,19 @@ IM 根据其设备登记确定被叫 CID 和可用通道。云函数从已验签
 }
 ```
 
-| 设备通道 | `transport` | 当前投递 |
-| --- | --- | --- |
-| 华为安卓 | `android-huawei` | 开启能力后用 UniPush 扩展发厂商纯透传，填充 `push_channel.android.ups.transmission` |
-| 荣耀 | `android-honor` | 普通通知，原生来电待接入专用接口 |
-| 小米、vivo、OPPO 国内及海外、魅族、坚果 | `android-xiaomi`、`android-vivo`、`android-oppo`、`android-oppo-global`、`android-meizu`、`android-smartisan` | 普通通知，原生来电按各厂商能力单独对接 |
-| 三星等已注册 FCM 的设备 | `android-fcm` | 普通通知，原生来电待接入 FCM 路径 |
-| 华为鸿蒙 | `harmony-huawei` | 普通通知，原生来电待接入鸿蒙路径 |
-| iPhone | `ios-voip` | 已核对 PushKit 登记和 APNs 环境时，走 iOS VoIP |
+| 设备通道 | 个推 `brand` | `transport` | `push-send-test` 投递 |
+| --- | --- | --- | --- |
+| 华为安卓 | `hw` | `android-huawei` | UniPush UPS 纯透传，填充 `push_channel.android.ups.transmission` |
+| 荣耀 | `ho` | `android-honor` | 普通通知 |
+| 小米／Redmi | `xm` | `android-xiaomi` | 普通通知 |
+| vivo／iQOO | `vv` | `android-vivo` | 普通通知 |
+| OPPO 国内（含登记在该通道的一加、realme） | `op` | `android-oppo` | 普通通知 |
+| OPPO 海外 | `opg` | `android-oppo-global` | 普通通知 |
+| 魅族 | `mz` | `android-meizu` | 普通通知 |
+| 锤子／坚果 | `st` | `android-smartisan` | 普通通知 |
+| 三星等已注册 FCM 的设备 | `fcm` | `android-fcm` | 普通通知 |
+| 华为鸿蒙 | — | `harmony-huawei` | 普通通知，原生来电待接入鸿蒙路径 |
+| iPhone | — | `ios-voip` | 已核对 PushKit 登记和 APNs 环境时，走 iOS VoIP |
 
 当前 UniPush 的标准 UPS 纯透传示例明示适用华为安卓。荣耀的系统 VoIP 由其专用下行能力提供。其余通道按表内路径验收。 [UPS 请求说明](https://docs.getui.com/getui/server/rest_v2/common_args/) · [荣耀 VoIP 下行消息](https://developer.honor.com/cn/kitdoc?category=%25E5%259F%25BA%25E7%25A1%2580%25E6%259C%258D%25E5%258A%25A1&docId=downlink-message.md&kitId=11002&navigation=ref&token=)
 

@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto')
-const { callTargetCids, iosCallRouteForCid, prepareVoip, prepareNativeVoip, prepareVoipScene, prepareMeetingRingInvitation } = require('./voip')
+const { callTargetCids, androidCallRouteForCid, iosCallRouteForCid, prepareVoip, prepareNativeVoip, prepareVoipScene, prepareMeetingRingInvitation } = require('./voip')
 
 const APP_ID = '__UNI__8BF05E4'          // 本项目的 DCloud AppID
 // 后端握手密钥：**只**从环境变量读（uniCloud 控制台 → 云函数 → 环境变量 PUSH_SIGN_KEY）。
@@ -292,28 +292,13 @@ function attachBadgeToPayload(payload, badge) {
   return JSON.stringify(out).length <= MAX_PAYLOAD ? out : payload
 }
 
-function callTransportEnabled(route) {
-  // 测试空间只配置 PUSH_SIGN_KEY / PUSH_DEBUG_MESSAGE_CONTENT：
-  // 后端给了 transport 就按该通道投递，不再校验 APNs 环境或厂商白名单。
-  return route != null && typeof route.transport === 'string' && route.transport.length > 0
-}
-
 // ==================== 无 callRoute 时的厂商通道动态判定 ====================
 //
 // ★为什么在云端查而不是端上：接收端可能无进程（这正是本链路要支持的场景），
 //   cid → 厂商 token / 品牌的档案存在个推服务端，是设备上次在线注册时写入并持久化的，
 //   云函数按 cid 查档案即可，不依赖接收端 App 存活 —— 与普通厂商通知用同一份数据。
-// ★判定口径（个推官方 REST v2 用户信息接口字段，2026-11-20 核对）：
-//   device_token 非空（确有厂商通道注册成功）+ brand === 'hw'（官方厂商代码：
-//   华为-hw、小米-xm、魅族-mz、OPPO-op、VIVO-vv、苹果-iphone）。
-//   不依赖 phoneModel/phone_model（实测可为空，且仅高级接口返回），
-//   不使用未经官方文档证实的字段。荣耀独立通道待真机验证后再放开。
-// ★回退语义：查不到/查失败/不匹配一律返回 null → 回退普通通知，绝不阻断投递。
-async function resolveAutoCallRoute(pushClientId, invocationId) {
-  const ids = callTargetCids(pushClientId)
-  // 语音呼叫按单设备逐台投递：多 cid 扇出时不做自动判定，交给后端逐台带 callRoute。
-  if (ids == null || ids.length !== 1) return null
-  const cid = ids[0]
+// device_token 非空时按 brand 选路。缺少专用发送能力或查档失败时走普通通知。
+async function resolveAutoCallRoute(cid, invocationId) {
   if (typeof uniPush.getClientDetailByCid !== 'function') return null
   let detail = null
   try {
@@ -326,20 +311,20 @@ async function resolveAutoCallRoute(pushClientId, invocationId) {
     }))
     return null
   }
-  const token = typeof detail?.device_token === 'string' ? detail.device_token : ''
+  const token = typeof detail?.device_token === 'string' ? detail.device_token.trim() : ''
   const brand = typeof detail?.brand === 'string' ? detail.brand.trim().toLowerCase() : ''
   // 全量键名+安全值形态落日志：校准 DCloud 封装与个推原生字段的实际映射。
   const shape = detail && typeof detail === 'object'
     ? Object.fromEntries(Object.entries(detail).map(([k, v]) =>
         [k, typeof v === 'string' ? (/token/i.test(k) ? `len:${v.length}` : v.slice(0, 24)) : v]))
     : null
-  const routed = token.length > 0 && brand === 'hw'
+  const route = token ? androidCallRouteForCid(cid, brand, detail.phone_type) : null
   console.log('[push-send] call route auto', JSON.stringify({
     invocationId, hasVendorToken: token.length > 0, brand,
     detailShape: shape,
-    transport: routed ? 'android-huawei' : null
+    transport: route?.transport ?? null
   }))
-  return routed ? { transport: 'android-huawei', platform: 'android', cid } : null
+  return route
 }
 
 async function sendNativeVoip(body, route, nativeVoip, invocationId) {
@@ -541,13 +526,7 @@ async function handle(event, invocationId) {
     if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
     if (nativeVoip.expired) return { errCode: 0, data: { skipped: true } }
     if (!body.title || !body.content) return { errCode: 400, errMsg: 'title/content required' }
-    const route = body.callRoute
-    if (!callTransportEnabled(route)) {
-      // 定向原生请求（无 scene/call）仍 fail-closed；通话/会议回退普通通知。
-      if (!strictCids) return { errCode: 503, errMsg: 'call transport unavailable' }
-    } else {
-      return sendNativeVoip(body, route, nativeVoip, invocationId)
-    }
+    if (!nativeVoip.notificationOnly) return sendNativeVoip(body, body.callRoute, nativeVoip, invocationId)
   }
 
   const ids = strictCids
@@ -569,12 +548,12 @@ async function handle(event, invocationId) {
       const cid = ids[i]
       const iosRoute = iosCallRouteForCid(cid, iosRegistrations,
         process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT || 'development')
-      const route = iosRoute ?? await resolveAutoCallRoute([cid], invocationId)
+      const route = iosRoute ?? await resolveAutoCallRoute(cid, invocationId)
       if (route != null) {
         const native = prepareNativeVoip({
           ...body, push_clientid: cid, payload: invitation.payload, callRoute: route,
         }, Date.now())
-        if (native != null && native.error == null && native.expired !== true && callTransportEnabled(route)) {
+        if (native != null && native.error == null && native.expired !== true && !native.notificationOnly) {
           const sent = await sendNativeVoip(body, route, native, invocationId)
           results.push({ cid, delivery: 'native', ...(iosRoute ? { transport: iosRoute.transport } : {}),
             errCode: sent.errCode, ...sent.data })

@@ -13,15 +13,14 @@ const ordinaryFixtures = JSON.parse(readFileSync(resolve(import.meta.dirname, 'f
 const now = 1_793_000_000_000;
 const locator = { type: 'voip', convId: '245475557381246976', msgId: '9223372036854775807' };
 const notificationOnlyTransports = [
-  ['android-honor', 'android'],
-  ['android-xiaomi', 'android'],
-  ['android-vivo', 'android'],
-  ['android-oppo', 'android'],
-  ['android-oppo-global', 'android'],
-  ['android-meizu', 'android'],
-  ['android-smartisan', 'android'],
-  ['android-fcm', 'android'],
-  ['harmony-huawei', 'harmonyos'],
+  ['android-honor', 'ho'],
+  ['android-xiaomi', 'xm'],
+  ['android-vivo', 'vv'],
+  ['android-oppo', 'op'],
+  ['android-oppo-global', 'opg'],
+  ['android-meizu', 'mz'],
+  ['android-smartisan', 'st'],
+  ['android-fcm', 'fcm'],
 ] as const;
 
 function load(entry = latestEntry, env: Record<string, string> = {}) {
@@ -29,11 +28,12 @@ function load(entry = latestEntry, env: Record<string, string> = {}) {
   const request = vi.fn().mockResolvedValue({ errCode: 0, data: { accepted: true } });
   const manager = { sendMessage: send, request };
   const database = vi.fn(() => { throw new Error('push delivery should not query a database'); });
+  const log = vi.fn();
   const module = { exports: {} as any };
   runInNewContext(readFileSync(entry, 'utf8'), { filename: entry, exports: module.exports, require: createRequire(entry), Buffer,
     process: { env: { PUSH_SIGN_KEY: 'fixture-only-sign', ...env } },
-    uniCloud: { database, getPushManager: () => manager }, console: { log() {}, error() {} } });
-  return { send, request, manager, database,
+    uniCloud: { database, getPushManager: () => manager }, console: { log, error() {} } });
+  return { send, request, manager, database, log,
     call: (body: any, sign = 'fixture-only-sign') => module.exports.main({ headers: { 'x-push-sign': sign }, body: JSON.stringify(body) }) };
 }
 
@@ -113,10 +113,33 @@ describe('native call delivery', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it.each(notificationOnlyTransports)('keeps %s unavailable for native calls on %s', async (transport, platform) => {
-    const { call, send, request } = load(latestEntry, { NUWAX_VOIP_ANDROID_TRANSPORTS: transport });
-    const result = await call({ ...makeBody(), callRoute: { cid, platform, transport } });
-    expect(result).toEqual({ errCode: 400, errMsg: 'native call transport unavailable' });
+  it.each(notificationOnlyTransports)('delivers an explicit %s route by notification', async (transport) => {
+    const { call, send, request } = load();
+    const body = makeBody();
+    const callRoute = { cid, platform: 'android', transport };
+    expect((await call({ ...body, push_clientid: [cid], callRoute })).errCode).toBe(0);
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0]).toMatchObject({ push_clientid: [cid], payload: body.payload });
+    expect(send.mock.calls[0][0].payload).not.toHaveProperty('delivery');
+    expect(send.mock.calls[0][0].settings).not.toHaveProperty('strategy');
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('rejects a notification-only route for a different target and skips expired invitations', async () => {
+    const { call, send, request } = load();
+    const callRoute = { cid, platform: 'android', transport: 'android-honor' };
+    expect(await call({ ...makeBody(), push_clientid: [cid, 'other-cid'], callRoute }))
+      .toEqual({ errCode: 400, errMsg: 'one matching call device is required' });
+    expect(await call({ ...makeBody(Date.now() - 1), callRoute }))
+      .toEqual({ errCode: 0, data: { skipped: true } });
+    expect(send).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('keeps the deferred HarmonyOS route unavailable for native calls', async () => {
+    const { call, send, request } = load();
+    expect(await call({ ...makeBody(), callRoute: { cid, platform: 'harmonyos', transport: 'harmony-huawei' } }))
+      .toEqual({ errCode: 400, errMsg: 'native call transport unavailable' });
     expect(send).not.toHaveBeenCalled();
     expect(request).not.toHaveBeenCalled();
   });
@@ -497,6 +520,19 @@ describe('automatic vendor route resolution', () => {
     return loadable;
   };
 
+  it.each(notificationOnlyTransports)('resolves %s from the registry and delivers one notification', async (transport, brand) => {
+    const cid = 'vendor-registry-cid';
+    const { call, send, request, log } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand: brand.toUpperCase(), phone_type: 1 },
+    });
+    const result = await call(makeCall(cid));
+    const [, routeLog] = log.mock.calls.find(([event]) => event === '[push-send] call route auto')!;
+    expect(JSON.parse(routeLog)).toMatchObject({ brand, transport });
+    expect(result.data.results).toEqual([{ delivery: 'notification', errCode: 0, cids: [cid] }]);
+    expect(send).toHaveBeenCalledOnce();
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it('routes one Huawei-registered cid through the native transmission channel', async () => {
     const cid = 'huawei-registry-cid';
     const { call, send, request, manager } = withRegistry(load(), {
@@ -547,7 +583,8 @@ describe('automatic vendor route resolution', () => {
 
   it.each([
     ['no vendor token', { device_token: '', brand: 'hw', phone_type: 1 }],
-    ['non-Huawei brand', { device_token: 'vendor-token', brand: 'vv', phone_type: 1 }],
+    ['unknown brand', { device_token: 'vendor-token', brand: 'unknown', phone_type: 1 }],
+    ['HarmonyOS reported as Huawei', { device_token: 'vendor-token', brand: 'hw', phone_type: 7 }],
     ['missing registry entry', undefined],
   ])('keeps the ordinary notification when the registry says %s', async (_name, entry) => {
     const cid = 'registry-cid';

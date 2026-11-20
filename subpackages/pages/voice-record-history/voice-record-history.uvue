@@ -35,11 +35,18 @@
             <text class="vh-card__btn-text">文档</text>
           </view>
           <view v-if="canReprocess(item.status)" class="vh-card__btn" hover-class="vh-card__btn--active" @click="handleReprocess(item)">
-            <svg-icon name="icon-restart" size="16" unit="px" color="#666666" />
+            <spin-loading v-if="reprocessingId == item.id" size="14px" color="#666666" :duration-ms="800" />
+            <svg-icon v-else name="icon-restart" size="16" unit="px" color="#666666" />
             <text class="vh-card__btn-text">{{ reprocessLabel(item.status) }}</text>
           </view>
+          <view v-if="canDownloadAudio(item.status)" class="vh-card__btn" hover-class="vh-card__btn--active" @click="handleAudioFiles(item)">
+            <spin-loading v-if="audioLoadingId == item.id" size="14px" color="#666666" :duration-ms="800" />
+            <svg-icon v-else name="icon-msg-download" size="16" unit="px" color="#666666" />
+            <text class="vh-card__btn-text">下载录音</text>
+          </view>
           <view class="vh-card__btn" hover-class="vh-card__btn--active" @click="handleDelete(item)">
-            <text class="vh-card__btn-text vh-card__btn-text--plain">删除</text>
+            <spin-loading v-if="deletingId == item.id" size="14px" color="#666666" :duration-ms="800" />
+            <text :class="['vh-card__btn-text', deletingId == item.id ? '' : 'vh-card__btn-text--plain']">删除</text>
           </view>
         </view>
       </view>
@@ -47,6 +54,25 @@
         <text class="vh-footer__text">{{ footerText }}</text>
       </view>
     </scroll-view>
+    <view v-if="audioSheetVisible" class="vh-mask" @click="closeAudioSheet">
+      <view class="vh-sheet" @click.stop="keepCardActions">
+        <text class="vh-sheet__title">{{ audioSheetTitle }}</text>
+        <scroll-view v-if="audioFiles.length > 0" class="vh-sheet__list" scroll-y="true">
+          <view v-for="file in audioFiles" :key="file.segmentIndex" class="vh-sheet__row" @click="downloadAudioFile(file)">
+            <view class="vh-sheet__meta">
+              <text class="vh-sheet__name">第 {{ file.segmentIndex + 1 }} 段</text>
+              <text class="vh-sheet__duration">{{ file.duration }}</text>
+            </view>
+            <spin-loading v-if="downloadingUrl == file.audioUrl" size="14px" color="#666666" :duration-ms="800" />
+            <text v-else class="vh-sheet__action">下载</text>
+          </view>
+        </scroll-view>
+        <text v-else class="vh-sheet__empty">暂无可下载的录音</text>
+        <view class="vh-sheet__close" @click="closeAudioSheet">
+          <text class="vh-sheet__close-text">关闭</text>
+        </view>
+      </view>
+    </view>
   </view>
 </template>
 
@@ -55,9 +81,14 @@
  * 录音历史。
  * 列表：POST /api/voice/note/list，按 noteId 游标翻页。
  * 卡片：标题右侧显示状态，下方是时长和 created 转成的本地时间。
- * 操作：已完成可看文档；转写失败、文档失败、文档已删除可重试；删除走确认框。
+ * 操作：已完成可看文档；转写失败、文档失败、文档已删除可重试；
+ * 转写中、部分转写失败、文档失败、已完成可下载录音；删除走确认框。
  */
-import { apiVoiceNoteDelete, apiVoiceNoteDetail, apiVoiceNoteList, apiVoiceNoteReprocess } from "@/servers/voiceNote.uts";
+import { apiVoiceNoteAudioFiles, apiVoiceNoteDelete, apiVoiceNoteDetail, apiVoiceNoteList, apiVoiceNoteReprocess } from "@/servers/voiceNote.uts";
+import SpinLoading from "@/subpackages/components/spin-loading/spin-loading.uvue";
+// #ifdef APP
+import { downloadFileInApp } from "@/subpackages/utils/fileTree";
+// #endif
 
 /** 列表一行。字段已从接口行转成展示用的字符串。 */
 type VoiceRecordHistoryItem = {
@@ -81,11 +112,102 @@ type VoiceRecordHistoryItem = {
   docLabel: string;
 };
 
+/** 弹窗里的一段可下载录音。audioUrl 是当次接口返回的地址。 */
+type VoiceAudioFileItem = {
+  segmentIndex: number;
+  duration: string;
+  audioUrl: string;
+};
+
 const records = ref<VoiceRecordHistoryItem[]>([]);
 /** 请求进行中，避免下拉和上拉叠在一起 */
 const loading = ref<boolean>(false);
-/** 重新转写、打开文档、删除进行中。挡住连点，遮罩消失前不再发下一次。 */
+/** 重新转写、打开文档、删除进行中。挡住连点。 */
 const actionLocked = ref<boolean>(false);
+/** 正在删除的 noteId。确认后在该条删除按钮前显示转圈。 */
+const deletingId = ref<string>("");
+/** 正在重新转写的 noteId。转圈显示在该按钮文字前面。 */
+const reprocessingId = ref<string>("");
+/** 正在拉取音频列表的 noteId。转圈显示在下载录音按钮前面。 */
+const audioLoadingId = ref<string>("");
+const audioSheetVisible = ref<boolean>(false);
+const audioSheetTitle = ref<string>("录音文件");
+const audioFiles = ref<VoiceAudioFileItem[]>([]);
+/** 正在下载的音频地址，用来挡住同一条连点。 */
+const downloadingUrl = ref<string>("");
+
+/** 转写中、部分转写失败、文档失败、已完成可以下载录音文件。 */
+function canDownloadAudio(status: string): boolean {
+  return status == "PROCESSING" || status == "ASR_PARTIAL_FAILED" || status == "DOC_FAILED" || status == "SUCCESS";
+}
+
+function closeAudioSheet(): void {
+  audioSheetVisible.value = false;
+  downloadingUrl.value = "";
+}
+
+/** 用 audioUrl 路径里的文件名；没有后缀时按分段号生成 m4a。 */
+function audioDownloadName(file: VoiceAudioFileItem): string {
+  const fallback = "录音-" + (file.segmentIndex + 1).toString() + ".m4a";
+  const url = file.audioUrl;
+  const query = url.indexOf("?");
+  const path = query >= 0 ? url.substring(0, query) : url;
+  const slash = path.lastIndexOf("/");
+  if (slash < 0 || slash >= path.length - 1) return fallback;
+  const base = path.substring(slash + 1);
+  if (base.length == 0 || base.indexOf(".") < 0) return fallback;
+  return base;
+}
+
+/** App 按 audioUrl 下载到本地。预签名地址不能带登录头。成功后弹出和产物预览一样的保存位置引导。 */
+function downloadAudioFile(file: VoiceAudioFileItem): void {
+  if (downloadingUrl.value.length > 0) return;
+  if (file.audioUrl.length == 0) return;
+  downloadingUrl.value = file.audioUrl;
+  const filename = audioDownloadName(file);
+  // #ifdef APP
+  downloadFileInApp(file.audioUrl, filename, false, false, true).then((_path: string) => {
+    downloadingUrl.value = "";
+  }).catch((_err: any | null) => {
+    downloadingUrl.value = "";
+  });
+  return;
+  // #endif
+  uni.downloadFile({
+    url: file.audioUrl,
+    success: (res) => {
+      downloadingUrl.value = "";
+      if (res.statusCode != 200) {
+        uni.showToast({ title: "下载失败", icon: "none" });
+        return;
+      }
+      uni.saveFile({
+        tempFilePath: res.tempFilePath,
+        success: () => {
+          uni.showToast({ title: "已下载", icon: "none" });
+        },
+        fail: () => {
+          uni.showToast({ title: "下载失败", icon: "none" });
+        },
+      });
+    },
+    fail: () => {
+      downloadingUrl.value = "";
+      uni.showToast({ title: "下载失败", icon: "none" });
+    },
+  });
+}
+
+/** 真正的拉列表逻辑在 readAudioFiles 之后赋值，避免模板引用时 Kotlin 还看不到后面的函数。 */
+let handleAudioFilesRunner: ((item: VoiceRecordHistoryItem) => void) | null = null;
+
+function handleAudioFiles(item: VoiceRecordHistoryItem): void {
+  const runner = handleAudioFilesRunner;
+  if (runner != null) {
+    runner(item);
+  }
+}
+
 const refreshing = ref<boolean>(false);
 /** 本页条数不足 pageSize 时不再请求下一页 */
 const hasMore = ref<boolean>(true);
@@ -322,6 +444,65 @@ function openDetail(item: VoiceRecordHistoryItem): void {
   });
 }
 
+function readAudioFiles(data: UTSJSONObject | null): VoiceAudioFileItem[] {
+  const result: VoiceAudioFileItem[] = [];
+  if (data == null) return result;
+  const raw = data["items"];
+  if (raw == null) return result;
+  const rows = raw as UTSJSONObject[];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const urlRaw = row["audioUrl"];
+    const url = urlRaw != null ? `${urlRaw}` : "";
+    if (url.length == 0 || url == "null") continue;
+    let segmentIndex = i;
+    const indexRaw = row["segmentIndex"];
+    if (indexRaw != null) {
+      const parsed = parseFloat(`${indexRaw}`);
+      if (!isNaN(parsed)) segmentIndex = Math.floor(parsed);
+    }
+    let durationMs = 0;
+    const durationRaw = row["durationMs"];
+    if (durationRaw != null) {
+      const parsedDuration = parseFloat(`${durationRaw}`);
+      if (!isNaN(parsedDuration)) durationMs = parsedDuration;
+    }
+    const file: VoiceAudioFileItem = {
+      segmentIndex: segmentIndex,
+      duration: formatDuration(durationMs),
+      audioUrl: url,
+    };
+    result.push(file);
+  }
+  return result;
+}
+
+/** 拉第一页音频列表，最多 50 条，在弹窗里展示。 */
+async function loadAudioFiles(item: VoiceRecordHistoryItem): Promise<void> {
+  let failMessage = "";
+  try {
+    const data = await apiVoiceNoteAudioFiles(item.id, 1, 50);
+    audioFiles.value = readAudioFiles(data);
+    audioSheetTitle.value = item.title.length > 0 ? item.title : "录音文件";
+    audioSheetVisible.value = true;
+  } catch (_error) {
+    failMessage = "录音列表加载失败";
+  } finally {
+    audioLoadingId.value = "";
+    actionLocked.value = false;
+  }
+  if (failMessage.length > 0) {
+    uni.showToast({ title: failMessage, icon: "none" });
+  }
+}
+
+handleAudioFilesRunner = (item: VoiceRecordHistoryItem): void => {
+  if (actionLocked.value) return;
+  actionLocked.value = true;
+  audioLoadingId.value = item.id;
+  void loadAudioFiles(item);
+};
+
 /** 只有转写失败、文档失败、文档已删除可以重试。 */
 function canReprocess(status: string): boolean {
   return status == "ASR_PARTIAL_FAILED" || status == "DOC_FAILED" || status == "DOC_REMOVED";
@@ -336,7 +517,9 @@ function reprocessLabel(status: string): string {
 }
 
 async function handleReprocess(item: VoiceRecordHistoryItem): Promise<void> {
-  if (!beginAction("处理中")) return;
+  if (actionLocked.value) return;
+  actionLocked.value = true;
+  reprocessingId.value = item.id;
   let failMessage = "";
   try {
     const status = await apiVoiceNoteReprocess(item.id);
@@ -345,7 +528,8 @@ async function handleReprocess(item: VoiceRecordHistoryItem): Promise<void> {
     const message = `${error}`;
     failMessage = message.length > 0 ? message : "处理失败";
   } finally {
-    endAction();
+    reprocessingId.value = "";
+    actionLocked.value = false;
   }
   if (failMessage.length > 0) {
     uni.showToast({ title: failMessage, icon: "none" });
@@ -361,21 +545,16 @@ function removeRecord(noteId: string): void {
 }
 
 async function confirmDelete(item: VoiceRecordHistoryItem): Promise<void> {
-  uni.showLoading({ title: "删除中", mask: true });
+  deletingId.value = item.id;
   let failMessage = "";
-  let deleted = false;
   try {
     await apiVoiceNoteDelete(item.id);
     removeRecord(item.id);
-    deleted = true;
   } catch (_error) {
     failMessage = "删除失败";
   } finally {
+    deletingId.value = "";
     endAction();
-  }
-  if (deleted) {
-    uni.showToast({ title: "删除成功", icon: "none" });
-    return;
   }
   if (failMessage.length > 0) {
     uni.showToast({ title: failMessage, icon: "none" });
@@ -412,6 +591,7 @@ onShow(() => {
 <style lang="scss" scoped>
 .vh-page {
   flex: 1;
+  position: relative;
   background-color: #f4f5f7;
 }
 
@@ -533,5 +713,84 @@ onShow(() => {
   color: #6a68b8;
   lines: 1;
   text-overflow: ellipsis;
+}
+
+.vh-mask {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.4);
+  justify-content: flex-end;
+}
+
+.vh-sheet {
+  background-color: #ffffff;
+  border-radius: 24rpx 24rpx 0 0;
+  padding: 32rpx 32rpx 24rpx 32rpx;
+}
+
+.vh-sheet__title {
+  font-size: 32rpx;
+  font-weight: 600;
+  color: #1a1a1a;
+  lines: 1;
+  text-overflow: ellipsis;
+}
+
+.vh-sheet__list {
+  margin-top: 24rpx;
+  max-height: 640rpx;
+}
+
+.vh-sheet__row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  padding: 24rpx 0;
+  border-bottom: 2rpx solid #f1f2f4;
+}
+
+.vh-sheet__meta {
+  flex: 1;
+  flex-direction: row;
+  align-items: center;
+}
+
+.vh-sheet__name {
+  font-size: 28rpx;
+  color: #1a1a1a;
+}
+
+.vh-sheet__duration {
+  margin-left: 16rpx;
+  font-size: 24rpx;
+  color: #9a9aa2;
+}
+
+.vh-sheet__action {
+  font-size: 26rpx;
+  color: #5147ff;
+}
+
+.vh-sheet__empty {
+  margin-top: 32rpx;
+  margin-bottom: 16rpx;
+  font-size: 26rpx;
+  color: #9a9aa2;
+  text-align: center;
+}
+
+.vh-sheet__close {
+  margin-top: 16rpx;
+  height: 88rpx;
+  align-items: center;
+  justify-content: center;
+}
+
+.vh-sheet__close-text {
+  font-size: 30rpx;
+  color: #1a1a1a;
 }
 </style>

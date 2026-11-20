@@ -32,6 +32,112 @@ function readDataString(data: any | null, key: string): string {
   return `${raw}`;
 }
 
+function isDigitChar(ch: string): boolean {
+  return ch >= "0" && ch <= "9";
+}
+
+function isJsonWs(ch: string): boolean {
+  return ch == " " || ch == "\n" || ch == "\r" || ch == "\t";
+}
+
+/**
+ * 上传响应里的 code 有时是未加引号的 0000。
+ * Android Gson 把前导零当成非法数字，JSON.parse 会直接打出 JsonSyntaxException，catch 拦不住。
+ * 只改写冒号后面的前导零整数，字符串里的内容不动。
+ */
+function quoteLeadingZeroInts(text: string): string {
+  let out = "";
+  let i = 0;
+  let segStart = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text.charAt(i);
+    if (ch == "\"") {
+      i = i + 1;
+      while (i < n) {
+        const sc = text.charAt(i);
+        if (sc == "\\") {
+          i = i + 2;
+          continue;
+        }
+        if (sc == "\"") {
+          i = i + 1;
+          break;
+        }
+        i = i + 1;
+      }
+      continue;
+    }
+    if (ch != ":") {
+      i = i + 1;
+      continue;
+    }
+    i = i + 1;
+    while (i < n && isJsonWs(text.charAt(i))) {
+      i = i + 1;
+    }
+    let j = i;
+    while (j < n && isDigitChar(text.charAt(j))) {
+      j = j + 1;
+    }
+    const digits = j - i;
+    const next = j < n ? text.charAt(j) : "";
+    const leadingZero = digits > 1 && text.charAt(i) == "0" && next != "." && next != "e" && next != "E";
+    if (leadingZero) {
+      out = out + text.substring(segStart, i) + "\"" + text.substring(i, j) + "\"";
+      segStart = j;
+    }
+    i = j;
+  }
+  if (segStart == 0) return text;
+  return out + text.substring(segStart, n);
+}
+
+/**
+ * 解析 uploadFile 的 res.data。
+ * 非对象正文不调用 JSON.parse，避免网关返回纯文本时打出 JsonSyntaxException。
+ */
+function parseUploadBody(raw: any | null): UTSJSONObject | null {
+  if (raw == null) return null;
+  if (typeof raw != "string") {
+    try {
+      const obj = raw as UTSJSONObject;
+      if (obj["code"] != null || obj["data"] != null || obj["message"] != null) return obj;
+    } catch (_obj) {
+      return null;
+    }
+    return null;
+  }
+  let text = `${raw}`.trim();
+  if (text.length == 0) return null;
+  if (text.charCodeAt(0) == 0xfeff) {
+    text = text.substring(1).trim();
+    if (text.length == 0) return null;
+  }
+  const first = text.charAt(0);
+  const last = text.charAt(text.length - 1);
+  const isObject = first == "{" && last == "}";
+  const isArray = first == "[" && last == "]";
+  if (!isObject && !isArray) return null;
+  const normalized = quoteLeadingZeroInts(text);
+  try {
+    const parsed = JSON.parse(normalized);
+    if (parsed == null || typeof parsed != "object") return null;
+    return parsed as UTSJSONObject;
+  } catch (_parse) {
+    return null;
+  }
+}
+
+function readSegmentId(data: any | null): string {
+  if (data == null) return "";
+  if (typeof data == "string" || typeof data == "number") return `${data}`;
+  if (typeof data != "object") return "";
+  const dataObj = data as UTSJSONObject;
+  if (dataObj["segmentId"] == null) return "";
+  return `${dataObj["segmentId"]}`;
+}
+
 /** 创建笔记会话，返回 noteId。title 可空，空则由服务端在转写后生成。 */
 export async function apiVoiceNoteCreate(title: string): Promise<string> {
   const body = {} as UTSJSONObject;
@@ -240,35 +346,18 @@ export function apiVoiceNoteUploadSegment(
       header: authHeader(),
       formData: formData,
       success: (res) => {
-        try {
-          const raw = res.data;
-          let parsed: UTSJSONObject | null = null;
-          if (typeof raw == "string") {
-            const text = `${raw}`.trim();
-            if (text.length > 0) parsed = JSON.parse(text) as UTSJSONObject;
-          } else if (raw != null) {
-            parsed = raw as UTSJSONObject;
-          }
-          if (parsed == null) {
-            reject(new Error("上传响应为空"));
-            return;
-          }
-          const code = parsed["code"] != null ? `${parsed["code"]}` : "";
-          if (code != SUCCESS_CODE) {
-            const message = parsed["message"] != null ? `${parsed["message"]}` : "分段上传失败";
-            reject(new Error(message));
-            return;
-          }
-          const data = parsed["data"];
-          let segmentId = "";
-          if (data != null) {
-            const dataObj = data as UTSJSONObject;
-            if (dataObj["segmentId"] != null) segmentId = `${dataObj["segmentId"]}`;
-          }
-          resolve(segmentId);
-        } catch (e) {
-          reject(e);
+        const parsed = parseUploadBody(res.data);
+        if (parsed == null) {
+          reject(new Error("上传响应无法解析"));
+          return;
         }
+        const code = parsed["code"] != null ? `${parsed["code"]}` : "";
+        if (code != SUCCESS_CODE) {
+          const message = parsed["message"] != null ? `${parsed["message"]}` : "分段上传失败";
+          reject(new Error(message));
+          return;
+        }
+        resolve(readSegmentId(parsed["data"]));
       },
       fail: (err) => {
         const message = err != null && err.errMsg != null ? `${err.errMsg}` : "分段上传失败";

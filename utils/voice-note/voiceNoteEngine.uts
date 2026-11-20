@@ -29,7 +29,11 @@ import {
 } from "@/uni_modules/nuwax-stream-pcm-player";
 // #endif
 // #ifdef APP-HARMONY
-import { VoiceNoteM4aRecorder } from "@/uni_modules/nuwax-stream-pcm-player";
+import {
+  VoiceNoteM4aRecorder,
+  beginVoiceNoteBackground,
+  endVoiceNoteBackground,
+} from "@/uni_modules/nuwax-stream-pcm-player";
 // #endif
 
 /**
@@ -72,7 +76,7 @@ function touch(record: VoiceNoteRecord): void {
 }
 
 function beginBackground(): void {
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try {
     beginVoiceNoteBackground();
   } catch (e) {
@@ -82,7 +86,7 @@ function beginBackground(): void {
 }
 
 function endBackground(): void {
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try {
     endVoiceNoteBackground();
   } catch (e) {
@@ -169,6 +173,11 @@ async function startRecorder(): Promise<void> {
   if (latest != null) {
     latest.openSegmentPath = path;
     touch(latest);
+    bindNoteAfterCapture(latest.localId);
+    // 鸿蒙长时任务会校验当前确实在录音，必须等 AVRecorder.start 成功后再申请。
+    // #ifdef APP-HARMONY
+    beginBackground();
+    // #endif
   }
   // #endif
   // #ifndef APP
@@ -331,6 +340,7 @@ function releaseRecorderCallbacks(): void {
   recorderBound = false;
   // #ifndef APP
   const recorder = uni.getRecorderManager();
+  recorder.onStart((_res: any | null) => {});
   recorder.onStop((_res: RecorderManagerOnStopResult) => {});
   recorder.onError((_err: any) => {});
   // #endif
@@ -344,6 +354,11 @@ function bindRecorder(): void {
   // #endif
   // #ifndef APP
   const recorder = uni.getRecorderManager();
+  recorder.onStart((_res: any | null) => {
+    const open = activeRecord();
+    if (open == null) return;
+    bindNoteAfterCapture(open.localId);
+  });
   recorder.onStop((res: RecorderManagerOnStopResult) => {
     const intent = stopIntent;
     stopIntent = "busy";
@@ -620,8 +635,10 @@ function removeMissingSegment(localId: string, segmentIndex: number): VoiceNoteR
 }
 
 function rememberCreateError(localId: string, message: string): void {
+  console.warn("[voice-note] create note failed " + message);
   const latest = findVoiceNoteByLocalId(localId);
   if (latest == null) return;
+  if (latest.phase == "recording" || latest.phase == "paused") return;
   latest.error = message;
   touch(latest);
 }
@@ -630,24 +647,28 @@ function rememberCreateError(localId: string, message: string): void {
  * 补齐 noteId。本地录音记录始终保留。
  * 已有非空 noteId 直接返回。创建进行中返回 null，调用方不得上传。
  * 创建失败或没有返回 noteId 时抛错，不把空编号写进这条记录。
+ * 创建返回时本地会话已删除或已放弃，则删掉刚建的服务端笔记，不再写回缓存。
  */
-async function ensureNoteId(localId: string, fallback: VoiceNoteRecord): Promise<VoiceNoteRecord | null> {
+async function ensureNoteId(localId: string): Promise<VoiceNoteRecord | null> {
   const current = findVoiceNoteByLocalId(localId);
-  const record = current != null ? current : fallback;
-  if (record.noteId.length > 0) return record;
+  if (current == null || current.phase == "discarded") return null;
+  if (current.noteId.length > 0) return current;
   if (noteCreateLocalId.length > 0) return null;
   noteCreateLocalId = localId;
   try {
-    const noteId = await apiVoiceNoteCreate(record.title);
+    const noteId = await apiVoiceNoteCreate(current.title);
     if (noteId.length == 0) {
       throw new Error("创建笔记未返回 noteId");
     }
     const latest = findVoiceNoteByLocalId(localId);
-    const target = latest != null ? latest : record;
-    target.noteId = noteId;
-    target.error = "";
-    touch(target);
-    return target;
+    if (latest == null || latest.phase == "discarded") {
+      void deleteNoteQuiet(noteId);
+      return null;
+    }
+    latest.noteId = noteId;
+    latest.error = "";
+    touch(latest);
+    return latest;
   } finally {
     noteCreateLocalId = "";
   }
@@ -766,7 +787,7 @@ async function pumpQueue(retrySegmentIndex: number): Promise<void> {
       }
       let ready: VoiceNoteRecord | null = null;
       try {
-        ready = await ensureNoteId(localId, open);
+        ready = await ensureNoteId(localId);
       } catch (e) {
         const message = `${e}`;
         rememberCreateError(localId, message);
@@ -952,17 +973,27 @@ function findPausedVoiceNote(): VoiceNoteRecord | null {
   return null;
 }
 
-/** 创建服务端笔记。失败只记在会话上，不挡住已经开始的录音和计时。 */
+/** 创建服务端笔记。失败只记在会话上，不改录音阶段，也不挡住计时。 */
 async function bindVoiceNoteId(localId: string): Promise<void> {
   const current = findVoiceNoteByLocalId(localId);
-  if (current == null) {
+  if (current == null || current.phase == "discarded") {
     return;
   }
   try {
-    await ensureNoteId(localId, current);
+    await ensureNoteId(localId);
   } catch (e) {
     rememberCreateError(localId, `${e}`);
   }
+}
+
+/** 原生录音已经在写之后才创建笔记。已有 noteId、未在录、或会话已结束时不请求。 */
+function bindNoteAfterCapture(localId: string): void {
+  if (!captureAlive) return;
+  const latest = findVoiceNoteByLocalId(localId);
+  if (latest == null) return;
+  if (latest.phase != "recording") return;
+  if (latest.noteId.length > 0) return;
+  void bindVoiceNoteId(localId);
 }
 
 /** 暂停后的同一条笔记接着录，不新建会话，也不新开文件。 */
@@ -974,13 +1005,19 @@ async function resumePausedNote(record: VoiceNoteRecord): Promise<void> {
   record.error = "";
   touch(record);
   captureAlive = true;
+  // #ifndef APP-HARMONY
   beginBackground();
+  // #endif
   stopIntent = "";
   ensureTicker();
   // #ifdef APP
   if (m4aRecorder != null && record.openSegmentPath.length > 0) {
     const resumed = await m4aRecorder!.resume();
     if (resumed == "1") {
+      bindNoteAfterCapture(record.localId);
+      // #ifdef APP-HARMONY
+      beginBackground();
+      // #endif
       return;
     }
   }
@@ -989,7 +1026,7 @@ async function resumePausedNote(record: VoiceNoteRecord): Promise<void> {
 }
 
 /** 开始一轮录音。已暂停的会话会接着录。调用前页面需已拿到麦克风权限。
- *  有权限后立刻进入录音并开始计时。创建笔记在后台进行，不参与这一步。 */
+ *  有权限后立刻进入录音并开始计时。笔记在原生真正开录之后才创建，不参与这一步。 */
 export async function startVoiceNote(): Promise<void> {
   const existing = activeRecord();
   if (existing != null) return;
@@ -1009,10 +1046,11 @@ export async function startVoiceNote(): Promise<void> {
   record.title = "";
   touch(record);
   captureAlive = true;
+  // #ifndef APP-HARMONY
   beginBackground();
+  // #endif
   stopIntent = "";
   ensureTicker();
-  void bindVoiceNoteId(record.localId);
   await startRecorder();
 }
 
@@ -1102,6 +1140,10 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
       target.phase = "paused";
       target.awaitComplete = false;
       touch(target);
+      // 暂停后已不再采集。停掉长时任务，避免系统因“未在录音仍占后台”把进程冻住。
+      // #ifdef APP-HARMONY
+      endBackground();
+      // #endif
       return;
     }
   }

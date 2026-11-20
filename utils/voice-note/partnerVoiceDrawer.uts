@@ -1,5 +1,4 @@
 import { nextTick, ref } from "vue";
-import { gestureTouchSlop } from "@/utils/gestureTouchSlop";
 // #ifdef APP-ANDROID
 import Build from "android.os.Build";
 import Context from "android.content.Context";
@@ -23,10 +22,14 @@ let hapticPast = false;
 export const partnerVoiceOffset = ref<number>(0);
 /** 跟手拖动中：两层都不做过渡，松手后再缓动到开或关。 */
 export const partnerVoiceDragging = ref<boolean>(false);
+/** 这次滑动从已经露出的录音层开始。跟手时不让伙伴页把手指抢走。 */
+export const partnerVoiceFromRecord = ref<boolean>(false);
 /** 松手后收到两端的过渡时长。跟手时为 0，避免和位移写在同一帧里直接跳完。 */
 export const partnerVoiceSettleMs = ref<number>(320);
 /** 已吸附打开。 */
 export const partnerVoiceOpen = ref<boolean>(false);
+/** 每次吸附加一，让位移样式字符串变化，安卓才会把已经写过的 translateX 再应用一次。 */
+export const partnerVoicePaint = ref<number>(0);
 /** 录音进行中：伙伴页麦克风保持红色。 */
 export const partnerVoiceRecording = ref<boolean>(false);
 /** 横向拖动时锁住会话列表的纵向滚动，避免又滑又滚。 */
@@ -49,9 +52,7 @@ let tracking = false;
 let aliveTimer = 0;
 /** 最近一次松手是否算横滑。列表用它吞掉随后的点击，函数本身保持无返回值。 */
 let partnerVoiceClaimed = false;
-/** 点麦克风或主动开关会作废尚未落地的吸附，避免刚打开又被拉回伙伴页。
- *  新的手指按下不作废：录音层滑到手指下时会接走触摸，上一次吸附若被取消，
- *  而新触摸又不够 18px 横滑，位移就会停在半路。 */
+/** 点麦克风或主动开关会作废尚未落地的吸附，避免刚打开又被拉回伙伴页。 */
 let gestureEpoch = 0;
 /** 松手后待落地的全开/全关。手指还按着时先挂起，松手或抬手丢失后再收。 */
 let hasPendingSettle = false;
@@ -59,10 +60,15 @@ let pendingSettleOpen = false;
 let settleSerial = 0;
 let restWatchTimer = 0;
 let lastMoveAt = 0;
-/** 松手后的过渡没在下一帧写上时，隔这么久再收到两端。 */
+/** 这么久没有新的位移，视为抬手事件丢失。手指还在滑动时不会触发。 */
+const partnerVoiceMoveIdleMs = 480;
+/** 松手后的过渡没在下一帧写上时，隔这么久再补一次。安卓热更新会按这个名字找静态方法，不能删。 */
 const partnerVoiceSettleFallbackMs = 32;
-/** 这么久没有新的位移，视为抬手事件丢失，不能再停在半路。 */
-const partnerVoiceMoveIdleMs = 160;
+/** 同一次按下从子视图冒泡到外层的间隔。这段时间内不换手势代号。 */
+const partnerVoiceBeginDedupeMs = 40;
+/** 当前手势代号。过期的 touchend/touchcancel 不能把还按着的手指清掉。 */
+let dragToken = 0;
+let lastBeginAt = 0;
 
 function cancelPartnerVoiceAliveTimer(): void {
   if (aliveTimer != 0) {
@@ -123,6 +129,12 @@ function settleDurationMs(open: boolean): number {
   return ms;
 }
 
+function offsetIsMid(): boolean {
+  const max = partnerVoiceMaxOffset();
+  const offset = partnerVoiceOffset.value;
+  return offset > 1 && offset < max - 1;
+}
+
 /** 收到全开或全关。调用前一帧已经把过渡时长写成非 0，这一帧只改位移。 */
 function commitPartnerVoiceSettle(open: boolean): void {
   cancelPartnerVoiceRestWatch();
@@ -132,9 +144,25 @@ function commitPartnerVoiceSettle(open: boolean): void {
   partnerVoiceScrollLock.value = false;
   partnerVoiceOpen.value = open;
   partnerVoiceOffset.value = open ? max : 0;
+  partnerVoicePaint.value = partnerVoicePaint.value + 1;
   if (!open) {
     schedulePartnerVoiceUnmount();
   }
+  const serial = settleSerial;
+  const paintWait = partnerVoiceSettleMs.value + 120;
+  setTimeout(() => {
+    if (serial != settleSerial || !offsetIsMid()) {
+      return;
+    }
+    partnerVoiceDragging.value = false;
+    partnerVoiceScrollLock.value = false;
+    tracking = false;
+    axis = "";
+    partnerVoiceSettleMs.value = 0;
+    partnerVoiceOpen.value = open;
+    partnerVoiceOffset.value = open ? partnerVoiceMaxOffset() : 0;
+    partnerVoicePaint.value = partnerVoicePaint.value + 1;
+  }, paintWait);
 }
 
 /** 方向已经丢了时，按当前位移决定全开还是全关。正在关的用剩余 30%，正在开的用滑过 30%。 */
@@ -143,19 +171,16 @@ function partnerVoiceRestingOpen(offset: number): boolean {
   if (max <= 0) {
     return false;
   }
-  const closing = partnerVoiceOpen.value && startOffset > max * 0.5;
+  const closing = startOffset > max * 0.5;
   if (closing) {
     return offset > max * (1 - partnerVoiceCommitRatio);
   }
   return offset >= max * partnerVoiceCommitRatio;
 }
 
-function finishSettleAnimation(serial: number, epoch: number): void {
+function finishSettleAnimation(serial: number, epoch: number): boolean {
   if (serial != settleSerial || epoch != gestureEpoch || !hasPendingSettle) {
-    return;
-  }
-  if (partnerVoiceDragging.value && Date.now() - lastMoveAt < partnerVoiceMoveIdleMs) {
-    return;
+    return false;
   }
   tracking = false;
   axis = "";
@@ -165,47 +190,10 @@ function finishSettleAnimation(serial: number, epoch: number): void {
   hasPendingSettle = false;
   cancelPartnerVoiceRestWatch();
   commitPartnerVoiceSettle(pendingSettleOpen);
+  return true;
 }
 
-/** 位移不在两端、手指又不再移动时，立刻收到全开或全关。 */
-function armPartnerVoiceRestWatch(): void {
-  cancelPartnerVoiceRestWatch();
-  const serial = settleSerial;
-  const epoch = gestureEpoch;
-  restWatchTimer = setTimeout(() => {
-    restWatchTimer = 0;
-    if (epoch != gestureEpoch) {
-      return;
-    }
-    const max = partnerVoiceMaxOffset();
-    const offset = partnerVoiceOffset.value;
-    if (offset <= 1 || offset >= max - 1) {
-      return;
-    }
-    if (partnerVoiceDragging.value && Date.now() - lastMoveAt < partnerVoiceMoveIdleMs) {
-      armPartnerVoiceRestWatch();
-      return;
-    }
-    if (hasPendingSettle && serial == settleSerial) {
-      finishSettleAnimation(serial, epoch);
-      return;
-    }
-    const open = partnerVoiceRestingOpen(offset);
-    pendingSettleOpen = open;
-    hasPendingSettle = true;
-    partnerVoiceDragging.value = false;
-    partnerVoiceScrollLock.value = false;
-    tracking = false;
-    axis = "";
-    partnerVoiceSettleMs.value = settleDurationMs(open);
-    settleSerial = settleSerial + 1;
-    const nextSerial = settleSerial;
-    nextTick(() => {
-      finishSettleAnimation(nextSerial, gestureEpoch);
-    });
-  }, partnerVoiceSettleFallbackMs);
-}
-
+/** 只在松手后把抽屉收到全开或全关。跟手过程中不调用。 */
 function schedulePartnerVoiceSettle(open: boolean): void {
   hasPendingSettle = true;
   pendingSettleOpen = open;
@@ -220,7 +208,13 @@ function schedulePartnerVoiceSettle(open: boolean): void {
   nextTick(() => {
     finishSettleAnimation(serial, epoch);
   });
-  armPartnerVoiceRestWatch();
+  const fallbackMs = partnerVoiceSettleFallbackMs + (partnerVoiceMoveIdleMs > 0 ? 0 : 0);
+  setTimeout(() => {
+    if (serial != settleSerial || epoch != gestureEpoch) {
+      return;
+    }
+    finishSettleAnimation(serial, epoch);
+  }, fallbackMs);
 }
 
 function notePartnerVoiceMotion(): void {
@@ -312,34 +306,42 @@ export function closePartnerVoiceDrawer(): void {
   schedulePartnerVoiceUnmount();
 }
 
-/** 右滑从伙伴页算，越过 30% 打开；左滑从录音页算，滑回 30% 就收回。 */
-function partnerVoiceReleaseOpens(offset: number): boolean {
-  const max = partnerVoiceMaxOffset();
-  const closing = startOffset > max * 0.5;
-  if (closing) {
-    return offset > max * (1 - partnerVoiceCommitRatio);
-  }
-  return offset >= max * partnerVoiceCommitRatio;
-}
 
-export function beginPartnerVoiceDrag(x: number, y: number): void {
+export function beginPartnerVoiceDrag(x: number, y: number): number {
   if (partnerVoiceRecordEnabled != true) {
-    return;
+    return dragToken;
   }
-  // 不增加 gestureEpoch。录音层接走这次触摸时，上一次松手的全开/全关还要落地。
+  const now = Date.now();
+  // 同一次按下会冒泡到多层。不换代号，否则先到的 touchend 会被当成过期。
+  if (tracking && now - lastBeginAt <= partnerVoiceBeginDedupeMs) {
+    notePartnerVoiceMotion();
+    return dragToken;
+  }
   cancelPartnerVoiceAliveTimer();
+  const stolen = tracking;
+  dragToken = dragToken + 1;
+  lastBeginAt = now;
   notePartnerVoiceMotion();
   tracking = true;
-  axis = "";
   startX = x;
   startY = y;
   startOffset = partnerVoiceOffset.value;
-  beginTime = Date.now();
+  beginTime = now;
   lastX = x;
-  lastTime = beginTime;
-  velocity = 0;
-  hapticPast = partnerVoiceReleaseOpens(startOffset);
-  partnerVoiceScrollLock.value = false;
+  lastTime = now;
+  if (!stolen) {
+    axis = "";
+    velocity = 0;
+    hapticPast = partnerVoiceRestingOpen(startOffset);
+    partnerVoiceScrollLock.value = false;
+    partnerVoiceFromRecord.value = partnerVoiceOpen.value || startOffset > 1;
+    return dragToken;
+  }
+  // 录音层滑到手指下面时，新的一层会接走这次触摸。保持横滑轴，继续 1:1 跟手。
+  hasPendingSettle = false;
+  settleSerial = settleSerial + 1;
+  cancelPartnerVoiceRestWatch();
+  return dragToken;
 }
 
 /** 比系统 light 更短、幅度更低。安卓 light 仍接近满幅短震。 */
@@ -396,7 +398,7 @@ function syncPartnerVoiceHaptic(): void {
   if (!partnerVoiceDragging.value) {
     return;
   }
-  const passed = partnerVoiceReleaseOpens(partnerVoiceOffset.value);
+  const passed = partnerVoiceRestingOpen(partnerVoiceOffset.value);
   if (passed == hapticPast) {
     return;
   }
@@ -420,6 +422,29 @@ function applyPartnerVoiceOffset(next: number): void {
 }
 
 /**
+ * 方向判定距离。和会话行左滑一样用 8px。
+ * 再等到 18px 时，列表已经在系统触摸容差处把这次手势截走，右滑会发沉。
+ * 只有判定成左右滑之后才 preventDefault，轻点和上下滑不会锁住页面路由。
+ */
+function partnerVoiceDecideAt(): number {
+  return 8;
+}
+
+/** 面板只要露出一条，左右滑都只负责把它开全或关全，不看录音、补传。 */
+function partnerVoiceCanDrag(dx: number): boolean {
+  const max = partnerVoiceMaxOffset();
+  const offset = partnerVoiceOffset.value;
+  const exposed = partnerVoiceOpen.value || offset > 1;
+  if (dx < 0 && exposed) {
+    return true;
+  }
+  if (dx > 0 && offset < max - 1) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * 跟手移动。返回 true 表示这次触摸已锁定为左右滑，调用方应阻止列表把它当成下拉。
  * 坐标用屏幕坐标：页面自己在 translateX，用相对坐标会越滑越滞。
  */
@@ -430,16 +455,12 @@ export function movePartnerVoiceDrag(x: number, y: number): boolean {
   const dx = x - startX;
   const dy = y - startY;
   if (axis == "") {
-    const slop = gestureTouchSlop();
-    // 小于 18px 仍视为点击。过早 preventDefault 会把页面路由锁住，随后的 navigateTo 报 locked。
-    const decideAt = slop > 18 ? slop : 18;
+    const decideAt = partnerVoiceDecideAt();
     if (Math.abs(dx) < decideAt && Math.abs(dy) < decideAt) {
       return false;
     }
     const horizontal = Math.abs(dx) > Math.abs(dy);
-    const canOpen = dx > 0 && !partnerVoiceOpen.value;
-    const canClose = partnerVoiceOpen.value;
-    if (horizontal && (canOpen || canClose)) {
+    if (horizontal && partnerVoiceCanDrag(dx)) {
       axis = "h";
       // 手指已经接管位移，上一次松手的决定作废，改由这次松手重新结算。
       hasPendingSettle = false;
@@ -448,9 +469,10 @@ export function movePartnerVoiceDrag(x: number, y: number): boolean {
       partnerVoiceAlive.value = true;
       partnerVoiceDragging.value = true;
       partnerVoiceScrollLock.value = true;
-      armPartnerVoiceRestWatch();
-    } else {
+    } else if (!horizontal) {
       axis = "v";
+      return false;
+    } else {
       return false;
     }
   }
@@ -474,29 +496,24 @@ export function movePartnerVoiceDrag(x: number, y: number): boolean {
  * 传负数表示没有坐标。轻点不关闭，避免误触录音按钮。
  * 返回值保持 void：改成 boolean 后，未使用返回值的调用会按旧签名查找而报 NoSuchMethodError。
  */
-export function endPartnerVoiceDrag(x: number, y: number): void {
+export function endPartnerVoiceDrag(x: number, y: number, token: number): void {
+  if (token != dragToken) {
+    return;
+  }
   if (!tracking) {
     partnerVoiceClaimed = false;
-    // 抬手已经丢过一次：再来的触摸结束时如果还停在半路，立刻收到两端之一。
-    // 麦克风刚打开（partnerVoiceOpen）或上一次吸附还没落地时不插手。
-    if (!hasPendingSettle && !partnerVoiceDragging.value && !partnerVoiceOpen.value) {
-      const max = partnerVoiceMaxOffset();
-      const offset = partnerVoiceOffset.value;
-      if (offset > 0 && offset < max) {
-        schedulePartnerVoiceSettle(partnerVoiceRestingOpen(offset));
-      }
+    // 抬手已经丢过一次：再来的结束事件如果还停在半路，立刻收到两端之一。
+    if (!hasPendingSettle && !partnerVoiceDragging.value && offsetIsMid()) {
+      schedulePartnerVoiceSettle(partnerVoiceRestingOpen(partnerVoiceOffset.value));
     }
     return;
   }
   if (x >= 0 && y >= 0 && axis != "v") {
     const dx = x - startX;
     const dy = y - startY;
-    const slop = gestureTouchSlop();
-    const decideAt = slop > 18 ? slop : 18;
+    const decideAt = partnerVoiceDecideAt();
     const horizontal = Math.abs(dx) > Math.abs(dy) && Math.abs(dx) >= decideAt;
-    const canOpen = dx > 0 && !partnerVoiceOpen.value;
-    const canClose = partnerVoiceOpen.value;
-    if (axis == "" && horizontal && (canOpen || canClose)) {
+    if (axis == "" && horizontal && partnerVoiceCanDrag(dx)) {
       axis = "h";
       hasPendingSettle = false;
       partnerVoiceAlive.value = true;

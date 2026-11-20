@@ -287,7 +287,7 @@ function callTransportEnabled(route) {
     : (process.env.NUWAX_VOIP_ANDROID_TRANSPORTS || '').split(',').includes(route.transport)
 }
 
-async function sendNativeVoip(body, route, nativeVoip) {
+async function sendNativeVoip(body, route, nativeVoip, invocationId) {
   const android = route.platform === 'android'
   if (android && typeof uniPush.request !== 'function') {
     return { errCode: 503, errMsg: 'UniPush transmission adapter unavailable', data: { requestId: nativeVoip.requestId } }
@@ -332,21 +332,25 @@ async function sendNativeVoip(body, route, nativeVoip) {
       const status = targets[route.cid]
       return { taskId, status: typeof status === 'string' && /^[A-Za-z0-9_-]{1,50}$/.test(status) ? status : 'unknown' }
     })
-    console.log('[push-send] call transport', route.transport, nativeVoip.payload.callId, nativeVoip.requestId, errCode)
+    console.log('[push-send] call transport', JSON.stringify({
+      invocationId, transport: route.transport, cid: route.cid, callId: nativeVoip.payload.callId,
+      requestId: nativeVoip.requestId, errCode,
+    }))
     return { errCode, data: { requestId: nativeVoip.requestId, tasks } }
   } catch {
-    console.error('[push-send] call transport failed', nativeVoip.requestId)
+    console.error('[push-send] call transport failed', JSON.stringify({ invocationId, cid: route.cid, requestId: nativeVoip.requestId }))
     return { errCode: -1, data: { requestId: nativeVoip.requestId } }
   }
 }
 
-async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting) {
+async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting, invocationId) {
   const { callId, expiresAt } = invitation.payload
   // 会议邀请可以不带 calleeId：用设备路由登记的账号补齐，原生端仍按 calleeId 校验归属。
   const calleeId = invitation.payload.calleeId ?? binding?.calleeId
   const result = { clientid: cid }
   if (binding && (binding.active !== true || binding.appId !== APP_ID || binding.calleeId !== calleeId)) {
     console.log('[push-send] call route rejected', JSON.stringify({
+      invocationId,
       cid,
       active: binding.active === true,
       appIdMatch: binding.appId === APP_ID,
@@ -366,6 +370,7 @@ async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting)
     }, now)
     const enabled = callTransportEnabled(route)
     console.log('[push-send] call route', JSON.stringify({
+      invocationId,
       cid,
       transport: route.transport,
       environment: route.environment ?? null,
@@ -374,16 +379,19 @@ async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting)
       nativeError: nativeVoip?.error ?? null,
     }))
     if (!nativeVoip.error && enabled) {
-      const sent = await sendNativeVoip(body, route, nativeVoip)
+      const sent = await sendNativeVoip(body, route, nativeVoip, invocationId)
       return { ...result, errCode: sent.errCode, errMsg: sent.errMsg, delivery: 'native', transport: route.transport, ...sent.data }
     }
   } else {
+    // 没有可用的原生路由 ⇒ 本设备回落普通通知。登记缺失时不要打 active/calleeMatch
+    // 这类对 null 求值的布尔（会打出「active=false、calleeMatch=true」的假象）。
     console.log('[push-send] call route', JSON.stringify({
+      invocationId,
       cid,
       found: binding != null,
-      active: binding?.active === true,
-      appIdMatch: binding?.appId === APP_ID,
-      calleeMatch: binding?.calleeId === calleeId,
+      active: binding == null ? null : binding.active === true,
+      appIdMatch: binding == null ? null : binding.appId === APP_ID,
+      calleeMatch: binding == null ? null : binding.calleeId === calleeId,
       transport: binding?.transport ?? null,
     }))
   }
@@ -394,18 +402,18 @@ async function sendCallToDevice(body, invitation, cid, binding, fallbackMeeting)
     .digest('hex').slice(0, 32)
   const sent = fallbackMeeting != null
     // 会议响铃的原生通道不可用时，回退普通 IM 通知（保留会议邀请卡片）。
-    ? await sendOrdinaryPush({ ...body, request_id: requestId }, [cid], null, fallbackMeeting)
+    ? await sendOrdinaryPush({ ...body, request_id: requestId }, [cid], null, fallbackMeeting, invocationId)
     : await sendOrdinaryPush({ ...body, request_id: requestId }, [cid],
-      prepareVoip({ ...body, payload: invitation.payload }, now), null)
+      prepareVoip({ ...body, payload: invitation.payload }, now), null, invocationId)
   return { ...result, errCode: sent.data.results[0]?.errCode ?? -1, delivery: 'notification', requestId }
 }
 
-async function sendRegisteredCalls(body, ids, invitation, fallbackMeeting) {
+async function sendRegisteredCalls(body, ids, invitation, fallbackMeeting, invocationId) {
   let bindings
   try {
     bindings = await loadDeviceRoutes(uniCloud.database(), ids)
   } catch {
-    console.error('[push-send] voip device route lookup failed', invitation.payload.callId)
+    console.error('[push-send] voip device route lookup failed', JSON.stringify({ invocationId, callId: invitation.payload.callId }))
     return { errCode: 503, errMsg: 'device route lookup unavailable' }
   }
 
@@ -414,7 +422,7 @@ async function sendRegisteredCalls(body, ids, invitation, fallbackMeeting) {
   for (let i = 0; i < ids.length; i += concurrency) {
     const chunk = ids.slice(i, i + concurrency)
     results.push(...await Promise.all(chunk.map(cid =>
-      sendCallToDevice(body, invitation, cid, bindings.get(cid), fallbackMeeting))))
+      sendCallToDevice(body, invitation, cid, bindings.get(cid), fallbackMeeting, invocationId))))
   }
   const failed = results.find(entry => entry.errCode !== 0)
   return {
@@ -424,25 +432,110 @@ async function sendRegisteredCalls(body, ids, invitation, fallbackMeeting) {
   }
 }
 
-exports.main = async (event) => {
+// ==================== 请求体检日志（排查「一次通话收到多条推送」） ====================
+//
+// ★排查口径：后端每次调用 = 一次独立的推送意图。所以日志必须让「同一条推送被调了几次」
+//   一眼可数 —— 每个请求打一行 `[push-send] in` 摘要，收尾再打一行 `[push-send] done` 耗时。
+//   ★摘要常开、且不含用户文案：cid 数/去重后数量、信封字段、通话/会议定位字段、路由与耗时
+//     已经足够定性「云函数发了多次」还是「后端触发了多次」。
+//   ★完整信封（含 title/content 原文与 payload 全文）由环境变量 PUSH_DEBUG_REQUEST=1 打开，
+//     只在需要逐字段比对时临时开启，避免生产日志长期留存用户私聊内容。签名头永不打印。
+const DEBUG_REQUEST = process.env.PUSH_DEBUG_REQUEST === '1'
+const CID_LOG_LIMIT = 20            // 摘要里最多列出的 cid（足以看出重复/多设备）
+const TEXT_HASH_LEN = 8             // 文案指纹长度：比对「是不是同一条」而不落原文
+
+/** 文案指纹：同一 title+content ⇒ 同一指纹。日志不留原文也能判定两次推送是否同一条。 */
+function textFingerprint(title, content) {
+  return crypto.createHash('sha256')
+    .update(`${title == null ? '' : String(title)}\u0000${content == null ? '' : String(content)}`)
+    .digest('hex').slice(0, TEXT_HASH_LEN)
+}
+
+/**
+ * 后端信封摘要。字段顺序固定，日志里一眼能对齐。
+ * ★duplicateCids > 0 是硬信号：一次请求里带了重复 cid ⇒ 普通通道会下发多次（见 ids 归一）。
+ */
+function describeEnvelope(body, event, rawBodyLength) {
+  const payload = body.payload && typeof body.payload === 'object' && !Array.isArray(body.payload) ? body.payload : null
+  const rawIds = Array.isArray(body.push_clientid) ? body.push_clientid : [body.push_clientid]
+  const cids = rawIds.filter(v => typeof v === 'string' && v.length > 0)
+  const route = body.callRoute && typeof body.callRoute === 'object' ? body.callRoute : null
+  const pick = field => (payload && payload[field] !== undefined ? payload[field] : undefined)
+  return {
+    httpMethod: event.httpMethod ?? event.method ?? null,
+    path: event.path ?? null,
+    bodyBytes: rawBodyLength,
+    // 信封骨架（区分 IM 普通消息 / 来电呼叫 / 会议邀请与响铃意图）
+    type: body.type ?? null,
+    scene: body.scene ?? pick('scene') ?? null,
+    payloadType: pick('type') ?? null,
+    requestId: body.request_id ?? null,
+    forceNotification: body.force_notification ?? null,
+    category: body.category ?? null,
+    badge: body.badge ?? null,
+    // 目标设备：这三个数就是判断「一次调用扇出几台设备」的直接依据
+    cidCount: rawIds.length,
+    distinctCids: new Set(cids).size,
+    duplicateCids: rawIds.length - new Set(cids).size,
+    cidsSample: cids.slice(0, CID_LOG_LIMIT),
+    // 业务定位字段（雪花号一律是字符串，原样打印才不丢精度）
+    convId: pick('convId') ?? null,
+    convType: pick('convType') ?? null,
+    msgId: pick('msgId') ?? null,
+    callId: pick('callId') ?? null,
+    inviteId: pick('inviteId') ?? null,
+    calleeId: pick('calleeId') ?? null,
+    mediaType: pick('mediaType') ?? null,
+    silent: pick('silent') ?? null,
+    groupCall: pick('groupCall') ?? null,
+    expiresAt: pick('expiresAt') ?? null,
+    sendTime: pick('sendTime') ?? null,
+    // 定向路由（后端逐设备投递时才带）
+    callRoute: route == null ? null : {
+      cid: route.cid ?? null,
+      platform: route.platform ?? null,
+      transport: route.transport ?? null,
+      environment: route.environment ?? null,
+      hasRegistrationId: typeof route.registrationId === 'string' && route.registrationId.length > 0,
+    },
+    // 文案只留长度与指纹；要正文就开 PUSH_DEBUG_REQUEST
+    titleLength: body.title == null ? 0 : Array.from(String(body.title)).length,
+    contentLength: body.content == null ? 0 : Array.from(String(body.content)).length,
+    textFingerprint: textFingerprint(body.title, body.content),
+  }
+}
+
+async function handle(event, invocationId) {
   if (!verifySign(event)) {
     console.error('[push-send] rejected: invalid sign')
     return { errCode: 401, errMsg: 'invalid sign' }
   }
 
+  const rawBody = event.isBase64Encoded
+    ? Buffer.from(event.body || '', 'base64').toString('utf8')
+    : (event.body || '{}')
   let body = {}
   try {
-    const raw = event.isBase64Encoded
-      ? Buffer.from(event.body || '', 'base64').toString('utf8')
-      : (event.body || '{}')
-    body = JSON.parse(raw)
+    body = JSON.parse(rawBody)
   } catch (e) {
+    console.error('[push-send] invalid json body', JSON.stringify({ invocationId, bodyBytes: rawBody.length }))
     return { errCode: 400, errMsg: 'invalid json body' }
   }
 
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { errCode: 400, errMsg: 'invalid request body' }
   // 顶层 type="voip" 是通话/会议的显式声明；payload.type 缺失时由云函数回填。
   body = withEnvelopeType(body)
+  // ★每个请求一行摘要：数 `[push-send] in` 的行数 = 后端/网关实际调了几次。
+  try {
+    console.log('[push-send] in', JSON.stringify({ invocationId, ...describeEnvelope(body, event, rawBody.length) }))
+    if (DEBUG_REQUEST) {
+      // 完整信封原文（不含签名头）：对照字段口径时用，排查完请关掉开关。
+      console.log('[push-send] in raw', JSON.stringify({ invocationId, body }))
+    }
+  } catch (e) {
+    // 日志异常绝不能影响投递
+    console.error('[push-send] in log failed', invocationId)
+  }
   const scene = prepareVoipScene(body)
   if (scene?.error) return { errCode: 400, errMsg: scene.error }
   if (scene?.meeting && JSON.stringify(scene.meeting).length > MAX_PAYLOAD) {
@@ -494,7 +587,7 @@ exports.main = async (event) => {
       // 定向原生请求（无 scene/call）仍 fail-closed；通话/会议回退普通通知。
       if (!strictCids) return { errCode: 503, errMsg: 'call transport unavailable' }
     } else {
-      return sendNativeVoip(body, route, nativeVoip)
+      return sendNativeVoip(body, route, nativeVoip, invocationId)
     }
   }
 
@@ -510,14 +603,37 @@ exports.main = async (event) => {
 
   if (useDeviceRoutes) {
     if (meetingRinging) {
-      return sendRegisteredCalls(body, ids, ringAttempt, scene.meeting)
+      return sendRegisteredCalls(body, ids, ringAttempt, scene.meeting, invocationId)
     }
-    return sendRegisteredCalls(body, ids, scene.call, null)
+    return sendRegisteredCalls(body, ids, scene.call, null, invocationId)
   }
-  return sendOrdinaryPush(body, ids, voip, scene?.meeting)
+  return sendOrdinaryPush(body, ids, voip, scene?.meeting, invocationId)
 }
 
-async function sendOrdinaryPush(body, ids, voip, meeting) {
+/**
+ * 入口：给每次调用挂一个 invocationId 并记录耗时。
+ * ★耗时是排查「后端重试」的关键：后端调云函数的超时默认 3s，超过就会被判可重试失败
+ *   并进补推队列（30s 起指数退避，最多 12 次）⇒ 端上就会收到同一条推送多次。
+ *   所以 `[push-send] done ... ms=` 若接近或超过 3000，先怀疑超时重试，而不是云函数重发。
+ */
+exports.main = async (event) => {
+  const invocationId = crypto.randomBytes(4).toString('hex')
+  const startedAt = Date.now()
+  let code = 'threw'
+  try {
+    const result = await handle(event, invocationId)
+    code = result && typeof result === 'object' ? (result.errCode ?? null) : 'invalid'
+    return result
+  } finally {
+    console.log('[push-send] done', JSON.stringify({
+      invocationId,
+      errCode: code,
+      ms: Date.now() - startedAt,
+    }))
+  }
+}
+
+async function sendOrdinaryPush(body, ids, voip, meeting, invocationId) {
   // 长度限制：厂商通道会静默截断甚至拒绝，这里先按官方上限裁好（按码点裁，不切坏 emoji）
   const title = clip(body.title, MAX_TITLE)
   const content = clip(body.content, MAX_CONTENT)
@@ -537,6 +653,7 @@ async function sendOrdinaryPush(body, ids, voip, meeting) {
   // ★不落文案与 payload 明文：云端日志多人可查，消息内容属于用户隐私。
   //   要核对"文案被截断/角标没生效"，看响应里的 applied 回显即可。
   console.log('[push-send] req', JSON.stringify({
+    invocationId,
     cidCount: ids.length,
     cidSample: privateInvitation ? undefined : ids.slice(0, 2),
     titleLength: title.length,
@@ -547,7 +664,9 @@ async function sendOrdinaryPush(body, ids, voip, meeting) {
     badge: body.badge === undefined ? null : body.badge,
     // 保留 feat-2026.11 的在线通知策略，展示由客户端前后台状态决定。
     force_notification: false,
-    request_id: privateInvitation ? undefined : (body.request_id || null),
+    // ★幂等键照打：回退路径的 request_id 是云函数按 (cid, callId) 派生的哈希，
+    //   排查「后端重试是否被厂商去重」时必须能对上这个值。
+    requestId: body.request_id || null,
     ...(voip ? { kind: 'voip', ttl: voip.settings.ttl } : {})
   }))
   if (DEBUG_MESSAGE_CONTENT && !privateInvitation) {
@@ -593,12 +712,12 @@ async function sendOrdinaryPush(body, ids, voip, meeting) {
     }
     try {
       const res = await uniPush.sendMessage(args)
-      console.log('[push-send] batch', chunk.length, 'errCode=', res && res.errCode, res && res.errMsg)
+      console.log('[push-send] batch', JSON.stringify({ invocationId, cids: chunk.length, errCode: res && res.errCode, errMsg: res && res.errMsg }))
       // errCode=0 只代表 DCloud 受理，不代表送达；完整结果里可能有按端的任务 id / 失败明细
-      if (!privateInvitation) console.log('[push-send] batch res', JSON.stringify(res))
+      if (!privateInvitation) console.log('[push-send] batch res', JSON.stringify({ invocationId, res }))
       results.push(res)
     } catch (err) {
-      console.error('[push-send] batch threw:', (err && err.message) || String(err))
+      console.error('[push-send] batch threw:', JSON.stringify({ invocationId, message: (err && err.message) || String(err) }))
       results.push({ errCode: -1, errMsg: (err && err.message) || String(err), push_clientid: chunk })
     }
   }

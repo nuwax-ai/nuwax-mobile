@@ -335,3 +335,34 @@ isNeedInterceptStart true, interceptionState:BACKGROUND   # 后台不弹横幅�
 
 排查「通知栏有没有」用 `adb shell dumpsys notification --noredact | grep <pkg>`，别只看屏幕顶部有没有横幅。
 通知权限开关同理：`adb shell cmd appops get <pkg> | grep POST_NOTIFICATION`，出现 `ignore` = 被关（华为机型会因此每次冷启动弹授权框），整行不存在 = 允许。
+
+### 6.4 一次通话收到多条相同通知：怎么判是云函数还是后端
+
+云函数 `push-send` 每次调用都会打两行对账日志（2026-11-20 起）：
+
+| 日志行 | 内容 |
+|---|---|
+| `[push-send] in` | 后端信封摘要：`httpMethod/path/bodyBytes`、`type/scene/payloadType`、`requestId`、`cidCount/distinctCids/duplicateCids/cidsSample`、`callId/inviteId/msgId/convId/calleeId`、`expiresAt/sendTime`、`callRoute`、`titleLength/contentLength/textFingerprint` |
+| `[push-send] done` | 本次调用的 `errCode` 与耗时 `ms` |
+
+两行都带同一个 `invocationId`，可与中间的 `call route` / `call transport` / `req` / `batch` 对上。
+
+判定顺序：
+
+1. **数 `[push-send] in` 的行数**（同一 `callId`/`inviteId`、时间相近）。3 行 = 后端调了 3 次（含网关重试），云函数只是忠实执行。
+2. **只有 1 行 `in`**：看 `cidCount` 与 `distinctCids`。
+   - `distinctCids` = 手机台数。手机只有 1 台却 `cidCount=3` ⇒ 后端带了重复/脏 cid。
+   - `duplicateCids > 0` 而且走普通通道 ⇒ **云函数确实会下发多次**：`index.js` 只在来电/响铃分支做 `Set` 去重，普通分支原样透传（待修）。
+3. **`done` 的 `ms` ≥ 3000** ⇒ 后端判超时并按可重试失败进补推队列（30s 起指数退避、最多 12 次），端上就会重复收到。这时是后端重试，不是云函数重发。
+4. `textFingerprint` 相同 = 两次确实是同一文案，可直接断定「同一条推送发了多次」而不是业务发了两条不同消息。
+
+开关（uniCloud 控制台 → 云函数 → 环境变量，改完需重新上传函数才生效）：
+
+- `PUSH_DEBUG_REQUEST=1`：额外打 `[push-send] in raw`，输出**完整信封原文**（含 `title`/`content` 与 payload 全文）。默认关闭，避免生产日志长期留存用户文案；签名头不打印。
+- `PUSH_DEBUG_MESSAGE_CONTENT=1`：已有的文案详情开关（普通消息 `message detail`）。
+
+已知链路缺口（排查时别误判成新问题）：
+
+- 云函数**没有按 `callId`/`msgId` 的幂等**，后端重试一次就真发一次。
+- 普通通道**不去重重复 cid**（来电/响铃分支会去重）。
+- 设备路由缺失时，会议响铃会**逐个 cid** 回落普通通知 ⇒ 一次调用里 3 个 cid 就是 3 条通知。

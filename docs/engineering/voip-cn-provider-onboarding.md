@@ -205,7 +205,7 @@ APNs 建议 expiration 为 0 或仅数秒，避免过时来电；业务响铃时
 
 ### 6.3 系统版本与国内发行边界
 
-- 当前代码保留 iOS 15 安装范围，17.4+ 走 LiveCommunicationKit；15–17.3 仅前台通话/普通通知，不注册 PushKit。LCK 的[来电上报 API](https://developer.apple.com/documentation/livecommunicationkit/conversationmanager/reportnewincomingconversation(uuid:update:))标注 17.4+，这不等于所有旧系统/地区签名组合已验收。
+- 当前代码保留 iOS 15 安装范围：15–17.3 走 CallKit，17.4+ 走 LiveCommunicationKit，两者共用 PushKit。LCK 的[来电上报 API](https://developer.apple.com/documentation/livecommunicationkit/conversationmanager/reportnewincomingconversation(uuid:update:))标注 17.4+；CallKit 兼容路径和不同地区签名组合仍须分别真机验收。
 - 原生回调按实际系统和 SDK 支持实现，不能把新版 API 直接用于旧系统，也不再建立第二个 registry。真实 PushKit 必须及时向系统通话框架报告，不能复制供应商旧示例绕过当前 Apple 要求。
 - 国内商店可用性须由团队针对本 App 向 Apple Developer Support/App Review 核对，并以相同发行签名实测；本次公开资料与开发包验收不能替代发行审核结论，不承诺仅更换系统框架就解决地区审核要求。
 - 本产品无需申请默认电话/默认拨号器，不走蜂窝拨号兜底。Apple 的[默认拨号器指南](https://developer.apple.com/documentation/livecommunicationkit/preparing-your-app-to-be-the-default-dialer-app)属于另一类能力，不能将其 EU 条件套到本次普通 App 内网络通话。

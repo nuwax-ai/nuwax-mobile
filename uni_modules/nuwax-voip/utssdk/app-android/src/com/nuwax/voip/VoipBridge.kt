@@ -447,7 +447,21 @@ object VoipBridge {
 
     private fun receiveSignal(event: JSONObject) {
         val payload = event.optJSONObject("payload") ?: return
-        val type = event.optString("eventType"); val id = payload.optString("callId")
+        val type = event.optString("eventType")
+        if (type == "meeting:invite-handled") {
+            val invite = payload.optString("inviteId")
+            if (invite.isNotEmpty()) {
+                terminal.add(invite)
+                if (terminal.size > 128) terminal.remove(terminal.first())
+            }
+            val call = current ?: return
+            if (call.optString("scene") != "meeting") return
+            val msg = payload.optString("msgId")
+            if ((msg.isNotEmpty() && msg == call.optString("msgId")) ||
+                (invite.isNotEmpty() && invite == call.optString("inviteId"))) closeMeeting()
+            return
+        }
+        val id = payload.optString("callId")
         val conv = payload.optString("convId"); if (conv.isEmpty()) return
         val call = current
         if (call != null && conv == call.optString("convId") && VoipCallPolicy.matches(id, payload.optString("msgId"), call.optString("callId"), call.optString("msgId"))) {

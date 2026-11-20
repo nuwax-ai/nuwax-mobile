@@ -130,7 +130,7 @@ APNs payload（业务 ID 全为字符串；expiresAt 是毫秒）：
 
 本地服务只将 APNs token 存内存并返回 nativePush=false，不读取 APNs 私钥、不发 APNs。它不能替代后端专用发送验收。正式后端新增接口前客户端会显示注册不可用状态，不虚报完成。
 
-后端测试环境就绪并经用户确认安装后，验证 Android 前台主叫 → iPhone 前台/后台/锁屏/系统回收；主动强退单列。还需立即接听/拒接、迟到/重复/取消先到、token 轮换、登出换账号、双向音频和挂断释放。iOS 15–17.3 仍仅前台/普通通知，不注册 PushKit。当前没有本批真机送达记录。
+后端测试环境就绪并经用户确认安装后，验证 Android 前台主叫 → iPhone 前台/后台/锁屏/系统回收；主动强退单列。还需立即接听/拒接、迟到/重复/取消先到、token 轮换、登出换账号、双向音频和挂断释放。iOS 15–17.3 已接入 PushKit/CallKit 兼容路径，但当前没有本批真机送达记录，不能视为验收通过。
 
 2026-11-16 用户将“客户端未运行时被唤起”列为核心验收。必须记录拨号前 App 进程确实不存在，以及 APNs → PushKit → 系统会话 → 接听媒体的证据；在线 WS 来电和重启 App 后补收都不能替代。动态岛残留另补了带结束时间的系统挂断确认、迟到注册终态和音频引擎收尾，修补版已安装，真实挂断回归仍待完成。Apple 对系统挂断完成的定义见 [fulfill(dateEnded:)](https://developer.apple.com/documentation/livecommunicationkit/endconversationaction/fulfill(dateended:))。
 

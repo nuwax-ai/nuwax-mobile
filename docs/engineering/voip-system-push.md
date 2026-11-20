@@ -11,7 +11,7 @@
 | 普通消息 | 现有 UniPush / 普通 APNs | 现有 UniPush / 厂商推送 | 现有 UniPush / 厂商推送 |
 | 在线邀请与控制 | 原生独立 IM WS，业务 REST | 原生独立 IM WS，业务 REST | 现有原生控制适配 |
 | 电话后台唤起 | 优先 UniPush／个推真实 VoIP → APNs VoIP → PushKit，投递未闭环 | UniPush 原生接收器 + 厂商允许的电话唤起能力，逐厂商验证 | 原生 VoIP Push 权益及系统接口，待真机 |
-| 电话接听与音频管理 | iOS 17.4+ LCK；15–17.3 前台/普通通知 | Core-Telecom、CallStyle、原生接听页与通话 FGS | Call Service、VoIP 后台任务及 ArkWeb 媒体 |
+| 电话接听与音频管理 | iOS 15–17.3 CallKit；17.4+ LiveCommunicationKit；共用 PushKit | Core-Telecom、CallStyle、原生接听页与通话 FGS | Call Service、VoIP 后台任务及 ArkWeb 媒体 |
 | 接通后的音视频 | LiveKit Swift | LiveKit Kotlin | LiveKit JS / ArkWeb |
 
 UniPush 的普通通知、个推 SDK 的原生能力和电话专用推送分别核对。参数可透传、SDK 受理、通知出现、原生回调、系统来电和双向媒体是不同证据，不能互相替代。本方案没有新建推送服务或重启第二套普通推送 SDK。

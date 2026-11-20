@@ -81,7 +81,7 @@
 | 平台 | 功能实现 | 对接前需要继续完成 |
 | --- | --- | --- |
 | Android | Kotlin LiveKit、Core-Telecom、CallStyle、原生接听页、通话 FGS | 分发基座原生厂商/FCM 接收器接 `VoipBridge.incoming`，正式 uni-push 路由及后台/冷启动送达 |
-| iOS | Swift LiveKit、17.4+ PushKit/LCK，15–17.3 前台与普通通知 | 正式证书和 APNs 环境、真实 VoIP token 路由、旧系统安装与系统回收后处理 |
+| iOS | Swift LiveKit、15–17.3 PushKit/CallKit、17.4+ PushKit/LCK | 正式证书和 APNs 环境、真实 VoIP token 路由、两类系统版本安装与系统回收后处理 |
 | Harmony | ArkWeb LiveKit、原生 SSE、Push Kit、Call Service、VoIP 持续任务，token 按包名/环境/账号代次注册 | token 轮换/撤销联调、通道权益/签名、系统接听与锁屏持续双向音频真机验证 |
 
 ## 正式体测准入与记录

@@ -22,6 +22,6 @@ UTS 不直接持有 SDK 对象，使用 JSON 命令和事件队列隔离 Kotlin/
 
 Android 推送接收器的原生集成 hook 为 `com.nuwax.voip.VoipBridge.incoming(context,payload)`。当前未绑定具体厂商 SDK 的冷启动回调；不能仅凭这个 hook 声称冷启动推送验收通过。
 
-Harmony 原生配置/媒体宿主由 `pnpm voip:harmony:assemble` 从源码重新生成，再用 DevEco 的 Node/JBR/hvigor 构建。鸿蒙锁屏持续通话及系统应答仍需厂商权益和真机验证。iOS 17.4+ LCK、PushKit 的正式签名与推送同样需要真实环境。
+Harmony 原生配置/媒体宿主由 `pnpm voip:harmony:assemble` 从源码重新生成，再用 DevEco 的 Node/JBR/hvigor 构建。鸿蒙锁屏持续通话及系统应答仍需厂商权益和真机验证。iOS 15–17.3 使用 CallKit，17.4+ 使用 LiveCommunicationKit，两者共用 PushKit；正式签名、推送和系统响铃仍需真实环境验收。
 
 依赖版本锁定见 [native-versions.json](native-versions.json)；接口见 [voip-client-contract.md](../../docs/engineering/voip-client-contract.md)。

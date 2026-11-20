@@ -10,7 +10,7 @@
 
 - `ImCallController` 仍提供 answered／ended／declined／meeting-invite-handled，没有当前客户端约定的电话设备注册入口。
 - 所查分支未发现专用 APNs VoIP sender。后端 `docs/07-移动端APP对接文档.md` §9.3 明确说明 `voipToken` 可落库，但尚无发送使用方，原 R-07 决策仍将 VoIP Push 列为取消；这一范围需要随移动端电话需求更新。
-- 客户端已有原生 launch restore、PushKit token 注册、原生系统来电及接听媒体逻辑。注册目标为 `POST /api/instant-message/calls/devices`，当前实现适用 iOS 17.4+；iOS 15–17.3 保持既有前台／普通通知能力。
+- 客户端已有原生 launch restore、PushKit token 注册、原生系统来电及接听媒体逻辑。注册目标为 `POST /api/instant-message/calls/devices`；iOS 15–17.3 使用 CallKit，17.4+ 使用 LiveCommunicationKit，两条路径均待完整真机矩阵验收。
 - 既有测试环境接口未就绪记录见 [验收记录](voip-acceptance.md)。本轮仅更新源码核对，没有重测已部署接口、发送 APNs、修改后端或读取私钥；不据某个分支断言所有独立服务的部署状态。
 
 Apple 说明 VoIP push 可启动或唤醒 App，并交给 PushKit 后报告系统来电；这与普通通知是不同机制。系统回收、用户上滑退出及重启后的行为必须分别留证，不能把普通推送的强退规则直接套用为 PushKit 结论。[Apple PushKit](https://developer.apple.com/documentation/pushkit)、[处理 VoIP push](https://developer.apple.com/documentation/pushkit/responding-to-voip-notifications-from-pushkit)

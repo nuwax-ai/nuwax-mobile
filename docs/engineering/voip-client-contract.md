@@ -110,7 +110,7 @@ UTS 页面的 onHide 可以断开现有 IM WebSocket；**通话控制流由原�
 uni-push/普通通知用 `kind:"voip.invite"` 标明邀请；原生 PushKit/鸿蒙 VoIP 通道由系统识别。邀请推送只含 `callId/version/expiresAt/callerId/calleeId/displayName/mediaType` 等最小显示信息；不含平台 token、RTC JWT 或可执行 URL。收到推送后启动/恢复控制连接并核对权威状态。取消、拒接、挂断、抢接结果都从已建立的原生控制连接送达，不能再用 VoIP 推送承载取消。
 
 - Android：厂商和 FCM 的接收回调通过 `VoipBridge.incoming(context,payload)` 接入；高优先级消息使用各平台允许的系统来电路径。CallStyle 通知、Core-Telecom 和 foreground service 持有通话。需要由实际分发基座的推送接收器调用此 hook；仅有 UTS `onPushMessage` 不能证明进程被回收后可来电。
-- iOS 17.4+：PushKit 委托中先 await LCK 来电上报，再做网络校验；系统 UUID 与业务 ID 独立映射。启动 hook 只恢复已同意隐私、已初始化过的加密会话；重装后的 Keychain 残留不能自动恢复。iOS 15–17.3 不注册 PushKit VoIP，前台呼叫加普通来电通知，不承诺相同的锁屏接听能力。
+- iOS：PushKit 委托中先上报系统来电，再做网络校验；15–17.3 使用 CallKit，17.4+ 使用 LiveCommunicationKit，系统 UUID 与业务 ID 独立映射。启动 hook 只恢复已同意隐私、已初始化过的加密会话；重装后的 Keychain 残留不能自动恢复。两条系统版本路径都必须分别完成前台、后台、锁屏和进程回收真机验收。
 - Harmony：EntryAbility.onCreate 同步注册 `receiveMessage('VoIP',…)`，且只有这个 Ability 拥有 `action.ohos.push.listener`。用原生推送回调的 `VoIPInfo.callId` 上报 Call Service，业务 callId 另存；禁止用业务 ID 冒充。原生系统应答先报 ANSWERED，媒体就绪后报 ACTIVE。锁屏语音接听，视频进入应用；VoIP 持续任务在媒体 Ability 上申请和释放。
 
 厂商权益、PushKit/APNs 环境、鸿蒙 push-type 10 权益与签名须由正式环境提供。开发服务返回 `nativePush:false`，不模拟供应商送达成功。

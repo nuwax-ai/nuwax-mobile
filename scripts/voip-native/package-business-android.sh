@@ -12,12 +12,15 @@ export NUWAX_HX_VERSION=5.34
 export NUWAX_MAIN_ROOT="$VOIP_REPO_ROOT"
 export NUWAX_LOCAL_BASE_ROOT="$VOIP_REPO_ROOT/out/voip-native-work"
 export ANDROID_ESP_WORK="$NUWAX_LOCAL_BASE_ROOT/android"
+export ANDROID_ESP_PROJECT="$ANDROID_ESP_WORK/project"
 for voip_sdk in "$ANDROID_ESP_WORK"/Android-uni-app-x-SDK@*-5.34; do
   [[ -d "$voip_sdk/uniappxnativepackage" ]] || continue
   export UNIAPPX_ANDROID_SDK_ROOT="$voip_sdk" ANDROID_ESP_PROJECT="$voip_sdk/uniappxnativepackage"
   break
 done
-[[ "${ANDROID_ESP_PROJECT:-}" == "$VOIP_REPO_ROOT/out/"* ]] || { echo 'Requires isolated HBuilderX 5.34 SDK under this worktree out/.' >&2; exit 1; }
+if [[ "$ANDROID_ESP_PROJECT" == "$ANDROID_ESP_WORK/project" ]]; then
+  bash "$VOIP_REPO_ROOT/scripts/android-esp/official/setup_sdk.sh"
+fi
 export APP_RESOURCES_DIR="$VOIP_REPO_ROOT/unpackage/resources/app-android"
 export ANDROID_CUSTOM_BASE_OUT="$VOIP_REPO_ROOT/out/voip-business-packages"
 export ENABLE_HX_DEBUG=1 ANDROID_BUILD_TYPE=debug

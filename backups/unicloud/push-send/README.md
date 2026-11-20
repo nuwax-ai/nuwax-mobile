@@ -6,6 +6,13 @@
 - 原路径为 `uniCloud-alipay/cloudfunctions/push-send/`，Git 目录对象为 `317df3f28d99daf405153d323b743e50d7de4e4d`。
 - 这是仓库中的 VoIP 前基线。生产当前版本尚未核对。备份存放在 `backups/`，需要恢复时再将选定版本放回云函数目录。
 
+## 2026-11-20-online-51fa66460
+
+- 2026-11-20 从生产运行日志与 HBuilderX 下载文件核对：线上 `push-send` 的 `version` 为 `aa9bc0f0`，下载的 `index.js` SHA-256 为 `d9f3bf65948fef4d871a942e4f7f9d9df281184cd2ce560e3022f0550a4d2910`，与 Git 提交 `51fa66460` 的 `index.js` 完全一致。
+- 备份目录包含该提交的完整函数目录：`index.js`、`voip.js`、`device-routes.js`、`package.json`。
+- 该版本是「按 CID 组装来电路由」的版本，**不包含**会议响铃（`meetingRinging` / `prepareMeetingRingInvitation`）与 `[push-send] meeting decision` 诊断日志。
+- 恢复时把本目录四个文件上传覆盖该函数即可；`voip-device-routes` 集合与环境变量无需回滚。
+
 ## 覆盖前确认备份
 
 1. 用生产 IM 实际调用的 URL 确认对应的 uniCloud 服务空间和 Space ID。在临时 HBuilderX 项目里下载当前云端 `push-send`，保留完整函数目录。

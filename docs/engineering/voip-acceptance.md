@@ -4,6 +4,10 @@
 
 **当前状态：华为新包锁屏来电铃声、亮屏及原生来电界面通过；荣耀可接打且锁屏有提示／能亮屏，铃声仍待新包复测。iOS 无进程来电及三端完整验收仍待验证。生产开关保持关闭。** 本文分别注明用户实机确认、构建检查与原生日志证据，不将其中一类扩大为完整验收。
 
+## 2026-11-20 环境隔离与设备自动选路
+
+本地 Mock 已覆盖错误空间、跨环境投递、测试绑定自动匹配华为、CID 轮换和撤销。用户确认此前华为已测通。测试 Space ID 已核对，待部署独立函数、核验实际发送授权及接通测试 IM。之后华为做新链路回归，荣耀和 vivo 各自按真实厂商通道独立验收，iOS 单列 PushKit 锁屏无进程流程。 [统一投递流程](../integration/im-call-meeting-invite-app-plan.md#标准投递流程) · [全厂商确认与联调契约](im-push-environment-isolation.md)
+
 ## 2026-11-17 iOS 无进程链路独立跟进
 
 本次只读核查现有已签 IPA：真实 App 1.3.6（136）、测试环境、5.34 runtime，AppDelegate 实际调用原生恢复 hook，entitlement／Info／profile 的 APNs 环境都为 development。iPhone 16 查询时进程存在，iPhone 13 的 CoreDevice 安装查询失败；未停止或启动 App。测试环境现有登录态 GET `/users/me` 成功，GET `/calls/devices` 仍为 404，未执行登记 POST 或发推送。

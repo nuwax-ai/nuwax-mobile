@@ -3,7 +3,11 @@ vi.mock('../../servers/voipIm.uts', () => ({ createImVoipCall: vi.fn(), imVoipCa
 const state = vi.hoisted(() => ({ allowed: true, consent: true, storage: new Map<string, unknown>(), requests: [] as any[] }));
 vi.mock('../../features/voip/development.uts', () => ({ isVoipDevelopmentBuild: () => state.allowed }));
 vi.mock('../../utils/appPrivacyConsent.uts', () => ({ hasAppPrivacyConsent: () => state.consent }));
-vi.mock('../../constants/config.uts', () => ({ getApiBaseUrl: () => 'https://platform.example', normalizeApiBaseUrl: (url: string) => url.trim() }));
+vi.mock('../../constants/config.uts', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../constants/config.uts')>(),
+  getApiBaseUrl: () => 'https://platform.example',
+  normalizeApiBaseUrl: (url: string) => url.trim(),
+}));
 vi.mock('../../servers/im.uts', () => ({ getImDeviceId: () => 'test-device' }));
 import { loginVoipDev, setVoipDevSession, readVoipDevSession, probeVoipDevServer, voipSessionConfig, registerVoipDevPush, voipRequest } from '../../servers/voip.uts';
 beforeEach(() => {

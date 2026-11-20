@@ -1194,7 +1194,34 @@
                 @input="handleInputTyped"
               />
               <!-- #endif -->
-              <!-- #ifndef APP-HARMONY -->
+              <!-- #ifdef APP-IOS -->
+              <!-- iOS 单独一支：只多一个 :cursor（程序化改写正文后把原生光标钉到末尾，
+                   iOS 的 UITextView 被整体重写后 selectedRange 复位到 0，真机症状=空输入框
+                   长按头像，@xxx 落在光标后面、继续输入会插到 @xxx 之前）。
+                   ★不能把 :cursor 加进下面 Android 共用的那支：Android 渲染 lambda 已顶
+                   255 参数硬限，多一个顶层引用即 R8 桩 VerifyError 整页加载失败。 -->
+              <textarea
+                id="chat-input-textarea"
+                class="chat-input"
+                v-model="inputText"
+                :cursor="inputCaret"
+                :disabled="composerLocked"
+                :maxlength="-1"
+                :auto-height="chatInputAutoHeight"
+                :placeholder="nativeChatInputPlaceholder"
+                placeholder-style="color:#b6b5c1;font-size:16px;font-weight:400;line-height:24px;"
+                :style="chatInputHeightStyle"
+                :show-confirm-bar="false"
+                :disable-default-padding="true"
+                :adjust-position="false"
+                :hold-keyboard="true"
+                :focus="focusRequest"
+                @focus="handleInputFocus"
+                @blur="handleInputBlur"
+                @input="handleInputTyped"
+              />
+              <!-- #endif -->
+              <!-- #ifndef APP-HARMONY || APP-IOS -->
               <textarea
                 id="chat-input-textarea"
                 class="chat-input"
@@ -3270,6 +3297,12 @@
   const focusRequest = ref<boolean>(false);
   /** 鸿蒙主输入框组件实例：程序化插入 @ 后显式恢复 Quill 光标。 */
   const chatMessageEditorRef = ref<any | null>(null);
+  /**
+   * iOS 主输入框 cursor 属性（仅 APP-IOS 模板绑定）：程序化改写正文后原生 UITextView 的
+   * selectedRange 会复位到 0，须把光标位置重新指到末尾。-1 = 不干预（默认值，与
+   * chat-input-phone 同口径：写 -1 是空操作，不会挪动用户自己的光标）。
+   */
+  const inputCaret = ref<number>(-1);
   /** @ 成员选择页选完待聚焦：事件先于 navigateBack 到达（本页仍隐藏），延迟到 onShow 后拉键盘。 */
   let pendingFocusAfterAtPick = false;
   /** 格式横条样式态（B/I/S/U 点击切背景，不插标记）：激活的样式在发送时按行包装正文，
@@ -5073,6 +5106,36 @@
     }
   }
 
+  /**
+   * iOS 专用：程序化改写正文（@提及追加 / 编辑回填）后把原生光标钉到正文末尾。
+   * iOS 的 UITextView 被整体重写后 selectedRange 复位到 0（Android 框架自己会把光标
+   * 带去末尾，鸿蒙走 setTextAndSelection）。真机症状：输入框空着、光标在里面时长按
+   * 头像，@xxx 出现在光标后面，继续输入会插到 @xxx 之前；编辑回填同款。
+   * 修法=下一帧单独发一次 cursor（与 value 分两轮推送，确保落在正文改写之后），再补一次
+   * 元素聚焦兜住「cursor 只在聚焦流程里落地」的端（已聚焦时幂等）；60ms 后写回 -1
+   * （-1 = 不干预，不会动后续用户光标）。未聚焦时不处理：那次聚焦由 focusChatInput 走。
+   */
+  function pinIosInputCaretAtEnd(text: string): void {
+    // #ifdef APP-IOS
+    if (inputFocused.value) {
+      // 两拍：第一拍等正文 value 渲染落地，第二拍推 cursor（属性更新可能即时生效，
+      // 也可能只在聚焦流程里落地）再补一次元素聚焦——两条链路都覆盖，已聚焦时聚焦幂等。
+      nextTick((): void => {
+        inputCaret.value = text.length;
+        nextTick((): void => {
+          const el = uni.getElementById("chat-input-textarea");
+          if (el != null) {
+            (el as UniTextareaElement).focus();
+          }
+          setTimeout((): void => {
+            inputCaret.value = -1;
+          }, 60);
+        });
+      });
+    }
+    // #endif
+  }
+
   /** 提及文本追加到输入末尾：前缀无空白时补一个空格（与既有正文隔开，PC replaceBeforeCaret 同语义）。 */
   function appendMentionText(token: string): void {
     const text = inputText.value;
@@ -5088,6 +5151,7 @@
       if (proxy != null) proxy.$callMethod("setTextAndSelection", nextText, nextText.length);
     });
     // #endif
+    pinIosInputCaretAtEnd(nextText);
   }
 
   /** 键盘敲 @ 检测用的输入快照：watch 跟随一切改写（发送清空/表情/提及回填/编辑等），
@@ -5181,9 +5245,51 @@
 
   // ===== Aa 键聚焦驱动 =====
 
-  /** 未聚焦时拉起键盘：focus 属性 false→true 变化触发（blur 已复位 false）。
-   *  仅 Aa 键调用（开格式横条时拉键盘）；格式横条 icon 一律不动键盘态。 */
+  /**
+   * 键盘被系统收起但输入框没失焦（Android 键盘右上「下三角」/ 鸿蒙收起箭头）时强制重开：
+   * 原生控件仍持焦点、光标还在闪，`focus` 属性对已聚焦控件是空操作，键盘唤不回。
+   * 处置=先真正断一次焦（Android textarea 走元素 blur；鸿蒙 editor 走 EditorContext.blur），
+   * 等 @blur 派发完再把 focus 属性推成 true，由框架走完整聚焦流程把软键盘拉起来。
+   * 见 conversation-input 的 scheduleAndroidEditorDefocus（同类「焦点悬挂」结论）。
+   */
+  function reopenChatInputKeyboard(): void {
+    // #ifdef APP-ANDROID
+    const raw = uni.getElementById("chat-input-textarea");
+    if (raw != null) {
+      (raw as UniTextareaElement).blur();
+    }
+    // #endif
+    // #ifdef APP-HARMONY
+    const proxy = chatMessageEditorRef.value as ComponentPublicInstance | null;
+    if (proxy != null) proxy.$callMethod("blur");
+    // #endif
+    focusRequest.value = false;
+    // 等原生 @blur 派发完再推 focus（handleInputBlur 会把 focusRequest 复位 false，
+    // 抢在它前面写 true 会被立刻踩掉，原生已聚焦又收不到 new focus）。
+    setTimeout((): void => {
+      focusRequest.value = true;
+      // #ifdef APP-HARMONY
+      nextTick((): void => {
+        const editor = uni.getElementById("chat-message-editor-input");
+        if (editor != null) {
+          (editor as UniEditorElement).focus();
+        }
+      });
+      // #endif
+    }, 80);
+  }
+
+  /** 拉起键盘：focus 属性 false→true 变化触发（blur 已复位 false）。
+   *  Aa 键、引用/编辑/长按头像 @提及等程序化入口共用；格式横条 icon 一律不动键盘态。 */
   function focusChatInput(): void {
+    // 已聚焦但键盘实际不在（光标在闪、IME 被系统收掉）：Android/鸿蒙不会因此失焦，
+    // 单靠下面的 focus 属性推不动键盘，先断焦再重聚焦（iOS 由系统保证收起即失焦，不触达）。
+    // #ifdef APP-ANDROID || APP-HARMONY
+    if (inputFocused.value && keyboardHeight.value <= 0) {
+      reopenChatInputKeyboard();
+      return;
+    }
+    // #endif
     if (inputFocused.value) {
       return;
     }
@@ -9452,6 +9558,8 @@
     resetQuoteMentionSnapshot();
     editTarget.value = target;
     inputText.value = msg.bodyText;
+    // iOS：整体重写正文后原生光标会复位到 0，不钉到末尾就成了「从头继续改」
+    pinIosInputCaretAtEnd(msg.bodyText);
     focusChatInput();
   }
 

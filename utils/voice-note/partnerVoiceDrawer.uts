@@ -12,7 +12,7 @@ import VibrationEffect from "android.os.VibrationEffect";
  * 伙伴页录音层开关。false：不显示顶部录音图标，右滑也不会打开录音面板。
  * 改成 true 即恢复现在的录音入口。
  */
-export const partnerVoiceRecordEnabled = false;
+export const partnerVoiceRecordEnabled = true;
 
 /** 松手完成切换的距离：右滑、左滑都是滑过屏幕宽度的三成。越过这条线轻震一下。 */
 const partnerVoiceCommitRatio = 0.3;
@@ -23,6 +23,8 @@ let hapticPast = false;
 export const partnerVoiceOffset = ref<number>(0);
 /** 跟手拖动中：两层都不做过渡，松手后再缓动到开或关。 */
 export const partnerVoiceDragging = ref<boolean>(false);
+/** 松手后收到两端的过渡时长。跟手时为 0，避免和位移写在同一帧里直接跳完。 */
+export const partnerVoiceSettleMs = ref<number>(320);
 /** 已吸附打开。 */
 export const partnerVoiceOpen = ref<boolean>(false);
 /** 录音进行中：伙伴页麦克风保持红色。 */
@@ -47,8 +49,20 @@ let tracking = false;
 let aliveTimer = 0;
 /** 最近一次松手是否算横滑。列表用它吞掉随后的点击，函数本身保持无返回值。 */
 let partnerVoiceClaimed = false;
-/** 点麦克风会作废同一次触摸里尚未结算的回弹，避免刚打开又被拉回伙伴页。 */
+/** 点麦克风或主动开关会作废尚未落地的吸附，避免刚打开又被拉回伙伴页。
+ *  新的手指按下不作废：录音层滑到手指下时会接走触摸，上一次吸附若被取消，
+ *  而新触摸又不够 18px 横滑，位移就会停在半路。 */
 let gestureEpoch = 0;
+/** 松手后待落地的全开/全关。手指还按着时先挂起，松手或抬手丢失后再收。 */
+let hasPendingSettle = false;
+let pendingSettleOpen = false;
+let settleSerial = 0;
+let restWatchTimer = 0;
+let lastMoveAt = 0;
+/** 松手后的过渡没在下一帧写上时，隔这么久再收到两端。 */
+const partnerVoiceSettleFallbackMs = 32;
+/** 这么久没有新的位移，视为抬手事件丢失，不能再停在半路。 */
+const partnerVoiceMoveIdleMs = 160;
 
 function cancelPartnerVoiceAliveTimer(): void {
   if (aliveTimer != 0) {
@@ -85,6 +99,157 @@ export function partnerVoiceMaxOffset(): number {
   return maxOffsetPx >= 240 ? maxOffsetPx : 240;
 }
 
+function cancelPartnerVoiceRestWatch(): void {
+  if (restWatchTimer != 0) {
+    clearTimeout(restWatchTimer);
+    restWatchTimer = 0;
+  }
+}
+
+/** 剩余距离越短，收得越快。整屏大约 320ms，接近微信侧滑松手后的 ease-out。 */
+function settleDurationMs(open: boolean): number {
+  const max = partnerVoiceMaxOffset();
+  const distance = Math.abs((open ? max : 0) - partnerVoiceOffset.value);
+  if (max <= 0) {
+    return 320;
+  }
+  let ms = Math.round(120 + (distance / max) * 200);
+  if (ms < 120) {
+    ms = 120;
+  }
+  if (ms > 320) {
+    ms = 320;
+  }
+  return ms;
+}
+
+/** 收到全开或全关。调用前一帧已经把过渡时长写成非 0，这一帧只改位移。 */
+function commitPartnerVoiceSettle(open: boolean): void {
+  cancelPartnerVoiceRestWatch();
+  cancelPartnerVoiceAliveTimer();
+  const max = partnerVoiceMaxOffset();
+  partnerVoiceDragging.value = false;
+  partnerVoiceScrollLock.value = false;
+  partnerVoiceOpen.value = open;
+  partnerVoiceOffset.value = open ? max : 0;
+  if (!open) {
+    schedulePartnerVoiceUnmount();
+  }
+}
+
+/** 方向已经丢了时，按当前位移决定全开还是全关。正在关的用剩余 30%，正在开的用滑过 30%。 */
+function partnerVoiceRestingOpen(offset: number): boolean {
+  const max = partnerVoiceMaxOffset();
+  if (max <= 0) {
+    return false;
+  }
+  const closing = partnerVoiceOpen.value && startOffset > max * 0.5;
+  if (closing) {
+    return offset > max * (1 - partnerVoiceCommitRatio);
+  }
+  return offset >= max * partnerVoiceCommitRatio;
+}
+
+function finishSettleAnimation(serial: number, epoch: number): void {
+  if (serial != settleSerial || epoch != gestureEpoch || !hasPendingSettle) {
+    return;
+  }
+  if (partnerVoiceDragging.value && Date.now() - lastMoveAt < partnerVoiceMoveIdleMs) {
+    return;
+  }
+  tracking = false;
+  axis = "";
+  velocity = 0;
+  partnerVoiceDragging.value = false;
+  partnerVoiceScrollLock.value = false;
+  hasPendingSettle = false;
+  cancelPartnerVoiceRestWatch();
+  commitPartnerVoiceSettle(pendingSettleOpen);
+}
+
+/** 位移不在两端、手指又不再移动时，立刻收到全开或全关。 */
+function armPartnerVoiceRestWatch(): void {
+  cancelPartnerVoiceRestWatch();
+  const serial = settleSerial;
+  const epoch = gestureEpoch;
+  restWatchTimer = setTimeout(() => {
+    restWatchTimer = 0;
+    if (epoch != gestureEpoch) {
+      return;
+    }
+    const max = partnerVoiceMaxOffset();
+    const offset = partnerVoiceOffset.value;
+    if (offset <= 1 || offset >= max - 1) {
+      return;
+    }
+    if (partnerVoiceDragging.value && Date.now() - lastMoveAt < partnerVoiceMoveIdleMs) {
+      armPartnerVoiceRestWatch();
+      return;
+    }
+    if (hasPendingSettle && serial == settleSerial) {
+      finishSettleAnimation(serial, epoch);
+      return;
+    }
+    const open = partnerVoiceRestingOpen(offset);
+    pendingSettleOpen = open;
+    hasPendingSettle = true;
+    partnerVoiceDragging.value = false;
+    partnerVoiceScrollLock.value = false;
+    tracking = false;
+    axis = "";
+    partnerVoiceSettleMs.value = settleDurationMs(open);
+    settleSerial = settleSerial + 1;
+    const nextSerial = settleSerial;
+    nextTick(() => {
+      finishSettleAnimation(nextSerial, gestureEpoch);
+    });
+  }, partnerVoiceSettleFallbackMs);
+}
+
+function schedulePartnerVoiceSettle(open: boolean): void {
+  hasPendingSettle = true;
+  pendingSettleOpen = open;
+  settleSerial = settleSerial + 1;
+  const serial = settleSerial;
+  const epoch = gestureEpoch;
+  partnerVoiceDragging.value = false;
+  partnerVoiceScrollLock.value = false;
+  tracking = false;
+  axis = "";
+  partnerVoiceSettleMs.value = settleDurationMs(open);
+  nextTick(() => {
+    finishSettleAnimation(serial, epoch);
+  });
+  armPartnerVoiceRestWatch();
+}
+
+function notePartnerVoiceMotion(): void {
+  lastMoveAt = Date.now();
+}
+
+/** 宽度变化后，已打开的录音层继续铺满；没有手指按下时不许停在半路。 */
+export function syncPartnerVoiceOffsetToWidth(): void {
+  if (tracking || partnerVoiceDragging.value || hasPendingSettle) {
+    return;
+  }
+  const max = partnerVoiceMaxOffset();
+  const offset = partnerVoiceOffset.value;
+  if (partnerVoiceOpen.value) {
+    if (offset != max) {
+      partnerVoiceOffset.value = max;
+    }
+    return;
+  }
+  if (offset <= 0) {
+    return;
+  }
+  if (offset >= max) {
+    partnerVoiceOffset.value = 0;
+    return;
+  }
+  commitPartnerVoiceSettle(partnerVoiceRestingOpen(offset));
+}
+
 export function setPartnerVoiceRecording(recording: boolean): void {
   partnerVoiceRecording.value = recording;
 }
@@ -96,6 +261,8 @@ export function openPartnerVoiceDrawer(): void {
   }
   gestureEpoch = gestureEpoch + 1;
   const epoch = gestureEpoch;
+  hasPendingSettle = false;
+  cancelPartnerVoiceRestWatch();
   cancelPartnerVoiceAliveTimer();
   partnerVoiceDragging.value = false;
   partnerVoiceScrollLock.value = false;
@@ -114,17 +281,26 @@ export function openPartnerVoiceDrawer(): void {
     partnerVoiceSnapless.value = true;
     partnerVoiceOffset.value = 0;
   }
+  partnerVoiceSettleMs.value = 320;
   nextTick(() => {
     if (epoch != gestureEpoch) {
       return;
     }
     partnerVoiceSnapless.value = false;
-    partnerVoiceOffset.value = partnerVoiceMaxOffset();
+    nextTick(() => {
+      if (epoch != gestureEpoch) {
+        return;
+      }
+      partnerVoiceOffset.value = partnerVoiceMaxOffset();
+    });
   });
 }
 
 /** 录音层返回，或切离伙伴页。 */
 export function closePartnerVoiceDrawer(): void {
+  gestureEpoch = gestureEpoch + 1;
+  hasPendingSettle = false;
+  cancelPartnerVoiceRestWatch();
   partnerVoiceDragging.value = false;
   partnerVoiceScrollLock.value = false;
   tracking = false;
@@ -150,8 +326,9 @@ export function beginPartnerVoiceDrag(x: number, y: number): void {
   if (partnerVoiceRecordEnabled != true) {
     return;
   }
-  gestureEpoch = gestureEpoch + 1;
+  // 不增加 gestureEpoch。录音层接走这次触摸时，上一次松手的全开/全关还要落地。
   cancelPartnerVoiceAliveTimer();
+  notePartnerVoiceMotion();
   tracking = true;
   axis = "";
   startX = x;
@@ -264,9 +441,14 @@ export function movePartnerVoiceDrag(x: number, y: number): boolean {
     const canClose = partnerVoiceOpen.value;
     if (horizontal && (canOpen || canClose)) {
       axis = "h";
+      // 手指已经接管位移，上一次松手的决定作废，改由这次松手重新结算。
+      hasPendingSettle = false;
+      settleSerial = settleSerial + 1;
+      cancelPartnerVoiceRestWatch();
       partnerVoiceAlive.value = true;
       partnerVoiceDragging.value = true;
       partnerVoiceScrollLock.value = true;
+      armPartnerVoiceRestWatch();
     } else {
       axis = "v";
       return false;
@@ -282,6 +464,7 @@ export function movePartnerVoiceDrag(x: number, y: number): boolean {
   }
   lastX = x;
   lastTime = now;
+  notePartnerVoiceMotion();
   applyPartnerVoiceOffset(startOffset + dx);
   return true;
 }
@@ -294,6 +477,15 @@ export function movePartnerVoiceDrag(x: number, y: number): boolean {
 export function endPartnerVoiceDrag(x: number, y: number): void {
   if (!tracking) {
     partnerVoiceClaimed = false;
+    // 抬手已经丢过一次：再来的触摸结束时如果还停在半路，立刻收到两端之一。
+    // 麦克风刚打开（partnerVoiceOpen）或上一次吸附还没落地时不插手。
+    if (!hasPendingSettle && !partnerVoiceDragging.value && !partnerVoiceOpen.value) {
+      const max = partnerVoiceMaxOffset();
+      const offset = partnerVoiceOffset.value;
+      if (offset > 0 && offset < max) {
+        schedulePartnerVoiceSettle(partnerVoiceRestingOpen(offset));
+      }
+    }
     return;
   }
   if (x >= 0 && y >= 0 && axis != "v") {
@@ -306,6 +498,7 @@ export function endPartnerVoiceDrag(x: number, y: number): void {
     const canClose = partnerVoiceOpen.value;
     if (axis == "" && horizontal && (canOpen || canClose)) {
       axis = "h";
+      hasPendingSettle = false;
       partnerVoiceAlive.value = true;
       partnerVoiceDragging.value = true;
     }
@@ -328,8 +521,19 @@ export function endPartnerVoiceDrag(x: number, y: number): void {
   partnerVoiceScrollLock.value = false;
   if (!wasHorizontal) {
     velocity = 0;
-    partnerVoiceClaimed = false;
-    if (!partnerVoiceOpen.value && partnerVoiceOffset.value <= 0) {
+    const max = partnerVoiceMaxOffset();
+    const offset = partnerVoiceOffset.value;
+    const shouldSettle = hasPendingSettle || (offset > 0 && offset < max);
+    partnerVoiceClaimed = shouldSettle;
+    if (hasPendingSettle) {
+      const serial = settleSerial;
+      const epoch = gestureEpoch;
+      nextTick(() => {
+        finishSettleAnimation(serial, epoch);
+      });
+    } else if (shouldSettle) {
+      schedulePartnerVoiceSettle(partnerVoiceRestingOpen(offset));
+    } else if (!partnerVoiceOpen.value && offset <= 0) {
       schedulePartnerVoiceUnmount();
     }
     return;
@@ -347,17 +551,7 @@ export function endPartnerVoiceDrag(x: number, y: number): void {
     }
   }
   velocity = 0;
-  const epoch = gestureEpoch;
-  nextTick(() => {
-    if (epoch != gestureEpoch) {
-      return;
-    }
-    partnerVoiceOffset.value = open ? max : 0;
-    partnerVoiceOpen.value = open;
-    if (!open) {
-      schedulePartnerVoiceUnmount();
-    }
-  });
+  schedulePartnerVoiceSettle(open);
   partnerVoiceClaimed = true;
 }
 

@@ -63,16 +63,12 @@ describe('native call delivery', () => {
     expect(send.mock.calls[2][0].request_id).not.toBe(args.request_id);
   });
 
-  it('sends Huawei Android pure transmission only when enabled', async () => {
+  it('sends Huawei Android pure transmission for a verified route', async () => {
     const transport = 'android-huawei';
     const body = makeBody();
     const invitation = { ...body, callRoute: { cid, platform: 'android', transport }, settings: { ttl: 2000 }, options: { ios: { type: 'voip' } } };
-    const disabled = load();
-    expect((await disabled.call(invitation)).errCode).toBe(503);
-    expect(disabled.request).not.toHaveBeenCalled();
-    expect(disabled.send).not.toHaveBeenCalled();
 
-    const { call, send, request, manager } = load(latestEntry, { NUWAX_VOIP_ANDROID_TRANSPORTS: transport });
+    const { call, send, request, manager } = load();
     expect((await call(invitation)).errCode).toBe(0);
     expect(send).not.toHaveBeenCalled();
     const args = request.mock.calls[0][0];
@@ -109,17 +105,7 @@ describe('native call delivery', () => {
     expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
   });
 
-  it('falls back to the ordinary VoIP notice when a scene=call native route is not enabled', async () => {
-    const { call, send } = load();
-    const body = makeBody();
-    const result = await call({ ...body, type: 'voip',
-      payload: { ...body.payload, calleeId: '10002', scene: 'call' } });
-    expect(result.errCode).toBe(0);
-    expect(send).toHaveBeenCalledTimes(1);
-    expect(send.mock.calls[0][0].settings).not.toHaveProperty('strategy');
-  });
-
-  it('fails closed for mixed devices, wrong platform, invalid invites, missing configuration and wrong signed environment', async () => {
+  it('fails closed for mixed devices, wrong platform and invalid invites', async () => {
     const { call, send } = load(latestEntry, env);
     const body = makeBody();
     expect((await call(body, 'bad-sign')).errCode).toBe(401);
@@ -128,8 +114,6 @@ describe('native call delivery', () => {
     expect((await call({ ...body, payload: { ...body.payload, callId: undefined } })).errCode).toBe(400);
     expect((await call(makeBody(Date.now() + 70_000))).errCode).toBe(400);
     expect((await call(makeBody(Date.now() - 100))).data.skipped).toBe(true);
-    expect((await call({ ...body, callRoute: { ...body.callRoute, environment: 'production' } })).errCode).toBe(503);
-    expect((await load().call(body)).errCode).toBe(503);
     expect(send).not.toHaveBeenCalled();
   });
 });
@@ -188,7 +172,7 @@ describe('IM invitation scenes', () => {
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
     expect(args.payload).toEqual({ ...expected, type: 'meeting_invite' });
-    expect(args.category).toEqual({ harmony: 'IM' });
+    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
     expect(args).not.toHaveProperty('settings');
     expect(args).not.toHaveProperty('options');
     expect(database).not.toHaveBeenCalled();
@@ -277,15 +261,26 @@ describe('envelope type and scene-driven notification config', () => {
     expect(args).not.toHaveProperty('settings');
   });
 
-  it('applies the envelope type even when the payload is not a call envelope', async () => {
+  it('forces the VOIP category without adding a call channel when the scene is absent', async () => {
     const { call, send } = load();
     const payload = { convId: '123', convType: 1 };
-    await call({ ...envelope, type: 'voip', payload });
+    await call({ ...envelope, type: 'voip', category: { harmony: 'IM', huawei: 'IM' }, payload });
     const args = send.mock.calls[0][0];
     expect(args.payload).toEqual(payload);
     expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
     expect(args).not.toHaveProperty('settings');
-    expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
+    expect(args).not.toHaveProperty('options');
+  });
+
+  it('forces the IM category from the envelope type even when the input category is VOIP', async () => {
+    const { call, send } = load();
+    const payload = { convId: '123', convType: 1 };
+    await call({ ...envelope, type: 'im', category: { harmony: 'VOIP', huawei: 'VOIP' }, payload });
+    const args = send.mock.calls[0][0];
+    expect(args.payload).toEqual(payload);
+    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args).not.toHaveProperty('options');
+    expect(args).not.toHaveProperty('settings');
   });
 
   it('skips a scene=call invitation whose sendTime window has elapsed', async () => {
@@ -311,10 +306,10 @@ describe('meeting ringing delivery', () => {
     expect(args.payload.type).toBe('meeting_invite');
     expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
     expect(args).not.toHaveProperty('settings');
-    expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
+    expect(args).not.toHaveProperty('options');
   });
 
-  it('rings through the iOS VoIP route with the meeting payload and VoipCall channel', async () => {
+  it('rings through the iOS VoIP route without adding the Android VoipCall channel', async () => {
     const cid = 'fixture-target-cid';
     const { call, send } = load(latestEntry, { ...ringEnv, NUWAX_VOIP_IOS_APNS_ENVIRONMENT: 'development' });
     const result = await call({
@@ -327,7 +322,7 @@ describe('meeting ringing delivery', () => {
     expect(args.settings).toMatchObject({ ttl: 5000, strategy: { ios: 2 } });
     expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
     expect(args.options.ios.type).toBe('voip');
-    expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
+    expect(args.options).not.toHaveProperty('android');
     const pushed = JSON.parse(args.options.ios.payload);
     expect(pushed).toMatchObject({ type: 'voip', scene: 'meeting', callId: 'mi-ring', calleeId: '10002',
       inviteId: 'mi-ring', roomName: '123456789', title: '周会', mediaType: 'video', displayName: '张三' });

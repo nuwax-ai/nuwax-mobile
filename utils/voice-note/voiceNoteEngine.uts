@@ -20,6 +20,7 @@ import {
   apiVoiceNoteUploadSegment,
 } from "@/servers/voiceNote.uts";
 import { pushVoiceNoteDebug } from "@/utils/voice-note/voiceNoteDebugLog.uts";
+import { partnerVoiceOpen } from "@/utils/voice-note/partnerVoiceDrawer.uts";
 
 // #ifdef APP-ANDROID || APP-IOS
 import {
@@ -57,6 +58,8 @@ let captureAlive = false;
 let tickTimer = 0;
 let lastPersistAt = 0;
 let queueRunning = false;
+/** 正在创建笔记的本地会话。开始录音和补传队列不要同时各打一次 create。 */
+let noteCreateLocalId = "";
 let pollTimer = 0;
 
 function activeRecord(): VoiceNoteRecord | null {
@@ -271,7 +274,7 @@ function onTick(): void {
   }
 }
 
-async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<void> {
+async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<number> {
   const index = record.openSegmentIndex;
   const endedAt = Date.now();
   const durationMs = openSegmentMs(record, endedAt);
@@ -298,6 +301,7 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
   record.accumulatedMs = record.accumulatedMs + duration;
   record.elapsedMs = record.accumulatedMs;
   touch(record);
+  return index;
 }
 
 function readErrorMessage(err: any | null): string {
@@ -413,9 +417,10 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     if (path.length == 0 && record.openSegmentPath.length > 0) {
       path = record.openSegmentPath;
     }
+    let closedIndex = -1;
     if (path.length > 0) {
       pushVoiceNoteDebug("录音", "完成本次录音，落盘 " + path);
-      await closeSegment(record, path);
+      closedIndex = await closeSegment(record, path);
     }
     record.phase = "uploading";
     record.awaitComplete = true;
@@ -428,12 +433,13 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     stopIntent = "";
     sessionEnding = false;
     endingLocalId = "";
-    void pumpQueue();
+    void pumpQueue(closedIndex);
     return;
   }
   const pausing = usedIntent == "user";
+  let closedIndex = -1;
   if (tempPath.length > 0) {
-    await closeSegment(record, tempPath);
+    closedIndex = await closeSegment(record, tempPath);
   }
   if (pausing) {
     if (sessionEnding) {
@@ -450,7 +456,7 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
       releaseRecorderCallbacks();
       sessionEnding = false;
       endingLocalId = "";
-      void pumpQueue();
+      void pumpQueue(closedIndex);
       return;
     }
     pushVoiceNoteDebug("录音", "暂停，会话未结束");
@@ -473,12 +479,11 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     endBackground();
     stopTicker();
     releaseRecorderCallbacks();
-    void pumpQueue();
     return;
   }
   // 分段时长已满：当前文件先落盘并上传，再开下一段。
   pushVoiceNoteDebug("录音", "分段已满，落盘并上传");
-  void pumpQueue();
+  void pumpQueue(closedIndex);
   record.segmentStartedAt = Date.now();
   touch(record);
   stopIntent = "";
@@ -527,8 +532,14 @@ function writeSegmentUpload(
 /** 同一分段最多上传 3 次，编号在落盘时确定，重试不再改。 */
 const maxSegmentUploadAttempts = 3;
 
+/**
+ * 补传只处理还没上传成功的分段。
+ * pending 未上传，failed 上传失败，uploading 是上次没传完。
+ * uploaded 已成功，不再上传。
+ */
 function segmentCanUpload(row: VoiceNoteSegmentRecord): boolean {
-  if (row.uploadStatus == "uploaded") return false;
+  const status = row.uploadStatus;
+  if (status != "pending" && status != "failed" && status != "uploading") return false;
   if (row.uploadAttempts >= maxSegmentUploadAttempts) return false;
   return true;
 }
@@ -541,24 +552,146 @@ function allSegmentsUploaded(record: VoiceNoteRecord): boolean {
   return true;
 }
 
-// 确保会话有 noteId，没有则创建。
-async function ensureNoteId(localId: string, fallback: VoiceNoteRecord): Promise<VoiceNoteRecord> {
+/** 异步确认本地文件还在。iOS 上 accessSync 对不存在的文件也会判成存在，所以只信 getFileInfo 回调。 */
+function segmentFileExists(filePath: string): Promise<boolean> {
+  if (filePath.length == 0) {
+    return Promise.resolve(false);
+  }
+  return new Promise<boolean>((resolve) => {
+    uni.getFileSystemManager().getFileInfo({
+      filePath: filePath,
+      success: (_res) => {
+        resolve(true);
+      },
+      fail: (_err) => {
+        resolve(false);
+      },
+    });
+  });
+}
+
+function segmentIndexUsed(indexes: number[], index: number): boolean {
+  for (let i = 0; i < indexes.length; i++) {
+    if (indexes[i] == index) return true;
+  }
+  return false;
+}
+
+/** 已上传分段的编号不能改。未上传的分段补进空位，保证剩下的编号从 0 连续排到最后。 */
+function compactPendingSegmentIndexes(record: VoiceNoteRecord): void {
+  const used: number[] = [];
+  for (let i = 0; i < record.segments.length; i++) {
+    const row = record.segments[i];
+    if (row.uploadStatus == "uploaded") used.push(row.segmentIndex);
+  }
+  let next = 0;
+  let maxIndex = -1;
+  for (let i = 0; i < record.segments.length; i++) {
+    const row = record.segments[i];
+    if (row.uploadStatus == "uploaded") {
+      if (row.segmentIndex > maxIndex) maxIndex = row.segmentIndex;
+      continue;
+    }
+    while (segmentIndexUsed(used, next)) {
+      next = next + 1;
+    }
+    row.segmentIndex = next;
+    used.push(next);
+    if (next > maxIndex) maxIndex = next;
+    next = next + 1;
+  }
+  const following = maxIndex + 1;
+  record.openSegmentIndex = following > 0 ? following : 0;
+}
+
+/** 补传时本地文件已被删掉：从分段列表移除，不占用上传次数。 */
+function removeMissingSegment(localId: string, segmentIndex: number): VoiceNoteRecord | null {
+  const record = findVoiceNoteByLocalId(localId);
+  if (record == null) return null;
+  const kept: VoiceNoteSegmentRecord[] = [];
+  for (let i = 0; i < record.segments.length; i++) {
+    const row = record.segments[i];
+    if (row.segmentIndex != segmentIndex || row.uploadStatus == "uploaded") {
+      kept.push(row);
+    }
+  }
+  while (record.segments.length > 0) {
+    record.segments.pop();
+  }
+  for (let i = 0; i < kept.length; i++) {
+    record.segments.push(kept[i]);
+  }
+  compactPendingSegmentIndexes(record);
+  touch(record);
+  pushVoiceNoteDebug(
+    "接口",
+    "分段文件不存在，已从本地记录移除 index=" + segmentIndex.toString() + " 剩余=" + record.segments.length.toString(),
+  );
+  return record;
+}
+
+function rememberCreateError(localId: string, message: string): void {
+  const latest = findVoiceNoteByLocalId(localId);
+  if (latest == null) return;
+  latest.error = message;
+  touch(latest);
+}
+
+/**
+ * 补齐 noteId。本地录音记录始终保留。
+ * 已有非空 noteId 直接返回。创建进行中返回 null，调用方不得上传。
+ * 创建失败或没有返回 noteId 时抛错，不把空编号写进这条记录。
+ */
+async function ensureNoteId(localId: string, fallback: VoiceNoteRecord): Promise<VoiceNoteRecord | null> {
   const current = findVoiceNoteByLocalId(localId);
   const record = current != null ? current : fallback;
   if (record.noteId.length > 0) return record;
-  const noteId = await apiVoiceNoteCreate(record.title);
-  const latest = findVoiceNoteByLocalId(localId);
-  const target = latest != null ? latest : record;
-  target.noteId = noteId;
-  touch(target);
-  return target;
+  if (noteCreateLocalId.length > 0) return null;
+  noteCreateLocalId = localId;
+  try {
+    const noteId = await apiVoiceNoteCreate(record.title);
+    if (noteId.length == 0) {
+      throw new Error("创建笔记未返回 noteId");
+    }
+    const latest = findVoiceNoteByLocalId(localId);
+    const target = latest != null ? latest : record;
+    target.noteId = noteId;
+    target.error = "";
+    touch(target);
+    return target;
+  } finally {
+    noteCreateLocalId = "";
+  }
 }
 
-async function pumpQueue(): Promise<void> {
+/** 补传只在录音页打开时跑。不在录音页就留在本地，等下次进入录音页。 */
+function pumpQueueOnRecordPage(): void {
+  if (partnerVoiceOpen.value != true) {
+    pushVoiceNoteDebug("接口", "不在录音页，不补传");
+    return;
+  }
+  void pumpQueue(-1);
+}
+
+/** 用户进入录音页时补传未完成的分段。失败不重试，直接下一条。 */
+export function retryVoiceNoteUploads(): void {
+  void pumpQueue(-1);
+}
+
+function segmentSkipped(indexes: number[], segmentIndex: number): boolean {
+  for (let i = 0; i < indexes.length; i++) {
+    if (indexes[i] == segmentIndex) return true;
+  }
+  return false;
+}
+
+/** retrySegmentIndex 小于 0：这次是补传，失败后直接下一条。大于等于 0：只重试刚落下的这一段。 */
+async function pumpQueue(retrySegmentIndex: number): Promise<void> {
   if (queueRunning) return;
   queueRunning = true;
   pushVoiceNoteDebug("接口", "开始处理上传队列");
   try {
+    const skipped: number[] = [];
     let guard = 0;
     while (guard < 10000) {
       guard = guard + 1;
@@ -567,7 +700,7 @@ async function pumpQueue(): Promise<void> {
       let pending: VoiceNoteSegmentRecord | null = null;
       for (let i = 0; i < open.segments.length; i++) {
         const row = open.segments[i];
-        if (segmentCanUpload(row)) {
+        if (segmentCanUpload(row) && !segmentSkipped(skipped, row.segmentIndex)) {
           pending = row;
           break;
         }
@@ -597,18 +730,44 @@ async function pumpQueue(): Promise<void> {
         break;
       }
       const localId = open.localId;
+      const missingPath = pending.filePath;
+      const fileExists = await segmentFileExists(missingPath);
+      if (!fileExists) {
+        const left = removeMissingSegment(localId, pending.segmentIndex);
+        if (left != null && left.segments.length == 0 && left.awaitComplete && left.phase != "recording") {
+          left.phase = "failed";
+          left.awaitComplete = false;
+          left.error = "录音文件已删除";
+          touch(left);
+          pushVoiceNoteDebug("接口", "分段文件都已删除，不调用 complete");
+          break;
+        }
+        continue;
+      }
+      let ready: VoiceNoteRecord | null = null;
+      try {
+        ready = await ensureNoteId(localId, open);
+      } catch (e) {
+        const message = `${e}`;
+        pushVoiceNoteDebug("接口", "没有 noteId，录音留在本地，补传前会再创建 " + message);
+        rememberCreateError(localId, message);
+        break;
+      }
+      if (ready == null || ready.noteId.length == 0) {
+        pushVoiceNoteDebug("接口", "没有 noteId，录音留在本地，这次不上传");
+        break;
+      }
       const segmentIndex = pending.segmentIndex;
       const filePath = pending.filePath;
       const durationMs = pending.durationMs;
       const attempts = pending.uploadAttempts + 1;
       pushVoiceNoteDebug(
         "接口",
-        "准备上传分段 index=" + segmentIndex.toString() + " 第" + attempts.toString() + "/" + maxSegmentUploadAttempts.toString() + "次",
+        "准备上传分段 index=" + segmentIndex.toString() + " noteId=" + ready.noteId + " 第" + attempts.toString() + "/" + maxSegmentUploadAttempts.toString() + "次",
       );
       const marked = writeSegmentUpload(localId, segmentIndex, "uploading", "", "", attempts);
       if (marked == null) break;
       try {
-        const ready = await ensureNoteId(localId, marked);
         const segmentId = await apiVoiceNoteUploadSegment(
           ready.noteId,
           filePath,
@@ -622,6 +781,10 @@ async function pumpQueue(): Promise<void> {
           "分段上传失败 index=" + segmentIndex.toString() + " 第" + attempts.toString() + "/" + maxSegmentUploadAttempts.toString() + "次 " + `${e}`,
         );
         writeSegmentUpload(localId, segmentIndex, "failed", "", `${e}`, attempts);
+        if (segmentIndex != retrySegmentIndex) {
+          skipped.push(segmentIndex);
+          pushVoiceNoteDebug("接口", "补传失败，跳过 index=" + segmentIndex.toString());
+        }
       }
     }
   } finally {
@@ -673,34 +836,52 @@ function ensurePoll(): void {
   void pollProcessing();
 }
 
+/** 本地列表只留未成功的录音。已经标成成功的旧记录也从缓存删掉。 */
+function dropStoredSuccessNotes(): void {
+  const rows = loadVoiceNotes();
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].phase == "success") {
+      pushVoiceNoteDebug("缓存", "移除已成功记录 noteId=" + rows[i].noteId);
+      removeVoiceNote(rows[i].localId);
+    }
+  }
+}
+
 async function pollProcessing(): Promise<void> {
+  dropStoredSuccessNotes();
   const rows = loadVoiceNotes();
   let pending = false;
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     if (row.phase != "processing" || row.noteId.length == 0) continue;
-    pending = true;
     try {
       const detail = await apiVoiceNoteDetail(row.noteId);
-      if (detail == null) continue;
+      if (detail == null) {
+        pending = true;
+        continue;
+      }
       const status = detail["status"] != null ? `${detail["status"]}` : "";
+      if (status == "SUCCESS") {
+        pushVoiceNoteDebug("接口", "转写成功，移除本地记录 noteId=" + row.noteId);
+        removeVoiceNote(row.localId);
+        continue;
+      }
       row.serverStatus = status;
       if (detail["title"] != null) row.title = `${detail["title"]}`;
       if (detail["docUrl"] != null) row.docUrl = `${detail["docUrl"]}`;
       if (detail["asrText"] != null) row.asrText = `${detail["asrText"]}`;
       const duration = parseFloat(`${detail["totalDurationMs"]}`);
       if (!isNaN(duration) && duration > 0) row.elapsedMs = duration;
-      if (status == "SUCCESS") {
-        row.phase = "success";
-        row.error = "";
-      } else if (status == "ASR_PARTIAL_FAILED" || status == "DOC_FAILED" || status == "DOC_REMOVED") {
+      if (status == "ASR_PARTIAL_FAILED" || status == "DOC_FAILED" || status == "DOC_REMOVED") {
         row.phase = "failed";
         row.error = status;
       }
       touch(row);
+      if (row.phase == "processing") pending = true;
     } catch (e) {
       row.error = `${e}`;
       touch(row);
+      pending = true;
     }
   }
   if (!pending && pollTimer != 0) {
@@ -743,12 +924,7 @@ async function bindVoiceNoteId(localId: string): Promise<void> {
   try {
     await ensureNoteId(localId, current);
   } catch (e) {
-    const latest = findVoiceNoteByLocalId(localId);
-    if (latest == null) {
-      return;
-    }
-    latest.error = `${e}`;
-    touch(latest);
+    rememberCreateError(localId, `${e}`);
   }
 }
 
@@ -922,7 +1098,7 @@ export function finishVoiceNote(): void {
   endBackground();
   stopTicker();
   releaseRecorderCallbacks();
-  void pumpQueue();
+  void pumpQueue(-1);
 }
 
 let recoveringAbandoned = false;
@@ -958,7 +1134,7 @@ async function recoverAbandonedRecording(): Promise<void> {
     endBackground();
     stopTicker();
     releaseRecorderCallbacks();
-    void pumpQueue();
+    pumpQueueOnRecordPage();
   } finally {
     recoveringAbandoned = false;
   }
@@ -974,8 +1150,9 @@ function resumeProcessingPoll(): void {
   }
 }
 
-/** 回前台：本进程仍在录就继续计时和切段。进程已被杀掉则把未写完的段暂停，不结束会话。 */
+/** 回前台：本进程仍在录就继续计时和切段。进程已被杀掉则把未写完的段暂停，不结束会话。录音页还开着才补传。 */
 export function voiceNoteOnAppShow(): void {
+  dropStoredSuccessNotes();
   const record = activeRecord();
   if (record != null && !captureAlive && stopIntent.length == 0) {
     if (!recoveringAbandoned) {
@@ -993,7 +1170,7 @@ export function voiceNoteOnAppShow(): void {
       stopActiveRecorder("rotate");
     }
   }
-  void pumpQueue();
+  pumpQueueOnRecordPage();
   resumeProcessingPoll();
 }
 

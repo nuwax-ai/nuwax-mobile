@@ -298,6 +298,46 @@ function callTransportEnabled(route) {
   return route != null && typeof route.transport === 'string' && route.transport.length > 0
 }
 
+// ==================== 无 callRoute 时的厂商通道动态判定 ====================
+//
+// ★为什么在云端查而不是端上：接收端可能无进程（这正是本链路要支持的场景），
+//   cid → 厂商 token / 机型 的档案存在个推服务端，是设备上次在线注册时写入并持久化的，
+//   云函数按 cid 查档案即可，不依赖接收端 App 存活 —— 与普通厂商通知用同一份数据。
+// ★判定口径：device_token 非空（确有厂商通道注册成功）+ 机型是华为（当前唯一真机
+//   验证过的 Android 原生来电通道；荣耀走独立通道 ho，待验证后再放开）。
+//   机型原文每次都落日志：phoneModel 的真实取值格式（品牌名还是内部型号码）以首跑
+//   实测为准，模式不合就按日志校准，不写死设备名单。
+// ★回退语义：查不到/查失败/不匹配一律返回 null → 回退普通通知，绝不阻断投递。
+const HUAWEI_MODEL_RE = /huawei/i
+
+async function resolveAutoCallRoute(pushClientId, invocationId) {
+  const ids = callTargetCids(pushClientId)
+  // 语音呼叫按单设备逐台投递：多 cid 扇出时不做自动判定，交给后端逐台带 callRoute。
+  if (ids == null || ids.length !== 1) return null
+  const cid = ids[0]
+  if (typeof uniPush.getClientDetailByCid !== 'function') return null
+  let detail = null
+  try {
+    const result = await uniPush.getClientDetailByCid(cid)
+    const valid = result?.data?.validCids
+    detail = valid && typeof valid === 'object' && !Array.isArray(valid) ? valid[cid] : null
+  } catch (e) {
+    console.error('[push-send] call route lookup failed', JSON.stringify({
+      invocationId, error: String((e && e.message) || e).slice(0, 120)
+    }))
+    return null
+  }
+  const token = typeof detail?.device_token === 'string' ? detail.device_token : ''
+  const model = typeof detail?.phoneModel === 'string' ? detail.phoneModel : ''
+  const routed = token.length > 0 && HUAWEI_MODEL_RE.test(model)
+  console.log('[push-send] call route auto', JSON.stringify({
+    invocationId, hasVendorToken: token.length > 0,
+    phoneModel: model.slice(0, 40),
+    transport: routed ? 'android-huawei' : null
+  }))
+  return routed ? { transport: 'android-huawei', platform: 'android', cid } : null
+}
+
 async function sendNativeVoip(body, route, nativeVoip, invocationId) {
   const android = route.platform === 'android'
   if (android && typeof uniPush.request !== 'function') {
@@ -485,6 +525,12 @@ async function handle(event, invocationId) {
       ringExpired: ringAttempt?.expired === true,
       meetingRinging
     }))
+  }
+  // 单设备语音邀请且后端未带 callRoute 时，按个推云端设备档案动态判定厂商通道。
+  // 显式 callRoute 优先；判定不成立回退普通通知，不改变既有错误语义。
+  if (body.callRoute == null && scene?.call != null) {
+    const autoRoute = await resolveAutoCallRoute(body.push_clientid, invocationId)
+    if (autoRoute != null) body.callRoute = autoRoute
   }
   const nativeAttempt = scene?.meeting && !meetingRinging ? null : prepareNativeVoip(body)
   const nativeVoip = nativeAttempt?.error && strictCids ? null : nativeAttempt

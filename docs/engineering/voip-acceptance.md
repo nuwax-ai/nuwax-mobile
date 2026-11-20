@@ -50,6 +50,21 @@
 
 18:37 已在女娲的应用通知页回读，高重要度开启屏幕提示、锁屏显示所有通知内容、振动开启，渠道选择了应用来电音。明确选择高重要度后系统记录了用户选择，实际投递仍被降级。该通实拨时全机为静音模式、铃声音量为 0，没有取得可听铃声、自动亮屏或双向通话的通过结果。
 
+### 11-20 晚间复盘：屏幕不亮的三层根因与两处修复
+
+对照代码与真机回读（`dumpsys notification`：渠道 `nuwax-voip-incoming-v2` 的原始与已保存重要度均为 4、铃声振动俱全，渠道本身无恙），18:32／18:37 屏幕不亮由三层因素叠加：
+
+1. **QA 1.4.0（140）不含 11-19 的锁屏开页补丁。** 当天验证通过的 `requestLockedHuaweiCallUi`（在 Core-Telecom `addCall` 注册成功后直接打开接听页）只存在于 `out/voip-huawei-direct-call.lGEUZIki/native-ui.patch` 与 1.3.9 隔离包，未合入任何分支；`git diff d568661d6..HEAD` 对 VoipBridge 为空证实 QA 140 无此逻辑。
+2. **主分支仅有的开页路径在无进程场景失效。** `VoipBridge.apply` 里的 `startActivity` 以 `!hidden` 为前提，冷启动无 Activity 时 `hidden = activity.get() == null` 恒为真，该分支不执行。
+3. **全屏 Intent 被 EMUI 降级拦截。** 渠道保存值为 4，但系统把该条通知的有效重要度算成 3，SystemUI 以 `Not important enough` 拒绝全屏展示；11-19 同样被拒绝，靠第 1 条的直接 `startActivity`（Telecom 后台启动豁免 + 悬浮窗权限）才点亮屏幕，铃声同理受全机静音影响。
+
+据此在 `feat-2026.11` 落两处修改（本轮只针对 Android，iOS 不动）：
+
+- **`VoipBridge.requestLockedCallUi`（正式化 11-19 补丁、放宽为通用门控）。** 在 `addCall` 成功回调内调用；条件为业务来电、被叫、ringing、audio、未过期、未展示过、锁屏、悬浮窗已授、通知启用、来电渠道保存重要度 ≥ HIGH、勿扰关闭，不再限定华为／API 31。渠道保存值（本机为 4）满足门控，EMUI 对单条通知的有效重要度降级不再阻断开页。
+- **`push-send-test` 按 CID 动态判定厂商通道自动路由。** 后端未带 `callRoute` 且为单 CID 语音邀请时，云函数经 `uniPush.getClientDetailByCid(cid)` 查个推云端设备档案：`device_token` 非空且 `phoneModel` 命中华为则自动按 `android-huawei` 原生路由投递；查询失败或多 CID 一律回退普通通知。档案存于服务端、由设备上次在线注册写入，不依赖接收端 App 存活，与「无进程来电」场景匹配；机型原文每次落日志以便校准真实格式。显式 `callRoute` 仍优先。
+
+vivo 侧结论不变：厂商离线通话链路需先完成权益申请（见[厂商接入记录](voip-cn-provider-onboarding.md)），本轮不展开。
+
 ## 2026-11-19 华为无进程锁屏来电成功，荣耀后续复测按此流程
 
 **实测条件。** iPhone 在女娲内发起语音，华为 ABR-AL80（EMUI 14.2、Android 12、API 31）安装女娲 1.3.9 隔离测试包。华为锁屏熄屏，女娲主进程与推送进程均不存在，应用未被强行停止。测试机已允许女娲关联启动、后台活动、后台弹窗、悬浮窗和麦克风，自启动关闭、勿扰关闭。这些是该轮的设备状态，各开关的必要性需分别验证。

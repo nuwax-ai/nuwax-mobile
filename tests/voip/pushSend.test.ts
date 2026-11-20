@@ -443,6 +443,83 @@ describe('VoIP CID validation without a route lookup', () => {
   });
 });
 
+describe('automatic vendor route resolution', () => {
+  const makeCall = (cid: string) => ({
+    push_clientid: cid, title: '张三', content: '邀请你通话',
+    payload: { ...locator, scene: 'call', convType: 1, callId: 'auto-route-call', calleeId: '10002',
+      mediaType: 'audio', expiresAt: Date.now() + 30_000, senderName: '张三' },
+  });
+  const withRegistry = (loadable: ReturnType<typeof load>, entries: Record<string, unknown>) => {
+    loadable.manager.getClientDetailByCid = vi.fn()
+      .mockResolvedValue({ errCode: 0, data: { validCids: entries } });
+    return loadable;
+  };
+
+  it('routes one Huawei-registered cid through the native transmission channel', async () => {
+    const cid = 'huawei-registry-cid';
+    const { call, send, request, manager } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', phoneModel: 'HUAWEI ABR-AL80' },
+    });
+    expect((await call(makeCall(cid))).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).toHaveBeenCalledWith(cid);
+    const [{ requestData }] = request.mock.calls[0];
+    expect(requestData.audience.cid).toEqual([cid]);
+    expect(requestData.settings).toMatchObject({ strategy: { hw: 2 } });
+    expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({
+      delivery: 'android-native', callId: 'auto-route-call',
+    });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['no vendor token', { device_token: '', phoneModel: 'HUAWEI ABR-AL80' }],
+    ['non-Huawei model', { device_token: 'vendor-token', phoneModel: 'V2219A' }],
+    ['missing registry entry', undefined],
+  ])('keeps the ordinary notification when the registry says %s', async (_name, entry) => {
+    const cid = 'registry-cid';
+    const { call, send, request, manager } = withRegistry(load(), entry ? { [cid]: entry } : {});
+    expect((await call(makeCall(cid))).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).toHaveBeenCalledWith(cid);
+    expect(request).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0]).toMatchObject({ push_clientid: [cid], payload: { callId: 'auto-route-call' } });
+  });
+
+  it('never blocks delivery when the registry lookup fails', async () => {
+    const cid = 'registry-outage-cid';
+    const { call, send, request, manager } = load();
+    manager.getClientDetailByCid = vi.fn().mockRejectedValue(new Error('registry down'));
+    expect((await call(makeCall(cid))).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).toHaveBeenCalledWith(cid);
+    expect(request).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it('does not resolve a multi-cid fan-out', async () => {
+    const { call, send, request, manager } = withRegistry(load(), {
+      'fanout-a': { device_token: 'vendor-token', phoneModel: 'HUAWEI ABR-AL80' },
+    });
+    expect((await call({ ...makeCall('fanout-a'), push_clientid: ['fanout-a', 'fanout-b'] })).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0].push_clientid).toEqual(['fanout-a', 'fanout-b']);
+  });
+
+  it('prefers an explicit callRoute over auto resolution', async () => {
+    const cid = 'explicit-route-cid';
+    const { call, send, request, manager } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', phoneModel: 'HUAWEI ABR-AL80' },
+    });
+    expect((await call({
+      ...makeCall(cid), callRoute: { cid, platform: 'ios', transport: 'ios-voip', environment: 'development', registrationId: 'cb67ff9e-54ee-44ef-a6c0-601fd536cdf5' },
+    })).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0].settings).toMatchObject({ strategy: { ios: 2 } });
+  });
+});
+
 describe('ordinary production notifications remain compatible', () => {
   it.each(ordinaryFixtures)('matches the rollback backup and expected output: $label', async fixture => {
     for (const entry of entries) {

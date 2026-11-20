@@ -609,6 +609,7 @@ object VoipBridge {
                     // Telecom must own the call before asking for background phone-call execution.
                     // Posting CallStyle here also satisfies Core-Telecom's five-second deadline.
                     publishCall()
+                    if (incoming && ownsCall()) requestLockedCallUi(id)
                     launch { isMuted.collect { muted -> if (control === owner) setMicrophone(!muted) } }
                     launch { currentCallEndpoint.collect { endpoint -> if (control === owner) { speaker = endpoint.type == CallEndpointCompat.TYPE_SPEAKER; emit("speaker", "enabled", speaker) } } }
                 }
@@ -646,6 +647,29 @@ object VoipBridge {
             if (run != generation || token != config.optString("accessToken") || current?.optString("callId") != id) return
             if (action != "ready") finish("failed")
             emit("error", "code", "CALL_ACTION_FAILED")
+        }
+    }
+    // A no-process cold start cannot rely on the notification full-screen intent alone:
+    // OEM SystemUI may downgrade the effective importance below HIGH and refuse the launch
+    // (observed on EMUI even with a user-locked HIGH channel). Once Core-Telecom owns the
+    // ringing connection the background-activity-start exemption holds, so open the
+    // incoming page directly; the notification remains the fallback entry.
+    private fun requestLockedCallUi(id: String) {
+        val ctx = context ?: return
+        val call = current ?: return
+        if (!business() || call.optString("callId") != id || call.optString("state") != "ringing" ||
+            call.optString("calleeId") != config.optString("userId") || call.optString("mediaType") != "audio" ||
+            call.optLong("expiresAt") <= System.currentTimeMillis() || nativeUiId == id) return
+        if (!ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked || !Settings.canDrawOverlays(ctx)) return
+        val manager = ctx.getSystemService(NotificationManager::class.java)
+        val channel = VoipNotificationChannels.incoming(manager) ?: return
+        if (!manager.areNotificationsEnabled() || channel.importance < NotificationManager.IMPORTANCE_HIGH ||
+            manager.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) return
+        trace("locked call activity requested")
+        try {
+            ctx.startActivity(VoipIncomingActivity.intent(ctx, id))
+        } catch (ex: RuntimeException) {
+            trace("locked call activity declined: " + ex.javaClass.simpleName)
         }
     }
     private fun publishCall() {

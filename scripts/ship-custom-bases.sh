@@ -7,7 +7,7 @@
 #   ① HBuilderX CLI：publish app --type appResource
 #      （等价菜单：发行 → 原生App-本地打包 → 生成本地打包App资源）
 #   ② package-custom-bases.sh：Android + iOS 真机 + iOS 模拟器 → unpackage/debug/
-#   ③ publish-custom-base-s3.sh：上传并更新 latest / channels/debug
+#   ③ publish-custom-base-s3.sh：上传并更新指定通道
 #
 # 前置：
 #   - HBuilderX 已启动，且本项目已导入
@@ -18,6 +18,7 @@
 #   SKIP_APP_RESOURCE=1  跳过 ①（本地资源已生成且未改业务/插件时）
 #   SKIP_PUBLISH=1       跳过 ③（只本地出包，不上 S3）
 #   TARGETS=…            传给出包脚本，默认 all（android,ios-device,ios-simulator）
+#   NUWAX_BASE_VERSION / NUWAX_BASE_CHANNEL / NUWAX_BASE_NO_PROMOTE  发布设置
 #   HX_CLI / HX_PROJECT  覆盖 HBuilderX CLI 路径与项目（默认本仓绝对路径）
 #
 # 用法：
@@ -64,18 +65,16 @@ echo ""
 if [[ "$SKIP_PUBLISH" == "1" ]]; then
   echo "######## [3/3] 跳过 S3 上传（SKIP_PUBLISH=1）########"
 else
-  echo "######## [3/3] 上传 S3（更新 latest）########"
+  echo "######## [3/3] 上传 S3 ########"
   # 将 TARGETS=all 映射为 publish 脚本识别的平台列表；单平台则原样传递
   publish_targets="android,ios-device,ios-simulator"
   if [[ "$TARGETS" != "all" ]]; then
     publish_targets="$TARGETS"
   fi
-  bash "$SCRIPT_DIR/publish-custom-base-s3.sh" --targets "$publish_targets"
+  bash "$SCRIPT_DIR/publish-custom-base-s3.sh" \
+    --targets "$publish_targets" --source "$ROOT_DIR/unpackage/debug"
 fi
 
 echo ""
 echo "======== base-ship 完成 ========"
 echo "本地产物: $ROOT_DIR/unpackage/debug/"
-if [[ "$SKIP_PUBLISH" != "1" ]]; then
-  echo "同事拉取: make base-fetch  （或不指定版本拉最新）"
-fi

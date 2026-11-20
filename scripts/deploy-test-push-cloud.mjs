@@ -24,7 +24,7 @@ function cloudCommand(args, step) {
 }
 
 function deploy(project) {
-  if (provider !== 'alipay' || !/^env-[a-z0-9]+$/.test(spaceId) || !spaceName.endsWith('-test')) {
+  if (provider !== 'alipay' || spaceId !== 'env-00jy72x2l4nj' || spaceName !== 'nuwax-push-test') {
     throw new Error('Expected a dedicated Alipay test space');
   }
   const spaces = cloudCommand(['service-space', 'list'], 'space-readback');

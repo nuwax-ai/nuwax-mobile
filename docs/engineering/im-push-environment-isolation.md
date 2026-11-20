@@ -38,9 +38,25 @@ flowchart LR
 
 ### 测试模块与上传命令
 
-测试模块位于 `cloud/test-push`，其中 `deployment.json` 固定使用支付宝云 `nuwax-push-test`（`env-00jy72x2l4nj`）。运行 `node scripts/deploy-test-push-cloud.mjs` 即可调用已登录的 HBuilderX CLI。脚本先核对空间名称、ID 和服务商，再逐项上传测试函数和首次建表所需资源。空间 ID 由模块配置提供，上传命令没有空间覆盖参数。主项目的 HBuilderX 空间绑定独立管理。
+测试模块位于 `cloud/test-push`，沿用生产模块的 `uniCloud-alipay/cloudfunctions` 和 `uniCloud-alipay/database` 目录结构。测试函数、设备表和空间配置都在这里维护。
 
-常规函数更新会复用测试设备表和索引。首次建表中断且索引尚未安装时，使用 `node scripts/deploy-test-push-cloud.mjs --init-index` 补齐。在已使用的表上调整结构或索引时，单独进行测试库迁移。若只需本地部署包，运行 `node scripts/prepare-test-push-cloud.mjs`。
+```text
+cloud/test-push/
+├── deployment.json
+└── uniCloud-alipay/
+    ├── cloudfunctions/push-send-test/
+    └── database/
+```
+
+在 `cloud/test-push/uniCloud-alipay/cloudfunctions/push-send-test/` 修改测试函数。入口、设备路由和 VoIP 等业务依赖都在这个目录。保存后在项目根目录运行一条命令：
+
+```sh
+pnpm push:test:upload
+```
+
+脚本通过已登录的 HBuilderX CLI 核对 `deployment.json` 中的支付宝云测试空间 `nuwax-push-test`（`env-00jy72x2l4nj`），在系统临时目录组装函数，上传后回读函数列表并清理副本。无需切换主项目在编辑器里的空间关联。测试验收通过后，团队自行选择业务文件复制到正式目录。
+
+常规函数更新会复用测试设备表和索引。首次建表中断且索引尚未安装时，使用 `node scripts/deploy-test-push-cloud.mjs --init-index` 补齐。在已使用的表上调整结构或索引时，单独进行测试库迁移。若只需要查看上传包，运行 `node scripts/prepare-test-push-cloud.mjs` 获取工作区外的临时预览路径。
 
 测试 IM 将 `IM_UNIPUSH_URL` 指向测试函数 HTTPS 入口。发送和登记凭据分别通过受控方式配置。 [测试 push-send-test 入口](https://env-00jy72x2l4nj.dev-hz.cloudbasefunction.cn/push-send-test)
 

@@ -17,7 +17,8 @@ export class VoiceNoteM4aBridge {
     }
     const folder = `${filesDir}/voice-notes/${safeId}`
     try {
-      fs.mkdirSync(folder)
+      // 父目录 voice-notes 首次不存在。不带递归时 mkdir 失败会被当成已存在，随后 open 直接失败。
+      fs.mkdirSync(folder, true)
     } catch (_eMkdir) {
       // 目录已存在时忽略
     }

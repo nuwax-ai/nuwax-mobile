@@ -43,12 +43,19 @@ function harness(platform = "android", disabled = false) {
     props: { playerId: "chatVideoPlayer-42" },
     playerElement: () => player,
     traceChatVideo: vi.fn(),
+    prepareAndroidChatVideoInlineLayout: vi.fn(),
+    cancelAndroidChatVideoInlineLayout: vi.fn(),
     nextTick: () => Promise.resolve(),
   });
   const bar = readFileSync("components/chat-video-bar/chat-video-bar.uvue", "utf8");
   const toggleBody = bar.slice(bar.indexOf("  async function toggleFullscreen("), bar.indexOf("  function clampedRatio("));
   const platformToggle = platformCode(toggleBody, platform);
   const toggle = new Function("scope", `with(scope){${transformSync(platformToggle, { loader: "ts" }).code};return toggleFullscreen;}`)(scope);
+  const chatView = readFileSync("pages/message/components/chat-view.uvue", "utf8");
+  const componentBack = chatView.slice(chatView.indexOf("  function onPageBackPress("), chatView.indexOf("  function onPageUnload("));
+  const handleBack = new Function("scope", `with(scope){${transformSync(componentBack, { loader: "ts" }).code};return onPageBackPress;}`)({
+    ...control, closePullEntryDialog: () => false,
+  });
   const chat = readFileSync("pages/message/chat.uvue", "utf8");
   const backStart = chat.indexOf("  onBackPress(");
   const backBody = chat.slice(backStart, chat.indexOf("\n  });", backStart) + 6);
@@ -57,7 +64,7 @@ function harness(platform = "android", disabled = false) {
     onBackPress: (callback: (options: { from: string }) => boolean) => {
       if (callback.length != 1) throw new Error("onBackPress requires an OnBackPressOptions parameter");
       back = callback;
-    }, ...control,
+    }, ...control, chatRef: { value: { $callMethod: (_method: string, options: unknown) => handleBack(options) } },
   });
   return { scope, control, toggle, back: () => back({ from: "backbutton" }), player, page, style };
 }
@@ -72,6 +79,12 @@ describe("native chat video fullscreen", () => {
     if (platform == "android") vi.advanceTimersByTime(180);
     expect(h.player.requestFullScreen).toHaveBeenCalledExactlyOnceWith({ direction: 0 });
     expect(h.player.play).toHaveBeenCalledOnce();
+    if (platform == "android") {
+      expect(h.scope.prepareAndroidChatVideoInlineLayout).toHaveBeenCalledExactlyOnceWith("chatVideoPlayer-42", h.player);
+      expect(h.scope.prepareAndroidChatVideoInlineLayout.mock.invocationCallOrder[0]).toBeLessThan(h.player.requestFullScreen.mock.invocationCallOrder[0]);
+    } else {
+      expect(h.scope.prepareAndroidChatVideoInlineLayout).not.toHaveBeenCalled();
+    }
     expect(h.player.seek).not.toHaveBeenCalled();
     expect(h.player.pause).not.toHaveBeenCalled();
     expect(h.scope.uni.navigateTo).not.toHaveBeenCalled();
@@ -103,6 +116,14 @@ describe("native chat video fullscreen", () => {
     expect(h.scope.fullscreenRequestPending).toBe(false);
     expect(h.control.isChatVideoFullscreen()).toBe(false);
     expect(h.style.disableSwipeBack).toBe(false);
+  });
+
+  it("removes the Android draw guard if the fullscreen request throws", async () => {
+    const h = harness("android");
+    h.player.requestFullScreen.mockImplementation(() => { throw new Error("request failed"); });
+    await h.toggle();
+    expect(h.scope.cancelAndroidChatVideoInlineLayout).toHaveBeenCalledExactlyOnceWith("chatVideoPlayer-42");
+    expect(h.control.isChatVideoFullscreen()).toBe(false);
   });
 
   it("exits an already fullscreen player through its native controls", async () => {

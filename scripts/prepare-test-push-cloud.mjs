@@ -1,4 +1,5 @@
-import { copyFileSync, cpSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,8 +27,11 @@ export function prepareTestPushCloud(output) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const parent = join(root, 'unpackage/push-test-deploy');
-  mkdirSync(parent, { recursive: true });
-  const output = join(parent, new Date().toISOString().replace(/[:.]/g, '-'));
-  process.stdout.write(`${prepareTestPushCloud(output)}\n`);
+  const staging = mkdtempSync(join(realpathSync(tmpdir()), 'nuwax-push-test-preview-'));
+  try {
+    process.stdout.write(`${prepareTestPushCloud(join(staging, testPushDeployment.projectName))}\n`);
+  } catch (error) {
+    rmSync(staging, { recursive: true, force: true });
+    throw error;
+  }
 }

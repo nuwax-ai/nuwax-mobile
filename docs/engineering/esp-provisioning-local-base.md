@@ -25,8 +25,8 @@ make base-android          # android_debug.apk
 make base-ios-device        # iOS_debug.ipa（真机）
 make base-ios-simulator    # Pandora_simulator_debug.app（模拟器，与真机分离）
 make base-all
-make base-publish          # 上传 S3（版本=versionName，同版本覆盖）
-make base-fetch            # 同事拉最新
+NUWAX_BASE_VERSION=1.3.8-zhuoda-r1 NUWAX_BASE_CHANNEL=zhuoda-dev make base-publish
+NUWAX_BASE_CHANNEL=zhuoda-dev make base-fetch
 ```
 
 `unpackage/debug/` 中 **iOS 真机与模拟器是两套包**，勿混用。S3 说明见 [custom-base-distribution-s3.md](./custom-base-distribution-s3.md)。

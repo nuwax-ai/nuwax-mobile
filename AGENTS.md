@@ -190,17 +190,17 @@ make base-ios-simulator              # → Pandora_simulator_debug.app（模拟�
 
 ## 自定义基座同步更新
 
-含原生插件联调时，从 S3 拉最新基座到 `unpackage/debug/`（**不指定版本 = 最新**）。详情：[docs/engineering/custom-base-distribution-s3.md](docs/engineering/custom-base-distribution-s3.md)。
+含原生插件联调时，从 S3 拉取自定义基座。默认跟随 `debug` 通道，保存到 `unpackage/debug/`；固定版本和非默认通道保存到 `unpackage/debug/versions/<基座 ID>/`。详情：[docs/engineering/custom-base-distribution-s3.md](docs/engineering/custom-base-distribution-s3.md)。
 
 ```bash
 pnpm base:fetch
 # 或：make base-fetch
-# 或：curl -fsSL https://s3.nuwax.com:9443/nuwax-packages/mobile-custom-bases/fetch-custom-base-s3.sh | bash
 # 自签证书：NUWAX_S3_INSECURE=1
-# 固定版本：NUWAX_BASE_VERSION=1.0.0 pnpm base:fetch
+# 固定版本：NUWAX_BASE_VERSION=1.3.7 pnpm base:fetch
+# 跟随独立通道：NUWAX_BASE_CHANNEL=vapor pnpm base:fetch
 ```
 
-HX：运行 → **使用自定义基座运行** → 选 `unpackage/debug/` 下 apk / ipa / 模拟器 `.app`（真机与模拟器勿混用）。仅同步使用**不需要**本机打基座，也不需要 iOS 开发证书。
+HX：运行 → **使用自定义基座运行** → 选下载命令输出目录下的 apk / ipa / 模拟器 `.app`（真机与模拟器勿混用）。仅同步使用**不需要**本机打基座，也不需要 iOS 开发证书。
 
 ## 离线 SDK 同步
 
@@ -224,7 +224,8 @@ pnpm i18n:export-defaults  # 导出平台默认文案
 pnpm verify:mcp-ask        # 校验 mcp-ask 契约
 pnpm uni:build             # 编译 app-android 并提取关键错误
 pnpm base:fetch            # 同步最新自定义基座（S3）
-pnpm base:publish          # 发布自定义基座到 S3（维护者）
+pnpm base:publish          # 发布指定版本的自定义基座到 S3（维护者）
+pnpm base:promote          # 将指定的已发布版本切换为通道当前版本（维护者）
 pnpm base:ship             # 一键：appResource → 出包 → 上传 S3（维护者）
 pnpm base:help             # 列出 make 基座相关目标
 pnpm sdk:fetch             # 拉取离线 SDK（sdk/+archives/，首次/换机）

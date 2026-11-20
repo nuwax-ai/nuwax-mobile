@@ -1,6 +1,6 @@
 # 本地离线自定义基座（仅出包，不安装/不唤起设备）
-# 详见 docs/local-custom-base-maintenance.md · docs/custom-base-distribution-s3.md
-.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-fetch sdk-publish sdk-fetch app-resource android-tester android-release
+# 详见 docs/engineering/custom-base-distribution-s3.md
+.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-promote base-fetch base-info base-list sdk-publish sdk-fetch app-resource android-tester android-release
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 HX_CLI ?= /Applications/HBuilderX.app/Contents/MacOS/cli
@@ -17,9 +17,12 @@ help:
 	@echo "  make android-tester       # 发测试：appResource → Release APK（无 HX 调试）"
 	@echo "  make android-release      # 正式上架：生产资源 → 正式签名 APK+AAB"
 	@echo ""
-	@echo "S3 分发（版本 = manifest versionName；同版本覆盖；fetch 默认最新）"
-	@echo "  make base-publish         # 上传当前 unpackage/debug 产物"
-	@echo "  make base-fetch           # 拉取最新基座（不指定版本）"
+	@echo "S3 分发（NUWAX_BASE_VERSION=基座版本，NUWAX_BASE_CHANNEL=通道）"
+	@echo "  make base-publish         # 指定新基座版本并上传当前 unpackage/debug 产物"
+	@echo "  make base-promote         # 将指定的已发布版本切换为通道当前版本"
+	@echo "  make base-fetch           # 自动下载当前 App 版本系列对应的基座"
+	@echo "  make base-info            # 查看当前分支匹配到的基座和发布清单摘要"
+	@echo "  make base-list            # 列出 S3 上可下载的基座版本"
 	@echo ""
 	@echo "离线 SDK S3 分发（版本 = NUWAX_HX_VERSION；打包 sdk/+archives，不含 work）"
 	@echo "  make sdk-publish          # 打包并上传离线 SDK"
@@ -66,8 +69,17 @@ base-harmony:
 base-publish:
 	@bash "$(ROOT)scripts/publish-custom-base-s3.sh"
 
+base-promote:
+	@bash "$(ROOT)scripts/publish-custom-base-s3.sh" --promote-only
+
 base-fetch:
 	@bash "$(ROOT)scripts/fetch-custom-base-s3.sh"
+
+base-info:
+	@bash "$(ROOT)scripts/fetch-custom-base-s3.sh" --info
+
+base-list:
+	@bash "$(ROOT)scripts/fetch-custom-base-s3.sh" --list
 
 sdk-publish:
 	@bash "$(ROOT)scripts/publish-offline-sdk-s3.sh"

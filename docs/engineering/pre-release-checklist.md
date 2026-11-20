@@ -2,6 +2,14 @@
 
 > 正式打包/上架前逐项过一遍。这些是联调期间为定位问题临时加的开关、硬编码、调试入口，**不处理会导致 release 包走测试环境 / 暴露调试信息**。
 
+## 版本核对
+
+- [ ] `manifest.json` 的 `versionName` 和 `versionCode` 均高于同一升级路径的上一正式版本，并核对发行平台已使用的最高构建号。
+- [ ] 执行 `pnpm app:version:check`，参数填写上次正式发版的 Git tag 或提交。
+- [ ] 使用自定义基座联调时，执行 `make base-info` 确认业务系列匹配到已验收版本，并将基座版本写入发版记录。
+
+完整规则见 [业务 App 与自定义基座版本规范](./custom-base-multi-version-plan.md)。
+
 ## 🚫 必改（不改会出生产事故）
 
 - [x] **生产 API** —— 已删除强制测试域名覆盖；prod 分支使用 `https://agent.nuwax.com`，`android:release` 会在构建前再次检查。

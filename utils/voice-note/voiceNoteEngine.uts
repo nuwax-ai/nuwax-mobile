@@ -17,6 +17,7 @@ import {
   apiVoiceNoteCreate,
   apiVoiceNoteDelete,
   apiVoiceNoteDetail,
+  apiVoiceNoteReprocess,
   apiVoiceNoteUploadSegment,
 } from "@/servers/voiceNote.uts";
 import { partnerVoiceOpen } from "@/utils/voice-note/partnerVoiceDrawer.uts";
@@ -560,6 +561,53 @@ function allSegmentsUploaded(record: VoiceNoteRecord): boolean {
   return true;
 }
 
+function parentDirectory(filePath: string): string {
+  const slash = filePath.lastIndexOf("/");
+  if (slash <= 0) return "";
+  return filePath.substring(0, slash);
+}
+
+function rememberDirectory(dirs: string[], dir: string): void {
+  if (dir.length == 0) return;
+  for (let i = 0; i < dirs.length; i++) {
+    if (dirs[i] == dir) return;
+  }
+  dirs.push(dir);
+}
+
+/** 本地录音记录被清掉时，一并删掉本机上的分段文件和会话目录。 */
+function deleteVoiceNoteFiles(record: VoiceNoteRecord): void {
+  const fs = uni.getFileSystemManager();
+  const dirs: string[] = [];
+  const unlinkOne = (filePath: string): void => {
+    if (filePath.length == 0) return;
+    rememberDirectory(dirs, parentDirectory(filePath));
+    try {
+      fs.unlink({
+        filePath: filePath,
+        fail: (_err) => {},
+      });
+    } catch (_eUnlink) {
+      // 文件已经不在时忽略。
+    }
+  };
+  for (let i = 0; i < record.segments.length; i++) {
+    unlinkOne(record.segments[i].filePath);
+  }
+  unlinkOne(record.openSegmentPath);
+  for (let i = 0; i < dirs.length; i++) {
+    try {
+      fs.rmdir({
+        dirPath: dirs[i],
+        recursive: true,
+        fail: (_err) => {},
+      });
+    } catch (_eRmdir) {
+      // 目录非空或已经删掉时忽略。
+    }
+  }
+}
+
 /** 异步确认本地文件还在。iOS 上 accessSync 对不存在的文件也会判成存在，所以只信 getFileInfo 回调。 */
 function segmentFileExists(filePath: string): Promise<boolean> {
   if (filePath.length == 0) {
@@ -896,11 +944,40 @@ function ensurePoll(): void {
   void pollProcessing();
 }
 
+/** 两次自动重试转写的最小间隔。没超过这个时间就跳过，继续后面的补传。 */
+const reprocessGapMs = 120000;
+
+function reprocessFailureStatus(status: string): boolean {
+  return status == "ASR_PARTIAL_FAILED" || status == "DOC_FAILED" || status == "DOC_REMOVED";
+}
+
+function reprocessDue(record: VoiceNoteRecord): boolean {
+  if (record.reprocessAt <= 0) return true;
+  return Date.now() - record.reprocessAt > reprocessGapMs;
+}
+
+/** 详情仍需跟进：转写中，或上次是转写/文档失败、还可以再查。 */
+function noteNeedsStatusPoll(record: VoiceNoteRecord): boolean {
+  if (record.noteId.length == 0) return false;
+  if (record.phase == "processing") return true;
+  return record.phase == "failed" && reprocessFailureStatus(record.serverStatus);
+}
+
+/** 重试转写。失败只记日志，不挡住同一次补传里后面的请求。 */
+async function reprocessQuiet(noteId: string): Promise<void> {
+  try {
+    await apiVoiceNoteReprocess(noteId);
+  } catch (e) {
+    console.warn("[voice-note] reprocess failed " + e);
+  }
+}
+
 /** 本地列表只留未成功的录音。已经标成成功的旧记录也从缓存删掉。 */
 function dropStoredSuccessNotes(): void {
   const rows = loadVoiceNotes();
   for (let i = 0; i < rows.length; i++) {
     if (rows[i].phase == "success") {
+      deleteVoiceNoteFiles(rows[i]);
       removeVoiceNote(rows[i].localId);
     }
   }
@@ -912,7 +989,7 @@ async function pollProcessing(): Promise<void> {
   let pending = false;
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
-    if (row.phase != "processing" || row.noteId.length == 0) continue;
+    if (!noteNeedsStatusPoll(row)) continue;
     try {
       const detail = await apiVoiceNoteDetail(row.noteId);
       if (detail == null) {
@@ -921,6 +998,7 @@ async function pollProcessing(): Promise<void> {
       }
       const status = detail["status"] != null ? `${detail["status"]}` : "";
       if (status == "SUCCESS") {
+        deleteVoiceNoteFiles(row);
         removeVoiceNote(row.localId);
         continue;
       }
@@ -930,11 +1008,22 @@ async function pollProcessing(): Promise<void> {
       if (detail["asrText"] != null) row.asrText = `${detail["asrText"]}`;
       const duration = parseFloat(`${detail["totalDurationMs"]}`);
       if (!isNaN(duration) && duration > 0) row.elapsedMs = duration;
-      if (status == "ASR_PARTIAL_FAILED" || status == "DOC_FAILED" || status == "DOC_REMOVED") {
+      let retryNoteId = "";
+      if (reprocessFailureStatus(status)) {
         row.phase = "failed";
         row.error = status;
+        if (reprocessDue(row)) {
+          row.reprocessAt = Date.now();
+          retryNoteId = row.noteId;
+        }
+      } else if (row.phase == "failed") {
+        row.phase = "processing";
+        row.error = "";
       }
       touch(row);
+      if (retryNoteId.length > 0) {
+        void reprocessQuiet(retryNoteId);
+      }
       if (row.phase == "processing") pending = true;
     } catch (e) {
       row.error = `${e}`;
@@ -1259,7 +1348,7 @@ async function recoverAbandonedRecording(): Promise<void> {
 function resumeProcessingPoll(): void {
   const rows = loadVoiceNotes();
   for (let i = 0; i < rows.length; i++) {
-    if (rows[i].phase == "processing") {
+    if (noteNeedsStatusPoll(rows[i])) {
       ensurePoll();
       break;
     }

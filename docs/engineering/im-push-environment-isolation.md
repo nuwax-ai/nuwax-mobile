@@ -48,7 +48,13 @@ cloud/test-push/
     └── database/
 ```
 
-`deployment.json` 固定使用支付宝云 `nuwax-push-test`（`env-00jy72x2l4nj`）。运行 `node scripts/deploy-test-push-cloud.mjs` 即可调用已登录的 HBuilderX CLI。脚本核对空间名称、ID 和服务商，然后在系统临时目录组装并上传测试函数及首次建表资源，结束后清理副本。主项目的 HBuilderX 关联独立管理。生产发布沿用仓库的云函数代码管理流程。
+在 `cloud/test-push/uniCloud-alipay/cloudfunctions/push-send-test/` 修改测试函数。入口、设备路由和 VoIP 等业务依赖都在这个目录。保存后在项目根目录运行一条命令：
+
+```sh
+pnpm push:test:upload
+```
+
+脚本通过已登录的 HBuilderX CLI 核对 `deployment.json` 中的支付宝云测试空间 `nuwax-push-test`（`env-00jy72x2l4nj`），在系统临时目录组装函数，上传后回读函数列表并清理副本。无需切换主项目在编辑器里的空间关联。测试验收通过后，团队自行选择业务文件复制到正式目录。
 
 常规函数更新会复用测试设备表和索引。首次建表中断且索引尚未安装时，使用 `node scripts/deploy-test-push-cloud.mjs --init-index` 补齐。在已使用的表上调整结构或索引时，单独进行测试库迁移。若只需要查看上传包，运行 `node scripts/prepare-test-push-cloud.mjs` 获取工作区外的临时预览路径。
 

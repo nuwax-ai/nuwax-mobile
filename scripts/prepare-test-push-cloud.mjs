@@ -1,11 +1,10 @@
-import { copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const testSource = join(root, 'cloud/test-push/uniCloud-alipay');
-const productionSource = join(root, 'uniCloud-alipay/cloudfunctions/push-send');
 export const testPushDeployment = Object.freeze(JSON.parse(
   readFileSync(join(root, 'cloud/test-push/deployment.json'), 'utf8'),
 ));
@@ -13,16 +12,16 @@ export const testPushDeployment = Object.freeze(JSON.parse(
 // Always prepare a new tree so an old deployment or space binding cannot be inherited.
 export function prepareTestPushCloud(output) {
   const cloud = join(output, 'uniCloud-alipay');
-  const testFunction = join(cloud, 'cloudfunctions/push-send-test');
   mkdirSync(output);
   const { projectName, appId } = testPushDeployment;
   writeFileSync(join(output, 'manifest.json'), JSON.stringify({ name: projectName, appid: appId }));
   writeFileSync(join(output, 'pages.json'), '{"pages":[]}\n');
   writeFileSync(join(output, 'App.vue'), '<script></script>\n');
-  cpSync(testSource, cloud, { recursive: true });
-  for (const file of ['device-routes.js', 'voip.js']) {
-    copyFileSync(join(productionSource, file), join(testFunction, file));
-  }
+  // HBuilderX keeps local environment variables in .env. Keep them out of the upload.
+  cpSync(testSource, cloud, {
+    recursive: true,
+    filter: path => !basename(path).startsWith('.') && basename(path) !== 'node_modules',
+  });
   return cloud;
 }
 

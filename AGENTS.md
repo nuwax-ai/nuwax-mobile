@@ -179,7 +179,7 @@ make base-ios-simulator              # → Pandora_simulator_debug.app（模拟�
 
 # Step 5  用 / 发
 #   HX：运行 → 使用自定义基座运行 → 选 unpackage/debug 下对应包
-#   或发给同事：make base-publish   /   make base-ship（一键：资源→出包→S3）
+#   或发给同事：显式设置 NUWAX_BASE_VERSION 后执行 make base-publish / make base-ship
 ```
 
 要点：
@@ -190,10 +190,12 @@ make base-ios-simulator              # → Pandora_simulator_debug.app（模拟�
 
 ## 自定义基座同步更新
 
-含原生插件联调时，从 S3 拉取自定义基座。默认跟随 `debug` 通道，保存到 `unpackage/debug/`；固定版本和非默认通道保存到 `unpackage/debug/versions/<基座 ID>/`。详情：[docs/engineering/custom-base-distribution-s3.md](docs/engineering/custom-base-distribution-s3.md)。
+含原生插件联调时，从 S3 拉取自定义基座。默认读取 `manifest.json` 的 App 版本系列和 `custom-base.lock.json` 的映射，保存到 `unpackage/debug/`。显式指定基座版本可临时覆盖映射并保存到版本目录。详情：[docs/engineering/custom-base-distribution-s3.md](docs/engineering/custom-base-distribution-s3.md)。
 
 ```bash
-pnpm base:fetch
+pnpm base:info     # 显示当前分支命中的映射、HX 及平台
+pnpm base:list     # 列出可下载的版本
+pnpm base:fetch    # 自动按映射下载
 # 或：make base-fetch
 # 自签证书：NUWAX_S3_INSECURE=1
 # 固定版本：NUWAX_BASE_VERSION=1.3.7 pnpm base:fetch
@@ -223,7 +225,8 @@ pnpm i18n:audit            # i18n 文案审计
 pnpm i18n:export-defaults  # 导出平台默认文案
 pnpm verify:mcp-ask        # 校验 mcp-ask 契约
 pnpm uni:build             # 编译 app-android 并提取关键错误
-pnpm base:fetch            # 同步最新自定义基座（S3）
+pnpm base:fetch            # 按当前 App 版本系列同步基座（S3）
+pnpm app:version:check     # 参数传上次正式发布的 Git tag 或提交
 pnpm base:publish          # 发布指定版本的自定义基座到 S3（维护者）
 pnpm base:promote          # 将指定的已发布版本切换为通道当前版本（维护者）
 pnpm base:ship             # 一键：appResource → 出包 → 上传 S3（维护者）

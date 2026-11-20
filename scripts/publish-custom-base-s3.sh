@@ -17,7 +17,7 @@ usage() {
   cat <<'HELP'
 Usage: bash scripts/publish-custom-base-s3.sh [options]
 
-  --version ID    基座版本（默认 App versionName；每次新出包使用新 ID）
+  --version ID    基座版本（新发布必填 X.Y.Z；每次新出包使用新版本）
   --channel NAME  更新指定通道（默认 debug）
   --source DIR    基座产物所在目录（默认 unpackage/debug）
   --targets LIST  android,ios-device,ios-simulator,harmony（默认上传找到的产物）
@@ -62,6 +62,10 @@ done
 [[ "$CHANNEL" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "无效通道：$CHANNEL"
 if [[ "$PROMOTE_ONLY" == 1 ]]; then
   [[ -n "$VERSION" && "$NO_PROMOTE" != 1 ]] || fail "切换通道需指定已发布版本，且不能使用 --no-promote"
+  [[ "$VERSION" =~ ^v[0-9] ]] && VERSION="${VERSION#v}"
+else
+  [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    || fail "请显式指定 X.Y.Z 格式的新基座版本（NUWAX_BASE_VERSION 或 --version）"
 fi
 command -v node >/dev/null 2>&1 || fail "需要 node"
 if [[ "$DRY_RUN" != 1 || "$PROMOTE_ONLY" == 1 ]]; then
@@ -80,9 +84,9 @@ APP_VERSION_CODE=""
 if [[ "$PROMOTE_ONLY" == 0 ]]; then
   APP_VERSION_NAME="$(node -p 'String(require(process.argv[1]).versionName || "").replace(/^v/i, "")' "$ROOT_DIR/manifest.json")"
   APP_VERSION_CODE="$(node -p 'String(require(process.argv[1]).versionCode ?? "")' "$ROOT_DIR/manifest.json")"
-  VERSION="${VERSION:-$APP_VERSION_NAME}"
+  [[ -n "$APP_VERSION_NAME" && "$APP_VERSION_CODE" =~ ^[1-9][0-9]*$ ]] \
+    || fail "manifest.json 缺少有效的 App versionName 或 versionCode"
 fi
-[[ "$VERSION" =~ ^v[0-9] ]] && VERSION="${VERSION#v}"
 [[ "$VERSION" =~ ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$ && "$VERSION" != *..* ]] || fail "无效基座版本：$VERSION"
 
 ENDPOINT="${NUWAX_S3_ENDPOINT:-https://s3.nuwax.com:9443}"
@@ -223,26 +227,53 @@ git_dirty=false
 [[ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=normal)" ]] && git_dirty=true
 released_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
+# 发布时记录每个包实际内置的 App 版本，避免将旧包标成当前工作区版本。
+bundled_app_version() {
+  local file="$1" resource_path
+  case "$2" in
+    android_debug.apk) resource_path='assets/apps/*/www/manifest.json' ;;
+    iOS_debug.ipa) resource_path='Payload/*.app/uni-app-x/apps/*/www/manifest.json' ;;
+    Pandora_simulator_debug.app.zip) resource_path='Pandora_simulator_debug.app/uni-app-x/apps/*/www/manifest.json' ;;
+    *) return 0 ;;
+  esac
+  unzip -p "$file" "$resource_path" | node -e '
+    const {version} = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    const name = version?.name;
+    const code = String(version?.code ?? "");
+    if (typeof name !== "string" || !/^[^\s]+$/.test(name) || !/^[1-9][0-9]*$/.test(code)) process.exit(1);
+    process.stdout.write(name + "\t" + code);
+  '
+}
+
 for name in "${artifacts[@]}"; do
   file="$STAGE_DIR/$name"
   bytes="$(wc -c < "$file")"
   [[ "$bytes" -gt 0 ]] || fail "空产物：$name"
+  app_version="$(bundled_app_version "$file" "$name")" || fail "无法读取 ${name} 的内置 App 版本"
+  case "$name" in
+    iOS_*|Pandora_*) reused_ios="${NUWAX_BASE_REUSED_IOS_VERSION:-}" ;;
+    *) reused_ios="" ;;
+  esac
+  if [[ -n "$app_version" && -z "$reused_ios" && "$app_version" != "$APP_VERSION_NAME"$'\t'"$APP_VERSION_CODE" ]]; then
+    fail "${name} 内置 App ${app_version%%$'\t'*}/${app_version#*$'\t'} 与当前源码 $APP_VERSION_NAME/$APP_VERSION_CODE 不一致"
+  fi
   sha256="$("${checksum[@]}" < "$file")"
-  printf '%s\t%s\t%s\n' "$name" "${sha256%% *}" "$bytes"
+  printf '%s\t%s\t%s\t%s\n' "$name" "${sha256%% *}" "$bytes" "$app_version"
 done | VERSION="$VERSION" APP_VERSION_NAME="$APP_VERSION_NAME" APP_VERSION_CODE="$APP_VERSION_CODE" \
   CHANNEL="$CHANNEL" HX_VERSION="$HX_VERSION" GIT_SHA="$git_sha" GIT_SHORT="$git_short" \
   GIT_DIRTY="$git_dirty" RELEASED_AT="$released_at" NOTE="$NOTE" node -e '
     const env = process.env;
     const artifacts = require("fs").readFileSync(0, "utf8").trim().split("\n").map(line => {
-      const [name, sha256, bytes] = line.split("\t");
+      const [name, sha256, bytes, appVersionName, appVersionCode] = line.split("\t");
+      const bundledApp = appVersionName ? {appVersionName, appVersionCode} : {};
       const sourceVersion = env.NUWAX_BASE_REUSED_IOS_VERSION;
       const reused = sourceVersion && /^(iOS_|Pandora_)/.test(name) ? {reused: true, sourceVersion} : {};
-      return {name, sha256, bytes: Number(bytes), ...reused};
+      return {name, sha256, bytes: Number(bytes), ...bundledApp, ...reused};
     });
     console.log(JSON.stringify({
       schema: "nuwax.mobile.customBase.v1",
       version: env.VERSION,
-      appVersionName: env.APP_VERSION_NAME || env.VERSION,
+      appVersionName: env.APP_VERSION_NAME,
       appVersionCode: env.APP_VERSION_CODE,
       channel: env.CHANNEL,
       gitSha: env.GIT_SHA,

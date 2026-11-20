@@ -25,8 +25,8 @@ import { apiResCode, apiResData } from '@/utils/apiResponse';
 import { RequestResponse } from '@/types/interfaces/request';
 import { ConversationInfo } from '@/types/interfaces/conversationInfo';
 import {
-  describeTurnUserGate,
   isTurnUserReadyFromRawMessageList,
+  readBizEnumStr,
 } from '@/subpackages/utils/subResumeGate.uts';
 import { isAppInBackground } from '@/utils/appLifecycle.uts';
 
@@ -84,7 +84,7 @@ let streamGenerationGetter: (() => number | null) | null = null;
  */
 let isResumePendingGetter: (() => boolean) | null = null;
 /** 终态回调：本地流式/sub 期间轮询发现任务已结束（他端结束/暂停）时通知页面强制收尾。 */
-let onTerminalWhileBusyCallback: ((id: number) => void) | null = null;
+let onTerminalWhileBusyCallback: ((id: number, response: RequestResponse<ConversationInfo>) => void) | null = null;
 /**
  * 终态「两轮确认」：本地忙时单次终态响应可能是上一轮任务的陈旧回包
  * （高频连续发送：新 send abort 旧 SSE → 服务端旧任务被打断成终态，
@@ -94,24 +94,8 @@ let onTerminalWhileBusyCallback: ((id: number) => void) | null = null;
 let pendingTerminalObserved = false;
 let pendingTerminalCid = 0;
 
-/**
- * 规范化 taskStatus（App 可能是字符串 / 带 value 的对象）。
- */
-function normalizeTaskStatus(val: any | null): string {
-  if (val == null) {
-    return '';
-  }
-  let raw: any | null = val;
-  try {
-    const obj = val as UTSJSONObject;
-    const nested = obj['value'];
-    if (nested != null) {
-      raw = nested;
-    }
-  } catch (_e) {
-    // not object
-  }
-  return `${raw}`;
+function isTerminalTaskStatus(status: string): boolean {
+  return status == `${TaskStatus.COMPLETE}` || status == `${TaskStatus.FAILED}` || status == `${TaskStatus.CANCEL}`;
 }
 
 /**
@@ -188,18 +172,24 @@ async function pollOnce(): Promise<void> {
   // 保持态快照：fail 后本地保持「需恢复」（loading 不消失、busy 判定放行续接）
   const resumePendingGetter = isResumePendingGetter;
   const resumePending = resumePendingGetter != null && resumePendingGetter() == true;
+  const requestGeneration = pollGeneration;
+  const conversationId = currentConversationId;
 
   try {
     isProcessing = true;
     // 请求发出时打戳代际：await 期间若本地已发消息（bumpPollGeneration），回包即过期
-    const requestGeneration = pollGeneration;
-    const response = await apiAgentConversation(currentConversationId);
+    const response = await apiAgentConversation(conversationId);
     // 代际不一致 = 发送已在途/已接管本轮：旧回包整段丢弃（终态/onExecuting 都不许触发），
     // 否则旧 EXECUTING 会误开 sub、旧终态会误触 onTerminalWhileBusy 掐死刚发出的新一轮。
     if (requestGeneration != pollGeneration) {
       return;
     }
-    if (apiResCode(response) != SUCCESS_CODE) return;
+    const code = apiResCode(response);
+    if (code != SUCCESS_CODE) {
+      pendingTerminalObserved = false;
+      if (resumePending == true) console.warn(`[ChatStream] detail_failed cid=${conversationId} gen=${genSnapshot} code=${code}`);
+      return;
+    }
 
     // await 后流代数：增长说明本地已接管新一轮，响应为发起时刻的旧快照，一律作废
     const genGetterNow = streamGenerationGetter;
@@ -207,9 +197,13 @@ async function pollOnce(): Promise<void> {
     const genChanged = genSnapshot != null && genNow != null && genNow != genSnapshot;
 
     const dataRaw = apiResData<any>(response);
-    if (dataRaw == null) return;
+    if (dataRaw == null) {
+      pendingTerminalObserved = false;
+      if (resumePending == true) console.warn(`[ChatStream] detail_missing cid=${conversationId} gen=${genSnapshot}`);
+      return;
+    }
     const dataObj = dataRaw as UTSJSONObject;
-    const taskStatusStr = normalizeTaskStatus(dataObj['taskStatus']);
+    const taskStatusStr = readBizEnumStr(dataObj, 'taskStatus');
     if (taskStatusStr == `${TaskStatus.EXECUTING}`) {
       // 服务端已回到执行态：上一轮终态观察作废（可能是旧任务的陈旧回包）
       pendingTerminalObserved = false;
@@ -249,9 +243,9 @@ async function pollOnce(): Promise<void> {
       const cb = onExecutingCallback;
       if (cb != null) {
         // 透传刚拉取的全量详情响应：续接可直接复用，避免 sub 前二次全量请求
-        cb(currentConversationId, response);
+        cb(conversationId, response);
       }
-    } else {
+    } else if (isTerminalTaskStatus(taskStatusStr)) {
       // 非 EXECUTING（终态：COMPLETE / FAILED / CANCEL）而本端仍认为在 live/sub 接收：
       // 说明他端已结束 / 暂停任务，通知页面强制收尾。
       // 空闲时不主动回调，避免旧轮询响应误中止刚开始的新会话。
@@ -301,7 +295,7 @@ async function pollOnce(): Promise<void> {
         pendingTerminalCid = 0;
         const tcb = onTerminalWhileBusyCallback;
         if (tcb != null) {
-          tcb(currentConversationId);
+          tcb(conversationId, response);
         }
       } else {
         // 第一轮终态：仅记录，下一轮仍是终态才回调
@@ -310,9 +304,16 @@ async function pollOnce(): Promise<void> {
       }
       resetWaitingUserFastPoll();
       ensurePollingInterval(POLLING_INTERVAL);
+    } else {
+      pendingTerminalObserved = false;
+      pendingTerminalCid = 0;
+      ensurePollingInterval(POLLING_INTERVAL);
     }
   } catch (error) {
-    console.error('[ConversationStatusPolling] 轮询失败:', error);
+    if (requestGeneration == pollGeneration) {
+      pendingTerminalObserved = false;
+      console.warn(`[ChatStream] detail_failed cid=${conversationId} gen=${genSnapshot} reason=request_error`);
+    }
   } finally {
     isProcessing = false;
   }
@@ -344,7 +345,7 @@ export function startConversationPolling(
   onExecuting: (id: number, response: RequestResponse<ConversationInfo> | null) => void,
   isConversationActive: () => boolean,
   isSubscribed: () => boolean,
-  onTerminalWhileBusy: (id: number) => void,
+  onTerminalWhileBusy: (id: number, response: RequestResponse<ConversationInfo>) => void,
   getStreamGeneration: (() => number | null) | null = null,
   getIsResumePending: (() => boolean) | null = null,
 ): void {
@@ -387,8 +388,7 @@ export function stopConversationPolling(): void {
   currentPollingInterval = POLLING_INTERVAL;
   resetWaitingUserFastPoll();
   // 停轮询即作废上一轮终态观察（切换会话 / 暂停 / 销毁后都从零重新确认）
-  pendingTerminalObserved = false;
-  pendingTerminalCid = 0;
+  bumpPollGeneration();
 }
 
 /**

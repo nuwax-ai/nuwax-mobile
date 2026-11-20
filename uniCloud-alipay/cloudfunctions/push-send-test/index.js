@@ -530,18 +530,6 @@ async function handle(event, invocationId) {
       meetingRinging
     }))
   }
-  // 单设备语音邀请且后端未带 callRoute 时，按个推云端设备档案动态判定厂商通道。
-  // 显式 callRoute 优先；判定不成立回退普通通知，不改变既有错误语义。
-  if (body.callRoute == null && scene?.call != null) {
-    const autoRoute = await resolveAutoCallRoute(body.push_clientid, invocationId)
-    if (autoRoute != null) {
-      body.callRoute = autoRoute
-      // 测试 IM 的 UniPushChannel.buildBody 用 putArray("push_clientid")，单目标也是 [cid]；
-      // prepareNativeVoip 严格要求 body.push_clientid === route.cid（字符串）。
-      // 此分支已经 callTargetCids 校验为单目标，归一为字符串；多目标与显式路由契约不变。
-      body.push_clientid = autoRoute.cid
-    }
-  }
   const nativeAttempt = scene?.meeting && !meetingRinging ? null : prepareNativeVoip(body)
   const nativeVoip = nativeAttempt?.error && strictCids ? null : nativeAttempt
   if (nativeVoip) {
@@ -566,6 +554,45 @@ async function handle(event, invocationId) {
   const voip = scene ? scene.call : prepareVoip(body)
   if (voip && voip.error) return { errCode: 400, errMsg: voip.error }
   if (voip && voip.expired) return { errCode: 0, errMsg: 'expired invitation skipped', data: { skipped: true, batches: 0 } }
+
+  // 未显式带 callRoute 的通话/会议：逐 CID 查个推设备档案，能判定厂商通道的走原生，
+  // 其余合并成一次普通通知。iOS PushKit 路由不在设备档案里，仍回退普通通知。
+  const invitation = scene?.call ?? ringAttempt
+  if (body.callRoute == null && invitation != null) {
+    const results = []
+    const notificationCids = []
+    for (let i = 0; i < ids.length; i++) {
+      const cid = ids[i]
+      const route = await resolveAutoCallRoute([cid], invocationId)
+      if (route != null) {
+        const native = prepareNativeVoip({
+          ...body, push_clientid: cid, payload: invitation.payload, callRoute: route,
+        }, Date.now())
+        if (native != null && native.error == null && native.expired !== true && callTransportEnabled(route)) {
+          const sent = await sendNativeVoip(body, route, native, invocationId)
+          results.push({ cid, delivery: 'native', errCode: sent.errCode, ...sent.data })
+          continue
+        }
+      }
+      notificationCids.push(cid)
+    }
+    if (notificationCids.length > 0) {
+      const sent = await sendOrdinaryPush(
+        { ...body, push_clientid: notificationCids },
+        notificationCids,
+        scene?.call != null ? voip : null,
+        scene?.meeting,
+        invocationId,
+      )
+      results.push({ delivery: 'notification', errCode: sent.errCode, cids: notificationCids })
+    }
+    const failed = results.find(entry => entry.errCode !== 0)
+    return {
+      errCode: failed?.errCode ?? 0,
+      errMsg: failed ? 'call delivery failed for some devices' : 'ok',
+      data: { total: ids.length, results },
+    }
+  }
 
   return sendOrdinaryPush(body, ids, voip, scene?.meeting, invocationId)
 }

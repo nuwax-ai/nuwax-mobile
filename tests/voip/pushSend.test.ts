@@ -527,15 +527,20 @@ describe('automatic vendor route resolution', () => {
     expect(send).toHaveBeenCalledOnce();
   });
 
-  it('does not resolve a multi-cid fan-out', async () => {
+  it('resolves a multi-cid fan-out per device', async () => {
     const { call, send, request, manager } = withRegistry(load(), {
       'fanout-a': { device_token: 'vendor-token', brand: 'hw', phone_type: 1 },
     });
-    expect((await call({ ...makeCall('fanout-a'), push_clientid: ['fanout-a', 'fanout-b'] })).errCode).toBe(0);
-    expect(manager.getClientDetailByCid).not.toHaveBeenCalled();
-    expect(request).not.toHaveBeenCalled();
+    const result = await call({ ...makeCall('fanout-a'), push_clientid: ['fanout-a', 'fanout-b'] });
+    expect(result.errCode).toBe(0);
+    expect(manager.getClientDetailByCid).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledOnce();
     expect(send).toHaveBeenCalledOnce();
-    expect(send.mock.calls[0][0].push_clientid).toEqual(['fanout-a', 'fanout-b']);
+    expect(send.mock.calls[0][0].push_clientid).toEqual(['fanout-b']);
+    expect(result.data.results).toMatchObject([
+      { cid: 'fanout-a', delivery: 'native' },
+      { delivery: 'notification', cids: ['fanout-b'] },
+    ]);
   });
 
   it('prefers an explicit callRoute over auto resolution', async () => {

@@ -624,6 +624,31 @@ def find_debug_server_aar() -> Path | None:
     return None
 
 
+def ensure_voip_overlay_permission() -> None:
+    """VoIP 锁屏直开接听页依赖 SYSTEM_ALERT_WINDOW 的 appop 豁免（Android 10+ 后台启动限制）。
+
+    只声明、不强授：安装后仍需用户/测试流程在系统设置里打开「悬浮窗/显示在其他应用上层」，
+    但没有清单声明时 EMUI 会把该开关整个隐藏（2026-11-20 实测），appops shell 写入也不生效。
+    生产云打包路径不受本函数影响（走 manifest.json，是否声明由产品另行决策）。
+    """
+    app_manifest = PROJ / "app" / "src" / "main" / "AndroidManifest.xml"
+    if not app_manifest.is_file():
+        die(f"找不到 {app_manifest}")
+    text = app_manifest.read_text()
+    if "android.permission.SYSTEM_ALERT_WINDOW" in text:
+        return
+    marker = "<application"
+    idx = text.find(marker)
+    if idx < 0:
+        die("app AndroidManifest 缺少 <application>，无法写入 SYSTEM_ALERT_WINDOW")
+    text = text[:idx] + (
+        '    <!-- VoIP 锁屏来电：后台启动接听页需要悬浮窗 appop，先声明才可见/可授 -->\n'
+        '    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />\n\n    '
+    ) + text[idx:]
+    app_manifest.write_text(text)
+    print("✓ app AndroidManifest SYSTEM_ALERT_WINDOW 已声明（VoIP 锁屏来电）")
+
+
 def enable_hx_debug_channel() -> None:
     """
     按官方「原生联调」为自定义调试基座打入 HX 控制台通道：
@@ -895,6 +920,7 @@ def main() -> None:
     configure_app_name()
     configure_splash_screen()
     configure_launcher_icon()
+    ensure_voip_overlay_permission()
     enable_hx_debug_channel()
     print("完成 configure_app")
 

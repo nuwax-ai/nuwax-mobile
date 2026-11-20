@@ -458,7 +458,7 @@ describe('automatic vendor route resolution', () => {
   it('routes one Huawei-registered cid through the native transmission channel', async () => {
     const cid = 'huawei-registry-cid';
     const { call, send, request, manager } = withRegistry(load(), {
-      [cid]: { device_token: 'vendor-token', phoneModel: 'HUAWEI ABR-AL80' },
+      [cid]: { device_token: 'vendor-token', brand: 'hw', phone_type: 1 },
     });
     expect((await call(makeCall(cid))).errCode).toBe(0);
     expect(manager.getClientDetailByCid).toHaveBeenCalledWith(cid);
@@ -471,9 +471,41 @@ describe('automatic vendor route resolution', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it('normalizes the IM single-cid array before the native route consistency check', async () => {
+    // 测试 IM 的 UniPushChannel.buildBody 用 putArray("push_clientid")，单目标也是 [cid]。
+    // 自动路由命中后必须归一为字符串，否则 prepareNativeVoip 的
+    // body.push_clientid !== route.cid 会拒掉并静默回退普通通知。
+    const cid = 'huawei-array-target-cid';
+    const { call, send, request, manager } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand: 'hw', phone_type: 1 },
+    });
+    expect((await call({ ...makeCall(cid), push_clientid: [cid] })).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).toHaveBeenCalledWith(cid);
+    expect(request).toHaveBeenCalledOnce();
+    const [{ requestData }] = request.mock.calls[0];
+    expect(requestData.audience.cid).toEqual([cid]);
+    expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({
+      delivery: 'android-native', callId: 'auto-route-call',
+    });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('routes by brand even when the registry phone model is empty', async () => {
+    // 2026-11-20 华为真机实测：hasVendorToken=true、phoneModel=""。机型字段不可作判据。
+    const cid = 'empty-model-huawei-cid';
+    const { call, send, request } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand: 'hw', phoneModel: '' },
+    });
+    expect((await call(makeCall(cid))).errCode).toBe(0);
+    expect(request).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+    const [{ requestData }] = request.mock.calls[0];
+    expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({ delivery: 'android-native' });
+  });
+
   it.each([
-    ['no vendor token', { device_token: '', phoneModel: 'HUAWEI ABR-AL80' }],
-    ['non-Huawei model', { device_token: 'vendor-token', phoneModel: 'V2219A' }],
+    ['no vendor token', { device_token: '', brand: 'hw', phone_type: 1 }],
+    ['non-Huawei brand', { device_token: 'vendor-token', brand: 'vv', phone_type: 1 }],
     ['missing registry entry', undefined],
   ])('keeps the ordinary notification when the registry says %s', async (_name, entry) => {
     const cid = 'registry-cid';
@@ -497,7 +529,7 @@ describe('automatic vendor route resolution', () => {
 
   it('does not resolve a multi-cid fan-out', async () => {
     const { call, send, request, manager } = withRegistry(load(), {
-      'fanout-a': { device_token: 'vendor-token', phoneModel: 'HUAWEI ABR-AL80' },
+      'fanout-a': { device_token: 'vendor-token', brand: 'hw', phone_type: 1 },
     });
     expect((await call({ ...makeCall('fanout-a'), push_clientid: ['fanout-a', 'fanout-b'] })).errCode).toBe(0);
     expect(manager.getClientDetailByCid).not.toHaveBeenCalled();
@@ -509,7 +541,7 @@ describe('automatic vendor route resolution', () => {
   it('prefers an explicit callRoute over auto resolution', async () => {
     const cid = 'explicit-route-cid';
     const { call, send, request, manager } = withRegistry(load(), {
-      [cid]: { device_token: 'vendor-token', phoneModel: 'HUAWEI ABR-AL80' },
+      [cid]: { device_token: 'vendor-token', brand: 'hw', phone_type: 1 },
     });
     expect((await call({
       ...makeCall(cid), callRoute: { cid, platform: 'ios', transport: 'ios-voip', environment: 'development', registrationId: 'cb67ff9e-54ee-44ef-a6c0-601fd536cdf5' },
@@ -517,39 +549,6 @@ describe('automatic vendor route resolution', () => {
     expect(manager.getClientDetailByCid).not.toHaveBeenCalled();
     expect(send).toHaveBeenCalledOnce();
     expect(send.mock.calls[0][0].settings).toMatchObject({ strategy: { ios: 2 } });
-  });
-
-  it('routes through the vendor probe when the registry model is empty', async () => {
-    const cid = 'empty-model-huawei-cid';
-    const { call, send, request, manager } = withRegistry(load(), {
-      [cid]: { device_token: 'vendor-token', phoneModel: '' },
-    });
-    request.mockResolvedValueOnce({ errCode: 0, data: { hw_token: 'hms-token', phone_type: 1 } });
-    expect((await call(makeCall(cid))).errCode).toBe(0);
-    expect(request.mock.calls.find(args => args[0]?.module === `/device/detail/${cid}`)).toBeTruthy();
-    expect(send).not.toHaveBeenCalled();
-    const [{ requestData }] = request.mock.calls.at(-1)!;
-    expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({ delivery: 'android-native' });
-  });
-
-  it('keeps the ordinary notification when the vendor probe finds no Huawei token', async () => {
-    const cid = 'empty-model-vendor-cid';
-    const { call, send, request, manager } = withRegistry(load(), {
-      [cid]: { device_token: 'vendor-token', phoneModel: '' },
-    });
-    request.mockResolvedValueOnce({ errCode: 0, data: { vv_token: 'vivo-token', phone_type: 1 } });
-    expect((await call(makeCall(cid))).errCode).toBe(0);
-    expect(send).toHaveBeenCalledOnce();
-  });
-
-  it('keeps the ordinary notification when the vendor probe fails', async () => {
-    const cid = 'empty-model-probe-error-cid';
-    const { call, send, request, manager } = withRegistry(load(), {
-      [cid]: { device_token: 'vendor-token', phoneModel: '' },
-    });
-    request.mockRejectedValueOnce(new Error('rest module unavailable'));
-    expect((await call(makeCall(cid))).errCode).toBe(0);
-    expect(send).toHaveBeenCalledOnce();
   });
 });
 

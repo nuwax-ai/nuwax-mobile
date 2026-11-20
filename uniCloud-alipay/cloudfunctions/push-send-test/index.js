@@ -301,15 +301,14 @@ function callTransportEnabled(route) {
 // ==================== 无 callRoute 时的厂商通道动态判定 ====================
 //
 // ★为什么在云端查而不是端上：接收端可能无进程（这正是本链路要支持的场景），
-//   cid → 厂商 token / 机型 的档案存在个推服务端，是设备上次在线注册时写入并持久化的，
+//   cid → 厂商 token / 品牌的档案存在个推服务端，是设备上次在线注册时写入并持久化的，
 //   云函数按 cid 查档案即可，不依赖接收端 App 存活 —— 与普通厂商通知用同一份数据。
-// ★判定口径：device_token 非空（确有厂商通道注册成功）+ 机型是华为（当前唯一真机
-//   验证过的 Android 原生来电通道；荣耀走独立通道 ho，待验证后再放开）。
-//   机型原文每次都落日志：phoneModel 的真实取值格式（品牌名还是内部型号码）以首跑
-//   实测为准，模式不合就按日志校准，不写死设备名单。
+// ★判定口径（个推官方 REST v2 用户信息接口字段，2026-11-20 核对）：
+//   device_token 非空（确有厂商通道注册成功）+ brand === 'hw'（官方厂商代码：
+//   华为-hw、小米-xm、魅族-mz、OPPO-op、VIVO-vv、苹果-iphone）。
+//   不依赖 phoneModel/phone_model（实测可为空，且仅高级接口返回），
+//   不使用未经官方文档证实的字段。荣耀独立通道待真机验证后再放开。
 // ★回退语义：查不到/查失败/不匹配一律返回 null → 回退普通通知，绝不阻断投递。
-const HUAWEI_MODEL_RE = /huawei/i
-
 async function resolveAutoCallRoute(pushClientId, invocationId) {
   const ids = callTargetCids(pushClientId)
   // 语音呼叫按单设备逐台投递：多 cid 扇出时不做自动判定，交给后端逐台带 callRoute。
@@ -328,50 +327,19 @@ async function resolveAutoCallRoute(pushClientId, invocationId) {
     return null
   }
   const token = typeof detail?.device_token === 'string' ? detail.device_token : ''
-  const model = typeof detail?.phoneModel === 'string' ? detail.phoneModel : ''
-  // phoneModel 实测可为空（2026-11-20 华为真机：hasVendorToken=true、phoneModel=""）。
-  // 全量键名+安全值形态落日志，用于校准 DCloud 封装的真实返回结构。
+  const brand = typeof detail?.brand === 'string' ? detail.brand.trim().toLowerCase() : ''
+  // 全量键名+安全值形态落日志：校准 DCloud 封装与个推原生字段的实际映射。
   const shape = detail && typeof detail === 'object'
     ? Object.fromEntries(Object.entries(detail).map(([k, v]) =>
         [k, typeof v === 'string' ? (/token/i.test(k) ? `len:${v.length}` : v.slice(0, 24)) : v]))
     : null
-  let routed = token.length > 0 && HUAWEI_MODEL_RE.test(model)
-  // 档案机型缺失但有厂商 token 时，用个推设备详情的华为 token 判定；
-  // hw_token 非空 = 该 cid 实际注册在华为通道，仍是动态判定、不写死设备。
-  let vendorProbe = null
-  if (!routed && token.length > 0 && model === '') {
-    vendorProbe = await probeHuaweiVendorToken(cid, invocationId)
-    routed = vendorProbe === true
-  }
+  const routed = token.length > 0 && brand === 'hw'
   console.log('[push-send] call route auto', JSON.stringify({
-    invocationId, hasVendorToken: token.length > 0,
-    phoneModel: model.slice(0, 40), detailShape: shape,
-    ...(vendorProbe !== null ? { vendorProbe } : {}),
+    invocationId, hasVendorToken: token.length > 0, brand,
+    detailShape: shape,
     transport: routed ? 'android-huawei' : null
   }))
   return routed ? { transport: 'android-huawei', platform: 'android', cid } : null
-}
-
-// 个推 REST 设备详情探测：返回 true=确认华为通道 / false=查到详情但无华为 token / null=探测不可用。
-async function probeHuaweiVendorToken(cid, invocationId) {
-  if (typeof uniPush.request !== 'function') return null
-  try {
-    const result = await uniPush.request({ method: 'GET', module: '/device/detail/' + cid, requestData: {} })
-    const data = result?.data
-    if (data == null || typeof data !== 'object' || Array.isArray(data)) return false
-    const hw = data.hw_token ?? data.hwToken ?? null
-    console.log('[push-send] vendor probe', JSON.stringify({
-      invocationId, errCode: result?.errCode ?? null,
-      keys: Object.keys(data).slice(0, 20),
-      hasHwToken: typeof hw === 'string' && hw.length > 0
-    }))
-    return typeof hw === 'string' && hw.length > 0
-  } catch (e) {
-    console.error('[push-send] vendor probe failed', JSON.stringify({
-      invocationId, error: String((e && e.message) || e).slice(0, 160)
-    }))
-    return null
-  }
 }
 
 async function sendNativeVoip(body, route, nativeVoip, invocationId) {
@@ -566,7 +534,13 @@ async function handle(event, invocationId) {
   // 显式 callRoute 优先；判定不成立回退普通通知，不改变既有错误语义。
   if (body.callRoute == null && scene?.call != null) {
     const autoRoute = await resolveAutoCallRoute(body.push_clientid, invocationId)
-    if (autoRoute != null) body.callRoute = autoRoute
+    if (autoRoute != null) {
+      body.callRoute = autoRoute
+      // 测试 IM 的 UniPushChannel.buildBody 用 putArray("push_clientid")，单目标也是 [cid]；
+      // prepareNativeVoip 严格要求 body.push_clientid === route.cid（字符串）。
+      // 此分支已经 callTargetCids 校验为单目标，归一为字符串；多目标与显式路由契约不变。
+      body.push_clientid = autoRoute.cid
+    }
   }
   const nativeAttempt = scene?.meeting && !meetingRinging ? null : prepareNativeVoip(body)
   const nativeVoip = nativeAttempt?.error && strictCids ? null : nativeAttempt

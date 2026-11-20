@@ -104,7 +104,7 @@ AppID、channelId 和申请结果可进入交接清单；AppSecret、MasterSecre
 | --- | --- | --- | --- |
 | 小米/Redmi | [小米开放平台](https://dev.mi.com/console/)创建移动应用、开通 MiPush、登记包名及对应信息，获取本应用凭据 | 单独申请 VoIP Service Kit：发至 `mipush-permission@xiaomi.com`；提供主体、应用/包名、AppID、channel 信息、场景、通话与设置截图。适用场景与内部应用证明按[申请规则](https://dev.mi.com/xiaomihyperos/documentation/detail?pId=1656)办理 | 普通推送开通不等于 VoIP；[新版 Kit](https://dev.mi.com/xiaomihyperos/documentation/detail?pId=2244)使用 MiPush RegId 和专用消息类型，须检测设备能力 |
 | 荣耀 | [荣耀开发者平台](https://developer.honor.com/cn/)创建应用，开通并接入荣耀推送新通道，登记签名指纹 | 单独申请 VoIP 权益：`honorpush@honor.com`；提交应用/包名、AppID、场景、通话及开关截图/录屏；内部应用附主体证明，其他场景先咨询。[官方规范](https://developer.honor.com/cn/docs/11002/guides/notification-voip-standards) | [Kit 入门](https://developer.honor.com/cn/docs/voip/guides/dev-overview)要求 MagicOS 10.0+ 测试设备；仍须运行时判断与支持列表核对 |
-| vivo/iQOO | [vivo 开发者平台](https://dev.vivo.com.cn/)创建并审核应用，在推送运营平台开通 Push、取得 AppID/AppKey/AppSecret；见[服务申请](https://dev.vivo.com.cn/documentCenter/doc/281) | 官方已有 [VoIP Service Kit](https://developers.vivo.com/product/d/voip)，覆盖系统通话 UI、音频路由和后台通话管理；通过该产品的在线提单或 `push@vivo.com` 获取当前接入/权益要求 | 本轮公开资料未核实到完整的申请资质、最低版本及冷唤起保证，必须取得厂商书面范围；Kit 的后台通话能力不能直接当作离线推送能力 |
+| vivo/iQOO | 在 [vivo 开发者平台](https://dev.vivo.com.cn/documentCenter/doc/281)开通普通 Push。通话权益另在工单系统选择「vivo 应用类 → 系统适配 → VoIP Service Kit 能力申请」，按应用场景提交材料。[准入与申请指南](https://dev.vivo.com.cn/documentCenter/doc/983) | 官方接入要求 vivo 推送 SDK 4.1.3.0 及以上。OriginOS 6.0 及以上通过 `onCallMessage` 收到专用邀请，可接入系统通话界面；较早系统由 `onTransmissionMessage` 接收专用邀请，再交由 App 管理通话。[vivo 接入文档](https://dev.vivo.com.cn/documentCenter/doc/967) | 11 月 20 日实机为 Y77（V2219A、OriginOS Ocean、Android 12）。普通通知与邀请已到达。当前个推辅助接收器未实现旧系统的专用来电回调，本应用的通话权益及厂商专用投递还待核实。 |
 | OPPO/一加/realme | [OPush](https://push.oppo.com/)创建应用、登记包名与信息、申请推送，按控制台配置本应用所需凭据 | 向平台工单核对真实音视频来电的消息分类、离线执行与系统来电权限；尚无本轮已核实、可直接引用的统一 VoIP Kit 申请规则 | 测试推送与正式推送的上架条件不同；不把可发普通通知写成可冷唤起系统电话 |
 | 华为 Android/HMS | [AppGallery Connect](https://developer.huawei.com/consumer/cn/service/josp/agc/index.html)创建 Android 应用、登记签名指纹、开通 Push Kit，取得对应客户端/服务端配置 | 核对该 Android 应用实际拥有的来电相关权益与投递方式 | 与下节 HarmonyOS 原生权益分开，不能共用一份开通结论 |
 | 魅族/Flyme | [魅族开发者平台](https://open.flyme.cn/)创建应用，在[推送平台](https://push.meizu.com/)登记包名并获取应用凭据 | 通过厂商支持确认通话类消息、进程执行机会和通知交互范围 | 本轮仅核实普通推送申请路径，未核实独立 VoIP Kit 权益，不做自动系统来电承诺 |
@@ -129,7 +129,7 @@ AppID、channelId 和申请结果可进入交接清单；AppSecret、MasterSecre
 | --- | --- | --- |
 | 小米 | 在小米平台补普通 Push／当前消息分类与 channel；向官方邮箱发送 `【Voip Service Kit 功能申请】- 女娲Nuwax - 日期`，按真实业务提供企业、应用、AppID、channel、开关／通话截图及审核入口 | 审批工单、允许场景、SDK／机型范围、是否需 MiPush RegId；再核实聚合支持 |
 | 荣耀 | 保留既有普通通道；向官方邮箱提交 `【VoIP权益】- 女娲Nuwax - 日期`，附 IM／办公场景、来电开关和通话录屏，企业内部证明仅在确属该范围时提供 | 权益批准、SDK 指引与支持版本；现有荣耀普通链路测试不能代替专用 Kit 开通 |
-| vivo | 在开发者／推送平台开通符合上架要求的普通 Push；向 `push@vivo.com` 或产品页提单，询问本应用 VoIP Service Kit 权益、SDK、系统及无进程回调要求 | 厂商书面接入清单和测试范围，尚未确认的材料不预填为已完成 |
+| vivo | 在开放平台工单查询对应应用的 VoIP 权益。若需申请，提交官方申请模板；仅服务于本政企组织内部的应用另附承诺函。[申请流程](https://dev.vivo.com.cn/documentCenter/doc/983) | 取得对应应用的审核结果及发送接口配置后，分别验证新系统 Kit 接听与旧系统自有接听界面 |
 | OPPO／一加／realme | OPush 建应用并完成相应测试／正式资格；工单说明真实双向来电、后台和锁屏诉求；逐个确认对应 ROM／机型覆盖 | AppID 及平台要求的凭据、批准分类、原生唤起方式和机型列表，不按品牌集团名称直接推定全覆盖 |
 | 华为 Android/HMS | AGC 选择 Android 应用，核对 SHA-256、Push Kit、实际 APK 配置文件和既有 UniPush 参数；就来电分类／执行范围向平台核实 | Android 应用的配置及批准范围，不拿 HarmonyOS 原生权益作凭证 |
 | 魅族 | 推送平台创建／核对应用和包名，按平台要求配置 AppID／客户端参数与服务端凭据；支持工单确认离线来电能力 | 普通 Push 开通、允许的通话行为与实测范围 |

@@ -38,6 +38,16 @@ function notificationCategory(body) {
   return body.category && typeof body.category === 'object' ? body.category : DEFAULT_CATEGORY
 }
 
+// vivo 用 IM 分类展示聊天及一对一来电回退通知。原生投递沿用各自的分类。
+function ordinaryNotificationCategory(body) {
+  const category = notificationCategory(body)
+  const peerCall = body.type === 'voip' && body.payload?.scene === 'call'
+  // 已部署的 IM 也会省略顶层 type，并携带会话、消息 ID 和 IM 分类。
+  const legacyChat = body.type == null && body.payload?.convId && body.payload?.msgId && body.category?.harmony === 'IM'
+  if (body.type === 'im' || peerCall || legacyChat) return { vivo: 'IM', ...category }
+  return category
+}
+
 /** 只有一对一通话才下发 VoipCall 渠道；会议邀请和 IM 消息都不传 channelId。 */
 function notificationChannel(body) {
   return body.type === 'voip' && body.payload?.scene === 'call' ? VOIP_CHANNEL : ''
@@ -288,6 +298,50 @@ function callTransportEnabled(route) {
   return route != null && typeof route.transport === 'string' && route.transport.length > 0
 }
 
+// ==================== 无 callRoute 时的厂商通道动态判定 ====================
+//
+// ★为什么在云端查而不是端上：接收端可能无进程（这正是本链路要支持的场景），
+//   cid → 厂商 token / 品牌的档案存在个推服务端，是设备上次在线注册时写入并持久化的，
+//   云函数按 cid 查档案即可，不依赖接收端 App 存活 —— 与普通厂商通知用同一份数据。
+// ★判定口径（个推官方 REST v2 用户信息接口字段，2026-11-20 核对）：
+//   device_token 非空（确有厂商通道注册成功）+ brand === 'hw'（官方厂商代码：
+//   华为-hw、小米-xm、魅族-mz、OPPO-op、VIVO-vv、苹果-iphone）。
+//   不依赖 phoneModel/phone_model（实测可为空，且仅高级接口返回），
+//   不使用未经官方文档证实的字段。荣耀独立通道待真机验证后再放开。
+// ★回退语义：查不到/查失败/不匹配一律返回 null → 回退普通通知，绝不阻断投递。
+async function resolveAutoCallRoute(pushClientId, invocationId) {
+  const ids = callTargetCids(pushClientId)
+  // 语音呼叫按单设备逐台投递：多 cid 扇出时不做自动判定，交给后端逐台带 callRoute。
+  if (ids == null || ids.length !== 1) return null
+  const cid = ids[0]
+  if (typeof uniPush.getClientDetailByCid !== 'function') return null
+  let detail = null
+  try {
+    const result = await uniPush.getClientDetailByCid(cid)
+    const valid = result?.data?.validCids
+    detail = valid && typeof valid === 'object' && !Array.isArray(valid) ? valid[cid] : null
+  } catch (e) {
+    console.error('[push-send] call route lookup failed', JSON.stringify({
+      invocationId, error: String((e && e.message) || e).slice(0, 120)
+    }))
+    return null
+  }
+  const token = typeof detail?.device_token === 'string' ? detail.device_token : ''
+  const brand = typeof detail?.brand === 'string' ? detail.brand.trim().toLowerCase() : ''
+  // 全量键名+安全值形态落日志：校准 DCloud 封装与个推原生字段的实际映射。
+  const shape = detail && typeof detail === 'object'
+    ? Object.fromEntries(Object.entries(detail).map(([k, v]) =>
+        [k, typeof v === 'string' ? (/token/i.test(k) ? `len:${v.length}` : v.slice(0, 24)) : v]))
+    : null
+  const routed = token.length > 0 && brand === 'hw'
+  console.log('[push-send] call route auto', JSON.stringify({
+    invocationId, hasVendorToken: token.length > 0, brand,
+    detailShape: shape,
+    transport: routed ? 'android-huawei' : null
+  }))
+  return routed ? { transport: 'android-huawei', platform: 'android', cid } : null
+}
+
 async function sendNativeVoip(body, route, nativeVoip, invocationId) {
   const android = route.platform === 'android'
   if (android && typeof uniPush.request !== 'function') {
@@ -476,6 +530,18 @@ async function handle(event, invocationId) {
       meetingRinging
     }))
   }
+  // 单设备语音邀请且后端未带 callRoute 时，按个推云端设备档案动态判定厂商通道。
+  // 显式 callRoute 优先；判定不成立回退普通通知，不改变既有错误语义。
+  if (body.callRoute == null && scene?.call != null) {
+    const autoRoute = await resolveAutoCallRoute(body.push_clientid, invocationId)
+    if (autoRoute != null) {
+      body.callRoute = autoRoute
+      // 测试 IM 的 UniPushChannel.buildBody 用 putArray("push_clientid")，单目标也是 [cid]；
+      // prepareNativeVoip 严格要求 body.push_clientid === route.cid（字符串）。
+      // 此分支已经 callTargetCids 校验为单目标，归一为字符串；多目标与显式路由契约不变。
+      body.push_clientid = autoRoute.cid
+    }
+  }
   const nativeAttempt = scene?.meeting && !meetingRinging ? null : prepareNativeVoip(body)
   const nativeVoip = nativeAttempt?.error && strictCids ? null : nativeAttempt
   if (nativeVoip) {
@@ -533,8 +599,7 @@ async function sendOrdinaryPush(body, ids, voip, meeting, invocationId) {
   const content = clip(body.content, MAX_CONTENT)
   // 先裁剪再塞角标：normalizePayload 超长时只保留 convId/convType，会把 badge 一起丢掉
   const payload = attachBadgeToPayload(voip?.payload ?? meeting ?? normalizePayload(body.payload), body.badge)
-  // 分类只看信封 type：voip → VOIP；IM 消息保持后端传入/默认值不变。
-  const category = notificationCategory(body)
+  const category = ordinaryNotificationCategory(body)
   const privateInvitation = voip || payload.type === 'meeting_invite'
   // 厂商离线角标参数（App 进程不在时唯一能改桌面角标的途径）
   const vendorBadgeOptions = buildVendorBadgeOptions(body.badge)

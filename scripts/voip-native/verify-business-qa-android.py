@@ -49,6 +49,14 @@ client_config = json.loads(Path(client_config_path).read_text()) if client_confi
 if "vivo" in client_config:
     for component in ["com.igexin.sdk.VivoPushMessageReceiver", "com.vivo.push.sdk.service.CommandClientService"]:
         assert component in xml, f"Missing vivo push component: {component}"
+    for name, field in [("com.vivo.push.app_id", "appId"), ("com.vivo.push.api_key", "appKey"),
+                        ("app_id", "appId"), ("api_key", "appKey")]:
+        # aapt renders numeric manifest values as typed hexadecimal integers.
+        match = re.search(r'android:name\([^)]*\)="' + re.escape(name) +
+                          r'"[^\n]*\n\s*A: android:value\([^)]*\)=(?:"([^"]*)"|\(type 0x10\)(0x[0-9a-fA-F]+))', xml)
+        assert match, f"Missing vivo metadata value: {name}"
+        value = match[1] if match[1] is not None else str(int(match[2], 16))
+        assert value == client_config["vivo"][field], f"Incorrect vivo metadata: {name}"
     vendor_adapters.append("vivo")
 resources = run(tools / "aapt", "dump", "--values", "resources", APK)
 for label in ["nuwax_voip_incoming_channel", "nuwax_voip_ongoing_channel", "音视频通话邀请通知", "通话状态",

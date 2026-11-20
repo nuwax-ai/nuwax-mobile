@@ -101,6 +101,7 @@ describe('native call delivery', () => {
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
     expect(args.settings.strategy).toEqual({ ios: 2 });
+    expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
     expect(args.options.ios.type).toBe('voip');
     expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
   });
@@ -172,7 +173,7 @@ describe('IM invitation scenes', () => {
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
     expect(args.payload).toEqual({ ...expected, type: 'meeting_invite' });
-    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM', vivo: 'IM' });
     expect(args).not.toHaveProperty('settings');
     expect(args).not.toHaveProperty('options');
     expect(database).not.toHaveBeenCalled();
@@ -223,7 +224,7 @@ describe('envelope type and scene-driven notification config', () => {
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
     expect(args.payload).toEqual({ ...expected, type: 'voip', displayName: '张三', sendTime, expiresAt: sendTime + 60_000 });
-    expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
+    expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP', vivo: 'IM' });
     expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
     expect(args.settings.ttl).toBeLessThanOrEqual(60_000);
   });
@@ -246,8 +247,15 @@ describe('envelope type and scene-driven notification config', () => {
     await call({ ...envelope, type: 'im', category: { harmony: 'IM', huawei: 'IM' }, payload: meetingFields() });
     const args = send.mock.calls[0][0];
     expect(args.payload.type).toBe('meeting_invite');
-    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM', vivo: 'IM' });
     expect(args).not.toHaveProperty('options');
+  });
+
+  it('adds the vivo IM category for a chat sent without an envelope type', async () => {
+    const { call, send } = load();
+    const payload = { convId: '123', msgId: '456', convType: 1, type: 'text' };
+    await call({ push_clientid: 'fixture-cid', payload, title: '张三', content: '你好', category: { harmony: 'IM', huawei: 'IM' } });
+    expect(send.mock.calls[0][0].category).toEqual({ harmony: 'IM', huawei: 'IM', vivo: 'IM' });
   });
 
   it('leaves ordinary IM message envelopes untouched by the VoIP channel and type fields', async () => {
@@ -278,7 +286,7 @@ describe('envelope type and scene-driven notification config', () => {
     await call({ ...envelope, type: 'im', category: { harmony: 'VOIP', huawei: 'VOIP' }, payload });
     const args = send.mock.calls[0][0];
     expect(args.payload).toEqual(payload);
-    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM' });
+    expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM', vivo: 'IM' });
     expect(args).not.toHaveProperty('options');
     expect(args).not.toHaveProperty('settings');
   });
@@ -432,6 +440,115 @@ describe('VoIP CID validation without a route lookup', () => {
     expect(request).toHaveBeenCalledOnce();
     expect(send).not.toHaveBeenCalled();
     expect(database).not.toHaveBeenCalled();
+  });
+});
+
+describe('automatic vendor route resolution', () => {
+  const makeCall = (cid: string) => ({
+    push_clientid: cid, title: '张三', content: '邀请你通话',
+    payload: { ...locator, scene: 'call', convType: 1, callId: 'auto-route-call', calleeId: '10002',
+      mediaType: 'audio', expiresAt: Date.now() + 30_000, senderName: '张三' },
+  });
+  const withRegistry = (loadable: ReturnType<typeof load>, entries: Record<string, unknown>) => {
+    loadable.manager.getClientDetailByCid = vi.fn()
+      .mockResolvedValue({ errCode: 0, data: { validCids: entries } });
+    return loadable;
+  };
+
+  it('routes one Huawei-registered cid through the native transmission channel', async () => {
+    const cid = 'huawei-registry-cid';
+    const { call, send, request, manager } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand: 'hw', phone_type: 1 },
+    });
+    expect((await call(makeCall(cid))).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).toHaveBeenCalledWith(cid);
+    const [{ requestData }] = request.mock.calls[0];
+    expect(requestData.audience.cid).toEqual([cid]);
+    expect(requestData.settings).toMatchObject({ strategy: { hw: 2 } });
+    expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({
+      delivery: 'android-native', callId: 'auto-route-call',
+    });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('normalizes the IM single-cid array before the native route consistency check', async () => {
+    // 测试 IM 的 UniPushChannel.buildBody 用 putArray("push_clientid")，单目标也是 [cid]。
+    // 自动路由命中后必须归一为字符串，否则 prepareNativeVoip 的
+    // body.push_clientid !== route.cid 会拒掉并静默回退普通通知。
+    const cid = 'huawei-array-target-cid';
+    const { call, send, request, manager } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand: 'hw', phone_type: 1 },
+    });
+    expect((await call({ ...makeCall(cid), push_clientid: [cid] })).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).toHaveBeenCalledWith(cid);
+    expect(request).toHaveBeenCalledOnce();
+    const [{ requestData }] = request.mock.calls[0];
+    expect(requestData.audience.cid).toEqual([cid]);
+    expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({
+      delivery: 'android-native', callId: 'auto-route-call',
+    });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('routes by brand even when the registry phone model is empty', async () => {
+    // 2026-11-20 华为真机实测：hasVendorToken=true、phoneModel=""。机型字段不可作判据。
+    const cid = 'empty-model-huawei-cid';
+    const { call, send, request } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand: 'hw', phoneModel: '' },
+    });
+    expect((await call(makeCall(cid))).errCode).toBe(0);
+    expect(request).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+    const [{ requestData }] = request.mock.calls[0];
+    expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({ delivery: 'android-native' });
+  });
+
+  it.each([
+    ['no vendor token', { device_token: '', brand: 'hw', phone_type: 1 }],
+    ['non-Huawei brand', { device_token: 'vendor-token', brand: 'vv', phone_type: 1 }],
+    ['missing registry entry', undefined],
+  ])('keeps the ordinary notification when the registry says %s', async (_name, entry) => {
+    const cid = 'registry-cid';
+    const { call, send, request, manager } = withRegistry(load(), entry ? { [cid]: entry } : {});
+    expect((await call(makeCall(cid))).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).toHaveBeenCalledWith(cid);
+    expect(request).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0]).toMatchObject({ push_clientid: [cid], payload: { callId: 'auto-route-call' } });
+  });
+
+  it('never blocks delivery when the registry lookup fails', async () => {
+    const cid = 'registry-outage-cid';
+    const { call, send, request, manager } = load();
+    manager.getClientDetailByCid = vi.fn().mockRejectedValue(new Error('registry down'));
+    expect((await call(makeCall(cid))).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).toHaveBeenCalledWith(cid);
+    expect(request).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it('does not resolve a multi-cid fan-out', async () => {
+    const { call, send, request, manager } = withRegistry(load(), {
+      'fanout-a': { device_token: 'vendor-token', brand: 'hw', phone_type: 1 },
+    });
+    expect((await call({ ...makeCall('fanout-a'), push_clientid: ['fanout-a', 'fanout-b'] })).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0].push_clientid).toEqual(['fanout-a', 'fanout-b']);
+  });
+
+  it('prefers an explicit callRoute over auto resolution', async () => {
+    const cid = 'explicit-route-cid';
+    const { call, send, request, manager } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand: 'hw', phone_type: 1 },
+    });
+    expect((await call({
+      ...makeCall(cid), callRoute: { cid, platform: 'ios', transport: 'ios-voip', environment: 'development', registrationId: 'cb67ff9e-54ee-44ef-a6c0-601fd536cdf5' },
+    })).errCode).toBe(0);
+    expect(manager.getClientDetailByCid).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0].settings).toMatchObject({ strategy: { ios: 2 } });
   });
 });
 

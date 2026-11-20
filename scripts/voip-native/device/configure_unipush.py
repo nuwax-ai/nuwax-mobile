@@ -32,6 +32,7 @@ def clear_previous_configuration(project: Path) -> None:
     )
     if owned:
         names = {"GETUI_APPID", "PUSH_APPID", "GETUI_APP_ID", "MIPUSH_APPID", "MIPUSH_APPKEY", "com.huawei.hms.client.appid", "com.hihonor.push.app_id", "dcloud_unipush_auto_notification", "nuwax.voip.uniPush", "com.vivo.push.app_id", "com.vivo.push.api_key"}
+        names.update(("OPPOPUSH_APPKEY", "OPPOPUSH_APPSECRET"))
         for node in list(application.findall("meta-data")):
             if node.get(ANDROID + "name") in names:
                 application.remove(node)
@@ -80,6 +81,16 @@ def configure(project: Path, config_file: Path | None) -> None:
             "MIPUSH_APPKEY": xiaomi["appKey"],
         })
 
+    oppo = config.get("oppo")
+    if oppo is not None:
+        if not isinstance(oppo, dict) or any(
+            not isinstance(oppo.get(key), str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", oppo[key])
+            for key in ("appKey", "appSecret")
+        ):
+            raise SystemExit("OPPO Android SDK client AppKey and AppSecret must both be configured")
+        dependencies.append("implementation 'com.assist-v3:oppo:3.4.0'")
+        metadata.update({"OPPOPUSH_APPKEY": "${OPPO_APP_KEY}", "OPPOPUSH_APPSECRET": "${OPPO_APP_SECRET}"})
+
     vivo = config.get("vivo")
     if vivo is not None:
         app_id_vivo = vivo.get("appId") if isinstance(vivo, dict) else None
@@ -99,6 +110,8 @@ def configure(project: Path, config_file: Path | None) -> None:
     # Vendor AAR manifests consume placeholders as well as app-level metadata.
     placeholders = {"GETUI_APPID": app_id, "PUSH_APPID": app_id, "GETUI_APP_ID": app_id,
                     "dcloud_unipush_auto_notification": "false"}
+    if oppo is not None:
+        placeholders.update({"OPPO_APP_KEY": oppo["appKey"], "OPPO_APP_SECRET": oppo["appSecret"]})
     if vivo is not None:
         placeholders.update({"VIVO_APP_ID": app_id_vivo, "VIVO_APP_KEY": app_key_vivo})
     # Existing UniPush vendor channels; client AppIDs are supplied locally, never server secrets.
@@ -158,7 +171,7 @@ def configure(project: Path, config_file: Path | None) -> None:
         ET.SubElement(application, "service", {ANDROID + "name": STOCK_RECEIVER, TOOLS + "node": "remove"})
         ET.SubElement(application, "service", {ANDROID + "name": CALL_RECEIVER, ANDROID + "exported": "false"})
     tree.write(manifest, encoding="utf-8", xml_declaration=True)
-    print("✓ uni-push client configured; vendor adapters: " + ", ".join(vendor for vendor in ["huawei", "honor", "xiaomi", "vivo"] if config.get(vendor)))
+    print("✓ uni-push client configured; vendor adapters: " + ", ".join(vendor for vendor in ["huawei", "honor", "xiaomi", "vivo", "oppo"] if config.get(vendor)))
 
 
 if __name__ == "__main__":

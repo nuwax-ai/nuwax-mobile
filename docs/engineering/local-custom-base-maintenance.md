@@ -93,7 +93,7 @@ make base-all              # 三份一起打（不装设备、不上 S3）
 
 Android 调试基座：`configure_app.py` 默认 `ENABLE_HX_DEBUG=1`（`app/libs/debug-server` + `DCLOUD_DEBUG`），否则 HX 控制台无 `console.log`。正式向 / 发测试包用 `ENABLE_HX_DEBUG=0`，并建议 `ANDROID_BUILD_TYPE=release`（`assembleRelease`，debuggable=false）。`configure_app.py` 会把官方示例的 LeakCanary 改为 `debugImplementation`，避免 Release 启动闪退。
 
-Android 基座和测试 APK 共用标准打包入口。脚本根据 HBuilderX 导出资源选择同版本的离线 SDK，首次使用 5.34 时会自动从 S3 拉取。标准本地包读取应用级的 [`config/android/unipush-client.json`](../../config/android/unipush-client.json)，其中是已发布的个推、华为、荣耀、vivo 和小米客户端配置。签名及 DCloud 离线 AppKey 复用 `scripts/local-secrets.env` 或团队的 `nuwax-signing/local-secrets.env`。Android 测试包使用测试环境，调试基座在测试环境下同样启用 VoIP。
+Android 基座和测试 APK 共用标准打包入口。脚本根据 HBuilderX 导出资源选择同版本的离线 SDK，首次使用 5.34 时会自动从 S3 拉取。标准本地包读取应用级的 [`config/android/unipush-client.json`](../../config/android/unipush-client.json)，复用已发布 APK 中的个推、华为、荣耀、vivo、小米和 OPPO 客户端配置。签名及 DCloud 离线 AppKey 复用 `scripts/local-secrets.env` 或团队的 `nuwax-signing/local-secrets.env`。Android 测试包使用测试环境，调试基座在测试环境下同样启用 VoIP。
 
 iOS 模拟器注意：官方 5.15 `DCloudUTSExtAPI` 无 arm64-simulator slice。Apple Silicon 上若出现「UTS-Storage / uni-getSystemInfo 模块不存在」，请用脚本默认的 `SIM_FORCE_X86_64=1` 重打，并安装/选用 **支持 Rosetta** 的 iOS Simulator runtime（见 DCloud 模拟器文档）。
 

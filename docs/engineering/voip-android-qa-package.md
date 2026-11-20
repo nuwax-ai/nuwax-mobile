@@ -14,7 +14,7 @@ make app-resource    # 自己重打可供 HBuilderX 调试的基座时使用
 make base-android     # 生成 unpackage/debug/android_debug.apk
 ```
 
-标准入口读取资源的 HBuilderX 版本，按需下载 SDK 并生成本机工作副本。团队的 Android 签名和 DCloud 离线 AppKey 沿用现有签名配置。个推、华为、荣耀、vivo 和小米使用现有客户端配置。vivo 和小米的厂商适配用于普通推送，专用来电按独立的厂商验收结果交付。
+标准入口读取资源的 HBuilderX 版本，按需下载 SDK 并生成本机工作副本。团队的 Android 签名和 DCloud 离线 AppKey 沿用现有签名配置。个推、华为、荣耀、vivo、小米和 OPPO 复用已发布 APK 的客户端配置。vivo、小米和 OPPO 的厂商适配用于普通推送，专用来电按各厂商实测结果验收。
 
 先前发布的 `1.4.0` 云基座包含华为 SDK 和接听页，使用 DCloud 默认 UniPush 接收器。标准本地入口打出的基座和 APK 都会注册 `VoipUniPushIntentService`，由它把华为收到的通话邀请送进原生流程。HBuilderX 云端产物覆盖同一场景仍需集成该接收器并重新验收。
 

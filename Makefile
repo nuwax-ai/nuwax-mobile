@@ -1,6 +1,6 @@
 # 本地离线自定义基座（仅出包，不安装/不唤起设备）
 # 详见 docs/local-custom-base-maintenance.md · docs/custom-base-distribution-s3.md
-.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-fetch sdk-publish sdk-fetch app-resource android-tester android-release
+.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-promote base-fetch base-info base-list sdk-publish sdk-fetch app-resource android-tester android-release
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 HX_CLI ?= /Applications/HBuilderX.app/Contents/MacOS/cli
@@ -17,13 +17,15 @@ help:
 	@echo "  make android-tester       # 发测试：appResource → Release APK（无 HX 调试）"
 	@echo "  make android-release      # 正式上架：生产资源 → 正式签名 APK+AAB"
 	@echo ""
-	@echo "S3 分发（版本 = manifest versionName；同版本覆盖；fetch 默认最新）"
+	@echo "S3 自定义基座（当前分支 → 默认配置）"
 	@echo "  make base-publish         # 上传当前 unpackage/debug 产物"
-	@echo "  make base-fetch           # 拉取最新基座（不指定版本）"
+	@echo "  make base-fetch           # 下载当前分支的基座"
+	@echo "  make base-info            # 查看所选基座、SDK 和目录"
+	@echo "  make base-list            # 列出已发布基座"
 	@echo ""
 	@echo "离线 SDK S3 分发（版本 = NUWAX_HX_VERSION；打包 sdk/+archives，不含 work）"
 	@echo "  make sdk-publish          # 打包并上传离线 SDK"
-	@echo "  make sdk-fetch            # 拉取离线 SDK 到 NUWAX_OFFLINE_SDK_HOME"
+	@echo "  make sdk-fetch            # 同步当前分支匹配的离线 SDK"
 	@echo ""
 	@echo "base-ship 开关：SKIP_APP_RESOURCE=1 / SKIP_PUBLISH=1 / TARGETS=android,…"
 	@echo "android-tester 开关：SKIP_APP_RESOURCE=1 / DELIVER_NAME=xxx.apk"
@@ -65,6 +67,16 @@ base-harmony:
 
 base-publish:
 	@bash "$(ROOT)scripts/publish-custom-base-s3.sh"
+
+base-promote:
+	@bash "$(ROOT)scripts/publish-custom-base-s3.sh" --promote-only
+
+base-info:
+	@node "$(ROOT)scripts/resolve-package-profile.mjs" info
+	@bash "$(ROOT)scripts/fetch-custom-base-s3.sh" --info
+
+base-list:
+	@bash "$(ROOT)scripts/fetch-custom-base-s3.sh" --list
 
 base-fetch:
 	@bash "$(ROOT)scripts/fetch-custom-base-s3.sh"

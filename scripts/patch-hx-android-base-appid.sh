@@ -12,6 +12,8 @@ OLD='getZipEntriesFile)(t,"manifest.json")'
 NEW='getZipEntriesFile)(t,"/www/manifest.json")'
 # HBuilderX 5.26+ 上游已自行收窄为 www/manifest.json（无前导斜杠），无需补丁
 UPSTREAM='getZipEntriesFile)(t,"www/manifest.json")'
+# 5.34 使用 getAppManifestJson，按 assets/apps/<appid> 的路径匹配应用清单。
+UPSTREAM_APP_MANIFEST='/^assets\/apps\/([^/]+)\/(?:(www)\/)?manifest\.json$/'
 
 if [[ ! -f "$TARGET" ]]; then
   echo "未找到 HBuilderX 启动器: $TARGET" >&2
@@ -23,7 +25,7 @@ if grep -qF "$NEW" "$TARGET"; then
   exit 0
 fi
 
-if grep -qF "$UPSTREAM" "$TARGET"; then
+if grep -qF "$UPSTREAM" "$TARGET" || grep -qF "$UPSTREAM_APP_MANIFEST" "$TARGET"; then
   # 上游已修复，无需也无法再打补丁
   exit 0
 fi

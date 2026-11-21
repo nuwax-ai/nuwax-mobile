@@ -27,7 +27,7 @@ Usage: bash scripts/fetch-offline-sdk-s3.sh [options]
 
 Options:
   --dest DIR      解压目标 = NUWAX_OFFLINE_SDK_HOME（默认 $HOME/workspace/nuwax-mobile-offline-sdk）
-  --version VER   固定 HX 版本（默认读 latest.json 拉最新）
+  --version VER   固定 HX 版本（仓内默认分支配置；独立引导默认 latest）
   -h, --help
 
 还原内容：sdk/ + archives/ + iOS ESP 源码（work 的派生产物由构建脚本按需生成）。
@@ -66,6 +66,17 @@ resolve_dest() {
   if [[ -n "$DEST_DIR" ]]; then echo "$DEST_DIR"; return; fi
   echo "${NUWAX_OFFLINE_SDK_HOME:-$HOME/workspace/nuwax-mobile-offline-sdk}"
 }
+
+if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$script_dir/../custom-base.lock.json" && -f "$script_dir/resolve-package-profile.mjs" ]]; then
+    profile="$(node "$script_dir/resolve-package-profile.mjs" sdk "$PINNED_VERSION")" || fail "无法读取分支 SDK 配置"
+    if [[ -n "$profile" ]]; then
+      IFS=$'\t' read -r PINNED_VERSION profile_dest <<< "$profile"
+      DEST_DIR="${DEST_DIR:-${NUWAX_OFFLINE_SDK_HOME:-$profile_dest}}"
+    fi
+  fi
+fi
 
 DEST_DIR="$(resolve_dest)"
 mkdir -p "$DEST_DIR"
@@ -113,18 +124,22 @@ else
   ok "最新 → ${VERSION}"
 fi
 
+[[ "$VERSION" =~ ^[0-9]+[.][0-9]+$ ]] || fail "无效 SDK 版本：$VERSION"
 TARBALL="nuwax-mobile-offline-sdk-${VERSION}.tar.gz"
 VER_BASE="$base/versions/${VERSION}"
 
-# manifest（取 sha256 校验）
+# manifest（取 sha256 和该版本包含的平台）
 MANIFEST_SHA=""
+MANIFEST_PLATFORMS="android ios"
 if fetch_small "$VER_BASE/manifest.json" "$TMP/manifest.json"; then
   if command -v node >/dev/null 2>&1; then
     MANIFEST_SHA="$(node -p "require('$TMP/manifest.json').sha256 || ''" 2>/dev/null || true)"
+    platforms="$(node -p "(require('$TMP/manifest.json').platforms || []).filter(p => ['android', 'ios', 'harmony'].includes(p)).join(' ')" 2>/dev/null || true)"
+    MANIFEST_PLATFORMS="${platforms:-$MANIFEST_PLATFORMS}"
   fi
 fi
 
-info "下载 ${TARBALL}（约 1G+，请耐心）..."
+info "下载 ${TARBALL}（平台：${MANIFEST_PLATFORMS}）..."
 fetch_big "$VER_BASE/$TARBALL" "$TMP/$TARBALL" || fail "下载失败：$VER_BASE/$TARBALL"
 
 # sha256 校验
@@ -136,7 +151,7 @@ if [[ -n "$MANIFEST_SHA" ]] && command -v shasum >/dev/null 2>&1; then
     fail "sha256 不匹配（期望 $MANIFEST_SHA，实际 $actual）— 包可能损坏，已中止"
   fi
 else
-  warn "跳过 sha256 校验（无 manifest 或 shasum）"
+  fail "无法校验离线 SDK：缺少清单 SHA-256 或 shasum"
 fi
 
 # 还原：tar 打包时是 -C SDK_HOME sdk archives，故解压回 DEST 即恢复结构
@@ -149,17 +164,19 @@ echo "{\"schema\":\"nuwax.mobile.offlineSdk.v1\",\"version\":\"$VERSION\",\"fetc
 
 # 自检还原结果（与 local-base-env.sh 期望对齐）
 miss=0
-[[ -d "$DEST_DIR/sdk/android/$VERSION" ]] || { warn "缺失 sdk/android/$VERSION"; miss=1; }
-[[ -d "$DEST_DIR/sdk/ios/$VERSION" ]]     || { warn "缺失 sdk/ios/$VERSION"; miss=1; }
+for platform in $MANIFEST_PLATFORMS; do
+  [[ -d "$DEST_DIR/sdk/$platform/$VERSION" ]] || { warn "缺失 sdk/$platform/$VERSION"; miss=1; }
+done
 [[ -d "$DEST_DIR/archives" ]]             || { warn "缺失 archives/"; miss=1; }
-# iOS ESP 源码（信息性：Android 用不到；缺失则 iOS 模拟器基座需另备 ESP 源码）
-[[ -d "$DEST_DIR/work/ios/src/SwiftProtobuf" ]] || warn "缺失 work/ios/src/SwiftProtobuf（iOS 模拟器基座需 ESP 源码）"
+if [[ " $MANIFEST_PLATFORMS " == *" ios "* ]]; then
+  [[ -d "$DEST_DIR/work/ios/src/SwiftProtobuf" ]] || warn "缺失 work/ios/src/SwiftProtobuf（iOS 模拟器基座需 ESP 源码）"
+fi
 
 echo
 if [[ "$miss" == "0" ]]; then
   ok "完成 → ${DEST_DIR} (version=${VERSION})"
 else
-  warn "还原完成但部分目录缺失（见上），构建前请检查"
+  fail "还原完成但清单要求的 SDK 目录缺失（见上）"
 fi
 echo "下一步："
 echo "  source scripts/local-base-env.sh        # 派生各平台路径"

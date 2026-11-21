@@ -27,7 +27,7 @@ Usage: bash scripts/fetch-offline-sdk-s3.sh [options]
 
 Options:
   --dest DIR      解压目标 = NUWAX_OFFLINE_SDK_HOME（默认 $HOME/workspace/nuwax-mobile-offline-sdk）
-  --version VER   固定 HX 版本（默认读 latest.json 拉最新）
+  --version VER   固定 HX 版本（仓内默认分支配置；独立引导默认 latest）
   -h, --help
 
 还原内容：sdk/ + archives/ + iOS ESP 源码（work 的派生产物由构建脚本按需生成）。
@@ -66,6 +66,17 @@ resolve_dest() {
   if [[ -n "$DEST_DIR" ]]; then echo "$DEST_DIR"; return; fi
   echo "${NUWAX_OFFLINE_SDK_HOME:-$HOME/workspace/nuwax-mobile-offline-sdk}"
 }
+
+if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$script_dir/../custom-base.lock.json" && -f "$script_dir/resolve-package-profile.mjs" ]]; then
+    profile="$(node "$script_dir/resolve-package-profile.mjs" sdk "$PINNED_VERSION")" || fail "无法读取分支 SDK 配置"
+    if [[ -n "$profile" ]]; then
+      IFS=$'\t' read -r PINNED_VERSION profile_dest <<< "$profile"
+      DEST_DIR="${DEST_DIR:-${NUWAX_OFFLINE_SDK_HOME:-$profile_dest}}"
+    fi
+  fi
+fi
 
 DEST_DIR="$(resolve_dest)"
 mkdir -p "$DEST_DIR"
@@ -113,6 +124,7 @@ else
   ok "最新 → ${VERSION}"
 fi
 
+[[ "$VERSION" =~ ^[0-9]+[.][0-9]+$ ]] || fail "无效 SDK 版本：$VERSION"
 TARBALL="nuwax-mobile-offline-sdk-${VERSION}.tar.gz"
 VER_BASE="$base/versions/${VERSION}"
 
@@ -139,7 +151,7 @@ if [[ -n "$MANIFEST_SHA" ]] && command -v shasum >/dev/null 2>&1; then
     fail "sha256 不匹配（期望 $MANIFEST_SHA，实际 $actual）— 包可能损坏，已中止"
   fi
 else
-  warn "跳过 sha256 校验（无 manifest 或 shasum）"
+  fail "无法校验离线 SDK：缺少清单 SHA-256 或 shasum"
 fi
 
 # 还原：tar 打包时是 -C SDK_HOME sdk archives，故解压回 DEST 即恢复结构
@@ -164,7 +176,7 @@ echo
 if [[ "$miss" == "0" ]]; then
   ok "完成 → ${DEST_DIR} (version=${VERSION})"
 else
-  warn "还原完成但部分目录缺失（见上），构建前请检查"
+  fail "还原完成但清单要求的 SDK 目录缺失（见上）"
 fi
 echo "下一步："
 echo "  source scripts/local-base-env.sh        # 派生各平台路径"

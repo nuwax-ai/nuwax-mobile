@@ -21,15 +21,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FETCH_SCRIPT="$SCRIPT_DIR/fetch-offline-sdk-s3.sh"
 
-VERSION="${NUWAX_HX_VERSION:-5.24}"
-DRY_RUN=0
+VERSION="${NUWAX_HX_VERSION:-}"
+DRY_RUN="${NUWAX_SDK_DRY_RUN:-0}"
+NO_PROMOTE="${NUWAX_SDK_NO_PROMOTE:-}"
 
 usage() {
   cat <<'EOF'
 Usage: bash scripts/publish-offline-sdk-s3.sh [options]
 
 Options:
-  --version VERSION   HX 版本（默认 NUWAX_HX_VERSION=5.24；同版本覆盖）
+  --version VERSION   HX 版本（默认当前分支配置；同版本覆盖）
+  --no-promote        只上传指定版本，保留 latest 和公共下载入口（配置了分支 SDK 时默认）
   --dry-run           只打印计划，不上传
   -h, --help
 
@@ -44,21 +46,32 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --version) VERSION="${2:-}"; shift 2 ;;
+    --version) [[ -n "${2:-}" && "$2" != --* ]] || { usage >&2; exit 1; }; VERSION="$2"; shift 2 ;;
+    --no-promote) NO_PROMOTE=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
 
-command -v aws >/dev/null 2>&1 || { echo "aws cli required (brew install awscli)" >&2; exit 1; }
+[[ "$DRY_RUN" == 1 ]] || command -v aws >/dev/null 2>&1 || { echo "aws cli required" >&2; exit 1; }
 command -v tar >/dev/null 2>&1 || { echo "tar required" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "node required（写 latest.json）" >&2; exit 1; }
 
-SDK_HOME="${NUWAX_OFFLINE_SDK_HOME:-$HOME/workspace/nuwax-mobile-offline-sdk}"
+profile_home=""
+if [[ -f "$ROOT_DIR/custom-base.lock.json" && -f "$SCRIPT_DIR/resolve-package-profile.mjs" ]]; then
+  profile="$(node "$SCRIPT_DIR/resolve-package-profile.mjs" sdk "$VERSION")"
+  if [[ -n "$profile" ]]; then
+    IFS=$'\t' read -r VERSION profile_home <<< "$profile"
+    NO_PROMOTE="${NO_PROMOTE:-1}"
+  fi
+fi
+VERSION="${VERSION:-5.24}"
+NO_PROMOTE="${NO_PROMOTE:-0}"
+SDK_HOME="${NUWAX_OFFLINE_SDK_HOME:-${profile_home:-$HOME/workspace/nuwax-mobile-offline-sdk}}"
 [[ -d "$SDK_HOME/sdk" || -d "$SDK_HOME/archives" ]] \
   || { echo "未找到 $SDK_HOME 下的 sdk/ 或 archives/（先按维护文档准备离线 SDK）" >&2; exit 1; }
-[[ "$VERSION" != *"/"* && "$VERSION" != *".."* ]] || { echo "非法 version: $VERSION" >&2; exit 1; }
+[[ "$VERSION" =~ ^[0-9]+[.][0-9]+$ ]] || { echo "非法 version: $VERSION" >&2; exit 1; }
 
 if [[ -z "${AWS_ACCESS_KEY_ID:-}" && -n "${NUWAX_S3_ACCESS_KEY_ID:-}" ]]; then
   export AWS_ACCESS_KEY_ID="$NUWAX_S3_ACCESS_KEY_ID"
@@ -74,10 +87,6 @@ PREFIX="${NUWAX_S3_SDK_PREFIX:-mobile-offline-sdk}"
 
 AWS_ARGS=(--endpoint-url "$ENDPOINT" --region "$REGION")
 [[ "${NUWAX_S3_NO_VERIFY_SSL:-0}" == "1" ]] && AWS_ARGS+=(--no-verify-ssl)
-
-run_aws() {
-  if [[ "$DRY_RUN" == "1" ]]; then echo "+ aws $*"; else aws "$@"; fi
-}
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
@@ -96,7 +105,15 @@ echo "  prefix:   $PREFIX"
 
 # 打包：sdk/ + archives/ + iOS ESP 源码输入（work 的派生产物 build/out/DerivedData 仍不打）
 INCLUDE=()
-[[ -d "$SDK_HOME/sdk" ]] && INCLUDE+=("sdk")
+PLATFORMS=()
+for platform in android ios harmony; do
+  if [[ -d "$SDK_HOME/sdk/$platform/$VERSION" ]]; then
+    PLATFORMS+=("$platform")
+    INCLUDE+=("sdk/$platform/$VERSION")
+  fi
+done
+[[ ${#PLATFORMS[@]} -gt 0 ]] || { echo "SDK $VERSION 未找到任何平台目录" >&2; exit 1; }
+PLATFORMS_JSON="$(node -e 'console.log(JSON.stringify(process.argv.slice(1)))' "${PLATFORMS[@]}")"
 [[ -d "$SDK_HOME/archives" ]] && INCLUDE+=("archives")
 # iOS ESP 源码（非派生输入；fresh fetch 后从源码编 ESPProvision/SwiftProtobuf framework 必需，否则 iOS 模拟器基座打不出）
 ESP_SRC_DIRS=("work/ios/src/SwiftProtobuf" "work/ios/src/ESPProvision" "work/ios/SwiftProtobuf" "work/ios/ESPProvision")
@@ -111,10 +128,13 @@ TARBALL="nuwax-mobile-offline-sdk-${VERSION}.tar.gz"
 OUT="$STAGE/$TARBALL"
 echo "→ 打包 $TARBALL (${INCLUDE[*]}) ..."
 if [[ "$DRY_RUN" == "1" ]]; then
-  echo "+ tar czf $OUT -C $SDK_HOME ${INCLUDE[*]}"
-else
-  tar czf "$OUT" -C "$SDK_HOME" "${INCLUDE[@]}"
+  printf '平台 %s；源 %s；目标 s3://%s/%s/versions/%s/\n' "${PLATFORMS[*]}" "$SDK_HOME" "$BUCKET" "$PREFIX" "$VERSION"
+  printf 'tar -czf %q -C %q' "$OUT" "$SDK_HOME"
+  printf ' %q' "${INCLUDE[@]}"
+  printf '\n'
+  exit 0
 fi
+tar czf "$OUT" -C "$SDK_HOME" "${INCLUDE[@]}"
 
 SIZE=$(wc -c < "$OUT" | tr -d ' ')
 SHA=$(sha256_file "$OUT")
@@ -126,6 +146,7 @@ MANIFEST="$STAGE/manifest.json"
   echo "{"
   echo "  \"schema\": \"nuwax.mobile.offlineSdk.v1\","
   echo "  \"version\": \"$VERSION\","
+  echo "  \"platforms\": $PLATFORMS_JSON,"
   echo "  \"tarball\": \"$TARBALL\","
   echo "  \"sha256\": \"$SHA\","
   echo "  \"bytes\": $SIZE,"
@@ -142,25 +163,32 @@ S3_BASE="s3://$BUCKET/$PREFIX"
 VER_BASE="$S3_BASE/versions/$VERSION"
 
 echo "→ 上传 $TARBALL ($((SIZE/1024/1024)) MiB)"
-run_aws s3 cp "$OUT" "$VER_BASE/$TARBALL" "${AWS_ARGS[@]}" \
+aws s3 cp "$OUT" "$VER_BASE/$TARBALL" "${AWS_ARGS[@]}" \
   --cache-control "public, max-age=60, must-revalidate" \
   --content-type "application/gzip" >/dev/null
 
 echo "→ 上传 manifest.json"
-run_aws s3 cp "$MANIFEST" "$VER_BASE/manifest.json" "${AWS_ARGS[@]}" \
+aws s3 cp "$MANIFEST" "$VER_BASE/manifest.json" "${AWS_ARGS[@]}" \
   --cache-control "public, max-age=60, must-revalidate" \
   --content-type "application/json" >/dev/null
 
 if [[ -f "$FETCH_SCRIPT" ]]; then
   echo "→ 引导 fetch-offline-sdk-s3.sh"
-  run_aws s3 cp "$FETCH_SCRIPT" "$VER_BASE/scripts/fetch-offline-sdk-s3.sh" "${AWS_ARGS[@]}" \
+  aws s3 cp "$FETCH_SCRIPT" "$VER_BASE/scripts/fetch-offline-sdk-s3.sh" "${AWS_ARGS[@]}" \
     --cache-control "public, max-age=60, must-revalidate" \
     --content-type "text/x-shellscript" >/dev/null
-  run_aws s3 cp "$FETCH_SCRIPT" "$S3_BASE/fetch-offline-sdk-s3.sh" "${AWS_ARGS[@]}" \
-    --cache-control "public, max-age=60, must-revalidate" \
-    --content-type "text/x-shellscript" >/dev/null
+  if [[ "$NO_PROMOTE" != 1 ]]; then
+    aws s3 cp "$FETCH_SCRIPT" "$S3_BASE/fetch-offline-sdk-s3.sh" "${AWS_ARGS[@]}" \
+      --cache-control "public, max-age=60, must-revalidate" \
+      --content-type "text/x-shellscript" >/dev/null
+  fi
 else
   echo "  warn: fetch script missing at $FETCH_SCRIPT" >&2
+fi
+
+if [[ "$NO_PROMOTE" == 1 ]]; then
+  echo "SDK $VERSION 已上传，保留原 latest 指针"
+  exit 0
 fi
 
 LATEST_BODY=$(VERSION="$VERSION" GITSHA="$GIT_SHA" DATE="$RELEASE_DATE" node <<'NODE'
@@ -173,15 +201,10 @@ process.stdout.write(JSON.stringify({
 NODE
 )
 echo "→ latest.json"
-if [[ "$DRY_RUN" == "1" ]]; then
-  echo "+ aws s3 cp - $S3_BASE/latest.json"
-  echo "$LATEST_BODY"
-else
-  printf '%s' "$LATEST_BODY" | aws s3 cp - "$S3_BASE/latest.json" \
-    "${AWS_ARGS[@]}" \
-    --cache-control "public, max-age=60, must-revalidate" \
-    --content-type "application/json"
-fi
+printf '%s' "$LATEST_BODY" | aws s3 cp - "$S3_BASE/latest.json" \
+  "${AWS_ARGS[@]}" \
+  --cache-control "public, max-age=60, must-revalidate" \
+  --content-type "application/json"
 
 echo
 echo "Publish complete: offline SDK $VERSION → versions/$VERSION/ (overwritten) + latest"

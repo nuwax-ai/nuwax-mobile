@@ -1,6 +1,6 @@
 # 自定义基座 S3 分发操作手册
 
-适用于 Android、iOS 真机、iOS 模拟器和已产出基座的鸿蒙。业务版本和基座选用规则见 [业务 App 与自定义基座版本规范](./custom-base-multi-version-plan.md)。
+适用于 Android、iOS 真机、iOS 模拟器和已产出基座的鸿蒙。分支选择、离线 SDK 和云打包入口见 [分支打包手册](./branch-packaging.md)。
 
 ## 同事下载和更新
 
@@ -22,9 +22,9 @@ NUWAX_BASE_CHANNEL=debug make base-fetch
 ```
 
 - 固定版本和非默认通道保存到 `unpackage/debug/versions/<基座 ID>/`。同一工作区可以保留多个版本。HBuilderX 中选择「运行 → 使用自定义基座运行」，使用命令输出目录下对应的文件。
-- 无参数下载按 `manifest.json` 的 App 版本系列匹配 `custom-base.lock.json`。映射版本和显式选择的 `debug` 通道都写 `unpackage/debug/`。要让仍读取该目录的命令使用指定版本，可显式传 `NUWAX_BASE_DEST=unpackage/debug`。该目录是共享位置，需要保留多个版本时使用默认的版本子目录。也可用 `--dest DIR` 保存到单独目录。
+- 分支映射和仓库默认均保存到版本子目录。旧 App 系列映射和显式选择的 `debug` 通道写 `unpackage/debug/`。要让仍读取该目录的命令使用指定版本，可显式传 `NUWAX_BASE_DEST=unpackage/debug`。该目录是共享位置，需要保留多个版本时使用默认的版本子目录。也可用 `--dest DIR` 保存到单独目录。
 - 下载先读取发布清单，校验文件大小和 SHA-256，模拟器包先解压，再替换目标文件。命令在下载、校验或解压阶段失败时保留已有包。更新时会清理下载器在该目录记录、但新版本未提供的旧包。
-- 选择顺序为显式固定版本、显式通道、当前仓库的系列映射。没有映射文件的旧工作区和仓外 bootstrap 使用 `debug` 通道。配置文件存在但缺少本系列时，命令会提示维护映射。
+- 选择顺序为显式固定版本、显式通道、当前分支映射、仓库默认，然后是旧系列映射。没有映射文件的旧工作区和仓外 bootstrap 使用 `debug` 通道。配置文件存在但缺少本系列时，命令会提示维护映射。
 - 没有指定平台时下载该版本清单里已有的平台。同一版本可分次下载不同平台。
 
 | 文件 | 用途 |
@@ -64,7 +64,7 @@ curl -fsSL https://s3.nuwax.com:9443/nuwax-packages/mobile-custom-bases/fetch-cu
 
 在对应源码的工作区运行。默认读取 `unpackage/debug/`。如果同时准备了几套包，用 `NUWAX_BASE_SOURCE` 或 `--source DIR` 指定本次产物目录。
 
-新发布须显式填写独立的 `X.Y.Z` 基座版本。Android 和 iOS 发布时读取包内 App 版本并与源码核对，清单会保留各产物的内置 App 版本。业务分支下载基座时按映射选用，允许使用从其他兼容 App 版本构建的基座。
+新发布使用当前分支条目配置的 `X.Y.Z` 基座版本，也可显式给出新的版本。Android 和 iOS 发布时读取包内 App 版本并与源码核对，清单会保留各产物的内置 App 版本。业务分支下载基座时按映射选用，允许使用从其他兼容 App 版本构建的基座。
 
 ```bash
 # 预演，检查产物、版本号以及目标路径
@@ -116,7 +116,7 @@ TARGETS=android NUWAX_HX_VERSION=5.34 NUWAX_BASE_VERSION=2.1.1 \
    NUWAX_BASE_VERSION="$BASE_VERSION" NUWAX_BASE_TARGETS=android make base-fetch
    ```
 
-4. 验收后提交对应的业务和原生插件改动、`manifest.json` 及 `custom-base.lock.json` 的新系列映射。仓库保存源码和映射，S3 保存 APK，离线 SDK 仅供本地重打包使用。版本映射按 App 系列生效。若同一系列要默认支持 iOS，先准备包含所需平台的基座版本再更新映射。锁定版本生效后，同事更新对应分支并运行 `make base-info`、`make base-fetch`。
+4. 验收后提交对应的业务和原生插件改动、`manifest.json` 及 `custom-base.lock.json` 的新系列映射。仓库保存源码和映射，S3 保存 APK，离线 SDK 仅供本地重打包使用。版本映射优先按 Git 分支生效。若同一系列要默认支持 iOS，先准备包含所需平台的基座版本再更新映射。锁定版本生效后，同事更新对应分支并运行 `make base-info`、`make base-fetch`。
 
 ### 版本重发、失败和回退
 

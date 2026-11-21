@@ -16,10 +16,10 @@ usage() {
 Usage: bash scripts/fetch-custom-base-s3.sh [options]
 
   --version ID    固定基座版本；优先于通道
-  --channel NAME  显式跟随通道，覆盖仓库版本映射
+  --channel NAME  显式跟随通道，覆盖分支及默认映射
   --targets LIST  android,ios-device,ios-simulator,harmony；默认下载清单中所有已发布平台
   --dest DIR      指定输出目录；默认固定版本/独立通道存入 unpackage/debug/versions/<ID>/
-                  仓库映射版本和默认 debug 通道使用 unpackage/debug/
+                  旧 App 系列映射和默认 debug 通道使用 unpackage/debug/
   --info          只读取并显示本次匹配的基座及发布清单摘要
   --list          列出 S3 上可用的已发布基座版本（需要 AWS CLI，无须凭证）
   -h, --help
@@ -88,7 +88,14 @@ if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
 fi
 
 versioned=1
-if [[ -n "$VERSION" ]]; then
+profile=""
+if [[ -z "$VERSION" && -z "$CHANNEL" && -f "$root/custom-base.lock.json" && -f "$root/scripts/resolve-package-profile.mjs" ]]; then
+  profile="$(node "$root/scripts/resolve-package-profile.mjs" base)" || fail "无法读取分支基座配置"
+fi
+if [[ -n "$profile" ]]; then
+  IFS=$'\t' read -r VERSION profile_name <<< "$profile"
+  printf '打包配置 %s → 基座 %s\n' "$profile_name" "$VERSION"
+elif [[ -n "$VERSION" ]]; then
   [[ "$VERSION" =~ ^v[0-9] ]] && VERSION="${VERSION#v}"
 elif [[ -z "$CHANNEL" && -f "$root/custom-base.lock.json" ]]; then
   [[ -f "$root/manifest.json" ]] || fail "仓库缺少 manifest.json，无法确定 App 版本系列"
@@ -133,14 +140,15 @@ fi
 
 art_base="$base/versions/$VERSION/artifacts"
 if [[ "$MODE" == info ]]; then
-  fetch "$art_base/manifest.json" - | VERSION="$VERSION" node -e '
+  manifest_json="$(fetch "$art_base/manifest.json" -)" || fail "无法读取基座 $VERSION 的发布清单"
+  VERSION="$VERSION" node -e '
     const manifest = JSON.parse(require("fs").readFileSync(0, "utf8"));
     if (manifest.version !== process.env.VERSION || !Array.isArray(manifest.artifacts) || !manifest.artifacts.length) {
       throw new Error("没有读取到有效的基座发布清单");
     }
-    const { version, hxVersion, appVersionName, artifacts } = manifest;
-    console.log(JSON.stringify({ version, hxVersion, appVersionName, artifacts: artifacts.map(({ name }) => name) }, null, 2));
-  ' || fail "无法读取基座 $VERSION 的发布清单"
+    const { version, hxVersion, appVersionName, appVersionCode, gitSha, gitDirty, artifacts } = manifest;
+    console.log(JSON.stringify({ version, hxVersion, appVersionName, appVersionCode, gitSha, gitDirty, artifacts: artifacts.map(({ name }) => name) }, null, 2));
+  ' <<< "$manifest_json" || fail "无法读取基座 $VERSION 的发布清单"
   echo "下载目录：$DEST_DIR"
   exit 0
 fi

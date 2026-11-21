@@ -903,7 +903,9 @@ object VoipBridge {
     }
 
     /** Called by the native UniPush service before the SDK converts force_notification into an IM notice. */
-    @JvmStatic fun receiveUniPush(ctx: Context, payload: String, source: String): Boolean {
+    @JvmStatic @JvmOverloads fun receiveUniPush(
+        ctx: Context, payload: String, source: String, onVerification: ((Job) -> Unit)? = null
+    ): Boolean {
         context = ctx.applicationContext
         val invitation = runCatching { JSONObject(payload) }.getOrNull() ?: return false
         val native = VoipPushPayload.isNative(invitation)
@@ -921,14 +923,15 @@ object VoipBridge {
         if (!debug && !saved.optBoolean("qaAccepted") && !native) return false
         if (native && !VoipPushPayload.eligible(invitation, saved.optString("userId"), System.currentTimeMillis())) return true
         trace(if (native) "native push routed to call source=$source callId=${invitation.optString("callId")}" else "native push routed to call")
-        incoming(ctx, invitation, saved.optString("scope"))
+        val verification = incoming(ctx, invitation, saved.optString("scope"))
+        onVerification?.invoke(verification)
         return true
     }
 
     /** Restore the authenticated native context and verify the invitation before ringing. */
-    private fun incoming(ctx: Context, invitation: JSONObject, sessionScope: String) {
+    private fun incoming(ctx: Context, invitation: JSONObject, sessionScope: String): Job {
         context = ctx.applicationContext
-        scope.launch {
+        return scope.launch {
             try {
                 if (config.optString("accessToken").isEmpty()) {
                     loadConfig()?.takeIf { it.optString("scope") == sessionScope }?.let { initialize(it) }

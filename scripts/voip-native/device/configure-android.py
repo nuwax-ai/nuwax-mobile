@@ -89,11 +89,11 @@ if __name__ == "__main__":
     project = Path(os.environ["ANDROID_ESP_PROJECT"])
     enabled = os.environ.get("NUWAX_VOIP_DEVICE_TEST") == "1"
     config_path = os.environ.get("NUWAX_ANDROID_UNIPUSH_CONFIG")
-    configure_test_host(project, enabled)
-    configure(project, Path(config_path) if config_path else None)
     qa_path = os.environ.get("NUWAX_ANDROID_QA_PROJECT")
-    configure_resources(project, Path(qa_path) if qa_path else Path(__file__).resolve().parents[3])
     release_origin = os.environ.get("NUWAX_ANDROID_VOIP_RELEASE_ORIGIN")
     if enabled and release_origin:
         raise SystemExit("Android VoIP release origin cannot be combined with the device test host")
     configure_qa_manifest(project, Path(qa_path) if qa_path else None, release_origin)
+    configure_test_host(project, enabled)
+    configure(project, Path(config_path) if config_path else None, enable_vivo_voip=bool(qa_path))
+    configure_resources(project, Path(qa_path) if qa_path else Path(__file__).resolve().parents[3])

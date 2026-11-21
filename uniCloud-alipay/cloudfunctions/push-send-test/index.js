@@ -328,13 +328,13 @@ async function resolveAutoCallRoute(cid, invocationId) {
 }
 
 async function sendNativeVoip(body, route, nativeVoip, invocationId) {
-  const android = route.platform === 'android'
-  if (android && typeof uniPush.request !== 'function') {
+  const huaweiTransmission = route.transport === 'android-huawei'
+  if (huaweiTransmission && typeof uniPush.request !== 'function') {
     return { errCode: 503, errMsg: 'UniPush transmission adapter unavailable', data: { requestId: nativeVoip.requestId } }
   }
   try {
     let result
-    if (android) {
+    if (huaweiTransmission) {
       const transmission = JSON.stringify({ unipush_version: '2.0', payload: nativeVoip.payload })
       // sendMessage builds ups.notification even when force_notification is false.
       result = await uniPush.request({
@@ -349,14 +349,15 @@ async function sendNativeVoip(body, route, nativeVoip, invocationId) {
         }
       })
     } else {
-      const nativeOptions = mergeOptions(nativeVoip.options, buildChannelOptions(notificationChannel(body)))
+      const ios = route.platform === 'ios'
+      const nativeOptions = ios ? mergeOptions(nativeVoip.options, buildChannelOptions(notificationChannel(body))) : nativeVoip.options
       result = await uniPush.sendMessage({
         push_clientid: [route.cid],
         title: clip(body.title, MAX_TITLE),
         content: clip(body.content, MAX_CONTENT),
         payload: nativeVoip.payload,
         settings: nativeVoip.settings,
-        category: notificationCategory(body),
+        ...(ios ? { category: notificationCategory(body) } : {}),
         force_notification: false,
         request_id: nativeVoip.requestId,
         ...(nativeOptions ? { options: nativeOptions } : {})
@@ -374,7 +375,7 @@ async function sendNativeVoip(body, route, nativeVoip, invocationId) {
     })
     console.log('[push-send] call transport', JSON.stringify({
       invocationId, transport: route.transport, cid: route.cid, callId: nativeVoip.payload.callId,
-      requestId: nativeVoip.requestId, errCode,
+      requestId: nativeVoip.requestId, scene: nativeVoip.payload.scene, errCode, tasks,
     }))
     return { errCode, data: { requestId: nativeVoip.requestId, tasks } }
   } catch {
@@ -492,9 +493,7 @@ async function handle(event, invocationId) {
   if (scene?.meeting && JSON.stringify(scene.meeting).length > MAX_PAYLOAD) {
     return { errCode: 400, errMsg: 'meeting invitation payload too large' }
   }
-  // 会议响铃：走原生来电通道（PushKit / 全屏 Intent / 前台服务），让熄屏和进程被杀时
-  // 也能亮屏、响铃并出现来电卡片。测试空间不再用环境变量总闸，也不以 callRoute 是否存在
-  // 作为决策条件：后端给了路由就原生投递，没给就回退普通通知。
+  // 响铃会议与单聊来电共用逐设备选路。无显式路由时查询 IM 的 iOS 登记或个推厂商档案。
   const meetingRequested = scene?.meeting != null &&
     body.payload?.silent !== true
   // 响铃字段不完整/已过期时回退普通 IM 通知，不能整条 400——否则用户连会议卡片都收不到。
@@ -553,9 +552,20 @@ async function handle(event, invocationId) {
         const native = prepareNativeVoip({
           ...body, push_clientid: cid, payload: invitation.payload, callRoute: route,
         }, Date.now())
-        if (native != null && native.error == null && native.expired !== true && !native.notificationOnly) {
+        if (native?.expired) {
+          results.push({ cid, transport: route.transport, skipped: true, errCode: 0 })
+          continue
+        }
+        if (native?.error) {
+          console.error('[push-send] call route rejected', JSON.stringify({
+            invocationId, transport: route.transport, callId: invitation.payload.callId, reason: native.error,
+          }))
+          results.push({ cid, transport: route.transport, errCode: 400, errMsg: native.error })
+          continue
+        }
+        if (native != null && !native.notificationOnly) {
           const sent = await sendNativeVoip(body, route, native, invocationId)
-          results.push({ cid, delivery: 'native', ...(iosRoute ? { transport: iosRoute.transport } : {}),
+          results.push({ cid, delivery: 'native', transport: route.transport,
             errCode: sent.errCode, ...sent.data })
           continue
         }

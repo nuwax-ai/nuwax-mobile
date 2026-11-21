@@ -10,6 +10,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 sys.path.insert(0, sys.argv[1])
 from configure_unipush import configure, ANDROID, TOOLS, CALL_RECEIVER, STOCK_RECEIVER, CALL_RECEIVER_FILE
+from configure_unipush import VIVO_STOCK_RECEIVER, VIVO_PUSH_RECEIVER, VIVO_CALL_RECEIVER, VIVO_RECEIVER_FILE
 with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     root = Path(directory)
     (root / 'app/src/main').mkdir(parents=True)
@@ -45,6 +46,22 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     assert metadata['com.hihonor.push.app_id'] == '987654321'
     assert metadata['com.vivo.push.app_id'] == '\${VIVO_APP_ID}'
     assert metadata['com.vivo.push.api_key'] == '\${VIVO_APP_KEY}'
+    configure(root, config, enable_vivo_voip=True)
+    configure(root, config, enable_vivo_voip=True)
+    app = ET.parse(manifest).getroot().find('application')
+    names = [r.get(ANDROID+'name') for r in app.findall('receiver')]
+    assert names == [VIVO_STOCK_RECEIVER, VIVO_PUSH_RECEIVER, VIVO_CALL_RECEIVER]
+    stock, push, call = app.findall('receiver')
+    assert stock.get(TOOLS+'node') == 'remove'
+    assert push.get(ANDROID+'process') == ':pushservice'
+    assert push.find('intent-filter/action').get(ANDROID+'name') == 'com.vivo.pushclient.action.RECEIVE'
+    assert call.get(ANDROID+'exported') == 'false' and call.get(ANDROID+'process') is None
+    assert (root / VIVO_RECEIVER_FILE).is_file()
+    assert (root / 'app/build.gradle').read_text().count('com.assist-v3:vivo:3.3.0') == 1
+    configure(root, config)
+    app = ET.parse(manifest).getroot().find('application')
+    assert not app.findall('receiver') and not (root / VIVO_RECEIVER_FILE).exists()
+    assert (root / 'app/build.gradle').read_text().count('com.assist-v3:vivo:3.1.2') == 1
     configure(root, None)
     app = ET.parse(manifest).getroot().find('application')
     assert [s.get(ANDROID+'name') for s in app.findall('service')] == ['example.OrdinaryService']

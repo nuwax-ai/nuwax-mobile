@@ -170,13 +170,13 @@ exports.prepareVoipScene = (body, now = Date.now()) => {
   return { meeting }
 }
 
-// Getui registry brand codes. A native route also needs a vendor-specific sender.
+// Getui brand codes and the UniPush strategies exercised in this test space.
 const callTransports = new Map([
   ['ios-voip', { platform: 'ios', strategy: 'ios' }],
   ['android-huawei', { platform: 'android', brand: 'hw', strategy: 'hw' }],
   ['android-honor', { platform: 'android', brand: 'ho' }],
   ['android-xiaomi', { platform: 'android', brand: 'xm' }],
-  ['android-vivo', { platform: 'android', brand: 'vv' }],
+  ['android-vivo', { platform: 'android', brand: 'vv', strategy: 'vv' }],
   // Includes OnePlus and realme devices registered with domestic OPPO PUSH.
   ['android-oppo', { platform: 'android', brand: 'op' }],
   ['android-oppo-global', { platform: 'android', brand: 'opg' }],
@@ -241,9 +241,21 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   const requestId = createHash('sha256')
     .update(JSON.stringify([route.transport, route.cid, ios ? route.registrationId : '', payload.callId]))
     .digest('hex').slice(0, 32)
-  return {
-    payload, requestId,
-    settings: { ttl: Math.min(5_000, invitation.settings.ttl), strategy: { [strategy]: 2 } },
-    ...(ios ? { options: { ios: { type: 'voip', payload: JSON.stringify(payload) } } } : {})
+  const ttl = Math.min(5_000, invitation.settings.ttl)
+  const settings = { ttl, strategy: { [strategy]: 2 } }
+  if (strategy === 'vv') {
+    // Test-space probe via UniPush. Vendor receipt and SDK callback are verified separately.
+    const seconds = Math.floor(ttl / 1000)
+    if (seconds < 1) return { expired: true }
+    const callPayload = { ...payload, scene: payload.scene ?? 'call', pushEnvironment: 'test' }
+    const options = { android: { VV: {
+      '/header/message-type': 3,
+      '/message/extraData': JSON.stringify(callPayload),
+      '/options/ttl': seconds,
+      '/options/appMessageId': requestId,
+    } } }
+    return { payload: callPayload, requestId, settings, options }
   }
+  return { payload, requestId, settings,
+    ...(ios ? { options: { ios: { type: 'voip', payload: JSON.stringify(payload) } } } : {}) }
 }

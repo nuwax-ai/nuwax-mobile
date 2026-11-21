@@ -364,7 +364,7 @@ IM 根据其设备登记确定被叫 CID 和可用通道。云函数从已验签
 | 华为安卓 | `hw` | `android-huawei` | UniPush UPS 纯透传，填充 `push_channel.android.ups.transmission` |
 | 荣耀 | `ho` | `android-honor` | 普通通知 |
 | 小米／Redmi | `xm` | `android-xiaomi` | 普通通知 |
-| vivo／iQOO | `vv` | `android-vivo` | 普通通知 |
+| vivo／iQOO | `vv` | `android-vivo` | 独立测试空间通过 UniPush 的 `options.android.VV` 尝试专用来电。个推已受理，Y77 锁屏无进程唤醒待通过 |
 | OPPO 国内（含登记在该通道的一加、realme） | `op` | `android-oppo` | 普通通知 |
 | OPPO 海外 | `opg` | `android-oppo-global` | 普通通知 |
 | 魅族 | `mz` | `android-meizu` | 普通通知 |

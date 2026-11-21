@@ -47,8 +47,10 @@ vendor_adapters = ["huawei", "honor"]
 client_config_path = os.environ.get("NUWAX_ANDROID_UNIPUSH_CONFIG")
 client_config = json.loads(Path(client_config_path).read_text()) if client_config_path else {}
 if "vivo" in client_config:
-    for component in ["com.igexin.sdk.VivoPushMessageReceiver", "com.vivo.push.sdk.service.CommandClientService"]:
+    for component in ["com.nuwax.voip.VivoVoipPushMessageReceiver", "com.nuwax.voip.VivoVoipCallReceiver",
+                      "com.vivo.push.sdk.service.CommandClientService"]:
         assert component in xml, f"Missing vivo push component: {component}"
+    assert "com.igexin.sdk.VivoPushMessageReceiver" not in xml, "Duplicate vivo SDK receiver"
     for name, field in [("com.vivo.push.app_id", "appId"), ("com.vivo.push.api_key", "appKey"),
                         ("app_id", "appId"), ("api_key", "appKey")]:
         # aapt renders numeric manifest values as typed hexadecimal integers.
@@ -96,6 +98,7 @@ with zipfile.ZipFile(APK) as archive:
         assert value.encode() in dex, f"Missing compiled implementation: {value}"
     if "vivo" in vendor_adapters:
         assert b"Lcom/igexin/sdk/VivoPushMessageReceiver;" in dex and b"Lcom/vivo/push/" in dex, "vivo push SDK is missing"
+        assert b"Lcom/nuwax/voip/VivoVoipPushMessageReceiver;" in dex and b"isCallMessage" in dex, "vivo VoIP receiver is missing"
     assert b"Lio/dcloud/debug/" not in dex, "HX debug server is bundled"
 
 native = ROOT / "uni_modules/nuwax-voip/utssdk/app-android/src/com/nuwax/voip"

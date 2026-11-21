@@ -340,9 +340,11 @@ public class MeetingRoomBridge: NSObject {
           screenShareErrorText = "replaykit_unavailable"
           return
         }
+        // ★15fps 在对方屏幕上会明显一顿一顿（PC 端共享是 30fps）。采集提到 30fps；
+        //   分辨率仍走 1080p 档，再高会明显吃带宽/电量。
         let options = ScreenShareCaptureOptions(
           dimensions: .h1080_169,
-          fps: 15,
+          fps: 30,
           showCursor: false,
           appAudio: false,
           useBroadcastExtension: false,
@@ -414,6 +416,13 @@ public class MeetingRoomBridge: NSObject {
     onMain {
       stopScreenShareInternal(room: room)
     }
+  }
+
+  /// 本端麦克风是否被**服务端**静音（PC 的 TrackMuted 同口径）。
+  /// ★主持人在服务端静音只改 publication.isMuted，本机开关状态不变，必须单独查。
+  public static func isMicMuted() -> Bool {
+    guard let room = room else { return false }
+    return room.localParticipant.getTrackPublication(source: .microphone)?.isMuted ?? false
   }
 
   public static func isScreenShareOn() -> Bool {

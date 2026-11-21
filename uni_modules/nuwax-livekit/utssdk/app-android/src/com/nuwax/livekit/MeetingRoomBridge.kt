@@ -238,6 +238,20 @@ class MeetingRoomBridge(context: Context) {
     }
   }
 
+  /**
+   * 本端麦克风是否被**服务端**静音（PC 的 TrackMuted 同口径）。
+   * ★与 setMicEnabled 的本地开关不是一回事：主持人静音只改 publication.muted，
+   *   本机 UI 仍以为自己开着，必须靠这个值把界面和采集收回。
+   */
+  fun isMicMuted(): Boolean {
+    val r = room ?: return false
+    return try {
+      r.localParticipant.getTrackPublication(Track.Source.MICROPHONE)?.muted ?: false
+    } catch (e: Throwable) {
+      false
+    }
+  }
+
   fun isScreenShareOn(): Boolean = screenShareOn
 
   fun screenShareError(): String = screenShareError

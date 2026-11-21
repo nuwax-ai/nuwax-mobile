@@ -17,7 +17,7 @@ test('publishes immutable versions and downloads or switches each channel indepe
   const root = mkdtempSync(join(tmpdir(), 'nuwax-custom-base-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   mkdirSync(join(root, 'scripts'));
-  for (const name of ['Makefile', 'scripts/fetch-custom-base-s3.sh', 'scripts/publish-custom-base-s3.sh', 'scripts/ship-custom-bases.sh']) {
+  for (const name of ['Makefile', 'scripts/fetch-custom-base-s3.sh', 'scripts/resolve-package-profile.mjs', 'scripts/publish-custom-base-s3.sh', 'scripts/ship-custom-bases.sh']) {
     copyFileSync(new URL(`../${name}`, import.meta.url), join(root, name));
   }
   writeFileSync(join(root, 'manifest.json'), '{"versionName":"1.3.9","versionCode":"139"}');
@@ -190,6 +190,23 @@ test('publishes immutable versions and downloads or switches each channel indepe
   await pointAt('debug', v1);
   assert.equal(pointerVersion('latest.json'), v1);
   assert.equal(pointerVersion('channels/dev.json'), v2);
+
+  const git = (...args) => execFileSync('git', args, { cwd: root });
+  git('symbolic-ref', 'HEAD', 'refs/heads/feat-2026.11.24');
+  writeFileSync(lockFile, JSON.stringify({
+    branches: { 'feat-2026.11.24': { baseVersion: v2, sdkVersion: '5.34' } },
+    default: { baseVersion: v1, sdkVersion: '5.23' },
+  }));
+  assert.match((await make('base-info')).stdout, /打包配置 feat-2026.11.24 → 基座 2[.]1[.]1/);
+  assert.match((await make('base-info')).stdout, /离线 SDK 5[.]34/);
+  assert.match((await make('base-info', { NUWAX_BASE_CHANNEL: 'debug' })).stdout, /通道 debug → 2[.]1[.]0/);
+  const devManifest = objects.get(artifactKey(v2, 'manifest.json'));
+  objects.delete(artifactKey(v2, 'manifest.json'));
+  await assert.rejects(make('base-fetch'), /无法读取版本 2[.]1[.]1 的发布清单/);
+  objects.set(artifactKey(v2, 'manifest.json'), devManifest);
+  git('symbolic-ref', 'HEAD', 'refs/heads/unmapped');
+  assert.match((await make('base-info')).stdout, /打包配置 default → 基座 2[.]1[.]0/);
+  assert.match((await make('base-info')).stdout, /离线 SDK 5[.]23/);
 
   const shipVersion = '2.1.2';
   writeFileSync(join(root, 'scripts/package-custom-bases.sh'), [

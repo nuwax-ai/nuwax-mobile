@@ -21,13 +21,13 @@ help:
 	@echo "S3 分发（NUWAX_BASE_VERSION=基座版本，NUWAX_BASE_CHANNEL=通道）"
 	@echo "  make base-publish         # 指定新基座版本并上传当前 unpackage/debug 产物"
 	@echo "  make base-promote         # 将指定的已发布版本切换为通道当前版本"
-	@echo "  make base-fetch           # 自动下载当前 App 版本系列对应的基座"
-	@echo "  make base-info            # 查看当前分支匹配到的基座和发布清单摘要"
+	@echo "  make base-fetch           # 下载当前分支的基座"
+	@echo "  make base-info            # 查看所选基座、SDK 和目录"
 	@echo "  make base-list            # 列出 S3 上可下载的基座版本"
 	@echo ""
 	@echo "离线 SDK S3 分发（版本 = NUWAX_HX_VERSION；打包 sdk/+archives，不含 work）"
 	@echo "  make sdk-publish          # 打包并上传离线 SDK"
-	@echo "  make sdk-fetch            # 拉取离线 SDK 到 NUWAX_OFFLINE_SDK_HOME"
+	@echo "  make sdk-fetch            # 同步当前分支匹配的离线 SDK"
 	@echo ""
 	@echo "base-ship 开关：SKIP_APP_RESOURCE=1 / SKIP_PUBLISH=1 / TARGETS=android,…"
 	@echo "android-tester 开关：SKIP_APP_RESOURCE=1 / DELIVER_NAME=xxx.apk"
@@ -80,6 +80,7 @@ base-fetch:
 	@bash "$(ROOT)scripts/fetch-custom-base-s3.sh"
 
 base-info:
+	@node "$(ROOT)scripts/resolve-package-profile.mjs" info
 	@bash "$(ROOT)scripts/fetch-custom-base-s3.sh" --info
 
 base-list:

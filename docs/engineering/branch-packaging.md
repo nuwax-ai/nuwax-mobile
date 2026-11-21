@@ -58,7 +58,7 @@ NUWAX_BASE_TARGETS=android make base-fetch
 
 ## 11.24 正式云打包
 
-1. 从两个托管端回读 `feat-2026.11.24`。发布人锁定已审核的完整提交和 tree。两端 SHA 不同时确认业务差异并明确唯一来源，等需要的提交纳入发布范围后再打包。正式发布前根据上次实际商店发布记录确认 App 版本，`node scripts/check-app-release-version.mjs <上次发布的提交或标签>` 核对两项均递增。当前 11.24 的 `1.3.8 / 138` 与仓库 `v1.3.8` 一致，需要和实际渠道记录核对。
+1. 从 GitHub 和 GitLab 回读同名发行分支（本次为 `feat-2026.11.24`）。一端是另一端的祖先时，以后继提交为准，将落后端快进到该提交。历史分叉时先审核并保留双方改动。两端回读同一 SHA 后，发布人锁定该完整提交和 tree。正式发布前根据上次实际商店发布记录确认 App 版本，`node scripts/check-app-release-version.mjs <上次发布的提交或标签>` 核对两项均递增。当前 11.24 的 `1.3.8 / 138` 与仓库 `v1.3.8` 一致，需要和实际渠道记录核对。
 2. 用干净发行 checkout，确认 `git status --short`、`git rev-parse HEAD HEAD^{tree}`、`manifest.json` 和 `pages.json`。项目内不要有其他分支的 `uni_modules`、调试基座、APP 打包资源、`.hbuilderx/launch.json` 或本地打包任务配置。检查 `uni_modules/nuwax-voip`、`uni_modules/nuwax-livekit`、来电页面和原生权限未进入源码和构建资源。保留已有 UniPush 和录音能力。
 3. 在本次源码执行 `node scripts/generate-app-privacy-policy.mjs` 与 `node scripts/prepare-offline-h5.mjs`。核对生成器是否改变已跟踪文件。选中该项目，在 HBuilderX「发行 → App-Android/iOS-云打包」提交普通发行包。使用既有 Android 发布签名和 iOS Distribution 证书、Profile，保持正式包名 `com.nuwax.app`，关闭「制作自定义调试基座」。Android 选择实际渠道需要的 APK/AAB，iOS 选择 App Store。云打包从本次源码构建，不需要先同步或选择调试基座。鸿蒙若在同批，走独立的鸿蒙发行入口，检查生成工程与最终 HAP 的权限、Ability 和语音录制/下载能力。 [DCloud 云打包说明](https://doc.dcloud.net.cn/uni-app-x/tutorial/app-package.html)
 4. 从云打包任务下载实际待发文件，保留任务 ID、开始和结束时间、Git SHA/tree、HBuilderX 版本、平台和文件 SHA-256。对 APK、AAB 和 IPA 运行 `python3 scripts/check-app-no-voip.py <产物路径...>`。APK/IPA 再用 `node scripts/verify-offline-h5-artifact.mjs <产物路径>` 复核离线 H5。

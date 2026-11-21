@@ -16,9 +16,15 @@
 _NUWAX_LB_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 _NUWAX_REPO_ROOT="$(cd "$_NUWAX_LB_ENV_DIR/.." && pwd)"
 
-export NUWAX_HX_VERSION="${NUWAX_HX_VERSION:-5.24}"
+_nuwax_profile=""
+if [[ -f "$_NUWAX_REPO_ROOT/custom-base.lock.json" && -f "$_NUWAX_LB_ENV_DIR/resolve-package-profile.mjs" ]]; then
+  _nuwax_profile="$(node "$_NUWAX_LB_ENV_DIR/resolve-package-profile.mjs" sdk "${NUWAX_HX_VERSION:-}")" || return 1
+fi
+IFS=$'\t' read -r _nuwax_sdk_version _nuwax_sdk_home <<< "$_nuwax_profile"
+export NUWAX_HX_VERSION="${NUWAX_HX_VERSION:-${_nuwax_sdk_version:-5.24}}"
 export NUWAX_WORKSPACE_ROOT="${NUWAX_WORKSPACE_ROOT:-$HOME/workspace}"
-export NUWAX_OFFLINE_SDK_HOME="${NUWAX_OFFLINE_SDK_HOME:-$NUWAX_WORKSPACE_ROOT/nuwax-mobile-offline-sdk}"
+export NUWAX_OFFLINE_SDK_HOME="${NUWAX_OFFLINE_SDK_HOME:-${_nuwax_sdk_home:-$NUWAX_WORKSPACE_ROOT/nuwax-mobile-offline-sdk}}"
+unset _nuwax_profile _nuwax_sdk_version _nuwax_sdk_home
 export NUWAX_SDK_ROOT="${NUWAX_SDK_ROOT:-$NUWAX_OFFLINE_SDK_HOME/sdk}"
 export NUWAX_LOCAL_BASE_ROOT="${NUWAX_LOCAL_BASE_ROOT:-$NUWAX_OFFLINE_SDK_HOME/work}"
 export NUWAX_SDK_ARCHIVES="${NUWAX_SDK_ARCHIVES:-$NUWAX_OFFLINE_SDK_HOME/archives}"

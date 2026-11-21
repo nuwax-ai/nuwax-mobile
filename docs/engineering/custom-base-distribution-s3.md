@@ -1,179 +1,161 @@
-# 自定义基座 · S3 分发（Nuwax MinIO）
+# 自定义基座 S3 分发操作手册
 
-对齐 [nuwa-cli `docs/distribution-s3.md`](../../../nuwa-cli/docs/distribution-s3.md)：基座二进制**不进 Git**，走公开读桶，同事免本地打自定义基座。
+适用于 Android、iOS 真机、iOS 模拟器和已产出基座的鸿蒙。分支选择、离线 SDK 和云打包入口见 [分支打包手册](./branch-packaging.md)。
 
-相关： [local-custom-base-maintenance.md](./local-custom-base-maintenance.md) · [esp-provisioning-local-base.md](./esp-provisioning-local-base.md)
+## 同事下载和更新
 
-## 本地目录 `unpackage/debug/`
-
-本目录放 HX「自定义基座」文件，**二进制默认不入库**（整目录 gitignore）。经本文 S3 流程分发。
-
-版本 = App [`manifest.json`](../manifest.json) → `versionName`；同版本覆盖；**不指定版本拉最新**。
-
-### 同事：安装 / 同步更新
+需要 Bash、curl、Node.js 18 或更高版本、`shasum` 或 `sha256sum`。模拟器等 ZIP 产物另需 `unzip`。Windows 使用 Git Bash。下载使用 S3 公共读，不需要写入凭证、离线 SDK 或 HBuilderX 编译。
 
 ```bash
+# 查看当前业务系列的匹配情况，再下载或更新
+make base-info
 make base-fetch
-# 或
-curl -fsSL https://s3.nuwax.com:9443/nuwax-packages/mobile-custom-bases/fetch-custom-base-s3.sh | bash
+
+# 使用已知基座 ID，通道后续更新也不影响本次选择
+NUWAX_BASE_VERSION=1.3.7 make base-fetch
+
+# 只下载指定平台，显式指定的平台缺失时命令会失败
+NUWAX_BASE_VERSION=1.3.7 NUWAX_BASE_TARGETS=android make base-fetch
+
+# 临时跟随默认通道指针
+NUWAX_BASE_CHANNEL=debug make base-fetch
 ```
+
+- 固定版本和非默认通道保存到 `unpackage/debug/versions/<基座 ID>/`。同一工作区可以保留多个版本。HBuilderX 中选择「运行 → 使用自定义基座运行」，使用命令输出目录下对应的文件。
+- 分支映射和仓库默认均保存到版本子目录。旧 App 系列映射和显式选择的 `debug` 通道写 `unpackage/debug/`。要让仍读取该目录的命令使用指定版本，可显式传 `NUWAX_BASE_DEST=unpackage/debug`。该目录是共享位置，需要保留多个版本时使用默认的版本子目录。也可用 `--dest DIR` 保存到单独目录。
+- 下载先读取发布清单，校验文件大小和 SHA-256，模拟器包先解压，再替换目标文件。命令在下载、校验或解压阶段失败时保留已有包。更新时会清理下载器在该目录记录、但新版本未提供的旧包。
+- 选择顺序为显式固定版本、显式通道、当前分支映射、仓库默认，然后是旧系列映射。没有映射文件的旧工作区和仓外 bootstrap 使用 `debug` 通道。配置文件存在但缺少本系列时，命令会提示维护映射。
+- 没有指定平台时下载该版本清单里已有的平台。同一版本可分次下载不同平台。
 
 | 文件 | 用途 |
-|------|------|
-| `android_debug.apk` | Android |
-| `iOS_debug.ipa` | iOS 真机 |
-| `Pandora_simulator_debug.app` | iOS 模拟器（勿与真机混用） |
-| `harmony_debug.*` | 鸿蒙（预留） |
+| --- | --- |
+| `android_debug.apk` | Android 真机、模拟器 |
+| `iOS_debug.ipa` | iOS 真机。已签名 IPA 的描述文件须覆盖测试设备 UDID |
+| `Pandora_simulator_debug.app` | iOS 模拟器。由同名 ZIP 解压 |
+| `android_debug_vapor.apk`、`iOS_debug_vapor.ipa` | 历史 Vapor 基座，按原文件名下载 |
+| `harmony_debug.*` | 已发布的鸿蒙基座 |
 
-HX：**运行 → 使用自定义基座运行**。仅用基座的同事**不需要** iOS 开发证书。
+`pnpm base:fetch` 等价于 `make base-fetch`。脚本也可以直接调用，例如 `bash scripts/fetch-custom-base-s3.sh --channel vapor --targets android`。
 
-### 维护者发布
+### 找历史版本
+
+以下入口只读 S3。列表需要 AWS CLI，可以匿名读取。信息查询会展示本次匹配的版本、HX 及产物名单。
 
 ```bash
-# 推荐一键：HX appResource → 出包 → 上传 S3（需 HX 已开、项目已导入）
-make base-ship
-# 或：pnpm base:ship
-
-# 分步（旧习惯仍可用）
-make base-all
-make base-publish    # 上传并更新 latest 指针
+make base-list
+make base-info
+NUWAX_BASE_VERSION=1.3.7 make base-info
 ```
 
-同事也可获得发布权限，见下文 [同事发布开通（权限）](#同事发布开通权限)。
+也可使用 `pnpm base:list` 和 `pnpm base:info`。版本列表以发布清单为准，上传中断且未生成清单的版本不会列出。
 
-## 版本策略
+单行下载入口由默认通道维护者更新。仓库脚本已更新时，可以直接用以上命令；需要从 S3 单独下载脚本时，等维护者通知该入口刷新后运行以下命令。
 
-| 规则 | 说明 |
-|------|------|
-| 版本号 | 默认 = [`manifest.json`](../manifest.json) 的 `versionName`（与 App 一致，如 `1.0.0`） |
-| 同版本发布 | **覆盖** `versions/<versionName>/artifacts/*`，只保留该版本最新一份 |
-| 升 App 版本 | 改 `versionName` 后再 `make base-publish` → 新目录；旧版本仍可 `--version` 拉取 |
-| 同事拉取 | **不指定版本 = 最新**（读 `channels/debug.json` / `latest.json`）；适合安装与同步更新 |
+```bash
+curl -fsSL https://s3.nuwax.com:9443/nuwax-packages/mobile-custom-bases/fetch-custom-base-s3.sh \
+  | bash -s -- --channel debug
+```
 
-## 桶布局
+## 维护者上传
 
-默认桶 `nuwax-packages`，前缀 `mobile-custom-bases`。
+需要 Node.js 18 或更高版本，以及支持 `aws s3api put-object --if-none-match` 的 AWS CLI。使用组织配置的 AWS profile 或 `NUWAX_S3_ACCESS_KEY_ID`、`NUWAX_S3_SECRET_ACCESS_KEY`。维护者凭证需能列举基座前缀、读取已发布清单并写入发布目录和所负责的通道。证书、描述文件和凭证走受控渠道。
+
+### 用已有产物发布
+
+在对应源码的工作区运行。默认读取 `unpackage/debug/`。如果同时准备了几套包，用 `NUWAX_BASE_SOURCE` 或 `--source DIR` 指定本次产物目录。
+
+新发布使用当前分支条目配置的 `X.Y.Z` 基座版本，也可显式给出新的版本。Android 和 iOS 发布时读取包内 App 版本并与源码核对，清单会保留各产物的内置 App 版本。业务分支下载基座时按映射选用，允许使用从其他兼容 App 版本构建的基座。
+
+```bash
+# 预演，检查产物、版本号以及目标路径
+NUWAX_BASE_VERSION=2.1.0 NUWAX_BASE_CHANNEL=debug \
+  NUWAX_BASE_TARGETS=android,ios-device,ios-simulator NUWAX_BASE_DRY_RUN=1 make base-publish
+
+# 入库供固定版本验收
+NUWAX_BASE_VERSION=2.1.0 NUWAX_BASE_CHANNEL=debug \
+  NUWAX_BASE_TARGETS=android,ios-device,ios-simulator NUWAX_BASE_NO_PROMOTE=1 make base-publish
+
+# 验收后提交 custom-base.lock.json 的映射修改
+# 显式跟随 debug 通道的用户可另外更新通道指针
+NUWAX_BASE_VERSION=2.1.0 NUWAX_BASE_CHANNEL=debug make base-promote
+```
+
+如发布对象是单端通道，把 `NUWAX_BASE_TARGETS` 设为该平台即可。未显式指定时会收集源目录里找到的产物；联调和稳定通道建议列明全部需要的平台，以免源目录里缺包或混入其他平台的旧包。Android 的 HX 版本从 APK 读取。仅发布 iOS 或鸿蒙时须填 `NUWAX_HX_VERSION` 为实际构建版本。
+
+### 从源码出包并发布
+
+启动 HBuilderX、导入当前项目并准备对应版本的离线 SDK。资源生成与签名步骤见 [本地基座维护规范](./local-custom-base-maintenance.md)。
+
+```bash
+# appResource → 三端出包 → 入库，等验收再切通道
+NUWAX_HX_VERSION=5.34 NUWAX_BASE_VERSION=2.1.0 \
+  NUWAX_BASE_NO_PROMOTE=1 make base-ship
+
+# 单端流水线示例
+TARGETS=android NUWAX_HX_VERSION=5.34 NUWAX_BASE_VERSION=2.1.1 \
+  NUWAX_BASE_NO_PROMOTE=1 make base-ship
+```
+
+`base-ship` 的 `TARGETS` 同时控制出包和上传。流水线使用当前工作区的 `unpackage/debug/`，多份产物建议用不同工作区出包；共享同一份离线 SDK 工作副本时，错开打包。三个 Make 目标也对应 `pnpm base:publish`、`pnpm base:ship`、`pnpm base:promote`。
+
+### Android 云打包后入库
+
+1. 在打包分支确认 `manifest.json` 的 App 版本和构建号，记录实际参与打包的源码版本。在 HBuilderX 的「发行 → App-Android/iOS-云打包」中只选 Android，勾选「制作自定义调试基座」，使用项目的包名和联调签名。若要保留已有的 `unpackage/debug/android_debug.apk`，提交云打包前先另存一份。参见 [DCloud 云打包说明](https://doc.dcloud.net.cn/uni-app-x/tutorial/app-package.html)。
+2. 云包下载完成后，将本次生成的 `android_debug.apk` 放到独立目录，例如 `out/android-cloud-base/`。在仓库根目录运行 `make base-list`，选一个尚未使用的数字基座版本。下面的 `1.4.0` 是示例基座 ID。
+
+   ```bash
+   BASE_VERSION=1.4.0
+   NUWAX_BASE_VERSION="$BASE_VERSION" NUWAX_BASE_SOURCE=out/android-cloud-base \
+     NUWAX_BASE_TARGETS=android NUWAX_BASE_NO_PROMOTE=1 NUWAX_BASE_DRY_RUN=1 make base-publish
+   ```
+
+   预演会读取 APK 内的 HX 运行时版本及 App 版本与构建号。确认生成的清单对应本次产物后，在相同源码下去掉 `NUWAX_BASE_DRY_RUN=1` 入库。
+3. 用固定版本重新下载，在 HBuilderX 选择下载目录中的 APK，验证自定义基座可以启动，并检查本次变更涉及的原生功能。
+
+   ```bash
+   NUWAX_BASE_VERSION="$BASE_VERSION" NUWAX_BASE_TARGETS=android make base-fetch
+   ```
+
+4. 验收后提交对应的业务和原生插件改动、`manifest.json` 及 `custom-base.lock.json` 的新系列映射。仓库保存源码和映射，S3 保存 APK，离线 SDK 仅供本地重打包使用。版本映射优先按 Git 分支生效。若同一系列要默认支持 iOS，先准备包含所需平台的基座版本再更新映射。锁定版本生效后，同事更新对应分支并运行 `make base-info`、`make base-fetch`。
+
+### 版本重发、失败和回退
+
+| 场景 | 操作 |
+| --- | --- |
+| 新包、补齐平台 | 显式指定新的数字版本，清单包含这次交付的所有平台。 |
+| 同名发布被拒绝 | 检查是否已有清单。已有清单时可直接下载或切通道。如需新产物，递增基座版本后重新发布。 |
+| 占用 ID 后上传中断 | 该版本无发布清单时用新 ID 重试；失败目录不会进入可下载版本。 |
+| 发布成功但通道更新失败 | 用同一 ID 执行 `base-promote`。若 `debug` 兼容指针更新失败，也用该命令补齐。 |
+| 业务系列映射有问题 | 在 `custom-base.lock.json` 把对应系列恢复到上一个已验收基座，随后同事使用 `make base-fetch` 同步。 |
+| 通道版本有问题 | 执行 `NUWAX_BASE_VERSION=<上一已验收版本> NUWAX_BASE_CHANNEL=<通道> make base-promote`，同事重新走通道下载即可。 |
+| 同一通道多人维护 | 协调通道切换顺序，最后一次成功切换生效。不同通道可以独立切换。 |
+
+## S3 目录与兼容
+
+默认桶 `nuwax-packages`，默认前缀 `mobile-custom-bases`。
 
 ```text
-s3://nuwax-packages/mobile-custom-bases/
-├── latest.json                          # 每次发布覆盖 → 当前最新 App 版本
-├── channels/debug.json                  # 同上
-├── fetch-custom-base-s3.sh
-└── versions/
-    └── 1.0.0/                           # = versionName；重复发布覆盖此目录
-        ├── artifacts/
-        │   ├── android_debug.apk
-        │   ├── iOS_debug.ipa
-        │   ├── Pandora_simulator_debug.app.zip
-        │   ├── harmony_debug.*          # 预留
-        │   └── manifest.json
-        └── scripts/
-            └── fetch-custom-base-s3.sh
+mobile-custom-bases/
+├── latest.json                       # debug 通道的兼容指针
+├── channels/<通道>.json
+├── fetch-custom-base-s3.sh           # debug 通道切换时刷新
+└── versions/<基座 ID>/
+    ├── reservation.json              # 新发布条件创建，用于占用 ID
+    ├── artifacts/
+    │   ├── …                         # 包文件
+    │   └── manifest.json             # 所有包上传结束才写入
+    └── scripts/fetch-custom-base-s3.sh
 ```
 
-| S3 对象 | 本地 | 说明 |
-|---------|------|------|
-| `android_debug.apk` | 同名 | Android |
-| `iOS_debug.ipa` | 同名 | iOS 真机 |
-| `Pandora_simulator_debug.app.zip` | 解压为 `.app` | iOS 模拟器（勿与真机混用） |
-| `harmony_debug.*` | 同名 | 鸿蒙预留 |
+历史版本的路径和清单继续可读。新脚本只创建新版本目录；仍用旧版脚本上传会绕过同名保护，维护者切换新流程后统一使用新版脚本发布。
 
-## 发布
-
-```bash
-make base-all
-# 可选：set -a; source ../nuwa-cli/.env; set +a
-export NUWAX_S3_NO_VERIFY_SSL=1
-make base-publish
-# 或 bash scripts/publish-custom-base-s3.sh --dry-run
-```
-
-凭证：`NUWAX_S3_*` 或 `~/.aws` profile；**勿提交**。证书/p12 **禁止**上传公开桶。
-
-## 同事发布开通（权限）
-
-发布 = 写 `nuwax-packages` 桶，默认无权限。同事要上传只需三样：工具、S3 凭证、自签证书开关；endpoint / bucket / prefix 脚内已默认，无需配置。
-
-### 1. 工具
-
-```bash
-brew install awscli    # 脚本强依赖 aws 与 node（manifest 生成用 node）
-```
-
-### 2. 凭证（向维护者要）
-
-凭证不进仓库，向维护者索取 access key / secret（维护者本机权威副本在 `~/.aws/credentials` 的 `[default]`）。写入自己的 `~/.aws/credentials`：
-
-```ini
-[default]
-aws_access_key_id = <向维护者索取>
-aws_secret_access_key = <向维护者索取>
-```
-
-```bash
-chmod 600 ~/.aws/credentials
-```
-
-- 该 key 对 `nuwax-packages` 桶**有写权限**（offline-sdk 前缀同样可写），走私密渠道传递，勿贴群、勿写进任何仓库
-- 不想用 profile 可改用 `NUWAX_S3_ACCESS_KEY_ID` / `NUWAX_S3_SECRET_ACCESS_KEY` 环境变量，二选一
-
-### 3. 验证与上传
-
-```bash
-# 验证凭证：必须带 --no-verify-ssl；MinIO 上 aws sts 会误判，用 s3 ls 实测
-aws s3 ls s3://nuwax-packages/mobile-custom-bases/ \
-  --endpoint-url https://s3.nuwax.com:9443 --no-verify-ssl
-
-export NUWAX_S3_NO_VERIFY_SSL=1   # 自签证书，必设，否则 aws TLS 校验失败
-make base-publish                 # 上传 unpackage/debug/ 下现有产物（或 pnpm base:publish）
-# 先预演：bash scripts/publish-custom-base-s3.sh --dry-run
-```
-
-### 注意事项
-
-| 事项 | 说明 |
-|------|------|
-| `--targets` 裁剪发布 | **别用**：只传单端会把远端 `versions/<ver>/artifacts/manifest.json` 覆盖成子集，拉取侧看到残缺清单，需手工合并重传 |
-| 版本覆盖 | 版本默认取 `manifest.json` 的 `versionName`，同版本覆盖；发新版先 bump `versionName` |
-| 基座产物 | 上传的是 `unpackage/debug/` 下已产出的包；从零打基座走 `make sdk-fetch` → `source scripts/local-base-env.sh` → `make base-ship`（需 HBuilderX 已导入项目） |
-| iOS 真机基座 | 另需 Apple 证书 / profile（不随 S3 分发）；Android 基座无证书要求 |
-
-## 拉取（同事：安装 / 同步更新）
-
-不指定版本 = 最新：
-
-```bash
-curl -fsSL https://s3.nuwax.com:9443/nuwax-packages/mobile-custom-bases/fetch-custom-base-s3.sh | bash
-# 或仓库内
-make base-fetch
-```
-
-固定某一 App 版本：
-
-```bash
-NUWAX_BASE_VERSION=1.0.0 make base-fetch
-```
-
-然后 HX：**运行 → 使用自定义基座运行**。
-
-## iOS 证书
-
-| 角色 | 是否需要 `Nuwa iOS 证书`（p12 / cer / mobileprovision） |
-|------|--------------------------------------------------------|
-| 只 `make base-fetch` 用自定义基座 | **不需要**装到本机 |
-| Android / iOS 模拟器 | **不需要** |
-| iOS 真机装已签名 ipa | 电脑不需要证书；手机 **UDID 须已在描述文件**，否则要重签重发 |
-| 自己 `make base-ios-device` | **需要** |
-
-## 环境变量
-
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `NUWAX_S3_*` | 同 nuwa-cli | endpoint / bucket / prefix / 凭证 |
-| `NUWAX_BASE_CHANNEL` | `debug` | channel |
-| `NUWAX_BASE_VERSION` | — | 固定版本；空则最新 |
-| `NUWAX_HX_VERSION` | `5.15` | 写入 manifest |
-
-## 鸿蒙
-
-`harmony` target 已预留：有 `unpackage/debug/harmony_debug.*` 则上传；拉取时尝试下载。
+| 设置 | 说明 |
+| --- | --- |
+| `NUWAX_BASE_VERSION` | 发布新包必填 `X.Y.Z`。下载和通道切换也支持原有历史版本标识。 |
+| `NUWAX_BASE_CHANNEL` | 显式指定通道时覆盖下载映射。发布和切换通道的默认值为 `debug`。 |
+| `NUWAX_BASE_TARGETS` | 拉取或上传的平台，逗号分隔 |
+| `NUWAX_BASE_SOURCE` / `NUWAX_BASE_DEST` | 分别覆盖已有产物上传源目录、下载目标目录 |
+| `NUWAX_BASE_NO_PROMOTE=1` | 发布版本但不切换通道 |
+| `NUWAX_BASE_DRY_RUN=1` | 预演上传，不写 S3 |
+| `NUWAX_S3_ENDPOINT` / `NUWAX_S3_BUCKET` / `NUWAX_S3_PREFIX` | 覆盖 S3 地址、桶和前缀 |
+| `NUWAX_S3_NO_VERIFY_SSL=1` / `NUWAX_S3_INSECURE=1` | AWS CLI 上传、curl 下载的自签证书兼容开关 |

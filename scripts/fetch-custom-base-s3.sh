@@ -1,182 +1,261 @@
 #!/usr/bin/env bash
-# 从 Nuwax S3（MinIO）拉取联调自定义基座到 unpackage/debug/。
-# 公开读，无需 aws 凭证（只需 curl）；自签证书失败时自动 -k 重试。
-#
-# 版本策略：
-#   - 不指定版本 → 读 channels/<channel>.json（默认 debug）= 当前最新（安装/同步更新用）
-#   - 指定 NUWAX_BASE_VERSION / --version → 固定 App versionName
-#
-# One-liner:
-#   curl -fsSL https://s3.nuwax.com:9443/nuwax-packages/mobile-custom-bases/fetch-custom-base-s3.sh | bash
-#
-# 仓库内:
-#   make base-fetch
-#   bash scripts/fetch-custom-base-s3.sh --targets android,ios-device
-#   NUWAX_BASE_VERSION=1.0.0 bash scripts/fetch-custom-base-s3.sh
+# 公开 S3 下载入口，同时作为独立 bootstrap 分发。
 set -euo pipefail
 
 ENDPOINT="${NUWAX_S3_ENDPOINT:-https://s3.nuwax.com:9443}"
 BUCKET="${NUWAX_S3_BUCKET:-nuwax-packages}"
 PREFIX="${NUWAX_S3_PREFIX:-mobile-custom-bases}"
-CHANNEL="${NUWAX_BASE_CHANNEL:-debug}"
-PINNED_VERSION="${NUWAX_BASE_VERSION:-}"
-INSECURE="${NUWAX_S3_INSECURE:-0}"
-TARGETS="android,ios-device,ios-simulator,harmony"
-DEST_DIR=""
-VERSION=""
+CHANNEL="${NUWAX_BASE_CHANNEL:-}"
+VERSION="${NUWAX_BASE_VERSION:-}"
+TARGETS="${NUWAX_BASE_TARGETS:-}"
+DEST_DIR="${NUWAX_BASE_DEST:-}"
+MODE=fetch
 
 usage() {
-  cat <<'EOF'
+  cat <<'HELP'
 Usage: bash scripts/fetch-custom-base-s3.sh [options]
 
-Options:
-  --targets LIST     android,ios-device,ios-simulator,harmony（默认全开）
-  --dest DIR         输出目录（默认：仓库 unpackage/debug）
-  --version VER      固定 App versionName（不设则拉最新）
-  --channel NAME     通道（默认 debug）
+  --version ID    固定基座版本；优先于通道
+  --channel NAME  显式跟随通道，覆盖分支及默认映射
+  --targets LIST  android,ios-device,ios-simulator,harmony；默认下载清单中所有已发布平台
+  --dest DIR      指定输出目录；默认固定版本/独立通道存入 unpackage/debug/versions/<ID>/
+                  旧 App 系列映射和默认 debug 通道使用 unpackage/debug/
+  --info          只读取并显示本次匹配的基座及发布清单摘要
+  --list          列出 S3 上可用的已发布基座版本（需要 AWS CLI，无须凭证）
   -h, --help
 
-不指定 --version：读 channels/<channel>.json → 当前最新（同步更新时再跑一次即可）。
-
 Environment:
-  NUWAX_S3_ENDPOINT / NUWAX_S3_BUCKET / NUWAX_S3_PREFIX
-  NUWAX_BASE_CHANNEL / NUWAX_BASE_VERSION
-  NUWAX_S3_INSECURE=1
-EOF
+  NUWAX_BASE_VERSION / NUWAX_BASE_CHANNEL / NUWAX_BASE_TARGETS / NUWAX_BASE_DEST
+  NUWAX_S3_ENDPOINT / NUWAX_S3_BUCKET / NUWAX_S3_PREFIX / NUWAX_S3_INSECURE
+Dependencies: bash, curl, node, shasum 或 sha256sum；目录压缩包另需 unzip。
+HELP
 }
+
+fail() { echo "错误：$*" >&2; exit 1; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --targets) TARGETS="${2:-}"; shift 2 ;;
-    --dest) DEST_DIR="${2:-}"; shift 2 ;;
-    --version) PINNED_VERSION="${2:-}"; shift 2 ;;
-    --channel) CHANNEL="${2:-}"; shift 2 ;;
+    --version|--channel|--targets|--dest)
+      [[ -n "${2:-}" && "$2" != --* ]] || fail "$1 需要参数"
+      case "$1" in
+        --version) VERSION="$2" ;;
+        --channel) CHANNEL="$2" ;;
+        --targets) TARGETS="$2" ;;
+        --dest) DEST_DIR="$2" ;;
+      esac
+      shift 2
+      ;;
+    --info) MODE=info; shift ;;
+    --list) MODE=list; shift ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *) fail "未知参数：$1" ;;
   esac
 done
 
-if [ -t 1 ]; then
-  GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'; CYAN=$'\033[36m'; NC=$'\033[0m'
-else
-  GREEN=""; YELLOW=""; RED=""; CYAN=""; NC=""
+if [[ "$MODE" == list ]]; then
+  command -v aws >/dev/null 2>&1 || fail "列出基座版本需要 AWS CLI"
+  aws_args=(--endpoint-url "$ENDPOINT" --region "${NUWAX_S3_REGION:-us-east-1}" --no-sign-request)
+  [[ "${NUWAX_S3_INSECURE:-0}" == 1 ]] && aws_args+=(--no-verify-ssl)
+  aws s3 ls "s3://$BUCKET/$PREFIX/versions/" --recursive "${aws_args[@]}" \
+    | awk '$4 ~ /\/artifacts\/manifest[.]json$/ { count = split($4, path, "/"); print path[count - 2] }'
+  exit 0
 fi
-ok()   { printf "%s[OK]%s %s\n" "$GREEN" "$NC" "$1"; }
-warn() { printf "%s[!]%s  %s\n" "$YELLOW" "$NC" "$1" >&2; }
-info() { printf "%s->%s %s\n" "$CYAN" "$NC" "$1"; }
-fail() { printf "%s[X]%s  %s\n" "$RED" "$NC" "$1" >&2; exit 1; }
 
-command -v curl >/dev/null 2>&1 || fail "需要 curl"
-command -v unzip >/dev/null 2>&1 || fail "需要 unzip"
+for tool in curl node; do
+  command -v "$tool" >/dev/null 2>&1 || fail "需要 $tool"
+done
 
-resolve_dest() {
-  if [[ -n "$DEST_DIR" ]]; then
-    echo "$DEST_DIR"
-    return
-  fi
-  if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-    local script_dir root
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    root="$(cd "$script_dir/.." && pwd)"
-    if [[ -d "$root/unpackage" || -f "$root/Makefile" ]]; then
-      echo "$root/unpackage/debug"
-      return
-    fi
-  fi
-  echo "$(pwd)/unpackage/debug"
-}
-
-DEST_DIR="$(resolve_dest)"
-mkdir -p "$DEST_DIR"
-base="$ENDPOINT/$BUCKET/$PREFIX"
-
+base="${ENDPOINT%/}/$BUCKET/$PREFIX"
 fetch() {
-  local url="$1" dest="$2"
-  local opts=(-fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache")
-  [[ "$INSECURE" == "1" ]] && opts+=(-k)
-  if ! curl "${opts[@]}" -o "$dest" "$url"; then
-    warn "下载失败(可能是自签证书),尝试 -k 重试 ..."
-    curl -fsSLk -H "Cache-Control: no-cache" -o "$dest" "$url" || return 1
+  local url="$1" dest="$2" status
+  local opts=(-fsSL -H "Cache-Control: no-cache")
+  [[ "${NUWAX_S3_INSECURE:-0}" == 1 ]] && opts+=(-k)
+  if curl "${opts[@]}" -o "$dest" "$url"; then
+    return
+  else
+    status=$?
   fi
+  # 保留自签证书环境的兼容行为；HTTP 失败直接返回。
+  [[ "$status" == 60 ]] && curl "${opts[@]}" -k -o "$dest" "$url"
 }
 
-want_target() {
-  local t="$1"
-  [[ ",$TARGETS," == *",$t,"* ]]
-}
+root="$PWD"
+if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+  script_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [[ -f "$script_root/Makefile" || -d "$script_root/unpackage" ]]; then
+    root="$script_root"
+  fi
+fi
 
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-
-if [[ -n "$PINNED_VERSION" ]]; then
-  VERSION="${PINNED_VERSION#v}"
-  ok "指定版本: ${VERSION}"
+versioned=1
+profile=""
+if [[ -z "$VERSION" && -z "$CHANNEL" && -f "$root/custom-base.lock.json" && -f "$root/scripts/resolve-package-profile.mjs" ]]; then
+  profile="$(node "$root/scripts/resolve-package-profile.mjs" base)" || fail "无法读取分支基座配置"
+fi
+if [[ -n "$profile" ]]; then
+  IFS=$'\t' read -r VERSION profile_name <<< "$profile"
+  printf '打包配置 %s → 基座 %s\n' "$profile_name" "$VERSION"
+elif [[ -n "$VERSION" ]]; then
+  [[ "$VERSION" =~ ^v[0-9] ]] && VERSION="${VERSION#v}"
+elif [[ -z "$CHANNEL" && -f "$root/custom-base.lock.json" ]]; then
+  [[ -f "$root/manifest.json" ]] || fail "仓库缺少 manifest.json，无法确定 App 版本系列"
+  # 使用标准输入，兼容 Git Bash 调用 Windows 版 Node。
+  selection="$({
+    printf '{"app":'
+    cat "$root/manifest.json"
+    printf ',"lock":'
+    cat "$root/custom-base.lock.json"
+    printf '}'
+  } | node -e '
+    const {app, lock} = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    const appVersion = app?.versionName;
+    const match = typeof appVersion === "string" && appVersion.match(/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/);
+    if (!match) throw new Error("manifest.json 的 versionName 应为 X.Y.Z");
+    const series = match[1] + "." + match[2];
+    const version = lock?.appVersionSeries?.[series];
+    if (typeof version !== "string" || !version) {
+      throw new Error("custom-base.lock.json 缺少 App " + series + ".x 的基座映射，可执行 make base-list 查看已发布版本");
+    }
+    process.stdout.write([appVersion, series, version].join("\t"));
+  ')" || fail "无法匹配当前 App 的基座版本"
+  IFS=$'\t' read -r APP_VERSION SERIES VERSION <<< "$selection"
+  versioned=0
+  printf 'App %s（%s.x）→ 仓库基座 %s\n' "$APP_VERSION" "$SERIES" "$VERSION"
 else
-  info "未指定版本，解析最新 channel '${CHANNEL}' ..."
-  fetch "$base/channels/$CHANNEL.json" "$TMP/channel.json" || fail "无法读取 channel: $base/channels/$CHANNEL.json（是否已发布过？）"
-  # Windows(Git Bash)：/tmp/... 路径传给 Windows node.exe 会 require 失败返回空，
-  # 因此 node 解析为空时统一回落到 sed（原 else 分支只覆盖"无 node"场景）。
-  VERSION=""
-  if command -v node >/dev/null 2>&1; then
-    VERSION="$(node -p "require('$TMP/channel.json').version" 2>/dev/null || true)"
-  fi
-  if [[ -z "$VERSION" ]]; then
-    VERSION="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/channel.json" | head -1)"
-  fi
-  [[ -n "${VERSION}" ]] || fail "channel 无 version 字段"
-  # 必须用 ${VERSION}：紧跟全角「（」时，$VERSION（ 会被当成未定义变量名（set -u 直接挂）
-  ok "最新 → ${VERSION}（与 App versionName 对齐）"
+  CHANNEL="${CHANNEL:-debug}"
+  [[ "$CHANNEL" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "无效通道：$CHANNEL"
+  if [[ "$CHANNEL" == debug ]]; then versioned=0; fi
+  VERSION="$(fetch "$base/channels/$CHANNEL.json" - | node -e '
+    const pointer = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    if (typeof pointer.version === "string") process.stdout.write(pointer.version);
+  ')" || fail "无法读取通道 $CHANNEL 的版本"
+  echo "通道 $CHANNEL → $VERSION"
+fi
+[[ "$VERSION" =~ ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$ && "$VERSION" != *..* ]] || fail "无效基座版本：$VERSION"
+
+if [[ -z "$DEST_DIR" ]]; then
+  DEST_DIR="$root/unpackage/debug"
+  if [[ "$versioned" == 1 ]]; then DEST_DIR="$DEST_DIR/versions/$VERSION"; fi
 fi
 
-ART_BASE="$base/versions/${VERSION}/artifacts"
-info "拉取 manifest ..."
-if fetch "$ART_BASE/manifest.json" "$TMP/manifest.json"; then
-  cp "$TMP/manifest.json" "$DEST_DIR/manifest.json"
-  ok "manifest.json"
-else
-  warn "无 manifest.json，按约定文件名拉取"
+art_base="$base/versions/$VERSION/artifacts"
+if [[ "$MODE" == info ]]; then
+  manifest_json="$(fetch "$art_base/manifest.json" -)" || fail "无法读取基座 $VERSION 的发布清单"
+  VERSION="$VERSION" node -e '
+    const manifest = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    if (manifest.version !== process.env.VERSION || !Array.isArray(manifest.artifacts) || !manifest.artifacts.length) {
+      throw new Error("没有读取到有效的基座发布清单");
+    }
+    const { version, hxVersion, appVersionName, appVersionCode, gitSha, gitDirty, artifacts } = manifest;
+    console.log(JSON.stringify({ version, hxVersion, appVersionName, appVersionCode, gitSha, gitDirty, artifacts: artifacts.map(({ name }) => name) }, null, 2));
+  ' <<< "$manifest_json" || fail "无法读取基座 $VERSION 的发布清单"
+  echo "下载目录：$DEST_DIR"
+  exit 0
 fi
 
-download_one() {
-  # 勿写成 local name="$1" url="...$name"：同语句内 $name 仍指向外层（set -u 会挂）
-  local name="$1"
-  local url="${ART_BASE}/${name}"
-  local out="${DEST_DIR}/${name}"
-  info "下载 ${name} ..."
-  if fetch "$url" "$out"; then
-    ok "${name} → ${out}"
-    return 0
-  fi
-  warn "跳过 ${name}（该版本可能未发布）"
-  rm -f "$out"
-  return 1
+mkdir -p "$DEST_DIR"
+lock="$DEST_DIR/.base-fetch.lock"
+mkdir "$lock" 2>/dev/null || fail "目标目录有下载正在进行：$DEST_DIR"
+stage=""
+cleanup() {
+  if [[ -n "$stage" ]]; then rm -rf "$stage"; fi
+  rmdir "$lock"
 }
+trap cleanup EXIT
+stage="$(mktemp -d "$DEST_DIR/.base-fetch.XXXXXX")"
 
-if want_target android; then download_one "android_debug.apk" || true; fi
-if want_target ios-device; then download_one "iOS_debug.ipa" || true; fi
+fetch "$art_base/manifest.json" "$stage/manifest.json" || fail "无法读取版本 $VERSION 的发布清单"
+# 用标准输入读取 JSON，兼容 Git Bash 调用 Windows 版 Node。
+VERSION="$VERSION" TARGETS="$TARGETS" node -e '
+  const manifest = JSON.parse(require("fs").readFileSync(0, "utf8"));
+  const platforms = {
+    android: ["android_debug.apk", "android_debug_vapor.apk"],
+    "ios-device": ["iOS_debug.ipa", "iOS_debug_vapor.ipa"],
+    "ios-simulator": ["Pandora_simulator_debug.app.zip"],
+    harmony: ["harmony_debug.hap", "harmony_debug.app.zip", "harmony_debug.app"],
+  };
+  if (manifest.version !== process.env.VERSION || !Array.isArray(manifest.artifacts)) {
+    throw new Error("发布清单与请求版本不匹配");
+  }
+  const requested = process.env.TARGETS;
+  const entries = new Map(manifest.artifacts.map(file => [file.name, file]));
+  if (entries.size !== manifest.artifacts.length) throw new Error("清单中有重复文件名");
+  for (const target of new Set(requested ? requested.split(",") : Object.keys(platforms))) {
+    if (!Object.hasOwn(platforms, target)) throw new Error("未知平台：" + target);
+    const files = platforms[target].filter(name => entries.has(name) &&
+      (name !== "harmony_debug.app" || !entries.has("harmony_debug.app.zip")));
+    if (requested && !files.length) throw new Error("此版本未发布 " + target);
+    for (const name of files) {
+      const {sha256, bytes} = entries.get(name);
+      if (!/^[0-9a-f]{64}$/i.test(sha256) || !Number.isSafeInteger(bytes) || bytes <= 0) {
+        throw new Error("产物校验信息无效：" + name);
+      }
+      console.log([name, sha256.toLowerCase(), bytes].join("\t"));
+    }
+  }
+' < "$stage/manifest.json" > "$stage/downloads"
+[[ -s "$stage/downloads" ]] || fail "版本 $VERSION 无可下载的基座"
 
-if want_target ios-simulator; then
-  if download_one "Pandora_simulator_debug.app.zip"; then
-    info "解压 Pandora_simulator_debug.app.zip ..."
-    rm -rf "$DEST_DIR/Pandora_simulator_debug.app"
-    unzip -q -o "$DEST_DIR/Pandora_simulator_debug.app.zip" -d "$DEST_DIR"
-    ok "Pandora_simulator_debug.app"
-  fi
+if command -v shasum >/dev/null 2>&1; then
+  checksum=(shasum -a 256)
+else
+  command -v sha256sum >/dev/null 2>&1 || fail "需要 shasum 或 sha256sum"
+  checksum=(sha256sum)
 fi
 
-if want_target harmony; then
-  for name in harmony_debug.hap harmony_debug.app.zip harmony_debug.app; do
-    download_one "$name" || true
-  done
-  if [[ -f "$DEST_DIR/harmony_debug.app.zip" ]]; then
-    info "解压 harmony_debug.app.zip ..."
-    rm -rf "$DEST_DIR/harmony_debug.app"
-    unzip -q -o "$DEST_DIR/harmony_debug.app.zip" -d "$DEST_DIR" || true
+outputs=()
+while IFS=$'\t' read -r name sha256 bytes; do
+  echo "下载 $VERSION/$name"
+  file="$stage/$name"
+  fetch "$art_base/$name" "$file" || fail "下载失败：$name"
+  actual_hash="$("${checksum[@]}" < "$file")"
+  [[ "${actual_hash%% *}" == "$sha256" && $(wc -c < "$file") -eq "$bytes" ]] || fail "校验失败：$name"
+  outputs+=("$name")
+done < "$stage/downloads"
+
+for name in "${outputs[@]}"; do
+  if [[ "$name" == *.app.zip ]]; then
+    unzip -q "$stage/$name" -d "$stage/extracted" || fail "解压失败：$name"
+    app="${name%.zip}"
+    [[ -d "$stage/extracted/$app" ]] || fail "压缩包缺少 $app"
+    mv "$stage/extracted/$app" "$stage/$app"
+    outputs+=("$app")
   fi
+done
+
+# 只清理这个目录中由下载器管理的旧包，保留其他本地文件。
+installed="$DEST_DIR/.base-fetch-files"
+printf '%s\n' "${outputs[@]}" > "$stage/.base-fetch-files"
+if [[ -f "$installed" ]] && cmp -s "$stage/manifest.json" "$DEST_DIR/manifest.json"; then
+  sort -u "$installed" "$stage/.base-fetch-files" > "$stage/merged-files"
+  mv "$stage/merged-files" "$stage/.base-fetch-files"
 fi
 
-echo
-ok "完成 → ${DEST_DIR} (version=${VERSION})"
-echo "HX：运行 → 使用自定义基座运行 → 选择对应 apk / ipa / simulator .app"
-echo "同步更新：再执行一次本脚本（不指定版本）即可覆盖本地文件。"
-echo "说明：真机与模拟器勿混用；iOS 真机包受证书/设备列表限制。"
+# 先完成所有下载、校验和解压，再替换已有文件。
+for name in "${outputs[@]}" manifest.json .base-fetch-files; do
+  if [[ "$name" == .base-fetch-files && -f "$installed" ]]; then
+    while IFS= read -r previous; do
+      case "$previous" in
+        android_debug.apk|android_debug_vapor.apk|iOS_debug.ipa|iOS_debug_vapor.ipa|\
+        Pandora_simulator_debug.app|Pandora_simulator_debug.app.zip|harmony_debug.hap|harmony_debug.app|harmony_debug.app.zip)
+          if ! grep -Fxq -- "$previous" "$stage/.base-fetch-files"; then
+            rm -rf "$DEST_DIR/$previous"
+          fi
+          ;;
+      esac
+    done < "$installed"
+  fi
+  if [[ -d "$DEST_DIR/$name" && ! -L "$DEST_DIR/$name" ]]; then
+    mv "$DEST_DIR/$name" "$stage/previous-$name"
+    if ! mv "$stage/$name" "$DEST_DIR/$name"; then
+      mv "$stage/previous-$name" "$DEST_DIR/$name"
+      fail "无法替换 $name"
+    fi
+  else
+    # 目标如果是 symlink，先移走链接，避免 mv 跟随目录链接。
+    if [[ -L "$DEST_DIR/$name" ]]; then rm "$DEST_DIR/$name"; fi
+    mv -f "$stage/$name" "$DEST_DIR/$name"
+  fi
+done
+printf '完成 → %s（基座 %s）\n' "$DEST_DIR" "$VERSION"
+echo "HBuilderX：运行 → 使用自定义基座运行 → 选择该目录的基座"

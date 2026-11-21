@@ -66,6 +66,8 @@ class MeetingRoomBridge(context: Context) {
   private val meetingMessages = ConcurrentLinkedQueue<String>()
   @Volatile private var screenShareOn = false
   @Volatile private var screenShareError = ""
+  /** 用户想要的输出路由（会议默认外放）；SDK 每次拉起音频会话都会重设，需要重放。 */
+  @Volatile private var speakerWanted = true
 
   companion object {
     @Volatile private var activeBridge: MeetingRoomBridge? = null
@@ -120,6 +122,8 @@ class MeetingRoomBridge(context: Context) {
           }
         }
         connectedFlag = true
+        // 会议默认外放：UI 初始 speakerOn=true，连上后必须把系统路由也切到扬声器。
+        setSpeakerEnabled(true)
         // 人数由业务层按需轮询 participantCount()，这里不需要定时器
       } catch (e: Throwable) {
         // 连接失败：置错误码，业务层轮询 lastError() 得知（无回调，见文件头说明）
@@ -258,6 +262,8 @@ class MeetingRoomBridge(context: Context) {
       } catch (e: Throwable) {
         // 权限被拒/设备被占用：保持原状，上层以实际权限为准
       }
+      // SDK 开麦时会重设音频路由（默认回到听筒），这里按用户选择重放一次。
+      if (enabled) applySpeakerRoute()
     }
   }
 
@@ -283,22 +289,35 @@ class MeetingRoomBridge(context: Context) {
    *   isSpeakerphoneOn 最稳，蓝牙/耳机路由由系统按优先级接管（插耳机时设扬声器也顶不掉耳机）。
    */
   fun setSpeakerEnabled(enabled: Boolean) {
+    speakerWanted = enabled
+    applySpeakerRoute()
+  }
+
+  /**
+   * 真正写系统路由。★SDK 每次拉起音频会话（开麦 / 订阅到远端音轨）都会重设一次路由，
+   * 所以开麦之后要按用户意愿再写一次，否则默认外放会被打回听筒。
+   */
+  private fun applySpeakerRoute() {
     try {
       val am = appContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
       am.mode = AudioManager.MODE_IN_COMMUNICATION
       @Suppress("DEPRECATION")
-      am.isSpeakerphoneOn = enabled
+      am.isSpeakerphoneOn = speakerWanted
     } catch (e: Throwable) {
     }
   }
 
-  /** 房间人数（含本端；未连接返回 0）。 */
+  /** 云端录制 Egress 也是 LiveKit 参与者（identity 前缀 EG_），和 PC 一样不算人。 */
+  private fun isEgressParticipant(p: io.livekit.android.room.participant.RemoteParticipant): Boolean =
+    (p.identity?.value ?: "").startsWith("EG_")
+
+  /** 房间人数（含本端；未连接返回 0）。★排除 EG_ 录制器，与 PC 口径一致。 */
   fun participantCount(): Int {
     val r = room ?: return 0
     if (!connectedFlag) {
       return 0
     }
-    return r.remoteParticipants.size + 1
+    return r.remoteParticipants.values.count { !isEgressParticipant(it) } + 1
   }
 
   /** 房间 metadata：服务端更新后 LiveKit 会同步到 Room，本端由页面轮询读取。 */
@@ -432,6 +451,7 @@ class MeetingRoomBridge(context: Context) {
     val out = StringBuilder()
     try {
       for (p in r.remoteParticipants.values) {
+        if (isEgressParticipant(p)) continue
         if (hasVideoTrack(p)) {
           if (out.isNotEmpty()) {
             out.append(",")

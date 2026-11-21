@@ -537,7 +537,11 @@ public class MeetingRoomBridge: NSObject {
 
   public static func participantCount() -> NSNumber {
     guard let room = room else { return 0 }
-    return NSNumber(value: room.remoteParticipants.count + 1)
+    // 云端录制 Egress 也是参与者（identity 前缀 EG_），不算人；与 PC 口径一致。
+    let people = room.remoteParticipants.values.filter {
+      !($0.identity?.stringValue ?? "").hasPrefix("EG_")
+    }.count
+    return NSNumber(value: people + 1)
   }
 
   /// 房间 metadata：服务端写入后由 LiveKit 同步，本端页面轮询读取。
@@ -624,6 +628,7 @@ public class MeetingRoomBridge: NSObject {
     guard let room = room else { return "" }
     var ids: [String] = []
     for (_, participant) in room.remoteParticipants {
+      if (participant.identity?.stringValue ?? "").hasPrefix("EG_") { continue }
       if firstVideoTrack(participant) != nil {
         // Swift 的 identity 是 `Participant.Identity?`（不是 String），取 stringValue
         ids.append(participant.identity?.stringValue ?? "")

@@ -680,11 +680,14 @@ public class MeetingRoomBridge: NSObject {
     }
   }
 
-  /// 取该远端已订阅的第一条视频轨道（遍历 trackPublications，不依赖具体 source 枚举名）。
+  /// 取该远端已订阅的第一条可展示视频轨道。
+  /// ★摄像头和屏幕共享都要认：只过滤 `.camera` 会让「别人共享的屏幕」在 iOS 上永远不显示
+  ///   （Android 侧 hasVideoTrack 早已同时认 CAMERA / SCREEN_SHARE，两端必须同口径）。
   private static func firstVideoTrack(_ participant: RemoteParticipant) -> VideoTrack? {
     for (_, publication) in participant.trackPublications {
       if publication.isMuted { continue }
-      if publication.source != .camera { continue }
+      // ★LiveKitClient 2.19 的枚举名是 screenShareVideo（不是 screenShare），写错直接编译失败
+      if publication.source != .camera && publication.source != .screenShareVideo { continue }
       if let video = publication.track as? VideoTrack {
         return video
       }

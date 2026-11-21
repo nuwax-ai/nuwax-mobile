@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Temporarily raise HX's compiler heap for the full App; restore the setting even on failure."""
-import re, signal, subprocess, sys
+import os, re, signal, subprocess, sys
 from pathlib import Path
 
 settings = Path.home()/'Library/Application Support/HBuilder X/user/settings.json'
-cli = '/Applications/HBuilderX.app/Contents/MacOS/cli'
+cli = os.environ.get('HX_CLI', '/Applications/HBuilderX.app/Contents/MacOS/cli')
 original = settings.read_bytes()
 text = original.decode('utf-8')
 pattern = r'("node\.run\.memoryParam"\s*:\s*)("[^"\n]*"|[0-9]+)'

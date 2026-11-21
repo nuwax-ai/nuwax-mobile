@@ -1,6 +1,6 @@
 # 本地离线自定义基座（仅出包，不安装/不唤起设备）
 # 详见 docs/engineering/custom-base-distribution-s3.md
-.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-promote base-fetch base-info base-list sdk-publish sdk-fetch app-resource android-tester android-release
+.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-promote base-fetch base-info base-list sdk-publish sdk-fetch app-resource android-tester android-release ios-tester
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 HX_CLI ?= /Applications/HBuilderX.app/Contents/MacOS/cli
@@ -8,7 +8,8 @@ HX_CLI ?= /Applications/HBuilderX.app/Contents/MacOS/cli
 help:
 	@echo "自定义基座 · 只生成包 → unpackage/debug/"
 	@echo "  make base-android         # android_debug.apk"
-	@echo "  make base-ios-device       # iOS_debug.ipa（真机）"
+	@echo "  make base-ios-device       # iOS_debug.ipa（真机，先 make app-resource）"
+	@echo "  make ios-tester            # 生成可独立安装的 iOS 测试环境 IPA"
 	@echo "  make base-ios-simulator   # Pandora_simulator_debug.app（模拟器）"
 	@echo "  make base-all             # 上述三份（仅出包，不生成资源、不上 S3）"
 	@echo "  make base-ship            # 一键：appResource → 出包 → 上传 S3"
@@ -47,7 +48,10 @@ android-release:
 	@bash "$(ROOT)scripts/android-esp/build_store_release.sh"
 
 base-ios-device:
-	@bash "$(ROOT)scripts/ios-esp/package_device_base.sh"
+	@bash "$(ROOT)scripts/voip-native/package-business-ios.sh"
+
+ios-tester:
+	@HX_CLI="$(HX_CLI)" bash "$(ROOT)scripts/voip-native/package-business-qa-ios.sh"
 
 base-ios-simulator:
 	@bash "$(ROOT)scripts/ios-esp/package_simulator_base.sh"

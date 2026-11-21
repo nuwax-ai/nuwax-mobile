@@ -129,10 +129,10 @@ git diff --check
 - [ ] 新代码在两端提交同步后，用 HBuilderX 5.34 和匹配 SDK 生成真实 App 测试环境资源及完整签名 IPA：
 
 ```bash
-bash scripts/voip-native/package-business-qa-ios.sh
+make ios-tester
 ```
 
-该脚本默认使用统一签名配置，仅本地出包，不上传、安装或部署。它把完整真实 App 源码复制到忽略目录后固定测试环境，内置完整业务页面，移除 HX DebugServe；不是旧 Alice/Bob 测试 App。安装文件名可能带 `VoIP-Test`，bundle 仍是 `com.nuwax.app`。
+默认使用统一签名配置，在本机生成 `Nuwax-iOS-Test-<时间>.ipa`。它从当前 App 源码生成测试环境资源并内置完整业务页面，bundle ID 为 `com.nuwax.app`。
 
 - [ ] 回读包内原生实现、启动 hook、签名、环境和资源摘要；在 `out/voip-business-packages/` 记录 IPA 实体文件、SHA-256 和配套构建元数据。
 - [ ] 同签名覆盖安装到 iPhone 16，不卸载清数据。确认真实测试环境账号、不同主叫账号；生产账号遗留身份不可直接复用。完整说明见 [测试包手册](voip-ios-qa-package.md)。

@@ -62,7 +62,7 @@ with tempfile.TemporaryDirectory() as directory:
     resources = root/'unpackage/resources/app-ios/__UNI__8BF05E4/www'
     resources.mkdir(parents=True)
     (resources/'app-service.js').write_text('// release resource must not be used')
-    sdk = root/'out/sdk'; sdk.mkdir(parents=True)
+    sdk = root/'out/UniAppX-iOS@5.34'; (sdk/'SDK/Libs').mkdir(parents=True)
     env = dict(os.environ, UNIAPPX_SDK_ROOT=str(sdk), NUWAX_VOIP_BUSINESS_HOST='1', NUWAX_IOS_HX_DEV_NATIVE='1')
     run = subprocess.run([sys.executable, str(scripts/'prepare-ios.py')], env=env, text=True, capture_output=True)
     assert run.returncode != 0

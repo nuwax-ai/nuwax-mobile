@@ -30,7 +30,7 @@ fi
 
 if want ios-device; then
   echo "######## iOS 真机 → iOS_debug.ipa ########"
-  "$SCRIPT_DIR/ios-esp/package_device_base.sh"
+  make -C "$ROOT" base-ios-device
   echo ""
 fi
 

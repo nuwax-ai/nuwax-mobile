@@ -6,7 +6,11 @@ import PushKit
 import Security
 import UserNotifications
 @preconcurrency import LiveCommunicationKit
+#if canImport(LiveKit)
 import LiveKit
+#else
+import LiveKitClient
+#endif
 
 /** All mutable call state is confined to main; Room delegates marshal back to main. */
 @MainActor @objc public final class NuwaxVoipBridge: NSObject, @unchecked Sendable {

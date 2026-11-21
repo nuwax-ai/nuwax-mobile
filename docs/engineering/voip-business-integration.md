@@ -33,16 +33,10 @@
 HBuilderX 与离线 SDK 均使用 **5.34**。脚本只修改此 worktree 的 `out/`，产物写 `out/voip-business-packages/` 及本 worktree `unpackage/debug/`，不安装、不上传。签名和 uni-push 配置仅通过受控本地路径传入，不提交。
 
 ```bash
-# HBuilderX 已启动；绝对路径确保不使用主 checkout 或专用测试工程
-/Applications/HBuilderX.app/Contents/MacOS/cli publish app \
-  --type appResource --project "$PWD"
-
-NUWAX_SIGNING_ENV=<受控签名环境文件> \
-NUWAX_ANDROID_UNIPUSH_CONFIG=<匹配包名和签名的本地配置> \
-  bash scripts/voip-native/package-business-android.sh
-
-NUWAX_SIGNING_ENV=<受控签名环境文件> \
-  bash scripts/voip-native/package-business-ios.sh
+# HBuilderX 已启动。从当前检出目录执行。
+make app-resource
+make base-android
+make base-ios-device
 
 # 同名项目的 launch 命令存在歧义：给工作树导入一个唯一 IDE 名称。
 # 链接放在工作树的同级，避免位于项目内部造成循环扫描。
@@ -69,11 +63,10 @@ iOS 完整宿主包含完整业务资源、所有导出 UTS 模块、模块声�
 
 ### HBuilderX 5.34 的 iOS 原生复用
 
-本机 HBuilderX 动态 SPM 编译遇到 Xcode 索引目录参数错误；完整原生工程的同一 Swift 源码可正常构建。需要原生调试包装信息时，先让 HX 生成开发 Swift，再以 `NUWAX_IOS_HX_DEV_NATIVE=1` 执行 `package-business-ios.sh`，使用同一批生成代码构建完整宿主。`register-business-ios-cache.mjs` 核对 HX 版本、LiveKit 锁定版本、原生源文件、生成 Swift、构建时序及宿主签名后，登记实际已构建的原生缓存，并将成功的 HX 原生补丁整合、签名进宿主；校验失败会中止。`--verify-only` 只验证，不登记或打包。
+本机 HBuilderX 动态 SPM 编译遇到 Xcode 索引目录参数错误；完整原生工程使用同一份 Swift 源码，并由会议和通话模块共用 CocoaPods 锁定的 LiveKit 版本。需要原生调试包装信息时，先让 HX 生成开发 Swift，再以 `NUWAX_IOS_HX_DEV_NATIVE=1` 执行 `make base-ios-device`。`register-business-ios-cache.mjs` 核对 HX 版本、LiveKit 锁定版本、原生源文件、生成 Swift、构建时序及宿主签名，再登记已构建的缓存，将已通过校验的 HX 原生补丁签名进宿主。`--verify-only` 用于单独校验。
 
 ```bash
-NUWAX_IOS_HX_DEV_NATIVE=1 NUWAX_SIGNING_ENV=<受控签名环境文件> \
-  bash scripts/voip-native/package-business-ios.sh
+NUWAX_IOS_HX_DEV_NATIVE=1 make base-ios-device
 node scripts/voip-native/register-business-ios-cache.mjs
 ```
 

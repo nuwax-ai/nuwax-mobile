@@ -15,14 +15,17 @@ if QA_PROJECT:
  assert qa['flavor']=='voip-business-qa' and qa['apiOrigin']=='https://testagent.xspaceagi.com', 'Invalid QA source variant'
 HX_DEV_ROOT=ROOT/'unpackage/dist/dev/app-ios'
 PROJECT='VoipBusiness' if BUSINESS else 'VoipDeviceTest'
-OUT=ROOT/('out/voip-business-ios' if BUSINESS else 'out/voip-device-ios')
+OUT=ROOT/('out/voip-business-qa-ios' if QA_PROJECT else 'out/voip-business-ios' if BUSINESS else 'out/voip-device-ios')
 RES=ROOT/('unpackage/resources/app-ios' if BUSINESS else 'out/voip-device-project/unpackage/resources/app-ios')
 if QA_PROJECT: RES=QA_PROJECT/'unpackage/resources/app-ios'
 MANIFEST=json.loads((ROOT/'manifest.json').read_text())
-assert str(SDK).startswith(str(ROOT/'out')+'/'), 'iOS SDK must be isolated under this worktree out/'
+assert SDK.name == 'UniAppX-iOS@5.34' and (SDK/'SDK/Libs').is_dir(), 'Select the iOS 5.34 offline SDK via UNIAPPX_SDK_ROOT'
 assert (RES/'__UNI__8BF05E4/www/app-service.js').is_file(), 'Export device project app resources in HBuilderX first'
 if HX_DEV:
  assert (HX_DEV_ROOT/'app-service.js').is_file(), 'HX development resources missing: finish the HBuilderX iOS compile before building the development host; never fall back to release resources'
+push_info, push_entitlements = selected_push_configuration('com.nuwax.app')
+if QA_PROJECT and push_entitlements['aps-environment'] != 'development':
+ raise ValueError('The standalone QA host requires a development APNs profile')
 OUT.mkdir(parents=True,exist_ok=True)
 APP=OUT/'App'
 shutil.copytree(SDK/'UniAppXDemo/UniAppXDemo',APP,dirs_exist_ok=True)
@@ -93,7 +96,6 @@ if BUSINESS:
  info.update(MANIFEST.get('app-ios',{}).get('distribute',{}).get('privacyDescription',{}))
  info['NSLocalNetworkUsageDescription']=info.get('NSLocalNetworkUsageDescription') if 'NSLocalNetworkUsageDescription' in MANIFEST.get('app-ios',{}).get('distribute',{}).get('privacyDescription',{}) else '连接您配置的企业服务器及局域网设备。'
  info['NSAppTransportSecurity']={'NSAllowsLocalNetworking':True}
-push_info, push_entitlements = selected_push_configuration('com.nuwax.app')
 info.update(push_info)
 (APP/'Info.plist').write_bytes(plistlib.dumps(info));os.chmod(APP/'Info.plist',0o600)
 if BUSINESS:
@@ -120,6 +122,12 @@ base={'SWIFT_VERSION':'5.0','IPHONEOS_DEPLOYMENT_TARGET':'15.0','ENABLE_MODULE_V
 spec={'name':PROJECT,'options':{'deploymentTarget':{'iOS':'15.0'},'transitivelyLinkDependencies':True},'settings':{'base':base,'configs':{'Debug':{'SWIFT_ACTIVE_COMPILATION_CONDITIONS':'$(inherited) DEBUG'},'Release':{'SWIFT_ACTIVE_COMPILATION_CONDITIONS':'$(inherited)'}}},'packages':{'LiveKit':{'url':'https://github.com/livekit/client-sdk-swift.git','exactVersion':'2.19.0'}},'targets':{}}
 modules=[]
 pods={}
+pod_sources=set()
+if BUSINESS:
+ # The meeting and VoIP frameworks import the same LiveKit module. Link one
+ # CocoaPods version into the business host instead of also embedding SwiftPM's.
+ spec.pop('packages')
+ livekit_config=json.loads((ROOT/'uni_modules/nuwax-livekit/utssdk/app-ios/config.json').read_text())
 for p in sorted((RES/'uni_modules').iterdir()):
  src=p/'utssdk/app-ios/src'
  if not src.is_dir():continue
@@ -147,13 +155,19 @@ for p in sorted((RES/'uni_modules').iterdir()):
    deps.append({'framework':str(library),'embed':False})
    frameworks.append({'framework':str(library),'embed':True,'codeSign':True})
   if config.get('dependencies-pods'): pods[module]=config['dependencies-pods']
+  pod_sources.update(config.get('dependencies-pod-sources', []))
  if p.name=='nuwax-voip':
-  deps += [{'package':'LiveKit','product':'LiveKit'},{'sdk':'LiveCommunicationKit.framework','weak':True},{'sdk':'PushKit.framework'},{'sdk':'AVFoundation.framework'},{'sdk':'Security.framework'},{'sdk':'UserNotifications.framework'}]
+  deps += [{'sdk':'LiveCommunicationKit.framework','weak':True},{'sdk':'CallKit.framework'},{'sdk':'PushKit.framework'},{'sdk':'AVFoundation.framework'},{'sdk':'Security.framework'},{'sdk':'UserNotifications.framework'}]
+  if BUSINESS:
+   pods[module]=livekit_config['dependencies-pods']
+   pod_sources.update(livekit_config['dependencies-pod-sources'])
+  else:
+   deps.append({'package':'LiveKit','product':'LiveKit'})
  spec['targets'][module]={'type':'framework','platform':'iOS','sources':[str(dest)],'dependencies':deps,'settings':{'base':settings}}
  modules.append({'target':module,'embed':True,'codeSign':True})
 spec['targets']['UniAppX']={'type':'application','platform':'iOS','sources':[{'path':str(APP),'excludes':['Info.plist','*.entitlements','uni-app-x']}],
  'dependencies':frameworks+modules,
- 'settings':{'base':{'PRODUCT_BUNDLE_IDENTIFIER':'com.nuwax.app','PRODUCT_NAME':'UniAppX','SWIFT_OBJC_INTERFACE_HEADER_NAME':'UniAppX-Swift.h','SWIFT_OBJC_BRIDGING_HEADER':str(APP/'UniAppXDemo-Bridging-Header.h'),'INFOPLIST_FILE':str(APP/'Info.plist'),'INFOPLIST_OUTPUT_FORMAT':'binary','CODE_SIGN_ENTITLEMENTS':str(APP/'Test.entitlements'),'CODE_SIGN_STYLE':'Manual','PROVISIONING_PROFILE_SPECIFIER':os.environ['IOS_PROVISIONING_PROFILE_UUID'],'OTHER_LDFLAGS':['$(inherited)','-ObjC','-lc++','-lz','-lsqlite3'],'LD_RUNPATH_SEARCH_PATHS':['$(inherited)','@executable_path/Frameworks'],'ASSETCATALOG_COMPILER_APPICON_NAME':'AppIcon','TARGETED_DEVICE_FAMILY':'1,2'}}}
+ 'settings':{'base':{'PRODUCT_BUNDLE_IDENTIFIER':'com.nuwax.app','PRODUCT_NAME':'UniAppX','SWIFT_OBJC_INTERFACE_HEADER_NAME':'UniAppX-Swift.h','SWIFT_OBJC_BRIDGING_HEADER':'App/UniAppXDemo-Bridging-Header.h','INFOPLIST_FILE':'App/Info.plist','INFOPLIST_OUTPUT_FORMAT':'binary','CODE_SIGN_ENTITLEMENTS':'App/Test.entitlements','CODE_SIGN_STYLE':'Manual','PROVISIONING_PROFILE_SPECIFIER':os.environ['IOS_PROVISIONING_PROFILE_UUID'],'OTHER_LDFLAGS':['$(inherited)','-ObjC','-lc++','-lz','-lsqlite3'],'LD_RUNPATH_SEARCH_PATHS':['$(inherited)','@executable_path/Frameworks'],'ASSETCATALOG_COMPILER_APPICON_NAME':'AppIcon','TARGETED_DEVICE_FAMILY':'1,2'}}}
 spec['targets']['UniAppX']['sources'] += [
  {'path':str(APP/'uni-app-x'),'type':'folder','buildPhase':'resources'},
  {'path':str(SDK/'SDK/Resources/uni-static'),'type':'folder','buildPhase':'resources'},
@@ -164,10 +178,12 @@ print('Generated isolated iOS host:',OUT,'with',len(modules),'UTS modules and',l
 subprocess.run(['xcodegen','generate','--spec',str(OUT/'project.json'),'--project',str(OUT)],check=True)
 
 if BUSINESS and pods:
- lines=["platform :ios, '15.0'", f"project '{PROJECT}.xcodeproj'", "use_frameworks!"]
+ lines=[f"source '{source}'" for source in sorted(pod_sources)]
+ lines += ["platform :ios, '15.0'", f"project '{PROJECT}.xcodeproj'", "use_frameworks!"]
  for target, entries in list(pods.items())+[('UniAppX',[entry for entries in pods.values() for entry in entries])]:
   lines.append(f"target '{target}' do")
-  for entry in entries: lines.append(f"  pod '{entry['name']}', '{entry['version']}'")
+  for name, version in dict.fromkeys((entry['name'], entry['version']) for entry in entries):
+   lines.append(f"  pod '{name}', '{version}'")
   lines.append("  pod 'SwiftProtobuf', '1.22.1'")
   lines.append('end')
  lines += ["post_install do |installer|", "  installer.pods_project.targets.each do |target|", "    target.build_configurations.each do |config|", "      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'", "      config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'", "    end", "  end", "end"]

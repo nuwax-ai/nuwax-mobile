@@ -16,7 +16,8 @@ const outputDir = `${root}/unpackage/dist/dev/app-ios`;
 const app = `${root}/out/voip-business-ios-derived/Build/Products/Debug-iphoneos/UniAppX.app`;
 if (spawnSync('codesign', ['--verify', '--deep', '--strict', app]).status !== 0) throw Error('Native host signature invalid');
 const spec = JSON.parse(await readFile(`${root}/out/voip-business-ios/project.json`, 'utf8'));
-if (spec.packages.LiveKit.exactVersion !== '2.19.0') throw Error('Unexpected LiveKit version');
+const podLock = await readFile(`${root}/out/voip-business-ios/Podfile.lock`, 'utf8');
+if (!/^ {2}- LiveKitClient \(2\.19\.0\):?$/m.test(podLock)) throw Error('Unexpected LiveKit version');
 const digest = async p => createHash('sha256').update(await readFile(p)).digest('hex');
 const modules = [];
 for (const dir of await readdir(`${root}/out/voip-business-ios/Modules`, { withFileTypes: true })) {

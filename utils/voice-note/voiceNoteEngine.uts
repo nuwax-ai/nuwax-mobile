@@ -72,6 +72,10 @@ let uploadRerunLocalId = "";
 let uploadLocalId = "";
 /** 补传是否在进行。不占用本次录音的上传。 */
 let backfillRunning = false;
+/** 总开关这一轮正在补的本地会话。历史记录里的单条补传不写这里。 */
+let activeBackfillLocalId = "";
+/** 历史列表里正在单独补传的本地会话。同一条不重复开。 */
+let historyBackfillLocalIds: string[] = [];
 /** 正在创建笔记的本地会话。不同会话可以同时创建，同一条不重复创建。 */
 let noteCreateLocalIds: string[] = [];
 let pollTimer = 0;
@@ -567,6 +571,13 @@ function segmentCanUpload(row: VoiceNoteSegmentRecord): boolean {
   return status == "pending" || status == "failed" || status == "uploading";
 }
 
+/** 历史记录触发的补传：正在上传或已经成功的分段不再传。 */
+function historySegmentNeedsUpload(row: VoiceNoteSegmentRecord): boolean {
+  const status = row.uploadStatus;
+  if (status == "uploading" || status == "uploaded") return false;
+  return true;
+}
+
 function allSegmentsUploaded(record: VoiceNoteRecord): boolean {
   if (record.segments.length <= 0) return false;
   for (let i = 0; i < record.segments.length; i++) {
@@ -767,10 +778,14 @@ function segmentSkipped(indexes: number[], segmentIndex: number): boolean {
  * backfill 为 true：某一段失败后跳过，继续下一个文件。
  * 为 false：刚落下的这一段失败后还可以在本次接着试，满 3 次后留给以后的补传。
  */
-async function pumpQueue(localId: string, backfill: boolean): Promise<void> {
-  if (backfill) {
+async function pumpQueue(localId: string, backfill: boolean, history: boolean = false): Promise<void> {
+  if (history) {
+    if (historyBackfillBusy(localId)) return;
+    rememberHistoryBackfill(localId);
+  } else if (backfill) {
     if (backfillRunning) return;
     backfillRunning = true;
+    activeBackfillLocalId = localId;
     markBackfillRunning(true);
   } else {
     if (uploadRunning) {
@@ -786,18 +801,36 @@ async function pumpQueue(localId: string, backfill: boolean): Promise<void> {
     while (guard < 10000) {
       const open = findVoiceNoteByLocalId(localId);
       if (open == null) break;
-      if (backfill && (open.phase == "recording" || open.phase == "paused" || open.localId == uploadLocalId)) {
+      if (history && (open.phase == "recording" || open.localId == uploadLocalId)) {
+        break;
+      }
+      if (!history && backfill && (open.phase == "recording" || open.phase == "paused" || open.localId == uploadLocalId)) {
         break;
       }
       let pending: VoiceNoteSegmentRecord | null = null;
       for (let i = 0; i < open.segments.length; i++) {
         const row = open.segments[i];
-        if (!segmentCanUpload(row) || segmentSkipped(skipped, row.segmentIndex)) continue;
+        if (segmentSkipped(skipped, row.segmentIndex)) continue;
+        if (history) {
+          if (!historySegmentNeedsUpload(row)) continue;
+        } else if (!segmentCanUpload(row)) {
+          continue;
+        }
         pending = row;
         break;
       }
       if (pending == null) {
-        if (open.awaitComplete && open.phase != "recording") {
+        if (history) {
+          const latest = findVoiceNoteByLocalId(localId);
+          if (latest != null && allSegmentsUploaded(latest)) {
+            await completeRecord(latest);
+          } else if (latest != null && !historyNoteStillUploading(latest) && latest.phase != "recording" && latest.phase != "paused") {
+            latest.phase = "failed";
+            latest.awaitComplete = false;
+            if (latest.error.length == 0) latest.error = "有录音分段上传失败";
+            touch(latest);
+          }
+        } else if (open.awaitComplete && open.phase != "recording") {
           if (allSegmentsUploaded(open)) {
             await completeRecord(open);
           } else {
@@ -851,15 +884,18 @@ async function pumpQueue(localId: string, backfill: boolean): Promise<void> {
         writeSegmentUpload(sessionId, segmentIndex, "uploaded", segmentId, "", attempts);
       } catch (e) {
         writeSegmentUpload(sessionId, segmentIndex, "failed", "", `${e}`, attempts);
-        if (backfill || attempts >= maxSegmentUploadAttempts) {
+        if (history || backfill || attempts >= maxSegmentUploadAttempts) {
           skipped.push(segmentIndex);
         }
       }
     }
   } finally {
-    if (backfill) {
+    if (history) {
+      forgetHistoryBackfill(localId);
+    } else if (backfill) {
       markBackfillRunning(false);
       backfillRunning = false;
+      activeBackfillLocalId = "";
     } else {
       uploadRunning = false;
       uploadLocalId = "";
@@ -927,6 +963,80 @@ function startBackfill(): void {
   gate.backfillStartedAt = Date.now();
   saveBackfillGate(gate);
   void pumpQueue(current.localId, true);
+}
+
+function findVoiceNoteByNoteId(noteId: string): VoiceNoteRecord | null {
+  if (noteId.length == 0) return null;
+  const rows = loadVoiceNotes();
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].noteId == noteId) return rows[i];
+  }
+  return null;
+}
+
+function noteHasPendingUpload(record: VoiceNoteRecord): boolean {
+  for (let i = 0; i < record.segments.length; i++) {
+    if (segmentCanUpload(record.segments[i])) return true;
+  }
+  return false;
+}
+
+function historyNoteNeedsUpload(record: VoiceNoteRecord): boolean {
+  for (let i = 0; i < record.segments.length; i++) {
+    if (historySegmentNeedsUpload(record.segments[i])) return true;
+  }
+  return false;
+}
+
+function historyNoteStillUploading(record: VoiceNoteRecord): boolean {
+  for (let i = 0; i < record.segments.length; i++) {
+    if (record.segments[i].uploadStatus == "uploading") return true;
+  }
+  return false;
+}
+
+function historyBackfillBusy(localId: string): boolean {
+  for (let i = 0; i < historyBackfillLocalIds.length; i++) {
+    if (historyBackfillLocalIds[i] == localId) return true;
+  }
+  return false;
+}
+
+function rememberHistoryBackfill(localId: string): void {
+  historyBackfillLocalIds.push(localId);
+}
+
+function forgetHistoryBackfill(localId: string): void {
+  const next: string[] = [];
+  for (let i = 0; i < historyBackfillLocalIds.length; i++) {
+    if (historyBackfillLocalIds[i] != localId) next.push(historyBackfillLocalIds[i]);
+  }
+  historyBackfillLocalIds = next;
+}
+
+/**
+ * 历史列表里已加载、且状态是上传中的某一条。
+ * 只用 noteId 找到本地那一条的文件。正在上传或已经成功的分段跳过。
+ * 失败和其他状态才传。不看 5 分钟间隔。正在录音的这一次不补。
+ * 全部分段补成功后收尾；服务端完成后从本地补传记录里删掉。
+ */
+export function backfillVoiceNoteByNoteId(noteId: string): void {
+  if (noteId.length == 0) return;
+  const recording = activeRecord();
+  if (recording != null && recording.noteId == noteId) return;
+  const target = findVoiceNoteByNoteId(noteId);
+  if (target == null) return;
+  if (target.phase == "recording") return;
+  if (target.localId == uploadLocalId) return;
+  if (backfillRunning && target.localId == activeBackfillLocalId) return;
+  if (historyBackfillBusy(target.localId)) return;
+  if (!historyNoteNeedsUpload(target)) {
+    if (allSegmentsUploaded(target)) {
+      void completeRecord(target);
+    }
+    return;
+  }
+  void pumpQueue(target.localId, false, true);
 }
 
 async function completeRecord(record: VoiceNoteRecord): Promise<void> {
@@ -1233,20 +1343,21 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
 
 /**
  * 播放前如果正在录音，只暂停采集，不落盘、不上传。
- * 已落盘的分段和当前还开着的文件都可以播。
- * @returns 可播放路径。优先当前这段，否则最近一段已落盘文件。没有则空字符串
+ * 正在写、还没封口的文件不能播。没有已落盘分段时不暂停，直接返回空字符串。
+ * @returns 最近一段已落盘文件的路径。没有则空字符串
  */
 export async function playableLocalVoiceFile(): Promise<string> {
   const recording = activeRecord();
+  const current = recording != null ? recording : findOpenVoiceNote();
+  if (current == null || newestSegmentPath(current).length == 0) {
+    return "";
+  }
   if (recording != null) {
     await pauseActiveRecorder(recording);
   }
   const record = findOpenVoiceNote();
   if (record == null) {
-    return "";
-  }
-  if (record.openSegmentPath.length > 0) {
-    return record.openSegmentPath;
+    return newestSegmentPath(current);
   }
   return newestSegmentPath(record);
 }

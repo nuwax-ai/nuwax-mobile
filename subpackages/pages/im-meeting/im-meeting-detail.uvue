@@ -110,6 +110,14 @@
               </view>
               <text class="player__time">{{ currentTimeText }} / {{ totalTimeText }}</text>
               <text v-if="audioLoading" class="player__loading">{{ t("Mobile.Common.loading") }}</text>
+              <view
+                class="player__download"
+                :class="{ 'player__download--busy': downloadBusy }"
+                hover-class="player__download--active"
+                @click="handleDownload"
+              >
+                <text class="player__download-text">{{ downloadBusy ? t("Mobile.Terminal.downloading") : t("Mobile.Terminal.download") }}</text>
+              </view>
             </view>
             <slider
               class="player__slider"
@@ -185,6 +193,7 @@
     durationSec: number = 0;
     sizeBytes: number = 0;
     meta: string = "";
+    isVideo: boolean = false;
   }
 
   class TranscriptLine {
@@ -227,6 +236,7 @@
   const selectedFileId = ref<string>("");
   const playing = ref<boolean>(false);
   const audioLoading = ref<boolean>(false);
+  const downloadBusy = ref<boolean>(false);
   const currentSec = ref<number>(0);
   const audioDurationSec = ref<number>(0);
   let audioCtx: InnerAudioContext | null = null;
@@ -321,6 +331,12 @@
     return "—";
   }
 
+  function isVideoFilename(filename: string): boolean {
+    const lower = filename.toLowerCase();
+    return lower.endsWith(".mp4") || lower.endsWith(".mov")
+      || lower.endsWith(".m4v") || lower.endsWith(".webm");
+  }
+
   function transcriptStateText(status: number, fallback: string): string {
     if (status >= 1 && status <= 4) return t("Mobile.Meeting.transcriptProcessing");
     if (status == 5) return t("Mobile.Meeting.transcriptDone");
@@ -351,6 +367,9 @@
       file.id = readStr(item, "id");
       const filename = readStr(item, "filename");
       file.name = filename.length > 0 ? filename : `${t("Mobile.Meeting.recording")} ${i + 1}`;
+      const contentType = readStr(item, "contentType").toLowerCase();
+      const kind = readStr(item, "kind").toLowerCase();
+      file.isVideo = isVideoFilename(file.name) || contentType.startsWith("video/") || kind == "video";
       file.status = Math.floor(readNum(item, "status", 1));
       file.stateText = fileStateText(file.status, readStr(item, "statusText"));
       file.durationSec = readNum(item, "durationSec", 0);
@@ -529,6 +548,83 @@
     }
   }
 
+  async function resolveFileUrl(file: DetailFile, download: boolean): Promise<string> {
+    const res = await apiImMeetingRecordFileUrl(meetingId.value, file.id, download);
+    if (apiResCode(res) != SUCCESS_CODE) {
+      const message = apiResMessage(res);
+      uni.showToast({ title: message.length > 0 ? message : t("Mobile.Meeting.audioPlayFailed"), icon: "none" });
+      return "";
+    }
+    const raw = apiResData<any>(res);
+    const data = raw != null ? (raw as UTSJSONObject) : null;
+    if (data == null) return "";
+    let url = download ? readStr(data, "downloadUrl") : readStr(data, "playUrl");
+    if (url.length == 0) url = readStr(data, "url");
+    if (url.length == 0) {
+      const reason = readStr(data, "reason");
+      uni.showToast({ title: reason.length > 0 ? reason : t("Mobile.Meeting.fileProcessing"), icon: "none" });
+    }
+    return url;
+  }
+
+  async function openVideoFile(file: DetailFile): Promise<void> {
+    if (!file.isVideo || file.status != 2 || file.id.length == 0) return;
+    const url = await resolveFileUrl(file, false);
+    if (url.length == 0) return;
+    uni.navigateTo({ url: `/subpackages/pages/im-video-preview/im-video-preview?src=${encodeURIComponent(url)}` });
+  }
+
+  function openDownloadedFile(tempFilePath: string): Promise<void> {
+    return new Promise<void>((resolve, _reject) => {
+      // uni-app x Android 当前不支持持久化保存 API；沿用项目录音下载方案，
+      // 下载到临时文件后交给系统应用打开，用户可在系统页面另存或分享。
+      uni.openDocument({
+        filePath: tempFilePath,
+        success: () => {
+          uni.showToast({ title: t("Mobile.Terminal.downloadDone"), icon: "none" });
+          resolve();
+        },
+        fail: (_error) => {
+          uni.showToast({ title: t("Mobile.Terminal.downloadOpenFailed"), icon: "none" });
+          resolve();
+        },
+      });
+    });
+  }
+
+  async function handleDownload(): Promise<void> {
+    if (downloadBusy.value) return;
+    const file = findFile(selectedFileId.value);
+    if (file == null || file.status != 2 || file.id.length == 0) return;
+    downloadBusy.value = true;
+    try {
+      const url = await resolveFileUrl(file, true);
+      if (url.length == 0) return;
+      await new Promise<void>((resolve, _reject) => {
+        uni.downloadFile({
+          url,
+          success: (result) => {
+            const temp = result.tempFilePath != null ? `${result.tempFilePath}` : "";
+            if (result.statusCode != 200 || temp.length == 0) {
+              uni.showToast({ title: t("Mobile.Terminal.downloadFailed"), icon: "none" });
+              resolve();
+              return;
+            }
+            openDownloadedFile(temp).then((): void => { resolve(); });
+          },
+          fail: (_error) => {
+            uni.showToast({ title: t("Mobile.Terminal.downloadFailed"), icon: "none" });
+            resolve();
+          },
+        });
+      });
+    } catch (_error) {
+      uni.showToast({ title: t("Mobile.Terminal.downloadFailed"), icon: "none" });
+    } finally {
+      downloadBusy.value = false;
+    }
+  }
+
   function applyDetail(data: UTSJSONObject): void {
     const meetingRaw = data["meeting"];
     if (meetingRaw == null) {
@@ -620,6 +716,10 @@
   function handleFileClick(file: DetailFile): void {
     selectedFileId.value = file.id;
     if (file.status == 2) {
+      if (file.isVideo) {
+        void openVideoFile(file);
+        return;
+      }
       if (audioLoadedFileId != file.id) {
         stopAudio();
         audioDurationSec.value = file.durationSec;
@@ -632,6 +732,10 @@
   function handlePlayToggle(): void {
     const file = findFile(selectedFileId.value);
     if (file == null || file.status != 2) return;
+    if (file.isVideo) {
+      void openVideoFile(file);
+      return;
+    }
     const ctx = ensureAudioContext();
     if (playing.value && audioLoadedFileId == file.id) {
       ctx.pause();
@@ -869,9 +973,13 @@
   .player__top { display: flex; flex-direction: row; align-items: center; }
   .play-button { width: 72rpx; height: 72rpx; border-radius: 36rpx; background: #5147ff; display: flex; align-items: center; justify-content: center; }
   .play-button--active { opacity: 0.8; }
-  .play-button__text { font-size: 26rpx; color: #ffffff; }
+  .play-button__text { position: relative; left: 3rpx; font-size: 36rpx; line-height: 40rpx; color: #ffffff; }
   .player__time { margin-left: 20rpx; font-size: 25rpx; color: #5c5863; }
   .player__loading { margin-left: auto; font-size: 23rpx; color: #9994a1; }
+  .player__download { margin-left: auto; min-width: 96rpx; height: 56rpx; padding: 0 18rpx; border-radius: 28rpx; background: #17171a; display: flex; align-items: center; justify-content: center; }
+  .player__download--busy { opacity: 0.55; }
+  .player__download--active { opacity: 0.75; }
+  .player__download-text { font-size: 23rpx; color: #ffffff; }
   .player__slider { margin: 18rpx 0 0; }
 
   .transcript-list { width: 100%; }

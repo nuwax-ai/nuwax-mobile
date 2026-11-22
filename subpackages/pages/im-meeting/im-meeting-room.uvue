@@ -406,9 +406,9 @@
                   <view
                     class="mr-act"
                     hover-class="mr-act--active"
-                    @click="handleMuteTile(tile)"
+                    @click="!tile.micOn && !tile.canPublish ? handleToggleSpeak(tile) : handleMuteTile(tile)"
                   >
-                    <text class="mr-act__text">{{ tile.micOn ? t("Mobile.Meeting.muteMember") : t("Mobile.Meeting.unmuteMember") }}</text>
+                    <text class="mr-act__text">{{ tile.micOn ? t("Mobile.Meeting.muteMember") : (!tile.canPublish ? t("Mobile.Meeting.enableSpeak") : t("Mobile.Meeting.unmuteMember")) }}</text>
                   </view>
                   <view
                     class="mr-act"
@@ -584,7 +584,7 @@
                   @click="toggleInvitee(person.userId)"
                 >
                   <view class="mr-invite-row__check">
-                    <svg-icon v-if="isInviteSelected(person.userId)" name="icon-Check" size="12" unit="px" color="#ffffff" />
+                    <svg-icon v-if="isInviteSelected(person.userId)" name="icon-Check" size="12" unit="px" color="#141416" />
                   </view>
                   <view class="mr-invite-row__avatar">
                     <image
@@ -665,12 +665,10 @@
     meetingMediaConnect,
     meetingMediaDebugLine,
     meetingMediaDisconnect,
-    meetingMediaLocalHandRaised,
     meetingMediaDrainMessages,
     meetingMediaSendMessage,
     meetingMediaStartScreenShare,
     meetingMediaStopScreenShare,
-    meetingMediaMicMuted,
     meetingMediaScreenShareOn,
     meetingMediaScreenShareError,
     meetingMediaPlatform,
@@ -1692,8 +1690,10 @@
   /** 本次共享开始时的原生错误快照：只把「之后新出现的错误」当本次失败。 */
   let shareErrorBaseline = "";
 
-  /** 本次「被主持人静音」是否已经提示过（服务端恢复后复位）。 */
+  /** 本次「被主持人静音」是否已经提示过（恢复开麦后复位）。 */
   let micMutedNotified = false;
+  /** 连续几次发现「自己的麦克风轨被服务端静音」：满 2 次才收麦。 */
+  let selfMicMutedSeen = 0;
 
   /** 共享失败原因 → 人话（原生给的是 error code / 英文 message，不能原样丢给用户）。 */
   function screenShareErrorText(code: string): string {
@@ -1730,22 +1730,17 @@
     if (shareFullKey.value.length > 0 && metadata.shareHolder != shareFullKey.value) {
       shareFullKey.value = "";
     }
-    // 主持人把我静音了：服务端只静音轨道（PC 靠 TrackMuted 事件收回本地开关），
-    // 这里用原生 publication 的 muted 对齐 —— 界面立刻变「已静音」并停放本机采集。
-    const micMutedByServer = meetingMediaMicMuted();
-    if (micOn.value && micMutedByServer) {
-      micOn.value = false;
-      mutedByRoomPolicy.value = false;
-      meetingMediaSetMic(false);
-      if (!micMutedNotified) {
-        micMutedNotified = true;
-        uni.showToast({ title: t("Mobile.Meeting.mutedByHost"), icon: "none" });
-      }
-    } else if (!micMutedByServer) {
-      micMutedNotified = false;
-    }
     const nativeShareOn = meetingMediaScreenShareOn();
     const nativeShareError = meetingMediaScreenShareError();
+    // 共享排障（保留到「别人共享我看不到」彻底关闭）：有没有把这个人的视频轨订阅上
+    if (metadata.shareHolder.length > 0) {
+      const shareVideos = meetingMediaRemoteVideoIdentities();
+      let videoText = "";
+      for (let i = 0; i < shareVideos.length; i++) {
+        videoText += (i > 0 ? "|" : "") + shareVideos[i];
+      }
+      console.error(`[MeetingUI] share holder=${metadata.shareHolder} nativeOn=${nativeShareOn} videoIds=${videoText}`);
+    }
     if (nativeShareOn) {
       localSharePending.value = false;
       localShareWasOn.value = true;
@@ -1796,7 +1791,6 @@
     if (metadata.hostUserId.length > 0 && myUserId.length > 0) {
       isHost.value = metadata.hostUserId == myUserId;
     }
-    handRaised.value = meetingMediaLocalHandRaised();
     syncRoomMutePolicy();
   }
 
@@ -2583,6 +2577,16 @@
           void handleKickedOut();
           return;
         }
+        // ★IM_30001 = 服务端「你已经不在该会议里」：被主持人移出后席位就没了，
+        //   成员接口会一直这样拒（不是空列表）。连续两次才收口，避免刚入会时的瞬时竞态。
+        if (failCode == "IM_30001") {
+          selfMissingChecks += 1;
+          if (selfMissingChecks >= 2) {
+            selfMissingChecks = 0;
+            void handleKickedOut();
+          }
+          return;
+        }
         // 成员列表拉不到（未加入/服务端未同步/会议已收尾）时只记日志：
         // 舞台退回"只有我"的样式，不留空白块
         await checkRoomEnded();
@@ -2672,9 +2676,15 @@
           const attributes = attributesRaw as UTSJSONObject;
           tile.handRaised = readStr(attributes, "handRaised").length > 0;
         }
+        // 更多面板里的举手按钮只代表本机席位，不能被其他参会人的 attributes 带动。
+        if (tile.isMe) {
+          handRaised.value = tile.handRaised;
+        }
         // 轨道：有未静音的音轨才算"在说"；摄像头同理
         let mic = false;
         let cam = false;
+        /** 是否存在麦克风轨（不管是否静音）：区分「还没发布」和「被服务端静音」。 */
+        let micTrack = false;
         const tracksRaw = obj["tracks"];
         if (tracksRaw != null && Array.isArray(tracksRaw)) {
           const tracks = tracksRaw as UTSJSONObject[];
@@ -2687,17 +2697,49 @@
             const source = readStr(trObj, "source").toUpperCase();
             const type = readStr(trObj, "type").toUpperCase();
             const muted = readStr(trObj, "muted") == "true";
-            if ((source == "MICROPHONE" || (source.length == 0 && type == "AUDIO")) && !muted) {
-              mic = true;
+            if (source == "MICROPHONE" || (source.length == 0 && type == "AUDIO")) {
+              micTrack = true;
+              if (!muted) {
+                mic = true;
+              }
             }
             if ((source == "CAMERA" || (source.length == 0 && type == "VIDEO")) && !muted) {
               cam = true;
             }
-            if (source == "SCREEN_SHARE" && !muted) tile.keepsShare = true;
+            if ((source == "SCREEN_SHARE" || source == "SCREEN_SHARE_VIDEO") && !muted) tile.keepsShare = true;
           }
         }
         tile.micOn = mic;
         tile.cameraOn = cam;
+        // 主持人把我静音了：服务端只把轨道置 muted（PC 靠 TrackMuted 事件收回本地开关），
+        // 本端没有事件回调，只能靠成员接口的权威轨道状态对齐。
+        // ★必须「麦克风轨存在且 muted」才算，刚开麦还没发布的空窗不会被误判；
+        //   连续两次（约 6 秒）确认后停放本机采集并提示。
+        if (tile.isMe && micTrack && micOn.value && !mic) {
+          selfMicMutedSeen += 1;
+          if (selfMicMutedSeen >= 2) {
+            selfMicMutedSeen = 0;
+            micOn.value = false;
+            mutedByRoomPolicy.value = false;
+            // 这里只同步按钮状态，不能关闭本地音轨；否则主持人随后取消静音时，
+            // 服务端已经找不到可恢复的 publication，会表现成点击没有反应。
+            if (!micMutedNotified) {
+              micMutedNotified = true;
+              uni.showToast({ title: t("Mobile.Meeting.mutedByHost"), icon: "none" });
+            }
+          }
+        } else if (tile.isMe && mic) {
+          selfMicMutedSeen = 0;
+          if (!micOn.value) {
+            micOn.value = true;
+          }
+          if (micMutedNotified) {
+            micMutedNotified = false;
+            uni.showToast({ title: t("Mobile.Meeting.unmutedByHost"), icon: "none" });
+          }
+        } else if (tile.isMe && !micOn.value) {
+          selfMicMutedSeen = 0;
+        }
         // 真实头像：自己用缓存里的头像（联系人表通常不含自己），别人查联系人表
         let avatarRaw = "";
         if (tile.isMe) {
@@ -2727,6 +2769,9 @@
         selfSeenInList = true;
         selfMissingChecks = 0;
         localMicPublishAllowed.value = localCanPublishMic;
+      } else if (!selfSeenInList) {
+        // 列表拉成功但还没有自己（刚入会）：属正常过渡，清掉「接口拒绝」的计数
+        selfMissingChecks = 0;
       } else if (selfSeenInList) {
         // 自己被主持人移出后，成员列表里就再也找不到本端 identity。
         selfMissingChecks++;
@@ -2863,12 +2908,22 @@
       return;
     }
     tile.busy = true;
+    const muted = tile.micOn;
     try {
-      const res = await apiImMeetingMuteParticipant(roomRaw.value, target, tile.micOn);
+      const res = await apiImMeetingMuteParticipant(roomRaw.value, target, muted);
       if (apiResCode(res) != SUCCESS_CODE) {
         console.error(`[MeetingUI] mute member failed target=${target} code=${apiResCode(res)} message=${apiResMessage(res)}`);
         const message = apiResMessage(res);
         uni.showToast({ title: message.length > 0 ? message : t("Mobile.Meeting.failed"), icon: "none" });
+      } else {
+        // 成员接口按 3 秒轮询，成功后先乐观更新当前行，避免主持人感觉“点了没反应”。
+        // 后续轮询仍会用服务端轨道状态校准。
+        tile.micOn = !muted;
+        refreshTiles();
+        uni.showToast({
+          title: muted ? t("Mobile.Meeting.muteMemberDone") : t("Mobile.Meeting.unmuteMemberDone"),
+          icon: "none",
+        });
       }
     } catch (error) {
       console.error(`[MeetingUI] mute member threw target=${target}: ${error}`);
@@ -4306,12 +4361,12 @@
     justify-content: center;
   }
 
-  /* 白色 icon 的视觉重心偏左，补 2px 让它在圆钮里看起来居中 */
+  /* 白色 icon 的视觉重心偏左，累计右移 4px 让它在圆钮里看起来居中 */
   .mr-chat-send__icon {
     /* ★用 relative + left：父级 justify-content:center 会把 margin/padding 的留白
        对半分，实际只挪一半甚至看不出来（项目里 mt-action__glyph--nudge 同款结论）。 */
     position: relative;
-    left: 2px;
+    left: 4px;
   }
 
   .mr-chat-send--disabled {
@@ -4725,11 +4780,11 @@
     font-size: 13px;
   }
 
-  /* 选中态用黑色实心勾（用户要求：勾选改成黑色） */
+  /* 选中态保留细边框，不再显示黑色实心圆；仅勾本身使用黑色。 */
   .mr-invite-row--selected .mr-invite-row__check {
     border-color: #141416;
-    background-color: #141416;
-    color: #ffffff;
+    background-color: transparent;
+    color: #141416;
   }
 
   .mr-invite-row__avatar {

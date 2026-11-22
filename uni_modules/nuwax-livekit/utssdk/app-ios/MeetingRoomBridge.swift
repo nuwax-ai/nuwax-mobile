@@ -31,7 +31,7 @@ import ReplayKit
  */
 public class MeetingRoomBridge: NSObject {
   /// 与页面诊断配套；只有重新制作原生基座才会更新。
-  private static let probeBuild = "ios-camera-20261115-p1"
+  private static let probeBuild = "ios-share-20261121-p2"
 
   private static var room: Room?
   private static var videoView: VideoView?
@@ -43,6 +43,11 @@ public class MeetingRoomBridge: NSObject {
   private static var deviceErrorText = ""
   /// 远端成员 identity → 当前渲染视图（重新挂载 native-view 时替换）
   private static var remoteViews: [String: VideoView] = [:]
+  /// 远端成员 identity → 当前轨道对象标识；防止轮询时重复赋同一 track 导致画面抖动。
+  private static var remoteTrackIDs: [String: ObjectIdentifier] = [:]
+  /// 防止每次 3 秒轮询都对同一条尚未订阅的 publication 重复发订阅请求。
+  private static var pendingVideoSubscriptions: Set<ObjectIdentifier> = []
+  private static let pendingVideoSubscriptionsLock = NSLock()
   private static var meetingMessages: [[String: Any]] = []
   private static let meetingMessagesLock = NSLock()
   private static var screenShareTrack: LocalVideoTrack?
@@ -207,7 +212,7 @@ public class MeetingRoomBridge: NSObject {
     let cam = (room?.localParticipant.firstCameraVideoTrack != nil) ? 1 : 0
     let conn = connectedFlag ? 1 : 0
     // 原生基座版本标记：页面据此避开旧基座的 UIView 返回值桥接路径。
-    return "bridge=ios-native-view-v2 probe=\(probeBuild) main=\(main) view=\(view) cam=\(cam) conn=\(conn) remotes=\(remoteViews.count) dev=\(deviceErrorText)"
+    return "bridge=ios-native-view-v2 probe=\(probeBuild) main=\(main) view=\(view) cam=\(cam) conn=\(conn) remotes=\(remoteViews.count) remotePub=\(remoteVideoPublicationDiag()) dev=\(deviceErrorText)"
   }
 
   /// 一行式诊断快照（页面每 3 秒打一次，闪退时看最后一行就知道卡在哪一步）。
@@ -418,13 +423,6 @@ public class MeetingRoomBridge: NSObject {
     }
   }
 
-  /// 本端麦克风是否被**服务端**静音（PC 的 TrackMuted 同口径）。
-  /// ★主持人在服务端静音只改 publication.isMuted，本机开关状态不变，必须单独查。
-  public static func isMicMuted() -> Bool {
-    guard let room = room else { return false }
-    return room.localParticipant.getTrackPublication(source: .microphone)?.isMuted ?? false
-  }
-
   public static func isScreenShareOn() -> Bool {
     screenShareLock.lock()
     defer { screenShareLock.unlock() }
@@ -632,17 +630,19 @@ public class MeetingRoomBridge: NSObject {
 
   // MARK: - 远端视频
 
-  /// 已订阅到视频的远端成员 identity（逗号分隔；与 Android 同口径）。
+  /// 有未静音视频 publication 的远端成员 identity（逗号分隔；与 Android 同口径）。
   public static func remoteVideoIdentities() -> String {
     guard let room = room else { return "" }
     var ids: [String] = []
     for (_, participant) in room.remoteParticipants {
       if (participant.identity?.stringValue ?? "").hasPrefix("EG_") { continue }
-      if firstVideoTrack(participant) != nil {
+      ensureVideoSubscriptions(participant)
+      if hasVideoPublication(participant) {
         // Swift 的 identity 是 `Participant.Identity?`（不是 String），取 stringValue
         ids.append(participant.identity?.stringValue ?? "")
       }
     }
+    syncRemoteVideoViews(room)
     return ids.joined(separator: ",")
   }
 
@@ -667,14 +667,19 @@ public class MeetingRoomBridge: NSObject {
         target = participant
       }
     }
-    guard let participant = target, let track = firstVideoTrack(participant) else {
+    guard let participant = target, hasVideoPublication(participant) else {
       return nil
     }
     remoteViews[identity]?.track = nil
     let view = VideoView()
     view.mirrorMode = .off
-    view.layoutMode = .fill
-    view.track = track
+    view.layoutMode = hasActiveScreenShare(participant) ? .fit : .fill
+    if let track = firstVideoTrack(participant) {
+      view.track = track
+      remoteTrackIDs[identity] = ObjectIdentifier(track)
+    } else {
+      remoteTrackIDs.removeValue(forKey: identity)
+    }
     remoteViews[identity] = view
     return view
   }
@@ -686,22 +691,138 @@ public class MeetingRoomBridge: NSObject {
         view.track = nil
       }
       remoteViews.removeAll()
+      remoteTrackIDs.removeAll()
+      pendingVideoSubscriptionsLock.lock()
+      pendingVideoSubscriptions.removeAll()
+      pendingVideoSubscriptionsLock.unlock()
     }
   }
 
-  /// 取该远端已订阅的第一条可展示视频轨道。
-  /// ★摄像头和屏幕共享都要认：只过滤 `.camera` 会让「别人共享的屏幕」在 iOS 上永远不显示
-  ///   （Android 侧 hasVideoTrack 早已同时认 CAMERA / SCREEN_SHARE，两端必须同口径）。
-  private static func firstVideoTrack(_ participant: RemoteParticipant) -> VideoTrack? {
+  /** publication 先于已订阅 track 到达；有发布就先把 native-view 挂上。 */
+  private static func hasVideoPublication(_ participant: RemoteParticipant) -> Bool {
     for (_, publication) in participant.trackPublications {
       if publication.isMuted { continue }
-      // ★LiveKitClient 2.19 的枚举名是 screenShareVideo（不是 screenShare），写错直接编译失败
-      if publication.source != .camera && publication.source != .screenShareVideo { continue }
-      if let video = publication.track as? VideoTrack {
-        return video
+      if publication.source == .camera || publication.source == .screenShareVideo {
+        return true
       }
     }
-    return nil
+    return false
+  }
+
+  /** 自动订阅异常时显式订阅视频轨，尤其用于排查 Android 屏幕共享 publication 已到但 track 为空。 */
+  private static func ensureVideoSubscriptions(_ participant: RemoteParticipant) {
+    for (_, publication) in participant.trackPublications {
+      if publication.isMuted { continue }
+      if publication.source != .camera && publication.source != .screenShareVideo { continue }
+      guard let remote = publication as? RemoteTrackPublication, !remote.isSubscribed else { continue }
+      guard let key = beginVideoSubscription(remote) else { continue }
+      Task {
+        defer {
+          finishVideoSubscription(key)
+        }
+        do {
+          try await remote.set(subscribed: true)
+          bridgeLog("requested remote video subscription source=\(remote.source)")
+        } catch {
+          bridgeLog("remote video subscribe failed source=\(remote.source) error=\(error)")
+        }
+      }
+    }
+  }
+
+  /**
+   * Swift 6 禁止在 async Task 的函数体中直接调用 NSLock.lock/unlock。
+   * 锁操作放入同步辅助方法，既保持去重，也避免原生插件因此编译失败。
+   */
+  private static func beginVideoSubscription(_ publication: RemoteTrackPublication) -> ObjectIdentifier? {
+    let key = ObjectIdentifier(publication)
+    pendingVideoSubscriptionsLock.lock()
+    defer { pendingVideoSubscriptionsLock.unlock() }
+    if pendingVideoSubscriptions.contains(key) {
+      return nil
+    }
+    pendingVideoSubscriptions.insert(key)
+    return key
+  }
+
+  private static func finishVideoSubscription(_ key: ObjectIdentifier) {
+    pendingVideoSubscriptionsLock.lock()
+    pendingVideoSubscriptions.remove(key)
+    pendingVideoSubscriptionsLock.unlock()
+  }
+
+  /** 压缩进 sdkVersion 诊断：identity:source/muted/subscribed/track。 */
+  private static func remoteVideoPublicationDiag() -> String {
+    guard let room = room else { return "none" }
+    var parts: [String] = []
+    for (_, participant) in room.remoteParticipants {
+      let identity = participant.identity?.stringValue ?? "?"
+      for (_, publication) in participant.trackPublications {
+        if publication.source != .camera && publication.source != .screenShareVideo { continue }
+        let remote = publication as? RemoteTrackPublication
+        let subscribed = remote?.isSubscribed == true ? 1 : 0
+        let track = publication.track != nil ? 1 : 0
+        let muted = publication.isMuted ? 1 : 0
+        parts.append("\(identity):\(publication.source)/m\(muted)/s\(subscribed)/t\(track)")
+      }
+    }
+    return parts.isEmpty ? "empty" : parts.joined(separator: ";")
+  }
+
+  private static func hasActiveScreenShare(_ participant: RemoteParticipant) -> Bool {
+    for (_, publication) in participant.trackPublications {
+      if !publication.isMuted && publication.source == .screenShareVideo {
+        return true
+      }
+    }
+    return false
+  }
+
+  /** 已有视图在轨道晚到、摄像头切共享或共享切摄像头时，幂等补绑最新轨道。 */
+  private static func syncRemoteVideoViews(_ current: Room) {
+    onMain {
+      for (identity, view) in remoteViews {
+        let participant = current.remoteParticipants.values.first {
+          ($0.identity?.stringValue ?? "") == identity
+        }
+        guard let participant = participant else {
+          view.track = nil
+          remoteTrackIDs.removeValue(forKey: identity)
+          continue
+        }
+        ensureVideoSubscriptions(participant)
+        view.layoutMode = hasActiveScreenShare(participant) ? .fit : .fill
+        guard let track = firstVideoTrack(participant) else {
+          view.track = nil
+          remoteTrackIDs.removeValue(forKey: identity)
+          continue
+        }
+        let nextID = ObjectIdentifier(track)
+        if remoteTrackIDs[identity] == nextID { continue }
+        view.track = track
+        remoteTrackIDs[identity] = nextID
+      }
+    }
+  }
+
+  /// 取该远端可展示的视频轨道：**优先屏幕共享**，没有才用摄像头。
+  /// ★只过滤 `.camera` 会让「别人共享的屏幕」在 iOS 上永远不显示；
+  ///   而遍历字典顺序不固定，对方同时又开了摄像头时，随机拿到摄像头轨就会出现
+  ///   「明明在共享，我却只看到他的脸」。所以这里显式优先 screenShareVideo。
+  /// ★LiveKitClient 2.19 的枚举名是 screenShareVideo（不是 screenShare），写错直接编译失败。
+  private static func firstVideoTrack(_ participant: RemoteParticipant) -> VideoTrack? {
+    var cameraTrack: VideoTrack?
+    for (_, publication) in participant.trackPublications {
+      if publication.isMuted { continue }
+      guard let video = publication.track as? VideoTrack else { continue }
+      if publication.source == .screenShareVideo {
+        return video
+      }
+      if publication.source == .camera && cameraTrack == nil {
+        cameraTrack = video
+      }
+    }
+    return cameraTrack
   }
 
   // MARK: - 音频会话

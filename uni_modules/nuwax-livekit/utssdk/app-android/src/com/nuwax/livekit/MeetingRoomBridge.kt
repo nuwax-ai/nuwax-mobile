@@ -21,6 +21,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentLinkedQueue
 
@@ -63,9 +64,13 @@ class MeetingRoomBridge(context: Context) {
   private var cameraPosition: CameraPosition = CameraPosition.FRONT
   /** 远端成员 identity → 渲染视图（同一人复用，离开会议统一释放）。 */
   private val remoteRenderers = HashMap<String, SurfaceViewRenderer>()
+  /** 远端成员 identity → 当前已挂载轨道；切摄像头/共享时用于先卸旧轨，避免重复 renderer。 */
+  private val remoteTracks = HashMap<String, VideoTrack>()
   private val meetingMessages = ConcurrentLinkedQueue<String>()
   @Volatile private var screenShareOn = false
   @Volatile private var screenShareError = ""
+  /** 本地共享发布诊断：授权成功不等于 LiveKit 已经发布出可订阅视频轨。 */
+  @Volatile private var screenShareDiag = "off"
   /** 用户想要的输出路由（会议默认外放）；SDK 每次拉起音频会话都会重设，需要重放。 */
   @Volatile private var speakerWanted = true
 
@@ -94,6 +99,7 @@ class MeetingRoomBridge(context: Context) {
     meetingMessages.clear()
     screenShareOn = false
     screenShareError = ""
+    screenShareDiag = "off"
     lastErrorText = ""
     val newScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     scope = newScope
@@ -206,7 +212,9 @@ class MeetingRoomBridge(context: Context) {
 
   private fun onScreenCaptureResult(resultCode: Int, data: Intent?) {
     if (resultCode != Activity.RESULT_OK || data == null) {
+      screenShareOn = false
       screenShareError = "cancelled"
+      screenShareDiag = "cancelled"
       return
     }
     val r = room ?: return
@@ -218,13 +226,35 @@ class MeetingRoomBridge(context: Context) {
           ScreenCaptureParams(mediaProjectionPermissionResultData = data, onStop = {
             screenShareOn = false
             screenShareError = "stopped"
+            screenShareDiag = "stopped"
           }),
         )
-        screenShareOn = started
-        if (!started) screenShareError = "screen_share_publish"
+        screenShareDiag = "started=${started}"
+        if (!started) {
+          screenShareOn = false
+          screenShareError = "screen_share_publish"
+          return@launch
+        }
+        // SDK 返回 true 只表示启动请求成功；publication/track 可能稍后才创建。
+        // 等待实际可发布轨道，避免授权弹窗一消失 UI 就误报“已开启共享”。
+        var ready = false
+        for (attempt in 0 until 20) {
+          if (refreshScreenShareState(r)) {
+            ready = true
+            break
+          }
+          delay(100)
+        }
+        if (!ready) {
+          refreshScreenShareState(r)
+          screenShareError = "screen_share_no_track"
+        } else {
+          screenShareError = ""
+        }
       } catch (e: Throwable) {
         screenShareOn = false
         screenShareError = e.message ?: "screen_share_publish"
+        screenShareDiag = "throw=${e.javaClass.simpleName}"
       }
     }
   }
@@ -235,24 +265,33 @@ class MeetingRoomBridge(context: Context) {
     s.launch {
       try { r.localParticipant.setScreenShareEnabled(false) } catch (_: Throwable) {}
       screenShareOn = false
+      screenShareDiag = "off"
     }
   }
 
-  /**
-   * 本端麦克风是否被**服务端**静音（PC 的 TrackMuted 同口径）。
-   * ★与 setMicEnabled 的本地开关不是一回事：主持人静音只改 publication.muted，
-   *   本机 UI 仍以为自己开着，必须靠这个值把界面和采集收回。
-   */
-  fun isMicMuted(): Boolean {
-    val r = room ?: return false
+  private fun refreshScreenShareState(r: Room): Boolean {
     return try {
-      r.localParticipant.getTrackPublication(Track.Source.MICROPHONE)?.muted ?: false
+      val publication = r.localParticipant.getTrackPublication(Track.Source.SCREEN_SHARE)
+      val hasPublication = publication != null
+      val muted = publication?.muted ?: false
+      val hasTrack = publication?.track != null
+      val ready = hasPublication && !muted && hasTrack
+      screenShareOn = ready
+      screenShareDiag = "pub=${if (hasPublication) 1 else 0},muted=${if (muted) 1 else 0},track=${if (hasTrack) 1 else 0}"
+      ready
     } catch (e: Throwable) {
+      screenShareOn = false
+      screenShareDiag = "probe=${e.javaClass.simpleName}"
       false
     }
   }
 
-  fun isScreenShareOn(): Boolean = screenShareOn
+  fun isScreenShareOn(): Boolean {
+    val r = room ?: return false
+    return refreshScreenShareState(r)
+  }
+
+  fun diag(): String = "share[${screenShareDiag}]"
 
   fun screenShareError(): String = screenShareError
 
@@ -456,7 +495,7 @@ class MeetingRoomBridge(context: Context) {
   // ------------------------------------------------------------------ 远端视频
 
   /**
-   * 当前**已订阅到视频轨道**的远端成员 identity 列表（逗号分隔）。
+   * 当前有未静音视频 publication 的远端成员 identity 列表（逗号分隔）。
    * ★不用 `room.events`：事件流在这个 SDK/协程组合下有重载解析问题（见文件头），
    *   这里直接查 `remoteParticipants` 的轨道发布状态，由页面轮询驱动。
    */
@@ -466,7 +505,7 @@ class MeetingRoomBridge(context: Context) {
     try {
       for (p in r.remoteParticipants.values) {
         if (isEgressParticipant(p)) continue
-        if (hasVideoTrack(p)) {
+        if (hasVideoPublication(p)) {
           if (out.isNotEmpty()) {
             out.append(",")
           }
@@ -474,6 +513,7 @@ class MeetingRoomBridge(context: Context) {
           out.append(p.identity?.value ?: "")
         }
       }
+      refreshRemoteRendererTracks(r)
     } catch (e: Throwable) {
     }
     return out.toString()
@@ -494,32 +534,23 @@ class MeetingRoomBridge(context: Context) {
         }
       }
       val participant = target ?: return null
-      // ★TrackPublication 上没有 videoTrack 便捷属性：统一 `track as? VideoTrack`
-      val cameraPublication = participant.getTrackPublication(Track.Source.CAMERA)
-      val screenPublication = participant.getTrackPublication(Track.Source.SCREEN_SHARE)
-      val track = if (screenPublication != null && !screenPublication.muted) {
-        screenPublication.track as? VideoTrack
-      } else {
-        if (cameraPublication != null && !cameraPublication.muted) cameraPublication.track as? VideoTrack else null
-      }
-      val video = track ?: return null
+      if (!hasVideoPublication(participant)) return null
+      val video = preferredVideoTrack(participant)
       val existing = remoteRenderers[identity]
       if (existing != null) {
-        // 对方关摄像头再打开时可能换成新轨道；复用 View，但必须重新挂当前轨道。
-        video.addRenderer(existing)
+        attachRemoteTrack(identity, existing, video, participant)
         return existing
       }
       val view = SurfaceViewRenderer(context)
       r.initVideoRenderer(view)
-      // 远端画面也按"裁切铺满"处理，避免黑边
-      applyFillScaling(view)
+      applyRemoteScaling(view, hasActiveScreenShare(participant))
       // 远端还没来帧时透出下层白底（否则格子是纯黑）
       try {
         view.setBackgroundColor(Color.TRANSPARENT)
       } catch (e: Throwable) {
       }
-      video.addRenderer(view)
       remoteRenderers[identity] = view
+      attachRemoteTrack(identity, view, video, participant)
       return view
     } catch (e: Throwable) {
       return null
@@ -529,8 +560,9 @@ class MeetingRoomBridge(context: Context) {
   /** 释放所有远端渲染视图（离开会议时调用）。 */
   fun releaseRemoteRenderers() {
     try {
-      for (view in remoteRenderers.values) {
+      for ((identity, view) in remoteRenderers) {
         try {
+          remoteTracks[identity]?.removeRenderer(view)
           view.release()
         } catch (e: Throwable) {
         }
@@ -538,6 +570,7 @@ class MeetingRoomBridge(context: Context) {
     } catch (e: Throwable) {
     }
     remoteRenderers.clear()
+    remoteTracks.clear()
   }
 
   /**
@@ -554,15 +587,88 @@ class MeetingRoomBridge(context: Context) {
     }
   }
 
-  /** 这个远端是否已经订阅到视频轨道（`track as? VideoTrack` 判空，同 createRemoteRenderer）。 */
-  private fun hasVideoTrack(p: io.livekit.android.room.participant.RemoteParticipant): Boolean {
+  /** 屏幕共享保持完整画面，摄像头才裁切铺满。 */
+  private fun applyRemoteScaling(view: SurfaceViewRenderer, screenShare: Boolean) {
+    try {
+      val mode = if (screenShare) {
+        livekit.org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FIT
+      } else {
+        livekit.org.webrtc.RendererCommon.ScalingType.SCALE_ASPECT_FILL
+      }
+      view.setScalingType(mode)
+    } catch (e: Throwable) {
+    }
+  }
+
+  /** publication 一出现就让页面挂 native-view；track 稍后订阅到时由轮询补绑。 */
+  private fun hasVideoPublication(p: io.livekit.android.room.participant.RemoteParticipant): Boolean {
     return try {
       val camera = p.getTrackPublication(Track.Source.CAMERA)
       val screen = p.getTrackPublication(Track.Source.SCREEN_SHARE)
-      (camera != null && !camera.muted && (camera.track as? VideoTrack) != null) ||
-        (screen != null && !screen.muted && (screen.track as? VideoTrack) != null)
+      (camera != null && !camera.muted) || (screen != null && !screen.muted)
     } catch (e: Throwable) {
       false
+    }
+  }
+
+  private fun hasActiveScreenShare(p: io.livekit.android.room.participant.RemoteParticipant): Boolean {
+    return try {
+      val screen = p.getTrackPublication(Track.Source.SCREEN_SHARE)
+      screen != null && !screen.muted
+    } catch (e: Throwable) {
+      false
+    }
+  }
+
+  /** 远端主画面优先共享轨，没有共享才回退摄像头。 */
+  private fun preferredVideoTrack(p: io.livekit.android.room.participant.RemoteParticipant): VideoTrack? {
+    return try {
+      val screen = p.getTrackPublication(Track.Source.SCREEN_SHARE)
+      if (screen != null && !screen.muted) {
+        val track = screen.track as? VideoTrack
+        if (track != null) return track
+      }
+      val camera = p.getTrackPublication(Track.Source.CAMERA)
+      if (camera != null && !camera.muted) camera.track as? VideoTrack else null
+    } catch (e: Throwable) {
+      null
+    }
+  }
+
+  /** 幂等切轨：同一轨道不重复 addRenderer；换轨先 removeRenderer。 */
+  private fun attachRemoteTrack(
+    identity: String,
+    view: SurfaceViewRenderer,
+    next: VideoTrack?,
+    participant: io.livekit.android.room.participant.RemoteParticipant,
+  ) {
+    val previous = remoteTracks[identity]
+    if (previous === next) {
+      applyRemoteScaling(view, hasActiveScreenShare(participant))
+      return
+    }
+    try { previous?.removeRenderer(view) } catch (_: Throwable) {}
+    remoteTracks.remove(identity)
+    if (next != null) {
+      try {
+        next.addRenderer(view)
+        remoteTracks[identity] = next
+      } catch (_: Throwable) {
+      }
+    }
+    applyRemoteScaling(view, hasActiveScreenShare(participant))
+  }
+
+  /** 轨道订阅通常晚于 publication；轮询 identity 时顺便把新轨道补到已有视图。 */
+  private fun refreshRemoteRendererTracks(r: Room) {
+    for ((identity, view) in remoteRenderers) {
+      val participant = r.remoteParticipants.values.firstOrNull { (it.identity?.value ?: "") == identity }
+      if (participant == null) {
+        try { remoteTracks[identity]?.removeRenderer(view) } catch (_: Throwable) {}
+        remoteTracks.remove(identity)
+        continue
+      }
+      attachRemoteTrack(identity, view, preferredVideoTrack(participant), participant)
     }
   }
 

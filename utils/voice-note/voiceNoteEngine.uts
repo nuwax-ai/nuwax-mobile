@@ -1,8 +1,8 @@
 /**
  * 伙伴页录音会话。
- * App 使用独立的 VoiceNoteM4aRecorder，直接把每一段写成 m4a，不经过聊天页的 PCM 采集。
- * 录音器挂在模块上，不随页面卸载停止。退到后台继续录，约 1 小时切一段后上传。
- * 主按钮只暂停或继续，不结束会话，也不落盘。当前段满 1 小时，或点完成，才落盘并上传。
+ * App 使用独立的 VoiceNoteM4aRecorder。一次会话只有一个采集器，每段单独写成 m4a，不经过聊天页的 PCM 采集。
+ * 录音器挂在模块上，不随页面卸载停止。退到后台继续录。切段只封口当前文件并打开下一份，不释放采集器。
+ * 主按钮只暂停或继续，不结束会话，也不落盘。当前段满 2 分钟，或点完成，才落盘并上传。
  */
 import {
   findOpenVoiceNote,
@@ -54,6 +54,12 @@ let currentSegmentPath = "";
 let recorderBusy = false;
 /** 停录过程中又点了停止或重录时，等这一段收尾后按这个意图处理。 */
 let queuedIntent = "";
+/** 切段已经打开的下一段路径。采集器不重建。 */
+let pendingRotatedPath = "";
+/** 原生按实际写入采样算出的刚封口时长。closeSegment 读一次后清零。 */
+let closedDurationOverride = 0;
+/** 切段过程中点了暂停。新文件打开后再暂停同一个采集器。 */
+let pauseAfterRotate = false;
 // #endif
 /** "" 用户没要求停 / rotate 到点切段 / user 用户停止 / discard 重录放弃 / busy 正在停 */
 /** 已经点了完成。暂停或切段的回调不能再把这次录音改回未结束。 */
@@ -231,19 +237,35 @@ function stopActiveRecorder(intent: string): void {
 // #ifdef APP
 async function finishM4aStop(intent: string, path: string): Promise<void> {
   let ok = "0";
+  let rotatedPath = "";
   if (m4aRecorder != null) {
     try {
-      ok = await m4aRecorder!.stop();
+      if (intent == "rotate") {
+        const recording = activeRecord();
+        if (recording != null) {
+          const nextName = segmentStampName(recording.openSegmentIndex + 1);
+          rotatedPath = await m4aRecorder!.rotate(recording.localId, nextName);
+          ok = rotatedPath.length > 0 ? "1" : "0";
+        }
+      } else {
+        ok = await m4aRecorder!.stop();
+      }
+      if (ok == "1") {
+        closedDurationOverride = m4aRecorder!.takeClosedDurationMs();
+      }
     } catch (e) {
       console.warn("[voice-note] m4a stop failed " + e);
       ok = "0";
+      rotatedPath = "";
     }
   }
   let intentToUse = intent;
   if (queuedIntent.length > 0) {
     intentToUse = queuedIntent;
     queuedIntent = "";
+    rotatedPath = "";
   }
+  pendingRotatedPath = ok == "1" ? rotatedPath : "";
   recorderBusy = false;
   await handleRecorderStop(intentToUse, ok == "1" ? path : "");
 }
@@ -300,7 +322,14 @@ function onTick(): void {
 async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<number> {
   const index = record.openSegmentIndex;
   const endedAt = Date.now();
-  const durationMs = openSegmentMs(record, endedAt);
+  let durationMs = 0;
+  // #ifdef APP
+  durationMs = closedDurationOverride;
+  closedDurationOverride = 0;
+  // #endif
+  if (durationMs <= 0) {
+    durationMs = openSegmentMs(record, endedAt);
+  }
   const startedAt = endedAt - durationMs;
   // App 的 m4a 已经写在最终路径上。小程序拿到的是临时 aac，再拷进会话目录。
   let filePath = tempPath;
@@ -423,6 +452,10 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     return;
   }
   if (intent == "discard") {
+    // #ifdef APP
+    pauseAfterRotate = false;
+    pendingRotatedPath = "";
+    // #endif
     sessionEnding = false;
     endingLocalId = "";
     record.phase = "discarded";
@@ -442,6 +475,10 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     return;
   }
   if (usedIntent == "finish") {
+    // #ifdef APP
+    pauseAfterRotate = false;
+    pendingRotatedPath = "";
+    // #endif
     let path = tempPath;
     if (path.length == 0 && record.openSegmentPath.length > 0) {
       path = record.openSegmentPath;
@@ -508,11 +545,28 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     releaseRecorderCallbacks();
     return;
   }
-  // 分段时长已满：当前文件先落盘并上传，再开下一段。
+  // 分段时长已满：当前文件已经封口。采集器仍是原来的那个，下一段文件也已打开。
   void pumpQueue(record.localId, false);
   record.segmentStartedAt = Date.now();
   touch(record);
   stopIntent = "";
+  // #ifdef APP
+  if (pendingRotatedPath.length > 0) {
+    const opened = pendingRotatedPath;
+    pendingRotatedPath = "";
+    currentSegmentPath = opened;
+    record.openSegmentPath = opened;
+    captureAlive = true;
+    touch(record);
+    pushVoiceNoteDebug("录音", "切段，采集器不重建");
+    if (pauseAfterRotate) {
+      pauseAfterRotate = false;
+      await pauseActiveRecorder(record);
+    }
+    return;
+  }
+  pendingRotatedPath = "";
+  // #endif
   await startRecorder();
 }
 
@@ -1301,6 +1355,10 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
     return;
   }
   // #ifdef APP
+  if (recorderBusy) {
+    pauseAfterRotate = true;
+    return;
+  }
   if (m4aRecorder != null && record.openSegmentPath.length > 0) {
     recorderBusy = true;
     let paused = "0";
@@ -1313,6 +1371,23 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
     if (sessionEnding || queuedIntent == "finish") {
       queuedIntent = "";
       stopActiveRecorder("finish");
+      return;
+    }
+    if (paused == "2") {
+      closedDurationOverride = m4aRecorder!.takeClosedDurationMs();
+      const sealedPath = record.openSegmentPath;
+      if (sealedPath.length > 0) {
+        await closeSegment(record, sealedPath);
+      }
+      record.phase = "paused";
+      record.awaitComplete = false;
+      record.openSegmentPath = "";
+      record.segmentStartedAt = 0;
+      touch(record);
+      pushVoiceNoteDebug("录音", "暂停接口不可用，当前段已封口");
+      // #ifdef APP-HARMONY
+      endBackground();
+      // #endif
       return;
     }
     if (paused == "1") {

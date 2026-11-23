@@ -19,7 +19,11 @@ public class VoiceNoteM4aBridge {
     private var segmentFrames: Int64 = 0
     private var lastClosedDurationMs: Int = 0
     private var currentPath = ""
-    private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true)
+    /// AAC 编码器接受的是非交错 Float32。交错 Int16 在 iOS 上转码会得到 0 帧，文件封口后仍是 0 字节。
+    private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)
+    private var pendingBuffers: [AVAudioPCMBuffer] = []
+    private var loggedConvert = false
+    private var loggedAppend = false
     private var interruptObserver: NSObjectProtocol?
     private var interruptHold = false
     private var pendingEvent = ""
@@ -296,6 +300,9 @@ public class VoiceNoteM4aBridge {
         guard let converter = converter else {
             return
         }
+        if buffer.format.sampleRate <= 0 || targetFormat.sampleRate <= 0 {
+            return
+        }
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 32)
         guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: max(capacity, 1)) else {
@@ -313,48 +320,86 @@ public class VoiceNoteM4aBridge {
             return buffer
         }
         if error != nil || converted.frameLength == 0 {
+            if !loggedConvert {
+                loggedConvert = true
+                NSLog("[voice-note] m4a convert failed \(error?.localizedDescription ?? "0 frames")")
+            }
             return
         }
-        append(converted)
+        pendingBuffers.append(converted)
+        if pendingBuffers.count > 64 {
+            pendingBuffers.removeFirst()
+        }
+        drainPending(force: false)
     }
 
-    private func append(_ buffer: AVAudioPCMBuffer) {
-        guard let input = writerInput, input.isReadyForMoreMediaData else {
+    /// 写入端暂时不接收时先留着，下一块到来或封口时再写。直接丢掉就会得到 0 字节文件。
+    private func drainPending(force: Bool) {
+        guard let input = writerInput, writer?.status == .writing else {
+            if writer?.status == .failed {
+                pendingBuffers.removeAll()
+            }
             return
         }
-        guard writer?.status == .writing else {
+        while !pendingBuffers.isEmpty {
+            if !force && !input.isReadyForMoreMediaData {
+                return
+            }
+            let buffer = pendingBuffers.removeFirst()
+            let frames = Int64(buffer.frameLength)
+            if frames <= 0 {
+                continue
+            }
+            let pts = CMTime(value: segmentFrames, timescale: 16000)
+            guard let sample = makeSampleBuffer(buffer, pts: pts) else {
+                continue
+            }
+            if input.append(sample) {
+                segmentFrames += frames
+                continue
+            }
+            if !loggedAppend {
+                loggedAppend = true
+                NSLog("[voice-note] m4a append failed \(self.writer?.error?.localizedDescription ?? "")")
+            }
             return
-        }
-        let frames = Int64(buffer.frameLength)
-        let pts = CMTime(value: segmentFrames, timescale: 16000)
-        segmentFrames += frames
-        guard let sample = makeSampleBuffer(buffer, pts: pts) else {
-            segmentFrames -= frames
-            return
-        }
-        if !input.append(sample) {
-            segmentFrames -= frames
         }
     }
 
     private func makeSampleBuffer(_ buffer: AVAudioPCMBuffer, pts: CMTime) -> CMSampleBuffer? {
         var asbd = buffer.format.streamDescription.pointee
+        var layout = AudioChannelLayout()
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_Mono
         var formatDesc: CMAudioFormatDescription?
-        let created = CMAudioFormatDescriptionCreate(
+        var created = CMAudioFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
             asbd: &asbd,
-            layoutSize: 0,
-            layout: nil,
+            layoutSize: MemoryLayout<AudioChannelLayout>.size,
+            layout: &layout,
             magicCookieSize: 0,
             magicCookie: nil,
             extensions: nil,
             formatDescriptionOut: &formatDesc
         )
+        if created != noErr || formatDesc == nil {
+            formatDesc = nil
+            created = CMAudioFormatDescriptionCreate(
+                allocator: kCFAllocatorDefault,
+                asbd: &asbd,
+                layoutSize: 0,
+                layout: nil,
+                magicCookieSize: 0,
+                magicCookie: nil,
+                extensions: nil,
+                formatDescriptionOut: &formatDesc
+            )
+        }
         guard created == noErr, let formatDesc = formatDesc else {
             return nil
         }
+        let rate = Int32(buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 16000)
         var timing = CMSampleTimingInfo(
-            duration: CMTime(value: CMTimeValue(buffer.frameLength), timescale: 16000),
+            duration: CMTime(value: 1, timescale: rate),
             presentationTimeStamp: pts,
             decodeTimeStamp: .invalid
         )
@@ -403,10 +448,12 @@ public class VoiceNoteM4aBridge {
             let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
             input.expectsMediaDataInRealTime = true
             if !created.canAdd(input) {
+                NSLog("[voice-note] m4a writer rejected audio input")
                 return false
             }
             created.add(input)
             if !created.startWriting() {
+                NSLog("[voice-note] m4a startWriting failed \(created.error?.localizedDescription ?? "")")
                 return false
             }
             created.startSession(atSourceTime: .zero)
@@ -424,8 +471,11 @@ public class VoiceNoteM4aBridge {
 
     private func closeWriter() {
         guard let created = writer else {
+            pendingBuffers.removeAll()
             return
         }
+        drainPending(force: true)
+        pendingBuffers.removeAll()
         writerInput?.markAsFinished()
         let group = DispatchGroup()
         group.enter()

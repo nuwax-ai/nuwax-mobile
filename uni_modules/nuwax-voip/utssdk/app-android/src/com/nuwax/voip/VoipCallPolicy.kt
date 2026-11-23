@@ -25,6 +25,9 @@ internal object VoipCallPolicy {
     fun releaseOriginAllowed(fixedOrigin: String?, origin: String): Boolean =
         !fixedOrigin.isNullOrEmpty() && origin == fixedOrigin && origin.startsWith("https://")
 
+    fun shouldOpenBackgroundCallUi(locked: Boolean, coldPush: Boolean, mediaType: String): Boolean =
+        if (locked) mediaType == "audio" else coldPush && (mediaType == "audio" || mediaType == "video")
+
     fun matches(signalId: String, messageId: String, callId: String, callMessageId: String): Boolean =
         if (signalId.isNotEmpty()) signalId == callId else messageId.isNotEmpty() && callMessageId.isNotEmpty() && messageId == callMessageId
 

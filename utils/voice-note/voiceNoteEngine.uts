@@ -19,11 +19,10 @@ import {
   apiVoiceNoteComplete,
   apiVoiceNoteCreate,
   apiVoiceNoteDelete,
-  apiVoiceNoteDetail,
-  apiVoiceNoteReprocess,
   apiVoiceNoteUploadSegment,
 } from "@/servers/voiceNote.uts";
 import { pushVoiceNoteDebug } from "@/utils/voice-note/voiceNoteDebugLog.uts";
+import { isAppInBackground } from "@/utils/appLifecycle.uts";
 
 // #ifdef APP-ANDROID || APP-IOS
 import {
@@ -56,6 +55,8 @@ let recorderBusy = false;
 let queuedIntent = "";
 /** 切段已经打开的下一段路径。采集器不重建。 */
 let pendingRotatedPath = "";
+/** 鸿蒙切段时下一段没有打开。当前段仍要留下，会话改为暂停。 */
+let rotateOpenFailed = false;
 /** 原生按实际写入采样算出的刚封口时长。closeSegment 读一次后清零。 */
 let closedDurationOverride = 0;
 /** 切段过程中点了暂停。新文件打开后再暂停同一个采集器。 */
@@ -244,6 +245,7 @@ function stopActiveRecorder(intent: string): void {
 async function finishM4aStop(intent: string, path: string): Promise<void> {
   let ok = "0";
   let rotatedPath = "";
+  rotateOpenFailed = false;
   if (m4aRecorder != null) {
     try {
       if (intent == "rotate") {
@@ -252,11 +254,13 @@ async function finishM4aStop(intent: string, path: string): Promise<void> {
           const nextName = segmentStampName(recording.openSegmentIndex + 1);
           rotatedPath = await m4aRecorder!.rotate(recording.localId, nextName);
           ok = rotatedPath.length > 0 ? "1" : "0";
+          rotateOpenFailed = ok != "1";
+          closedDurationOverride = m4aRecorder!.takeClosedDurationMs();
         }
       } else {
         ok = await m4aRecorder!.stop();
       }
-      if (ok == "1") {
+      if (ok == "1" && intent != "rotate") {
         closedDurationOverride = m4aRecorder!.takeClosedDurationMs();
       }
     } catch (e) {
@@ -270,10 +274,12 @@ async function finishM4aStop(intent: string, path: string): Promise<void> {
     intentToUse = queuedIntent;
     queuedIntent = "";
     rotatedPath = "";
+    rotateOpenFailed = false;
   }
   pendingRotatedPath = ok == "1" ? rotatedPath : "";
   recorderBusy = false;
-  await handleRecorderStop(intentToUse, ok == "1" ? path : "");
+  const sealedPath = ok == "1" || rotateOpenFailed ? path : "";
+  await handleRecorderStop(intentToUse, sealedPath);
 }
 // #endif
 
@@ -321,6 +327,12 @@ function onTick(): void {
     touch(record);
   }
   if (segmentElapsed >= segmentMs && stopIntent.length == 0) {
+    // 鸿蒙切段要先停掉 AVRecorder 再 start。后台不允许重新 start，文件继续写，回前台再切。
+    // #ifdef APP-HARMONY
+    if (isAppInBackground()) {
+      return;
+    }
+    // #endif
     stopActiveRecorder("rotate");
   }
 }
@@ -372,6 +384,13 @@ function readErrorMessage(err: any | null): string {
 function onNativeError(err: any | null): void {
   captureAlive = false;
   stopIntent = "";
+  // #ifdef APP-HARMONY
+  if (m4aRecorder != null) {
+    const dying = m4aRecorder;
+    m4aRecorder = null;
+    void dying.stop();
+  }
+  // #endif
   const record = activeRecord();
   if (record == null) {
     releaseRecorderCallbacks();
@@ -573,6 +592,32 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
   }
   pendingRotatedPath = "";
   // #endif
+  // #ifdef APP-HARMONY
+  if (rotateOpenFailed) {
+    rotateOpenFailed = false;
+    record.phase = "paused";
+    record.openSegmentPath = "";
+    record.segmentStartedAt = 0;
+    record.awaitComplete = false;
+    touch(record);
+    captureAlive = false;
+    pushVoiceNoteDebug("录音", "下一段没有打开，已暂停");
+    endBackground();
+    stopTicker();
+    if (m4aRecorder != null) {
+      const dying = m4aRecorder;
+      m4aRecorder = null;
+      try {
+        await dying.stop();
+      } catch (_e) {
+      }
+    }
+    return;
+  }
+  // #endif
+  // #ifdef APP
+  rotateOpenFailed = false;
+  // #endif
   await startRecorder();
 }
 
@@ -618,8 +663,8 @@ function writeSegmentUpload(
 /** 刚落下的一段在同一次上传里连续失败时，最多再试到 3 次，然后留给以后的补传。 */
 const maxSegmentUploadAttempts = 3;
 
-/** 两次补传开始时间至少间隔 5 分钟。不满就跳过这次。 */
-const backfillGapMs = 300000;
+/** 两次补传开始时间至少间隔 2 分钟。不满就跳过这次。 */
+const backfillGapMs = 120000;
 
 /**
  * 补传只处理还没上传成功的分段。
@@ -988,7 +1033,7 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
   }
 }
 
-/** 补传总开关。正在补传，或距上次开始不满 5 分钟，这一轮都不开。 */
+/** 补传总开关。正在补传，或距上次开始不满 2 分钟，这一轮都不开。 */
 function backfillBlocked(gate: VoiceNoteBackfillGate): boolean {
   if (gate.catchingUp) return true;
   if (gate.backfillStartedAt <= 0) return false;
@@ -1062,7 +1107,7 @@ function forgetHistoryBackfill(localId: string): void {
  * 只用 noteId 找到本地那一条的文件。正在上传或已经成功的分段跳过。
  * 失败和其他状态才传。不看 5 分钟间隔。
  * 面板上这一次不补：录音中，或播放时已经暂停。其他录音的补传不改这一次。
- * 全部分段补成功后收尾；服务端完成后从本地补传记录里删掉。
+ * 全部分段补成功后收尾。转写和文档是否成功不在这里跟进。
  */
 export function backfillVoiceNoteByNoteId(noteId: string): void {
   if (noteId.length == 0) return;
@@ -1117,34 +1162,6 @@ async function completeRecord(record: VoiceNoteRecord): Promise<void> {
   }
 }
 
-/** 两次自动重试转写的最小间隔。没超过这个时间就跳过，继续后面的补传。 */
-const reprocessGapMs = 120000;
-
-function reprocessFailureStatus(status: string): boolean {
-  return status == "ASR_PARTIAL_FAILED" || status == "DOC_FAILED" || status == "DOC_REMOVED";
-}
-
-function reprocessDue(record: VoiceNoteRecord): boolean {
-  if (record.reprocessAt <= 0) return true;
-  return Date.now() - record.reprocessAt > reprocessGapMs;
-}
-
-/** 详情仍需跟进：转写中，或上次是转写/文档失败、还可以再查。 */
-function noteNeedsStatusPoll(record: VoiceNoteRecord): boolean {
-  if (record.noteId.length == 0) return false;
-  if (record.phase == "processing") return true;
-  return record.phase == "failed" && reprocessFailureStatus(record.serverStatus);
-}
-
-/** 重试转写。失败只记日志，不挡住同一次补传里后面的请求。 */
-async function reprocessQuiet(noteId: string): Promise<void> {
-  try {
-    await apiVoiceNoteReprocess(noteId);
-  } catch (e) {
-    console.warn("[voice-note] reprocess failed " + e);
-  }
-}
-
 /** 本地列表只留未成功的录音。已经标成成功的旧记录也从缓存删掉。 */
 function dropStoredSuccessNotes(): void {
   const rows = loadVoiceNotes();
@@ -1156,62 +1173,16 @@ function dropStoredSuccessNotes(): void {
   }
 }
 
-/**
- * 按原来的转写查询处理一条。只查一次，失败不重试。
- * 成功就删掉本地记录。转写或文档失败时，到了间隔才重新发起一次。
- */
-async function refreshNoteStatusOnce(localId: string): Promise<void> {
-  const row = findVoiceNoteByLocalId(localId);
-  if (row == null || !noteNeedsStatusPoll(row)) return;
-  if (row.phase == "recording" || row.phase == "paused") return;
-  let detail: UTSJSONObject | null = null;
-  try {
-    detail = await apiVoiceNoteDetail(row.noteId);
-  } catch (e) {
-    const latest = findVoiceNoteByLocalId(localId);
-    if (latest == null || latest.phase == "recording" || latest.phase == "paused") return;
-    latest.error = `${e}`;
-    touch(latest);
-    return;
-  }
-  const latest = findVoiceNoteByLocalId(localId);
-  if (latest == null || latest.phase == "recording" || latest.phase == "paused") return;
-  if (detail == null) return;
-  const status = detail["status"] != null ? `${detail["status"]}` : "";
-  if (status == "SUCCESS") {
-    deleteVoiceNoteFiles(latest);
-    removeVoiceNote(latest.localId);
-    return;
-  }
-  latest.serverStatus = status;
-  if (detail["title"] != null) latest.title = `${detail["title"]}`;
-  if (detail["docUrl"] != null) latest.docUrl = `${detail["docUrl"]}`;
-  if (detail["asrText"] != null) latest.asrText = `${detail["asrText"]}`;
-  const duration = parseFloat(`${detail["totalDurationMs"]}`);
-  if (!isNaN(duration) && duration > 0) latest.elapsedMs = duration;
-  let retryNoteId = "";
-  if (reprocessFailureStatus(status)) {
-    latest.phase = "failed";
-    latest.error = status;
-    if (reprocessDue(latest)) {
-      latest.reprocessAt = Date.now();
-      retryNoteId = latest.noteId;
-    }
-  } else if (latest.phase == "failed") {
-    latest.phase = "processing";
-    latest.error = "";
-  }
-  touch(latest);
-  if (retryNoteId.length > 0) {
-    await reprocessQuiet(retryNoteId);
-  }
+/** 这条不参与补传：正在录、已暂停，或就是面板上这一次。 */
+function backfillSkips(record: VoiceNoteRecord): boolean {
+  if (record.phase == "recording" || record.phase == "paused") return true;
+  if (record.localId.length == 0 || record.localId == uploadLocalId) return true;
+  const panel = panelVoiceNote();
+  if (panel != null && panel.localId == record.localId) return true;
+  return false;
 }
 
-/**
- * 补传这一轮要处理的本地会话。和转写查询用的是同一份本地缓存。
- * 正在录、已暂停、以及面板上这一次都不放进来。
- * 还有分段没传完，或转写还要查一次的，才放进来。
- */
+/** 补传这一轮：还有分段没传完的，以及分段已全部上传、可以移出列表的。正在录、已暂停、面板上这一次不放进来。 */
 function backfillPassLocalIds(): string[] {
   const panel = panelVoiceNote();
   const panelId = panel != null ? panel.localId : "";
@@ -1225,16 +1196,16 @@ function backfillPassLocalIds(): string[] {
     if (row.phase != "stopped" && row.phase != "uploading" && row.phase != "processing" && row.phase != "failed") {
       continue;
     }
-    let take = noteNeedsStatusPoll(row);
-    if (!take) {
-      for (let s = 0; s < row.segments.length; s++) {
-        if (segmentCanUpload(row.segments[s])) {
-          take = true;
-          break;
-        }
+    if (allSegmentsUploaded(row)) {
+      ids.push(row.localId);
+      continue;
+    }
+    for (let s = 0; s < row.segments.length; s++) {
+      if (segmentCanUpload(row.segments[s])) {
+        ids.push(row.localId);
+        break;
       }
     }
-    if (take) ids.push(row.localId);
   }
   return ids;
 }
@@ -1246,8 +1217,7 @@ async function runBackfillPass(ids: string[]): Promise<void> {
       const localId = ids[i];
       const open = findVoiceNoteByLocalId(localId);
       if (open == null) continue;
-      if (open.phase == "recording" || open.phase == "paused") continue;
-      if (open.localId == uploadLocalId) continue;
+      if (backfillSkips(open)) continue;
       let needsUpload = false;
       for (let s = 0; s < open.segments.length; s++) {
         if (segmentCanUpload(open.segments[s])) {
@@ -1257,8 +1227,14 @@ async function runBackfillPass(ids: string[]): Promise<void> {
       }
       if (needsUpload) {
         await pumpQueue(localId, true, false, false);
+      } else if (open.awaitComplete && open.noteId.length > 0 && allSegmentsUploaded(open)) {
+        await completeRecord(open);
       }
-      await refreshNoteStatusOnce(localId);
+      const latest = findVoiceNoteByLocalId(localId);
+      if (latest != null && !backfillSkips(latest) && allSegmentsUploaded(latest)) {
+        deleteVoiceNoteFiles(latest);
+        removeVoiceNote(latest.localId);
+      }
     }
   } finally {
     backfillRunning = false;
@@ -1268,9 +1244,8 @@ async function runBackfillPass(ids: string[]): Promise<void> {
 }
 
 /**
- * 只在点击开始录音后调用。上一轮还没结束，或距上次开始不满 5 分钟，都跳过。
- * 更早的会话排成一列。每一条先按原来的规则补传分段，再按原来的规则查一次转写。
- * 失败就继续下一条，不在这一轮里重试，也不在回到前台时再查。
+ * 只在点击开始录音后调用。上一轮还没结束，或距上次开始不满 2 分钟，都跳过。
+ * 只补还有分段没上传成功的会话。传完就从补传列表去掉，不再查转写，也不为转写或文档失败重试。
  */
 function startBackfill(): void {
   if (backfillRunning) return;

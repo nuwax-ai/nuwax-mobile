@@ -187,7 +187,10 @@
   import { mainTabBarCovered } from "@/utils/mainTabNavigation";
   import { DRAWER_TITLE_CHANGED, captureDrawerTitleContext, publishDrawerTitleChange } from "@/utils/drawerTitleSync";
   import { beginDrawerTitleRead, resolveDrawerTitle } from "@/utils/drawerTitleState";
+  import { ensureConversationTitleFromDetail, readDefinedConversationTitle } from "@/utils/conversationTitleBootstrap";
+  import { getImSessionStamp } from "@/utils/im/imSessionScope";
   import {
+    apiAgentConversation,
     apiAgentConversationUpdate,
     apiAgentConversationDelete,
   } from "@/servers/conversation";
@@ -434,7 +437,9 @@
       group.name = resolveDrawerTitle("project", group.id, group.projectType, group.name, titleRevision);
       for (let j = 0; j < group.children.length; j++) {
         const child = group.children[j];
-        child.name = resolveDrawerTitle("conversation", child.id, "", child.name, titleRevision);
+        const title = resolveDrawerTitle("conversation", child.id, "", child.name, titleRevision);
+        if (title != child.name) child.titlePending = false;
+        child.name = title;
       }
     }
   }
@@ -474,6 +479,14 @@
             if (current.children[c].id != fresh.children[n].id) continue;
             if (current.children[c].name != fresh.children[n].name) {
               current.children[c].name = fresh.children[n].name;
+              changed = true;
+            }
+            if (current.children[c].titlePending != fresh.children[n].titlePending) {
+              current.children[c].titlePending = fresh.children[n].titlePending;
+              changed = true;
+            }
+            if (current.children[c].taskStatus != fresh.children[n].taskStatus) {
+              current.children[c].taskStatus = fresh.children[n].taskStatus;
               changed = true;
             }
             break;
@@ -1123,6 +1136,7 @@
     return apiAgentConversationUpdate(updateParams).then((updateRes) => {
       if (apiResCode(updateRes) == SUCCESS_CODE) {
         child.name = newName;
+        child.titlePending = false;
         publishDrawerTitleChange("conversation", child.id, newName, "", titleContext);
         projectVersion.value = projectVersion.value + 1;
         uni.showToast({ title: t("Mobile.Components.HistoryConversationList.renameSuccess"), icon: "success" });
@@ -1373,9 +1387,74 @@
     }
   }
 
+  const MAX_PROJECT_TITLE_CHECKS = 4;
+  const attemptedProjectTitleIds = new Set<number>();
+  const pendingProjectTitleIds = new Set<number>();
+  let projectTitleChecksThisOpen = 0;
+
+  function needsProjectConversationTitle(child: ProjectChildView): boolean {
+    return child.id > 0 && child.titlePending && child.taskStatus != "CREATE" && child.taskStatus != "EXECUTING";
+  }
+
+  async function recoverProjectConversationTitle(groupKey: string, id: number, onSettled: () => void): Promise<void> {
+    const context = captureDrawerTitleContext();
+    const generation = projectDataGeneration;
+    pendingProjectTitleIds.add(id);
+    try {
+      const response = await apiAgentConversation(id, true);
+      if (generation != projectDataGeneration || context.session != getImSessionStamp() || apiResCode(response) != SUCCESS_CODE) return;
+      const group = findProjectGroup(groupKey);
+      // 在途期间列表可能已经收到新标题，或用户已经手动改名。
+      if (group == null || !group.children.some((child: ProjectChildView): boolean => {
+        return child.id == id && needsProjectConversationTitle(child);
+      })) return;
+      const detail = apiResData<any>(response);
+      const title = readDefinedConversationTitle(detail);
+      if (title.length > 0) {
+        publishDrawerTitleChange("conversation", id, title, "", context);
+      } else {
+        await ensureConversationTitleFromDetail(detail);
+      }
+    } catch (_error) {
+      // 下次打开抽屉可再补偿；后台读取失败不影响抽屉操作。
+    } finally {
+      pendingProjectTitleIds.delete(id);
+      if (generation == projectDataGeneration && context.session == getImSessionStamp()) onSettled();
+    }
+  }
+
+  // 项目会话的标题可能晚于 ChatFinished，也可能因离开 WebView 丢失自动命名触发。
+  // 仅在可见抽屉补查少量未命名项，优先采用服务端已落库的标题。
+  function recoverUnnamedProjectTitles(): void {
+    if (!drawerDataVisible.value || !props.isLoggedIn) return;
+    const groups = visibleProjectGroups.value;
+    let hasCandidate = false;
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      if (!group.expanded || (group.projectType != "NormalProject" && group.projectType != "UserApp")) continue;
+      for (let j = 0; j < group.children.length; j++) {
+        if (projectTitleChecksThisOpen >= MAX_PROJECT_TITLE_CHECKS ||
+          pendingProjectTitleIds.size >= MAX_PROJECT_TITLE_CHECKS) return;
+        const child = group.children[j];
+        if (!needsProjectConversationTitle(child)) continue;
+        hasCandidate = true;
+        if (attemptedProjectTitleIds.has(child.id) || pendingProjectTitleIds.has(child.id)) continue;
+        attemptedProjectTitleIds.add(child.id);
+        projectTitleChecksThisOpen++;
+        recoverProjectConversationTitle(group.key, child.id, (): void => { recoverUnnamedProjectTitles(); });
+      }
+    }
+    // 跨次打开保留进度。只有本次尚未补查且已轮过可见候选时，才开始下一轮。
+    if (hasCandidate && projectTitleChecksThisOpen == 0 && pendingProjectTitleIds.size == 0) {
+      attemptedProjectTitleIds.clear();
+      recoverUnnamedProjectTitles();
+    }
+  }
+
   // 项目区高度变化（展开/收起/子会话懒加载/标记增删）后重测锚点
   watch(projectVersion, (_v: number) => {
     scheduleMeasureStickyAnchors(120);
+    recoverUnnamedProjectTitles();
   });
 
   /** 点击分组头折叠/展开整个分组（PC 同款）；折叠改变内容高度，降级端需重测任务头锚点 */
@@ -1598,6 +1677,7 @@
   // 抽屉每次变为可见且子组件挂载完成后再触发任务列表首载（见 open() 注释）
   watch(drawerDataVisible, (visible: boolean) => {
     if (visible != true || props.isLoggedIn != true) return;
+    projectTitleChecksThisOpen = 0;
     armStructureRefresh();
     nextTick(() => {
       ensureTaskListLoaded(8);
@@ -1643,6 +1723,8 @@
       return;
     }
     projectDataGeneration++;
+    attemptedProjectTitleIds.clear();
+    projectTitleChecksThisOpen = 0;
     projectSilentRefreshPending = false;
     projectLoadedOnce = false;
     projectGroupsData = [] as ProjectGroupView[];
@@ -1669,7 +1751,12 @@
       }
       if (payload["kind"] == "conversation") {
         for (let j = 0; j < group.children.length; j++) {
-          if (group.children[j].id == id) { group.children[j].name = title; changed = true; }
+          const child = group.children[j];
+          if (child.id == id) {
+            child.name = title;
+            child.titlePending = false;
+            changed = true;
+          }
         }
       }
     }

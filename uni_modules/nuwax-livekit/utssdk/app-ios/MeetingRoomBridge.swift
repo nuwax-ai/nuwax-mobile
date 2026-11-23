@@ -364,7 +364,25 @@ public class MeetingRoomBridge: NSObject {
           _ = try? await track.capturer.stopCapture()
           return
         }
-        _ = try await current.localParticipant.publish(videoTrack: track)
+        // 屏幕共享不能沿用 SDK 默认的 simulcast 分层：1080p 默认会同时发布
+        // 低帧率层（3/5fps），Android 全屏订阅到低层时会出现画面分块刷新、操作卡顿。
+        // 移动端先固定为单层 1080p/30fps，并提高带宽分配优先级；网络不足时
+        // 优先保持帧率，允许分辨率适度下降，避免共享操作界面一顿一顿。
+        let publishOptions = VideoPublishOptions(
+          screenShareEncoding: VideoEncoding(
+            maxBitrate: 8_000_000,
+            maxFps: 30,
+            bitratePriority: .high,
+            networkPriority: nil
+          ),
+          simulcast: false,
+          screenShareSimulcastLayers: [],
+          degradationPreference: .maintainFramerate
+        )
+        _ = try await current.localParticipant.publish(
+          videoTrack: track,
+          options: publishOptions
+        )
         screenShareLock.lock()
         let publishStillActive = requestID == screenShareRequestID
         screenShareLock.unlock()
@@ -379,7 +397,7 @@ public class MeetingRoomBridge: NSObject {
         screenShareTrack = track
         screenShareLock.unlock()
         screenShareErrorText = ""
-        bridgeLog("in-app screen share published")
+        bridgeLog("in-app screen share published: single-layer 1080p 30fps 8Mbps priority=high degradation=maintain-framerate")
       } catch {
         screenShareLock.lock()
         let requestStillActive = requestID == screenShareRequestID

@@ -1156,6 +1156,7 @@ object VoipBridge {
             s.optString(if (s.optString("callerId") == config.optString("userId")) "calleeDisplayName" else "callerDisplayName", "Nuwax")
         val person = Person.Builder().setName(personName).setImportant(true).build()
         val style = if (incoming) NotificationCompat.CallStyle.forIncomingCall(person, intent("reject"), answer)
+            .setIsVideo(!meeting && s.optString("mediaType") == "video")
             else NotificationCompat.CallStyle.forOngoingCall(person, intent(if (s.optString("state") == "ringing") "cancel" else "end"))
         val channel = when {
             alert -> VoipNotificationChannels.INCOMING

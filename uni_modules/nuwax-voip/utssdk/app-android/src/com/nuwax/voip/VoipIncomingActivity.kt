@@ -72,11 +72,14 @@ class VoipIncomingActivity : Activity() {
         super.onDestroy()
     }
     private fun consumeAnswerIntent() {
-        if (intent.getBooleanExtra("answer", false)) { intent.removeExtra("answer"); answer("audio") }
+        if (!intent.getBooleanExtra("answer", false)) return
+        intent.removeExtra("answer")
+        answer()
     }
-    private fun answer(type: String) {
+    private fun answer(requestedType: String? = null) {
         val value = VoipBridge.uiSnapshot(callId) ?: return
         if (!value.optBoolean("incoming") || value.optString("state") != "ringing" || actionPending) return
+        val type = VoipCallPolicy.answerMediaType(value.optString("mediaType"), requestedType)
         // 会议接听只负责打开会议页，麦克风/摄像头由会议页按需申请，不在锁屏强行弹权限。
         if (value.optString("scene") == "meeting") {
             actionPending = true
@@ -90,8 +93,11 @@ class VoipIncomingActivity : Activity() {
         if (type == "video" && ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.CAMERA)
         val keyguard = getSystemService(KeyguardManager::class.java)
         if ((type == "video" || missing.isNotEmpty()) && keyguard.isKeyguardLocked) {
+            val pendingCallId = callId
             keyguard.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
-                override fun onDismissSucceeded() { answer(type) }
+                override fun onDismissSucceeded() {
+                    if (!isFinishing && callId == pendingCallId) answer(type)
+                }
             })
             return
         }

@@ -28,6 +28,9 @@ internal object VoipCallPolicy {
     fun shouldOpenBackgroundCallUi(locked: Boolean, mediaType: String): Boolean =
         mediaType == "audio" || (!locked && mediaType == "video")
 
+    fun answerMediaType(invited: String, requested: String?): String =
+        if (invited == "video" && (requested == null || requested == "video")) "video" else "audio"
+
     fun matches(signalId: String, messageId: String, callId: String, callMessageId: String): Boolean =
         if (signalId.isNotEmpty()) signalId == callId else messageId.isNotEmpty() && callMessageId.isNotEmpty() && messageId == callMessageId
 

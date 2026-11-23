@@ -792,12 +792,17 @@ object VoipBridge {
         } catch (ex: RuntimeException) {
             trace("incoming call activity declined: " + ex.javaClass.simpleName)
             if (!fallbackToAppPage) return
-            emit("openPage")
         }
         // startActivity can return without showing anything. Leave enough time for the
         // Activity to resume while still posting CallStyle within Telecom's five seconds.
         incomingUiWait = scope.launch {
             delay(750)
+            val ringing = current
+            if (fallbackToAppPage && !hidden && ringing?.optString("callId") == id &&
+                isRingingIncoming(ringing) && !callUiVisible(id)) {
+                emit("openPage")
+                delay(500)
+            }
             incomingUiWait = null
             val call = current
             if (call?.optString("callId") == id && isRingingIncoming(call) && hasSystemCall()) publishCall()

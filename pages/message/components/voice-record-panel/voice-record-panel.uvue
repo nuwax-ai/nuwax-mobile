@@ -20,11 +20,18 @@
       <text class="vr-timer">{{ timerText }}</text>
       <text v-if="statusText.length > 0" class="vr-status">{{ statusText }}</text>
       <view class="vr-wave">
-        <view class="vr-wave__clip">
+        <view class="vr-wave__clip" :class="phase == 'idle' ? '' : 'vr-wave__clip--live'">
           <view class="vr-wave__base"></view>
-          <view class="vr-wave__track">
-            <view v-for="n in levelIndexes" :key="n" class="vr-wave__mark" :style="waveMarkStyle(n)">
-              <view class="vr-wave__bar" :style="eqBarStyle(n)"></view>
+          <view class="vr-wave__track" :style="waveTrackStyle">
+            <view v-for="n in waveBarIndexes" :key="n" class="vr-wave__mark" :style="waveMarkStyle(n)">
+              <view class="vr-wave__bar" :style="waveBarHeight(n)"></view>
+            </view>
+          </view>
+          <view class="vr-wave__gold">
+            <view class="vr-wave__track" :style="waveTrackStyle">
+              <view v-for="n in waveBarIndexes" :key="n" class="vr-wave__mark" :style="waveMarkStyle(n)">
+                <view class="vr-wave__bar vr-wave__bar--gold" :style="waveBarHeight(n)"></view>
+              </view>
             </view>
           </view>
         </view>
@@ -172,13 +179,36 @@ const emit = defineEmits<{
   "recording-change": [recording: boolean];
 }>();
 
-const levelIndexes: number[] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47];
 /** 音波左右各留出的宽度（rpx）。左侧留给播放按钮，右侧留出对称空白。 */
 const WAVE_SIDE_RPX = 112;
 /** 音柱间距（px）。整段音波按这个间距从右往左滑。 */
 const WAVE_PITCH = 12;
 /** 录音时音波向左滑动的速度（px/秒）。 */
 const WAVE_SPEED = 22;
+/** 循环波形的柱数。拼三份，平移一整段后两边仍然盖住画面。 */
+const WAVE_PATTERN = 32;
+const WAVE_COPIES = 3;
+const waveLoopPx = WAVE_PATTERN * WAVE_PITCH;
+
+const waveBarIndexes: number[] = [];
+const waveMarkStyles: string[] = [];
+const waveBarHeights: string[] = [];
+
+function buildWaveStrip(): void {
+  const heights: number[] = [];
+  for (let i = 0; i < WAVE_PATTERN; i++) {
+    heights.push(8 + Math.floor(Math.random() * 54));
+  }
+  const count = WAVE_PATTERN * WAVE_COPIES;
+  for (let i = 0; i < count; i++) {
+    waveBarIndexes.push(i);
+    waveMarkStyles.push("left: " + (i * WAVE_PITCH).toString() + "px;");
+    const height = heights[i % WAVE_PATTERN];
+    waveBarHeights.push("height: " + height.toString() + "px;");
+  }
+}
+
+buildWaveStrip();
 
 const elapsedMs = ref<number>(0);
 /** 录音进度和播放进度分开记，切换时各自回到自己的波浪线位置。 */
@@ -186,21 +216,19 @@ let recordWaveMs = 0;
 let playWaveMs = 0;
 /** 当前波浪线跟随播放进度。继续录音时改回录音进度。 */
 let waveFollowsPlay = false;
-/** 音波已向左滑过的整格数。 */
-const waveStep = ref<number>(0);
-/** 当前这一格里的平移（px），范围是 -WAVE_PITCH 到 0。 */
-const waveShift = ref<number>(0);
 /** 中间竖线的横坐标（px）。 */
 const waveHeadLeft = ref<number>(187);
-/** 和竖线对齐的音柱下标。它左边是已录波浪，右边保持初始基线。 */
-const WAVE_ANCHOR = 24;
-/** 已经滑过竖线的音柱高度。下标 0 对应的是第 waveHistoryOrigin 格，更早的格子不再保留。 */
-let waveHistory: number[] = [];
-let waveHistoryOrigin = 0;
-const markStyles = ref<string[]>([]);
-const barStyles = ref<string[]>([]);
-/** 已有封口落盘的录音分段。正在写、还没封口的文件不能播，不显示播放图标。 */
+/** 整条波形的横坐标和位移动画。只改这一处，柱子本身不再逐根重画。 */
+const waveTrackStyle = ref<string>("left: 0px; transform: translateX(0px);");
+/** 竖线在裁切区域中的位置。波形从这里向左铺一段循环。 */
+let waveTrackBase = 0;
+let waveLayoutWidth = 0;
+/** 上一拍已经移到的距离。用来分辨正常滑动和循环段首相接。 */
+let waveShownShift = -1;
+/** 当前这条录音已经有过封口分段。满足一次后保持显示，不再每次刷新重判。 */
 const canPlay = ref<boolean>(false);
+/** 播放图标属于哪一条录音。换一条时重新判断一次。 */
+let playIconLocalId = "";
 const playing = ref<boolean>(false);
 /** idle 未开始 / recording 录音中 / paused 已暂停可继续 / stopped 正在收尾 */
 const phase = ref<string>("idle");
@@ -289,83 +317,59 @@ function waveViewWidth(): number {
   return windowWidthPx();
 }
 
-function randomBarHeight(): number {
-  return 8 + Math.floor(Math.random() * 54);
-}
-
-/** 按当前进度画出音柱。竖线左边是已录波浪，右边保持初始基线。 */
-function paintWave(): void {
+function ensureWaveLayout(): void {
   const view = waveViewWidth();
-  const head = Math.round(view * 0.5);
-  waveHeadLeft.value = waveSidePx() + head;
-  const idle = phase.value == "idle";
-  const marks: string[] = [];
-  const bars: string[] = [];
-  for (let index = 0; index < levelIndexes.length; index++) {
-    const x = head + (index - WAVE_ANCHOR) * WAVE_PITCH + (idle ? 0 : waveShift.value);
-    marks.push("left: " + x.toString() + "px;");
-    let height = 6;
-    let color = "#e4e4e8";
-    if (!idle && index <= WAVE_ANCHOR) {
-      const sample = waveStep.value + index - WAVE_ANCHOR - waveHistoryOrigin;
-      if (sample >= 0 && sample < waveHistory.length) {
-        const recorded = waveHistory[sample];
-        if (recorded != null && recorded > 0) {
-          height = recorded;
-          color = "#f0b429";
-        }
-      }
-    }
-    bars.push("height: " + height.toString() + "px; background-color: " + color + ";");
-  }
-  markStyles.value = marks;
-  barStyles.value = bars;
-}
-
-/** 竖线停在中间。已录音柱排在竖线左边并向左滑，右边保持初始基线。 */
-function syncLevels(): void {
-  if (phase.value == "idle") {
-    waveHistory = [];
-    waveHistoryOrigin = 0;
-    waveShift.value = 0;
-    waveStep.value = 0;
-    paintWave();
+  if (view == waveLayoutWidth) {
     return;
   }
-  const travel = elapsedMs.value / 1000 * WAVE_SPEED;
-  const steps = Math.floor(travel / WAVE_PITCH);
-  const tail = WAVE_ANCHOR + 2;
-  const gap = steps + 1 - (waveHistoryOrigin + waveHistory.length);
-  if (gap > tail) {
-    waveHistory = [];
-    waveHistoryOrigin = steps + 1 - tail;
-    if (waveHistoryOrigin < 0) {
-      waveHistoryOrigin = 0;
+  waveLayoutWidth = view;
+  const head = Math.round(view * 0.5);
+  waveHeadLeft.value = waveSidePx() + head;
+  waveTrackBase = head - waveLoopPx;
+}
+
+/** 竖线停在中间。整条循环波形按时间向左滑，两拍之间用线性动画连上。移完一段后直接从段首接上。 */
+function syncLevels(): void {
+  ensureWaveLayout();
+  let shift = 0;
+  if (phase.value != "idle") {
+    const travel = elapsedMs.value / 1000 * WAVE_SPEED;
+    shift = travel % waveLoopPx;
+    if (shift < 0) {
+      shift = 0;
     }
   }
-  while (waveHistoryOrigin + waveHistory.length <= steps) {
-    waveHistory.push(randomBarHeight());
+  const previous = waveShownShift;
+  waveShownShift = shift;
+  let duration = 80;
+  if (previous < 0 || phase.value == "idle") {
+    duration = 0;
+  } else {
+    const delta = shift - previous;
+    const wrapped = delta < -waveLoopPx * 0.5;
+    const jumped = delta > WAVE_PITCH * 2 || delta < -WAVE_PITCH * 2;
+    if (wrapped || jumped) {
+      duration = 0;
+    }
   }
-  const into = travel - steps * WAVE_PITCH;
-  waveStep.value = steps;
-  waveShift.value = -Math.floor(into);
-  paintWave();
+  const next = "left: " + waveTrackBase.toString() + "px; transform: translateX(-" + shift.toString() + "px); transition-property: transform; transition-duration: " + duration.toString() + "ms; transition-timing-function: linear;";
+  if (waveTrackStyle.value != next) {
+    waveTrackStyle.value = next;
+  }
 }
 
 function waveMarkStyle(index: number): string {
-  const styles = markStyles.value;
-  if (index >= 0 && index < styles.length) {
-    return styles[index];
+  if (index >= 0 && index < waveMarkStyles.length) {
+    return waveMarkStyles[index];
   }
   return "left: 0px;";
 }
 
-function eqBarStyle(index: number): string {
-  const styles = barStyles.value;
-  if (index >= 0 && index < styles.length) {
-    return styles[index];
+function waveBarHeight(index: number): string {
+  if (index >= 0 && index < waveBarHeights.length) {
+    return waveBarHeights[index];
   }
-  return "height: 6px; background-color: #e4e4e8;";
+  return "height: 8px;";
 }
 
 const waveHeadStyle = computed((): string => {
@@ -404,15 +408,6 @@ function playSlices(): PlaySlice[] {
     cursor = cursor + slice.durationMs;
   }
   return list;
-}
-
-function playablePaths(): string[] {
-  const slices = playSlices();
-  const paths: string[] = [];
-  for (let i = 0; i < slices.length; i++) {
-    paths.push(slices[i].filePath);
-  }
-  return paths;
 }
 
 /** 可播放内容的总时长。竖线停在末尾时，下一次播放从头开始。 */
@@ -466,6 +461,23 @@ function showRecordWave(): void {
   syncLevels();
 }
 
+/** 这条录音是否已有封口分段。只在图标还没出现时看一次内存里的分段。 */
+function rememberPlayIcon(record: VoiceNoteRecord): void {
+  if (playIconLocalId != record.localId) {
+    playIconLocalId = record.localId;
+    canPlay.value = false;
+  }
+  if (canPlay.value) {
+    return;
+  }
+  for (let i = 0; i < record.segments.length; i++) {
+    if (record.segments[i].filePath.length > 0) {
+      canPlay.value = true;
+      return;
+    }
+  }
+}
+
 function applySnapshot(): void {
   // 退到后台只让录音和计时继续。不读缓存，也不刷新波形和页面。
   if (isAppInBackground()) {
@@ -484,10 +496,11 @@ function applySnapshot(): void {
     waveFollowsPlay = false;
     statusText.value = "";
     canPlay.value = false;
+    playIconLocalId = "";
     syncLevels();
     return;
   }
-  canPlay.value = playablePaths().length > 0;
+  rememberPlayIcon(record);
   statusText.value = statusOf(record);
   if (record.phase == "recording") {
     phase.value = "recording";
@@ -1011,8 +1024,23 @@ onUnmounted(() => {
   position: absolute;
   top: 0;
   left: 0;
-  width: 640px;
+  width: 1152px;
   height: 100%;
+  transition-property: transform;
+  transition-timing-function: linear;
+}
+
+.vr-wave__gold {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 0;
+  overflow: hidden;
+}
+
+.vr-wave__clip--live .vr-wave__gold {
+  width: 50%;
 }
 
 .vr-wave__mark {
@@ -1028,6 +1056,10 @@ onUnmounted(() => {
   width: 3px;
   border-radius: 2px;
   background-color: #e4e4e8;
+}
+
+.vr-wave__bar--gold {
+  background-color: #f0b429;
 }
 
 .vr-wave__base {

@@ -95,6 +95,20 @@ describe("会话自动命名独立于 SSE", () => {
     await flow;
   });
 
+  it("历史里尚未读到用户正文时，用已经发起的消息生成标题", async () => {
+    const s = streamService();
+    s.service.data.messageList.value = [{ role: "ASSISTANT", text: "欢迎使用" }];
+    const flow = s.service.handleConversation({ conversationId: 11, message: "新建搜索页" }, "assistant", false, null);
+    expect(api.update).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ firstMessage: "新建搜索页" }));
+    s.flow.resolve();
+    await flow;
+  });
+
+  it("预建项目会话 topicUpdated=1 但标题空白时仍补写", async () => {
+    await title.ensureConversationTitleFromDetail({ ...unnamed, topic: "  ", topicUpdated: 1 });
+    expect(api.update).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: 11, firstMessage: "整理文档" }));
+  });
+
   it("续接仅补偿未命名会话，使用历史第一条用户正文，不依赖 needUpdateTopicRef", async () => {
     await title.ensureConversationTitleFromDetail(unnamed);
     await title.ensureConversationTitleFromDetail(unnamed);

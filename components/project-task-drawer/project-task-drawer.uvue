@@ -187,7 +187,10 @@
   import { mainTabBarCovered } from "@/utils/mainTabNavigation";
   import { DRAWER_TITLE_CHANGED, captureDrawerTitleContext, publishDrawerTitleChange } from "@/utils/drawerTitleSync";
   import { beginDrawerTitleRead, resolveDrawerTitle } from "@/utils/drawerTitleState";
+  import { ensureConversationTitleFromDetail, readDefinedConversationTitle } from "@/utils/conversationTitleBootstrap";
+  import { getImSessionStamp } from "@/utils/im/imSessionScope";
   import {
+    apiAgentConversation,
     apiAgentConversationUpdate,
     apiAgentConversationDelete,
   } from "@/servers/conversation";
@@ -474,6 +477,10 @@
             if (current.children[c].id != fresh.children[n].id) continue;
             if (current.children[c].name != fresh.children[n].name) {
               current.children[c].name = fresh.children[n].name;
+              changed = true;
+            }
+            if (current.children[c].taskStatus != fresh.children[n].taskStatus) {
+              current.children[c].taskStatus = fresh.children[n].taskStatus;
               changed = true;
             }
             break;
@@ -1373,9 +1380,66 @@
     }
   }
 
+  const MAX_PROJECT_TITLE_CHECKS = 4;
+  const attemptedProjectTitleIds = new Set<number>();
+  const pendingProjectTitleIds = new Set<number>();
+
+  function needsProjectConversationTitle(child: ProjectChildView): boolean {
+    const name = child.name.trim();
+    return child.id > 0 && (name.length == 0 || name == t("Mobile.Conversation.unnamed"))
+      && child.taskStatus != "CREATE" && child.taskStatus != "EXECUTING";
+  }
+
+  async function recoverProjectConversationTitle(groupKey: string, id: number): Promise<void> {
+    const context = captureDrawerTitleContext();
+    const generation = projectDataGeneration;
+    pendingProjectTitleIds.add(id);
+    try {
+      const response = await apiAgentConversation(id, true);
+      if (generation != projectDataGeneration || context.session != getImSessionStamp() || apiResCode(response) != SUCCESS_CODE) return;
+      const group = findProjectGroup(groupKey);
+      // 在途期间列表可能已经收到新标题，或用户已经手动改名。
+      if (group == null || !group.children.some((child: ProjectChildView): boolean => {
+        return child.id == id && needsProjectConversationTitle(child);
+      })) return;
+      const detail = apiResData<any>(response);
+      const title = readDefinedConversationTitle(detail);
+      if (title.length > 0) {
+        publishDrawerTitleChange("conversation", id, title, "", context);
+      } else {
+        await ensureConversationTitleFromDetail(detail);
+      }
+    } catch (_error) {
+      // 下次打开抽屉可再补偿；后台读取失败不影响抽屉操作。
+    } finally {
+      pendingProjectTitleIds.delete(id);
+    }
+  }
+
+  // 项目会话的标题可能晚于 ChatFinished，也可能因离开 WebView 丢失自动命名触发。
+  // 仅在可见抽屉补查少量未命名项，优先采用服务端已落库的标题。
+  function recoverUnnamedProjectTitles(): void {
+    if (!drawerDataVisible.value || !props.isLoggedIn) return;
+    const groups = visibleProjectGroups.value;
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      if (!group.expanded || (group.projectType != "NormalProject" && group.projectType != "UserApp")) continue;
+      for (let j = 0; j < group.children.length; j++) {
+        if (attemptedProjectTitleIds.size >= MAX_PROJECT_TITLE_CHECKS ||
+          pendingProjectTitleIds.size >= MAX_PROJECT_TITLE_CHECKS) return;
+        const child = group.children[j];
+        if (!needsProjectConversationTitle(child) ||
+          attemptedProjectTitleIds.has(child.id) || pendingProjectTitleIds.has(child.id)) continue;
+        attemptedProjectTitleIds.add(child.id);
+        recoverProjectConversationTitle(group.key, child.id);
+      }
+    }
+  }
+
   // 项目区高度变化（展开/收起/子会话懒加载/标记增删）后重测锚点
   watch(projectVersion, (_v: number) => {
     scheduleMeasureStickyAnchors(120);
+    recoverUnnamedProjectTitles();
   });
 
   /** 点击分组头折叠/展开整个分组（PC 同款）；折叠改变内容高度，降级端需重测任务头锚点 */
@@ -1598,6 +1662,7 @@
   // 抽屉每次变为可见且子组件挂载完成后再触发任务列表首载（见 open() 注释）
   watch(drawerDataVisible, (visible: boolean) => {
     if (visible != true || props.isLoggedIn != true) return;
+    attemptedProjectTitleIds.clear();
     armStructureRefresh();
     nextTick(() => {
       ensureTaskListLoaded(8);
@@ -1643,6 +1708,7 @@
       return;
     }
     projectDataGeneration++;
+    attemptedProjectTitleIds.clear();
     projectSilentRefreshPending = false;
     projectLoadedOnce = false;
     projectGroupsData = [] as ProjectGroupView[];

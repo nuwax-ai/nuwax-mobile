@@ -109,6 +109,40 @@ function taskState(rows: Record<string, any>[], request: any) {
 const taskFunctions = ["toNum", "updateConversationItem", "mergeConversationHead", "mergeConversationTitles", "flushPendingTaskRefresh", "silentFetchTasks"];
 
 describe("滚动与请求时序", () => {
+  it.each(["NormalProject", "UserApp"])("补查 %s 的未命名会话，保留最新改名并避免重复请求", async projectType => {
+    const children = [
+      { id: 11, name: "未命名会话", taskStatus: "COMPLETE" },
+      { id: 12, name: "未命名会话", taskStatus: "EXECUTING" },
+      { id: 13, name: "未命名会话", taskStatus: "COMPLETE" },
+    ];
+    const group = { key: `${projectType}:3`, projectType, expanded: true, children };
+    const response = deferred<any>();
+    const state = {
+      props: { isLoggedIn: true }, drawerDataVisible: { value: true }, visibleProjectGroups: { value: [group] },
+      t: () => "未命名会话", MAX_PROJECT_TITLE_CHECKS: 4,
+      attemptedProjectTitleIds: new Set(), pendingProjectTitleIds: new Set(),
+      projectDataGeneration: 0, captureDrawerTitleContext: () => ({ session: "current" }),
+      getImSessionStamp: () => "current", findProjectGroup: () => group,
+      apiAgentConversation: vi.fn(() => response.promise), SUCCESS_CODE: "0000",
+      apiResCode: (r: any) => r.code, apiResData: (r: any) => r.data,
+      readDefinedConversationTitle: (d: any) => d.topic,
+      publishDrawerTitleChange: vi.fn(), ensureConversationTitleFromDetail: vi.fn(),
+    };
+    const api = await bind(drawer, [
+      "needsProjectConversationTitle", "recoverProjectConversationTitle", "recoverUnnamedProjectTitles",
+    ], state);
+    api.recoverUnnamedProjectTitles();
+    api.recoverUnnamedProjectTitles();
+    expect(state.apiAgentConversation.mock.calls).toEqual([[11, true], [13, true]]);
+    children[2].name = "刚手动改名";
+    response.resolve({ code: "0000", data: { topic: "刚落库的标题" } });
+    await vi.waitFor(() => expect(state.pendingProjectTitleIds.size).toBe(0));
+    expect(state.publishDrawerTitleChange).toHaveBeenCalledExactlyOnceWith(
+      "conversation", 11, "刚落库的标题", "", { session: "current" },
+    );
+    expect(state.ensureConversationTitleFromDetail).not.toHaveBeenCalled();
+  });
+
   it("下滚时更新超过头10条的标题，保留行顺序、数量和标记", async () => {
     const rows = Array.from({ length: 20 }, (_, i) => ({ id: i + 1, topic: "旧标题", pinned: false }));
     const state = taskState(rows, vi.fn(async () => ({ code: 0, data: [
@@ -146,6 +180,7 @@ describe("滚动与请求时序", () => {
     const state = {
       props: { isLoggedIn: true }, projectLoadedOnce: true, projectRequestPromise: null,
       drawerDataVisible: { value: true },
+      forceProjectStructure: false,
       projectSilentRefreshPending: false, projectNextPage: 2, projectDataGeneration: 0,
       projectGroupsData: [{ key: "NormalProject:3", id: 3, projectType: "NormalProject", name: "旧项目", expanded: true, children: [{ id: 11, name: "旧会话" }] }],
       projectVersion: { value: 0 }, allowSilentRefresh: { value: false },
@@ -240,7 +275,8 @@ describe("会话详情期间延后列表查询", () => {
     const state = {
       props: { isLoggedIn: true }, drawerDataVisible: { value: false },
       projectGroupsData: [row], projectVersion: { value: 0 }, projectLoadedOnce: false,
-      projectRequestPromise: null, projectSilentRefreshPending: false,
+      projectRequestPromise: null, projectSilentRefreshPending: false, forceProjectStructure: false,
+      allowSilentRefresh: { value: false },
       requestProjects: vi.fn(async () => true),
     };
     const api = await bind(drawer, ["silentRefreshProjects", "onDrawerTitleChanged"], state);

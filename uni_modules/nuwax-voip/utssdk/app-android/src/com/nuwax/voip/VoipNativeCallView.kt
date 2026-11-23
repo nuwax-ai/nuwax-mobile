@@ -15,6 +15,8 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -111,13 +113,22 @@ internal class VoipNativeCallView(
         background = gradient(BACKDROP_TOP, BACKDROP_BOTTOM)
         addView(remote, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         addView(shade, LayoutParams(LayoutParams.MATCH_PARENT, dp(320), Gravity.BOTTOM))
+        val content = FrameLayout(context)
+        addView(content, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        ViewCompat.setOnApplyWindowInsetsListener(this) { _, insets ->
+            val safeArea = insets.getInsetsIgnoringVisibility(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            content.setPadding(safeArea.left, safeArea.top, safeArea.right, safeArea.bottom)
+            insets
+        }
         local.background = rounded(Color.rgb(61, 73, 67), 14)
         local.clipToOutline = true
-        addView(local, LayoutParams(dp(94), dp(138), Gravity.TOP or Gravity.END).apply {
+        content.addView(local, LayoutParams(dp(94), dp(138), Gravity.TOP or Gravity.END).apply {
             topMargin = dp(64)
             marginEnd = dp(16)
         })
-        addView(LinearLayout(context).apply {
+        content.addView(LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             addView(header(minimize), LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(48)))

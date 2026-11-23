@@ -14,6 +14,7 @@ import android.os.Looper
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 
 /** A real notification destination, available before the UTS page resumes.
  * Intents contain only a business call ID. State, identity and actions stay in the singleton.
@@ -32,6 +33,7 @@ class VoipIncomingActivity : Activity() {
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(true); setTurnScreenOn(true) }
         else window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         window.statusBarColor = VoipNativeCallView.BACKDROP_TOP
         window.navigationBarColor = VoipNativeCallView.BACKDROP_BOTTOM
         callId = intent.getStringExtra("callId") ?: ""

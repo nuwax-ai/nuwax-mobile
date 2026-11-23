@@ -97,7 +97,6 @@ object VoipBridge {
     private var nativeUiId = ""
     private var appCallUiId = ""
     private var incomingUiWait: Job? = null
-    private var coldPushUiMessageId: String? = null
     private var speaker = false
     private val terminal = LinkedHashSet<String>()
     private val incomingNotifications = VoipIncomingNotificationGate()
@@ -688,7 +687,6 @@ object VoipBridge {
 
     private fun addTelecom(snapshot: JSONObject, incoming: Boolean) {
         val id = snapshot.optString("callId")
-        val coldPush = coldPushUiMessageId == snapshot.optString("msgId")
         val run = generation
         val ready = CompletableDeferred<CallControlScope?>()
         val previousCleanup = telecomCleanup
@@ -714,7 +712,7 @@ object VoipBridge {
                     control = owner
                     trace("telecom call registered")
                     // Telecom must own the call before asking for background phone-call execution.
-                    if (incoming && ownsCall()) requestBackgroundCallUi(id, coldPush)
+                    if (incoming && ownsCall()) requestBackgroundCallUi(id)
                     publishCall()
                     launch { isMuted.collect { muted -> if (control === owner) setMicrophone(!muted) } }
                     launch { currentCallEndpoint.collect { endpoint -> if (control === owner) { speaker = endpoint.type == CallEndpointCompat.TYPE_SPEAKER; emit("speaker", "enabled", speaker) } } }
@@ -758,19 +756,19 @@ object VoipBridge {
     // After Telecom registers the call, use the user-granted overlay permission to try
     // the native incoming Activity. Some devices show a banner for the full-screen
     // notification intent, so keep it as the fallback when the Activity cannot open.
-    private fun requestBackgroundCallUi(id: String, coldPush: Boolean) {
+    private fun requestBackgroundCallUi(id: String) {
         val ctx = context ?: return
         val call = current ?: return
         if (!business() || call.optString("callId") != id || !isRingingIncoming(call) ||
             call.optLong("expiresAt") <= System.currentTimeMillis() || callUiVisible(id) || incomingUiWait != null) return
         val locked = ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked
-        if (!VoipCallPolicy.shouldOpenBackgroundCallUi(locked, coldPush, call.optString("mediaType")) || !Settings.canDrawOverlays(ctx)) return
+        if (!VoipCallPolicy.shouldOpenBackgroundCallUi(locked, call.optString("mediaType")) || !Settings.canDrawOverlays(ctx)) return
         val manager = ctx.getSystemService(NotificationManager::class.java)
         if (runCatching { ensureNotificationChannels(ctx) }.isFailure) return
         val channel = VoipNotificationChannels.incoming(manager) ?: return
         if (!manager.areNotificationsEnabled() || channel.importance < NotificationManager.IMPORTANCE_HIGH ||
             manager.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) return
-        trace(if (locked) "locked call activity requested" else "unlocked cold-start call activity requested")
+        trace(if (locked) "locked call activity requested" else "unlocked incoming call activity requested")
         requestIncomingCallUi(id)
     }
 
@@ -1043,7 +1041,6 @@ object VoipBridge {
     }
     private fun reset() {
         context?.stopService(Intent(context, VoipDevControlService::class.java))
-        coldPushUiMessageId = null
         closeServerCall()
         generation++; imSocket?.cancel(); imSocket = null; streamCall?.cancel(); streamJob?.cancel(); streamJob = null; finish("sessionChanged")
         config = JSONObject(); terminal.clear(); queue.clear()
@@ -1071,27 +1068,20 @@ object VoipBridge {
         if (!debug && !saved.optBoolean("qaAccepted") && !native) return false
         if (native && !VoipPushPayload.eligible(invitation, saved.optString("userId"), System.currentTimeMillis())) return true
         trace(if (native) "native push routed to call source=$source callId=${invitation.optString("callId")}" else "native push routed to call")
-        val verification = incoming(ctx, invitation, saved.optString("scope"), fromDelivery = source != "click")
+        val verification = incoming(ctx, invitation, saved.optString("scope"))
         onVerification?.invoke(verification)
         return true
     }
 
     /** Restore the authenticated native context and verify the invitation before ringing. */
-    private fun incoming(ctx: Context, invitation: JSONObject, sessionScope: String, fromDelivery: Boolean): Job {
+    private fun incoming(ctx: Context, invitation: JSONObject, sessionScope: String): Job {
         context = ctx.applicationContext
         return scope.launch {
-            val restoreSession = config.optString("accessToken").isEmpty()
-            val coldPushMessageId = invitation.optString("msgId").takeIf {
-                it.isNotEmpty() && fromDelivery && restoreSession && activity.get() == null && invitation.optString("scene") != "meeting"
-            }
             try {
-                if (restoreSession) {
+                if (config.optString("accessToken").isEmpty()) {
                     loadConfig()?.takeIf { it.optString("scope") == sessionScope }?.let { initialize(it) }
                 }
                 if (!business() || sessionScope.isEmpty() || config.optString("scope") != sessionScope) return@launch
-                // The restored socket may verify this same invitation before the push lookup.
-                // Capture eligibility by message so a different incoming call cannot inherit it.
-                if (coldPushMessageId != null) coldPushUiMessageId = coldPushMessageId
                 val message = api("/api/instant-message/messages/" + Uri.encode(invitation.getString("msgId")) +
                     "?convId=" + Uri.encode(invitation.getString("convId")), absolute = true)
                 if (config.optString("scope") != sessionScope) return@launch
@@ -1100,7 +1090,6 @@ object VoipBridge {
                 receiveInvitation(message, invitation.takeIf { native }, sessionScope)
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { if (config.optString("scope") == sessionScope) emit("error", "code", "CALL_INVITATION_FAILED") }
-            finally { if (coldPushMessageId != null && coldPushUiMessageId == coldPushMessageId) coldPushUiMessageId = null }
         }
     }
 

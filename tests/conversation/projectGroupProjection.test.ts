@@ -123,6 +123,26 @@ describe("mapProjectTabResponse", () => {
     expect(groups[0].children.length).toBe(0);
   });
 
+  it("按 topicUpdated 识别待命名会话，保留同名的手动标题与旧列表兜底", () => {
+    const groups = mapProjectTabResponse(makeResponse([{
+      projectId: 1,
+      conversations: [
+        { id: 11, topic: "新会话", topicUpdated: 0 },
+        { id: 12, topic: "新会话", topicUpdated: "1" },
+        { id: 13, topic: "未命名会话", topicUpdated: true },
+        { id: 14, topic: "未命名会话" },
+        { id: 15, topic: " ", topicUpdated: 1 },
+        { id: 16, topic: "最近会话", topicUpdated: -1 },
+        { id: 17, topic: "默认会话", topicUpdated: false },
+        { id: 18, topic: "已有名称" },
+      ],
+    }]), identityFormat, "未命名会话");
+    expect(groups[0].children.map(child => child.titlePending)).toEqual([
+      true, false, false, true, true, true, true, false,
+    ]);
+    expect(groups[0].children[4].name).toBe("未命名会话");
+  });
+
   it("id/agentId 为字符串时归一为数字", () => {
     const groups = mapProjectTabResponse(
       makeResponse([

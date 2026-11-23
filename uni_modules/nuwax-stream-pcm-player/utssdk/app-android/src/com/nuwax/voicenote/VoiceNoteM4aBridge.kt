@@ -1,13 +1,17 @@
 package com.nuwax.voicenote
 
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.MediaRecorder
+import android.os.Build
 import java.io.File
 
 /**
@@ -15,6 +19,10 @@ import java.io.File
  * 不使用 MediaRecorder，也不走聊天页的 StreamPcmRecorder。
  */
 class VoiceNoteM4aBridge {
+    init {
+        active = this
+    }
+
     private val lock = Object()
     private var audioRecord: AudioRecord? = null
     private var readThread: Thread? = null
@@ -28,20 +36,56 @@ class VoiceNoteM4aBridge {
     private var segmentSamples: Long = 0
     private var lastClosedDurationMs: Int = 0
     private var currentPath: String = ""
+    private var audioManager: AudioManager? = null
+    private var focusRequest: AudioFocusRequest? = null
+    private var interruptHold: Boolean = false
+    @Volatile private var pendingEvent: String = ""
+
+    private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+        if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+            synchronized(lock) {
+                if (!running || paused) {
+                    return@synchronized
+                }
+                paused = true
+                interruptHold = true
+                pendingEvent = "began"
+                try {
+                    if (audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                        audioRecord?.stop()
+                    }
+                } catch (_e: Exception) {
+                }
+            }
+            return@OnAudioFocusChangeListener
+        }
+        if (change == AudioManager.AUDIOFOCUS_GAIN) {
+            synchronized(lock) {
+                if (!interruptHold) {
+                    return@synchronized
+                }
+                pendingEvent = "ended"
+            }
+        }
+    }
 
     fun startSegment(context: Context, localId: String, indexName: String): String {
-        synchronized(lock) {
-            val path = preparePath(context, localId, indexName) ?: return ""
+        val opened = synchronized(lock) {
+            val path = preparePath(context, localId, indexName) ?: return@synchronized ""
             if (audioRecord == null && !startCapture()) {
-                return ""
+                return@synchronized ""
             }
             if (!openEncoder(path)) {
-                return ""
+                return@synchronized ""
             }
             paused = false
             ensureRecording()
-            return currentPath
+            currentPath
         }
+        if (opened.isNotEmpty()) {
+            requestFocus(context)
+        }
+        return opened
     }
 
     /** 封上当前 m4a，立刻打开下一段。AudioRecord 不停、不释放。 */
@@ -80,6 +124,7 @@ class VoiceNoteM4aBridge {
                 return "0"
             }
             paused = false
+            interruptHold = false
             return if (ensureRecording()) "1" else "0"
         }
     }
@@ -89,6 +134,8 @@ class VoiceNoteM4aBridge {
             val joined = readThread
             running = false
             paused = false
+            interruptHold = false
+            pendingEvent = ""
             closeEncoder()
             val current = audioRecord
             audioRecord = null
@@ -106,7 +153,58 @@ class VoiceNoteM4aBridge {
             thread?.join(800)
         } catch (_e: Exception) {
         }
+        abandonFocus()
         return "1"
+    }
+
+    fun takeInterruption(): String {
+        synchronized(lock) {
+            val event = pendingEvent
+            pendingEvent = ""
+            return event
+        }
+    }
+
+    private fun requestFocus(context: Context) {
+        if (audioManager != null) {
+            return
+        }
+        val manager = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager = manager
+        if (Build.VERSION.SDK_INT >= 26) {
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setOnAudioFocusChangeListener(focusListener)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .build()
+            focusRequest = request
+            manager.requestAudioFocus(request)
+        } else {
+            @Suppress("DEPRECATION")
+            manager.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+        }
+    }
+
+    private fun abandonFocus() {
+        val manager = audioManager
+        audioManager = null
+        if (manager == null) {
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 26) {
+            val request = focusRequest
+            focusRequest = null
+            if (request != null) {
+                manager.abandonAudioFocusRequest(request)
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            manager.abandonAudioFocus(focusListener)
+        }
     }
 
     fun takeClosedDurationMs(): String {
@@ -361,5 +459,14 @@ class VoiceNoteM4aBridge {
 
     companion object {
         private const val SAMPLE_RATE = 16000
+
+        @Volatile
+        private var active: VoiceNoteM4aBridge? = null
+
+        /** 用户划掉任务时由前台服务调用，把正在写的 m4a 封口并放开麦克风。 */
+        @JvmStatic
+        fun stopActive() {
+            active?.stopSegment()
+        }
     }
 }

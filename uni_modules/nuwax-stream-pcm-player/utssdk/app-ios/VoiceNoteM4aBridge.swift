@@ -20,8 +20,27 @@ public class VoiceNoteM4aBridge {
     private var lastClosedDurationMs: Int = 0
     private var currentPath = ""
     private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true)
+    private var interruptObserver: NSObjectProtocol?
+    private var interruptHold = false
+    private var pendingEvent = ""
+    private var ignoreBeganUntil = Date()
 
-    public init() {}
+    public init() {
+        let center = NotificationCenter.default
+        interruptObserver = center.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: nil
+        ) { [weak self] notification in
+            self?.handleInterruption(notification)
+        }
+    }
+
+    deinit {
+        if let observer = interruptObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
 
     public func startSegment(_ segmentKey: String) -> String {
         guard let targetFormat = targetFormat else {
@@ -37,6 +56,8 @@ public class VoiceNoteM4aBridge {
         queue.sync {
             self.paused = false
             self.running = true
+            self.interruptHold = false
+            self.ignoreBeganUntil = Date().addingTimeInterval(1.5)
             if self.openWriter(path, format: targetFormat) {
                 opened = path
             }
@@ -76,13 +97,19 @@ public class VoiceNoteM4aBridge {
 
     public func resumeSegment() -> String {
         var ok = "0"
+        var shouldStart = false
         queue.sync {
             if self.engine == nil || self.writerInput == nil {
                 return
             }
             self.paused = false
             self.running = true
+            self.interruptHold = false
+            shouldStart = self.engine?.isRunning != true
             ok = "1"
+        }
+        if shouldStart {
+            try? engine?.start()
         }
         return ok
     }
@@ -91,6 +118,8 @@ public class VoiceNoteM4aBridge {
         queue.sync {
             self.running = false
             self.paused = false
+            self.interruptHold = false
+            self.pendingEvent = ""
             self.closeWriter()
         }
         engine?.inputNode.removeTap(onBus: 0)
@@ -108,6 +137,44 @@ public class VoiceNoteM4aBridge {
             self.lastClosedDurationMs = 0
         }
         return duration
+    }
+
+    /// 来电、微信语音、飞书语音等抢走音频会话。返回一次 "began" 或 "ended"，读完即清。
+    public func takeInterruption() -> String {
+        var event = ""
+        queue.sync {
+            event = self.pendingEvent
+            self.pendingEvent = ""
+        }
+        return event
+    }
+
+    private func handleInterruption(_ notification: Notification) {
+        guard let info = notification.userInfo,
+              let typeRaw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else {
+            return
+        }
+        if type == .began {
+            if Date() < ignoreBeganUntil {
+                return
+            }
+            queue.sync {
+                if !self.running || self.paused {
+                    return
+                }
+                self.paused = true
+                self.interruptHold = true
+                self.pendingEvent = "began"
+            }
+            return
+        }
+        queue.sync {
+            if !self.interruptHold {
+                return
+            }
+            self.pendingEvent = "ended"
+        }
     }
 
     private func ensureEngine() -> Bool {

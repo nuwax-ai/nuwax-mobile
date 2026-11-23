@@ -7,7 +7,8 @@
       <view class="atp__player-main">
         <view class="atp__play-btn" hover-class="atp__play-btn--active" @click="handlePlayToggle">
           <view class="atp__play-glyph">
-            <view v-if="playing" class="atp__wave">
+            <view v-if="buffering" class="atp__loading" :style="bufferSpinStyle"></view>
+            <view v-else-if="playing" class="atp__wave">
               <view class="atp__wave-bar atp__wave-bar--1"></view>
               <view class="atp__wave-bar atp__wave-bar--2"></view>
               <view class="atp__wave-bar atp__wave-bar--3"></view>
@@ -93,6 +94,9 @@
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
   import { apiVoiceNoteAudioFiles } from "@/servers/voiceNote.uts";
   import { VoiceNoteAudioPart, VoiceNoteTranscriptFrame } from "./types.uts";
+  // #ifdef APP
+  import { downloadAuthProtectedFileToTemp } from "@/utils/authProtectedFileUrl.uts";
+  // #endif
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
@@ -182,6 +186,8 @@
     audioUrl: string = "";
     durationMs: number = 0;
     startedAt: string = "";
+    /** 跳转到段内位置前落盘的本地路径。已有文件则复用。 */
+    localPath: string = "";
     constructor(audioUrl: string = "", durationMs: number = 0, startedAt: string = "") {
       this.audioUrl = audioUrl;
       this.durationMs = durationMs;
@@ -242,11 +248,285 @@
     }
     return acc;
   };
+
+  /**
+   * 只给当前要播的这一段设置地址，让播放器自己缓冲。
+   * 地址或跳转还没就绪时先转圈，能播了再播，这段时间不提示播放失败。
+   */
+  const buffering = ref<boolean>(false);
+  const bufferSpin = ref<number>(0);
+  let bufferSpinTimer: number = 0;
+  let bufferRetries: number = 0;
+  let pendingAutoplay: boolean = false;
   /** 音频上下文尚未就绪时保留最后一次跳转，初始化完成后补做 */
   let pendingSeekMs: number = -1;
   /** seek 异步生效前忽略旧的 onTimeUpdate，避免滑杆松手后跳回旧位置 */
   let seekGuardTargetMs: number = -1;
   let seekGuardUntilMs: number = 0;
+
+  const bufferSpinStyle = computed((): string => {
+    return "transform: rotate(" + (bufferSpin.value * 360).toString() + "deg); transition-duration: 800ms;";
+  });
+
+  function setBuffering(on: boolean): void {
+    buffering.value = on;
+    if (!on) {
+      if (bufferSpinTimer != 0) {
+        clearInterval(bufferSpinTimer);
+        bufferSpinTimer = 0;
+      }
+      return;
+    }
+    if (bufferSpinTimer != 0) {
+      return;
+    }
+    bufferSpinTimer = setInterval(() => {
+      bufferSpin.value = bufferSpin.value + 1;
+    }, 800);
+  }
+
+  // #ifdef APP
+  /** 同一段只下载一次。再次进入详情时文件还在就直接播，不再重新拉。 */
+  let segmentInflightIndex: number = -1;
+  let segmentInflight: Promise<string> | null = null;
+  let seekReadyTimer: number = 0;
+
+  function segmentCacheRoot(): string {
+    const base = uni.env.USER_DATA_PATH;
+    return base.endsWith("/") ? base + "voice-note-play" : base + "/voice-note-play";
+  }
+
+  function segmentCachePath(index: number): string {
+    const note = props.noteId.length > 0 ? props.noteId : "0";
+    return segmentCacheRoot() + "/" + note + "-" + index.toString() + ".m4a";
+  }
+
+  function segmentFileReady(path: string): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      uni.getFileSystemManager().getFileInfo({
+        filePath: path,
+        success: (res) => {
+          resolve(res.size > 4096);
+        },
+        fail: (_err) => {
+          resolve(false);
+        },
+      });
+    });
+  }
+
+  function copySegmentCache(src: string, dest: string): Promise<string> {
+    const fs = uni.getFileSystemManager();
+    return new Promise<string>((resolve) => {
+      const copy = (): void => {
+        fs.copyFile({
+          srcPath: src,
+          destPath: dest,
+          success: (_res) => {
+            resolve(dest);
+          },
+          fail: (_err) => {
+            resolve(src);
+          },
+        });
+      };
+      fs.mkdir({
+        dirPath: segmentCacheRoot(),
+        recursive: true,
+        success: (_res) => {
+          copy();
+        },
+        fail: (_err) => {
+          copy();
+        },
+      });
+    });
+  }
+
+  function clearSeekReadyTimer(): void {
+    if (seekReadyTimer != 0) {
+      clearTimeout(seekReadyTimer);
+      seekReadyTimer = 0;
+    }
+  }
+
+  /** 跳转完成后再播。seek 同一刻 play 时，播放器还没到目标位置就会报播放失败。 */
+  function playAfterSeekReady(): void {
+    clearSeekReadyTimer();
+    if (audioCtx == null) {
+      return;
+    }
+    setBuffering(false);
+    switchingSeg = false;
+    seekGuardTargetMs = -1;
+    seekGuardUntilMs = 0;
+    if (playing.value && pendingAutoplay) {
+      audioCtx!!.play();
+    }
+    pendingAutoplay = false;
+  }
+
+  function armSeekReadyFallback(): void {
+    clearSeekReadyTimer();
+    seekReadyTimer = setTimeout(() => {
+      seekReadyTimer = 0;
+      if (!buffering.value) {
+        return;
+      }
+      playAfterSeekReady();
+    }, 1200) as number;
+  }
+
+  async function ensureSegmentLocalNow(index: number): Promise<string> {
+    if (index < 0 || index >= audioSegments.length) {
+      return "";
+    }
+    const cached = audioSegments[index].localPath;
+    if (cached.length > 0 && await segmentFileReady(cached)) {
+      return cached;
+    }
+    const dest = segmentCachePath(index);
+    if (await segmentFileReady(dest)) {
+      audioSegments[index].localPath = dest;
+      return dest;
+    }
+    const url = audioSegments[index].audioUrl;
+    if (url.length == 0) {
+      return "";
+    }
+    try {
+      const temp = await downloadAuthProtectedFileToTemp(url);
+      const saved = await copySegmentCache(temp, dest);
+      audioSegments[index].localPath = saved;
+      return saved;
+    } catch (e) {
+      console.error("voice-note segment cache failed", e);
+      return "";
+    }
+  }
+
+  async function ensureSegmentLocal(index: number): Promise<string> {
+    if (segmentInflight != null && segmentInflightIndex == index) {
+      return await segmentInflight!;
+    }
+    const task = ensureSegmentLocalNow(index);
+    segmentInflightIndex = index;
+    segmentInflight = task;
+    const path = await task;
+    if (segmentInflightIndex == index) {
+      segmentInflight = null;
+      segmentInflightIndex = -1;
+    }
+    return path;
+  }
+
+  /**
+   * 进度条和 ±15 秒都要跳到段内某个位置。
+   * 网络地址还没缓冲到那里时直接 seek 会报播放失败。
+   * 先把当前这一段落到本地（已有则复用），能播之后再跳、再播。
+   */
+  async function loadSegmentThenOpen(index: number, offsetMs: number, autoplay: boolean, serial: number): Promise<void> {
+    const local = await ensureSegmentLocal(index);
+    if (serial != advanceSerial || audioCtx == null) {
+      return;
+    }
+    if (local.length == 0) {
+      setBuffering(false);
+      playing.value = false;
+      pendingAutoplay = false;
+      if (playbackRequested) {
+        uni.showToast({ title: t("Mobile.Terminal.audioPlayFailed"), icon: "none" });
+      }
+      return;
+    }
+    const same = audioCtx!!.src == local;
+    if (!same) {
+      setBuffering(true);
+      audioCtx!!.src = local;
+      // #ifndef APP-HARMONY
+      audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
+      // #endif
+      return;
+    }
+    if (offsetMs > 0) {
+      setBuffering(true);
+      audioCtx!!.pause();
+      audioCtx!!.seek(offsetMs / 1000);
+      armSeekReadyFallback();
+      return;
+    }
+    setBuffering(false);
+    if (autoplay) {
+      audioCtx!!.play();
+    }
+    pendingAutoplay = false;
+    switchingSeg = false;
+  }
+  // #endif
+
+  function openAudioSegment(index: number, offsetMs: number, autoplay: boolean, serial: number): void {
+    if (serial != advanceSerial || audioCtx == null) {
+      return;
+    }
+    if (index < 0 || index >= audioSegments.length) {
+      return;
+    }
+    const src = audioSegments[index].audioUrl;
+    if (src.length == 0) {
+      return;
+    }
+    currentSegIndex = index;
+    segBaseMs = segmentBaseMs(index);
+    segPendingSeekMs = offsetMs;
+    pendingAutoplay = autoplay;
+    // #ifdef APP
+    // 从头播可以边下边播。进度条和 ±15 秒要跳到段内位置，等这一段文件落盘后再跳、再播。
+    if (offsetMs <= 0) {
+      const sameRemote = audioCtx!!.src == src;
+      if (!sameRemote) {
+        setBuffering(true);
+        audioCtx!!.src = src;
+        // #ifndef APP-HARMONY
+        audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
+        // #endif
+        return;
+      }
+      setBuffering(false);
+      if (autoplay) {
+        audioCtx!!.play();
+      }
+      pendingAutoplay = false;
+      switchingSeg = false;
+      return;
+    }
+    setBuffering(true);
+    audioCtx!!.pause();
+    void loadSegmentThenOpen(index, offsetMs, autoplay, serial);
+    return;
+    // #endif
+    const same = audioCtx!!.src == src;
+    if (!same) {
+      setBuffering(true);
+      audioCtx!!.src = src;
+      // #ifndef APP-HARMONY
+      audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
+      // #endif
+      return;
+    }
+    if (offsetMs > 0) {
+      setBuffering(true);
+      audioCtx!!.seek(offsetMs / 1000);
+      if (autoplay) {
+        audioCtx!!.play();
+      }
+      return;
+    }
+    setBuffering(false);
+    if (autoplay) {
+      audioCtx!!.play();
+    }
+    switchingSeg = false;
+  }
 
   const audioLoaded = ref<boolean>(false);
   const audioSegmentCount = ref<number>(0);
@@ -363,16 +643,8 @@
 
   /**
    * 切换到下一段并续播（NW-269 分段连播）。
-   * fromNaturalEnd=true 表示 onEnded 自然播完；false 表示段有效时长将尽的提前推进。
    * 末段走原有「重置到起点并 ended」的结束语义。
    */
-  const releaseAdvanceGuard = (serial: number) => {
-    if (serial != advanceSerial) {
-      return;
-    }
-    switchingSeg = false;
-  };
-
   const advanceSegment = () => {
     if (audioCtx == null) return;
     if (switchingSeg) return;
@@ -392,19 +664,8 @@
     const serial = advanceSerial;
     currentSegIndex = nextIndex;
     segBaseMs = segmentBaseMs(nextIndex);
-    segPendingSeekMs = 0;
     playing.value = true;
-    audioCtx!!.src = audioSegments[nextIndex].audioUrl;
-    // #ifndef APP-HARMONY
-    audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
-    // #endif
-    audioCtx!!.play();
-    setTimeout(() => {
-      releaseAdvanceGuard(serial);
-      if (serial == advanceSerial && audioCtx != null && playing.value) {
-        audioCtx!!.play();
-      }
-    }, 300);
+    openAudioSegment(nextIndex, 0, true, serial);
   };
 
   const updateProgress = () => {
@@ -432,11 +693,15 @@
       if (Math.abs(ms - seekGuardTargetMs) <= 1000) {
         seekGuardTargetMs = -1;
         seekGuardUntilMs = 0;
+        setBuffering(false);
+        switchingSeg = false;
       } else if (Date.now() < seekGuardUntilMs) {
         return;
       } else {
         seekGuardTargetMs = -1;
         seekGuardUntilMs = 0;
+        setBuffering(false);
+        switchingSeg = false;
       }
     }
     const durMs = resolveDurationMs();
@@ -472,23 +737,9 @@
     if (audioSegments.length > 0) {
       const seg = locateSegment(targetMs);
       const offsetMs = segmentOffsetMs(targetMs);
-      if (seg != currentSegIndex) {
-        // 跨段 seek：切 src 后立即 seek；个别平台 src 未就绪时由 onCanplay 补做
-        currentSegIndex = seg;
-        segBaseMs = segmentBaseMs(seg);
-        segPendingSeekMs = offsetMs;
-        audioCtx!!.src = audioSegments[seg].audioUrl;
-        // #ifndef APP-HARMONY
-        audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
-        // #endif
-        audioCtx!!.seek(offsetMs / 1000);
-        if (playing.value) {
-          audioCtx!!.play();
-        }
-        emit("seek", targetMs);
-        return;
-      }
-      audioCtx!!.seek(offsetMs / 1000);
+      switchingSeg = true;
+      advanceSerial = advanceSerial + 1;
+      openAudioSegment(seg, offsetMs, playing.value, advanceSerial);
       emit("seek", targetMs);
       return;
     }
@@ -513,6 +764,12 @@
     seekGuardTargetMs = -1;
     seekGuardUntilMs = 0;
     audioSegments = [] as SegRuntime[];
+    setBuffering(false);
+    bufferRetries = 0;
+    pendingAutoplay = false;
+    // #ifdef APP
+    clearSeekReadyTimer();
+    // #endif
     segIndexOfTranscript.value = [] as number[];
     currentSegIndex = -1;
     segBaseMs = 0;
@@ -533,19 +790,62 @@
       advanceSegment();
     });
     audioCtx!!.onCanplay(() => {
-      if (segPendingSeekMs >= 0) {
-        audioCtx!!.seek(segPendingSeekMs / 1000);
-        segPendingSeekMs = -1;
+      bufferRetries = 0;
+      const pending = segPendingSeekMs;
+      segPendingSeekMs = -1;
+      // #ifndef APP-HARMONY
+      audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
+      // #endif
+      if (pending > 0) {
+        audioCtx!!.seek(pending / 1000);
+        armSeekReadyFallback();
+        return;
       }
-      if (switchingSeg && playing.value) {
+      setBuffering(false);
+      if (playing.value && pendingAutoplay) {
         audioCtx!!.play();
       }
+      pendingAutoplay = false;
+      switchingSeg = false;
+    });
+    audioCtx!!.onSeeked((_res) => {
+      if (!buffering.value) {
+        return;
+      }
+      playAfterSeekReady();
     });
     audioCtx!!.onError((err) => {
       console.error("audio-transcript-player audio error", err);
+      // 还在等这一段落盘或跳转时，不要拆掉播放器，也不要提示失败。
+      if (buffering.value && bufferRetries < 1 && currentSegIndex >= 0 && currentSegIndex < audioSegments.length) {
+        const local = audioSegments[currentSegIndex].localPath;
+        if (local.length > 0 && audioCtx != null) {
+          bufferRetries = bufferRetries + 1;
+          audioCtx!!.stop();
+          audioCtx!!.src = local;
+          // #ifndef APP-HARMONY
+          audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
+          // #endif
+          return;
+        }
+        if (segPendingSeekMs > 0) {
+          return;
+        }
+      }
+      // 还在缓冲这一段时，系统可能因为跳转过早报错。保持转圈并再准备一次，不提示失败。
+      if (buffering.value && bufferRetries < 1 && currentSegIndex >= 0 && currentSegIndex < audioSegments.length) {
+        bufferRetries = bufferRetries + 1;
+        const src = audioSegments[currentSegIndex].audioUrl;
+        if (src.length > 0 && audioCtx != null) {
+          audioCtx!!.src = src;
+          return;
+        }
+      }
+      setBuffering(false);
       const shouldToast = playbackRequested;
       playing.value = false;
       playbackRequested = false;
+      pendingAutoplay = false;
       const failed = audioCtx;
       audioCtx = null;
       if (failed != null) {
@@ -567,20 +867,16 @@
     ensureAudioContext();
     if (audioCtx == null) return;
     enableFollowTranscript();
-    const url = audioSegments[currentSegIndex].audioUrl;
-    if (audioCtx!!.src != url) {
-      audioCtx!!.src = url;
-    }
-    // #ifndef APP-HARMONY
-    audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
-    // #endif
     playing.value = true;
     if (pendingSeekMs >= 0) {
       const target = pendingSeekMs;
       pendingSeekMs = -1;
       applySeekToAudio(target);
+    } else {
+      switchingSeg = true;
+      advanceSerial = advanceSerial + 1;
+      openAudioSegment(currentSegIndex, 0, true, advanceSerial);
     }
-    audioCtx!!.play();
     emit("play");
     setTimeout(() => {
       syncActiveFromTime(currentTimeMs.value, true);
@@ -702,6 +998,9 @@
   };
 
   const handlePlayToggle = () => {
+    if (buffering.value) {
+      return;
+    }
     if (playing.value) {
       pause();
     } else {
@@ -732,7 +1031,11 @@
     syncActiveFromTime(clamped, true);
     if (audioCtx == null) {
       pendingSeekMs = clamped;
-      initAudio(false);
+      if (audioLoaded.value) {
+        beginPlayback();
+      } else {
+        initAudio(playing.value);
+      }
       return;
     }
     applySeekToAudio(clamped);
@@ -747,6 +1050,7 @@
     let target = currentTimeMs.value + deltaMs;
     if (target < 0) target = 0;
     if (durMs > 0 && target > durMs) target = durMs;
+    playing.value = true;
     seekToMs(target);
     // #endif
   };
@@ -767,21 +1071,18 @@
     progressPercent.value = percent;
     const dur = resolveDurationMs();
     if (dur > 0) {
+      playing.value = true;
       seekToMs(Math.floor((percent / 100) * dur));
     }
     sliderDragging.value = false;
   };
 
-  const handleSegmentClick = (index: number) => {
+    const handleSegmentClick = (index: number) => {
     const targetMs = transcriptTimeMs(index);
     if (!resolvedHasAudio.value || targetMs < 0) return;
     enableFollowTranscript();
+    playing.value = true;
     seekToMs(targetMs);
-    // #ifdef APP
-    if (!playing.value) {
-      play();
-    }
-    // #endif
   };
 
   const isActiveSegment = (seg: VoiceNoteTranscriptFrame): boolean => {
@@ -899,6 +1200,16 @@
       align-items: center;
       justify-content: center;
       overflow: hidden;
+    }
+
+    &__loading {
+      width: 28rpx;
+      height: 28rpx;
+      border-radius: 50%;
+      border-width: 4rpx;
+      border-style: solid;
+      border-color: rgba(255, 255, 255, 0.35);
+      border-top-color: #ffffff;
     }
 
     &__play-icon {

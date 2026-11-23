@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import java.io.File
 
 /**
  * 伙伴页录音退后台继续采集。
@@ -56,11 +57,46 @@ class VoiceNoteForegroundService : Service() {
         } else {
             startForeground(NOTIFY_ID, notification)
         }
-        return START_STICKY
+        return START_NOT_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        VoiceNoteM4aBridge.stopActive()
+        VoiceNoteExitMark.mark(this)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
     }
 
     companion object {
         private const val CHANNEL = "nuwax_voice_note"
         private const val NOTIFY_ID = 24011
+    }
+}
+
+/** 用户从最近任务划掉应用。进程不一定马上退出，回前台时凭这个标记结束本次录音。 */
+object VoiceNoteExitMark {
+    private const val NAME = "voice-note-task-removed"
+
+    @JvmStatic
+    fun mark(context: android.content.Context) {
+        try {
+            File(context.filesDir, NAME).writeText("1")
+        } catch (_e: Exception) {
+        }
+    }
+
+    @JvmStatic
+    fun consume(context: android.content.Context): Boolean {
+        val file = File(context.filesDir, NAME)
+        if (!file.exists()) {
+            return false
+        }
+        return file.delete()
     }
 }

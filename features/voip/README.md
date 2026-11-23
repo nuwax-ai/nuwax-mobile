@@ -26,6 +26,7 @@ PC 行为补齐与 iOS 后台唤醒统一按 [实施与交付清单](../../docs/
 | `callErrors.uts` | 稳定错误对象 |
 | `callHistory.uts` | 本机记录的边界校验与显示模型；账号存储由原生 Keychain 隔离 |
 | `components/chat-actions.uvue` | 单聊加号菜单中的独立语音、视频、返回通话入口 |
+| `components/return-to-call.uvue` | Android 主界面和聊天页中的返回通话入口 |
 | `screens/call.uvue` | 通话界面与用户操作 |
 | `screens/history.uvue` | iOS 本机记录、未接标识、能力校验后回拨和清空 |
 | `screens/development.uvue` | 独立测试身份、测试服务、设备诊断和开发监听 |
@@ -42,7 +43,7 @@ iOS PushKit 校验、现有 APNs 注册器和系统 action 归属插件 `app-ios
 - 聊天页挂载 `chat-actions.uvue`，输入 `convId`。呼叫能力、拨号和忙线处理归组件及管理器。
 - 已有推送分发器识别 `{type:"voip",convId,msgId}`（兼容开发协议 `voip.invite`）后交给 `integration.uts`，原生推送回调交给原生桥。
 - 录音、TTS 和消息音视频只依赖 `audioFocus.uts` 的占用检查与中断事件。此入口保持轻量，避免播放器与管理器形成循环依赖。
-- 通知清理模块通过 `integration.uts` 查询鸿蒙原生通话占用。
+- 通知清理模块保留 Android 来电和通话状态渠道，通过 `integration.uts` 查询鸿蒙原生通话占用。
 - 主应用启动页按既有登录流程运行。测试包使用 `scripts/voip-native/device` 自己的启动页。
 
 新增通话规则、后端字段、重连逻辑和平台差异均在上述归属目录实现。新增宿主接点时同步更新对接说明及边界测试。

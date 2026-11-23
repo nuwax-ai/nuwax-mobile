@@ -38,14 +38,23 @@ internal object VoipCallPolicy {
     }
 }
 
-/** One incoming notification per call: reposting ONLY_ALERT_ONCE would stop an ongoing ringtone. */
+/** Allow an alert to move to the notification shade once the call UI has appeared. */
 internal class VoipIncomingNotificationGate {
     private var incomingId: String? = null
-    fun publish(id: String, incoming: Boolean): Boolean {
-        if (!incoming) { incomingId = null; return true }
-        if (id == incomingId) return false
+    private var presented = false
+
+    fun publish(id: String, incoming: Boolean, uiVisible: Boolean = false): Boolean {
+        if (!incoming) { reset(); return true }
+        if (id == incomingId && (presented || !uiVisible)) return false
         incomingId = id
+        presented = uiVisible
         return true
     }
-    fun reset() { incomingId = null }
+
+    fun wasPresented(id: String) = incomingId == id && presented
+
+    fun reset() {
+        incomingId = null
+        presented = false
+    }
 }

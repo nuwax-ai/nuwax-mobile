@@ -15,6 +15,10 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import kotlin.math.roundToInt
 
@@ -48,10 +52,19 @@ internal class VoipNativeCallView(
 
     private val kind = label(13f, LABEL)
     private val initials = label(44f, Color.rgb(240, 245, 242))
+    private var avatarUrl = ""
+    private var avatarJob: Job? = null
+    private val avatarImage = ImageView(context).apply {
+        scaleType = ImageView.ScaleType.CENTER_CROP
+        background = rounded(Color.TRANSPARENT, 24)
+        clipToOutline = true
+        visibility = GONE
+    }
     private val avatar = FrameLayout(context).apply {
         background = rounded(Color.TRANSPARENT, 30).apply { setStroke(dp(1), Color.argb(26, 255, 255, 255)) }
         setPadding(dp(6), dp(6), dp(6), dp(6))
         addView(initials, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        addView(avatarImage, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         initials.background = rounded(Color.rgb(113, 134, 124), 24)
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
     }
@@ -153,6 +166,7 @@ internal class VoipNativeCallView(
         kind.text = if (mediaLabel == kindKey) VoipBridge.label("title") else mediaLabel
         name.text = displayName
         initials.text = displayName.substring(0, Character.charCount(displayName.codePointAt(0)))
+        updateAvatar((value.opt(if (incoming) "callerAvatar" else "calleeAvatar") as? String)?.trim().orEmpty())
         val connectedAt = value.optLong("connectedAt", System.currentTimeMillis())
         val seconds = ((System.currentTimeMillis() - connectedAt) / 1000).coerceAtLeast(0)
         status.text = when {
@@ -216,7 +230,22 @@ internal class VoipNativeCallView(
         }
     }
 
-    fun releaseVideo() {
+    private fun updateAvatar(url: String) {
+        if (url == avatarUrl) return
+        avatarUrl = url
+        avatarJob?.cancel()
+        avatarImage.setImageDrawable(null)
+        avatarImage.visibility = GONE
+        if (url.isEmpty()) return
+        avatarJob = CoroutineScope(Dispatchers.Main.immediate).launch {
+            val bitmap = VoipBridge.loadPeerAvatar(url, dp(104)) ?: return@launch
+            avatarImage.setImageBitmap(bitmap)
+            avatarImage.visibility = VISIBLE
+        }
+    }
+
+    fun release() {
+        avatarJob?.cancel()
         VoipBridge.releaseVideoView(remote)
         VoipBridge.releaseVideoView(local)
     }

@@ -44,14 +44,17 @@ class VoipIncomingActivity : Activity() {
 
     override fun onNewIntent(value: Intent) {
         super.onNewIntent(value)
-        VoipBridge.nativeVisible(callId, false)
-        intent = value; callId = value.getStringExtra("callId") ?: ""
-        pendingAnswer = null; actionPending = false
-        VoipBridge.nativeVisible(callId, true)
-        render(); consumeAnswerIntent()
+        intent = value
+        val nextCallId = value.getStringExtra("callId") ?: ""
+        if (nextCallId != callId) {
+            callId = nextCallId
+            pendingAnswer = null; actionPending = false
+        }
+        render()
     }
     override fun onResume() {
         super.onResume()
+        if (isFinishing) return
         VoipBridge.nativeVisible(callId, true)
         handler.removeCallbacks(refresh); handler.post(refresh)
         consumeAnswerIntent()
@@ -63,7 +66,7 @@ class VoipIncomingActivity : Activity() {
     }
     override fun onDestroy() {
         handler.removeCallbacks(refresh)
-        callView.releaseVideo()
+        callView.release()
         super.onDestroy()
     }
     private fun consumeAnswerIntent() {

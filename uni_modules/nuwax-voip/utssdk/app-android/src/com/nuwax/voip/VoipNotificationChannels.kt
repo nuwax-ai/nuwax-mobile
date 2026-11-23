@@ -12,6 +12,7 @@ import android.provider.Settings
 internal object VoipNotificationChannels {
     private const val LEGACY = "nuwax-voip"
     private const val PREVIOUS_INCOMING = "nuwax-voip-incoming-v1"
+    private const val PRESENTED_INCOMING = "nuwax-voip-incoming-presented-v1"
     const val INCOMING = "nuwax-voip-incoming-v2"
     const val ONGOING = "nuwax-voip-ongoing-v1"
 
@@ -22,6 +23,26 @@ internal object VoipNotificationChannels {
         val id = context.resources.getIdentifier(resource, "string", context.packageName)
         check(id != 0) { "Missing packaged call notification label" }
         return context.getString(id)
+    }
+
+    fun presentedIncoming(context: Context): String {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val incoming = manager.getNotificationChannel(INCOMING) ?: return INCOMING
+        // Keep using the invitation channel if the user has already reduced its importance.
+        if (incoming.importance <= NotificationManager.IMPORTANCE_DEFAULT) return INCOMING
+        if (manager.getNotificationChannel(PRESENTED_INCOMING) == null) {
+            val channel = NotificationChannel(PRESENTED_INCOMING,
+                resourceLabel(context, "nuwax_voip_presented_incoming_channel"), NotificationManager.IMPORTANCE_DEFAULT)
+            channel.setSound(incoming.sound, incoming.audioAttributes)
+            incoming.vibrationPattern?.let { channel.vibrationPattern = it }
+            channel.enableVibration(incoming.shouldVibrate())
+            channel.lockscreenVisibility = incoming.lockscreenVisibility
+            channel.setShowBadge(incoming.canShowBadge())
+            incoming.group?.let { channel.group = it }
+            channel.setBypassDnd(incoming.canBypassDnd())
+            manager.createNotificationChannel(channel)
+        }
+        return PRESENTED_INCOMING
     }
 
     fun ensure(context: Context, name: String, incomingName: String) {

@@ -7,11 +7,13 @@ object VoipCallPolicyTest {
         standaloneQaCannotRestoreProductionIdentity()
         releaseOriginRequiresAnExplicitMatchingHttpsPin()
         incomingSoundHonorsSilenceAndExplicitChoices()
+        unlockedBackgroundUiRequiresAColdPush()
         duplicatedInvitationsCannotRestartOrStopTheRingingNotification()
+        showingTheCallUiReplacesTheAlertWithoutRearmingIt()
         endingOrAnsweringReleasesTheIncomingNotificationSlot()
         ringTimeStartsAfterInvitationAcknowledgement(); activeHangupDoesNotSendLegacyCancel()
         reconnectMustNotLookLikeRemoteHangup(); authFailuresAreSeparateFromNotificationFailures()
-        println("13 Kotlin call policy cases passed")
+        println("15 Kotlin call policy cases passed")
     }
     private fun ringTimeStartsAfterInvitationAcknowledgement() {
         check(VoipCallPolicy.ringDeadline(120000, 120500) == 180000L)
@@ -61,6 +63,28 @@ object VoipCallPolicyTest {
         repeat(5) { check(!gate.publish("call-a", true)) }
         check(gate.publish("call-b", true))
         check(!gate.publish("call-b", true))
+    }
+    private fun unlockedBackgroundUiRequiresAColdPush() {
+        for (mediaType in listOf("audio", "video")) {
+            check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, coldPush = true, mediaType = mediaType))
+            check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, coldPush = false, mediaType = mediaType))
+        }
+        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, coldPush = false, mediaType = "audio"))
+        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, coldPush = true, mediaType = "video"))
+    }
+    private fun showingTheCallUiReplacesTheAlertWithoutRearmingIt() {
+        val gate = VoipIncomingNotificationGate()
+        check(gate.publish("direct", incoming = true, uiVisible = true))
+        check(gate.wasPresented("direct"))
+        check(!gate.publish("direct", incoming = true, uiVisible = false))
+        check(gate.publish("fallback", incoming = true))
+        check(!gate.wasPresented("fallback"))
+        check(gate.publish("fallback", incoming = true, uiVisible = true))
+        check(gate.wasPresented("fallback"))
+        check(!gate.publish("fallback", incoming = true, uiVisible = true))
+        check(!gate.publish("fallback", incoming = true, uiVisible = false))
+        gate.reset()
+        check(!gate.wasPresented("fallback"))
     }
     private fun endingOrAnsweringReleasesTheIncomingNotificationSlot() {
         val gate = VoipIncomingNotificationGate()

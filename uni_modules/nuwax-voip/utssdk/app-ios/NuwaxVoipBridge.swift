@@ -444,7 +444,9 @@ import LiveKitClient
         guard let conversation = try? await request("/api/instant-message/conversations/\(conv)", absolute: true),
               run == generation, user == configuration["userId"] as? String,
               conversation["convType"] as? Int == 1, wireString(conversation["peerUserId"]) == sender else { return nil }
-        let next: [String: Any] = ["protocol": "im-voip-v1", "callId": id, "roomName": roomName, "msgId": wireString(message["msgId"]), "convId": conv, "version": 1, "state": "ringing", "callerId": sender, "calleeId": configuration["userId"] as? String ?? "", "callerDeviceId": "", "acceptedDeviceId": "", "mediaType": media, "displayName": conversation["peerName"] as? String ?? sender, "callerDisplayName": conversation["peerName"] as? String ?? sender, "calleeDisplayName": configuration["userId"] as? String ?? "", "expiresAt": sent + 60000]
+        let profileAvatar = (conversation["peerAvatar"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let callerAvatar = profileAvatar.isEmpty ? (message["senderAvatar"] as? String ?? "") : profileAvatar
+        let next: [String: Any] = ["protocol": "im-voip-v1", "callId": id, "roomName": roomName, "msgId": wireString(message["msgId"]), "convId": conv, "version": 1, "state": "ringing", "callerId": sender, "calleeId": configuration["userId"] as? String ?? "", "callerDeviceId": "", "acceptedDeviceId": "", "mediaType": media, "displayName": conversation["peerName"] as? String ?? sender, "callerDisplayName": conversation["peerName"] as? String ?? sender, "calleeDisplayName": configuration["userId"] as? String ?? "", "callerAvatar": callerAvatar, "expiresAt": sent + 60000]
         return next
     }
     private func adoptBusinessInvitation(_ next: [String: Any]) {

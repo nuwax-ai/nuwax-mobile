@@ -82,6 +82,27 @@ flowchart TD
 
 希望锁屏语音直接接通的用户可以提前开麦克风。App 通话页收到视频邀请时也可选择语音接听。iOS 在通话设置显示媒体授权和 PushKit 登记状态，设备通过 App 和服务侧完成登记。专注模式可能影响系统是否展示。 [通话生命周期](voip-call-lifecycle.md#账号和页面边界) · [iOS PushKit 登记](voip-ios-im-cloud-handoff.md#iphone-向测试-im-登记什么)
 
+### iOS 17.4 前后与普通通知回退
+
+iOS 17.4 是 **LiveCommunicationKit（LCK）** 来电界面的最低版本。女娲保留的 iOS 15–17.3 兼容分支可用 **CallKit** 向系统报告来电，也可以由 PushKit 接收 VoIP 推送。两个原生框架都由系统决定最终是否展示接听界面。 [Apple LCK 来电 API](https://developer.apple.com/documentation/livecommunicationkit/conversationmanager/reportnewincomingconversation%28uuid%3Aupdate%3A%29) · [Apple CallKit 来电示例](https://developer.apple.com/documentation/callkit/voip-calling-with-callkit)
+
+```mermaid
+flowchart TD
+    A["iPhone 离线，有一通有效邀请"] --> B{"测试 IM 和推送函数选中<br/>有效的 iOS VoIP 设备登记？"}
+    B -->|是| C["APNs VoIP → PushKit"]
+    C --> D{"系统版本"}
+    D -->|iOS 17.4 及以上| E["LiveCommunicationKit 报告系统来电"]
+    D -->|iOS 15 至 17.3| F["CallKit 兼容分支报告系统来电"]
+    E --> G["系统决定展示，用户可操作接听"]
+    F --> G
+    B -->|未选中且符合普通投递条件| H["普通 APNs 来电通知"]
+    H --> I["用户点通知进入女娲<br/>核对原邀请是否仍可接听"]
+```
+
+上图对应当前测试选路。测试函数按目标设备的有效来电登记选路，iOS 版本用于原生层选择接听框架。系统拒绝展示或专用发送失败要分别记录，目前不能假定会立刻补发一条普通通知。 [当前设备选路](../../uniCloud-alipay/cloudfunctions/push-send-test/index.js) · [女娲 iOS 原生分支](../../uni_modules/nuwax-voip/utssdk/app-ios/NuwaxVoipBridge.swift)
+
+**中国大陆 App Store 的产品口径待发行确认。** 腾讯云的大陆接入方案选用 iOS 17.4+ 的 LCK 系统来电，并为低版本保留普通 APNs 横幅，点击后进入 App。女娲可参考这个方案。提测时把旧系统 CallKit 兼容验证和大陆发行包的普通通知回退分开。大陆发行包是否启用旧系统 CallKit，需要结合实际签名、包配置和审核确认。若决定旧系统仅走普通通知，还需明确设备登记与发送策略，以及点通知后在 App 内接听的行为。这条发行分流属于待实现和验收项。 [腾讯云大陆接入方案](https://cloud.tencent.com.cn/document/product/269/111743) · [女娲发行边界](voip-cn-provider-onboarding.md#63-系统版本与国内发行边界)
+
 ## 研发如何提测
 
 ```mermaid
@@ -108,7 +129,7 @@ flowchart TD
 | 分支和提交、App 版本、基座版本、签名 APK／IPA、包校验值 | 确认系统设置跳转和通知渠道确实在机上包里。注明「消息页首次提示卡」是否包含在本包。 |
 | 测试域名、IM 部署版本、测试云空间及函数版本 | 区分测试和生产推送。 |
 | 主叫、被叫两个不同测试账号，设备登记结果 | 从正常 Web 或 App 入口实拨，并与被叫的有效登记关联。 |
-| 目标机型与系统、厂商权益与接入状态、当前阻塞 | 指定哪些场景本轮可验、哪些只能验普通通知回退。 |
+| 目标机型与系统、发行渠道、厂商权益与接入状态、当前阻塞 | iOS 15–17.3 和 17.4+ 分别写明预期的通知通道与接听框架。 |
 
 ## QA 如何验证
 
@@ -123,6 +144,7 @@ flowchart TD
 | 锁屏且有进程 | 记下亮屏、铃声、接听页或通知、是否可以从锁屏操作。进程存活证据和无进程结果分别记录。 |
 | **未锁屏、无进程** | Android 分别实拨语音和视频，确认推送到达且设置允许时能否自动打开全屏接听页。 |
 | **锁屏、无进程** | Android 分别核对语音原生直开和视频系统通知。iOS 核对 PushKit 回调、系统来电、接听和媒体。Android 拨号前确认主进程及推送子进程，记录应用未被强停。 |
+| iOS 旧系统兼容与普通通知 | iOS 15–17.3 的测试包单列 PushKit 和 CallKit 上报及展示。普通通知回退单列通知到达、点击进 App、有效邀请可接听、已取消或过期邀请不可恢复。iOS 17.4+ 单列 LCK 上报和展示。 |
 | 系统来电兜底和干扰条件 | Android 分别测试悬浮窗关闭、Android 14+ 全屏通知关闭和勿扰。关闭悬浮窗验证系统通知兜底，保持悬浮窗允许可单独验证系统全屏通知关闭时的原生直开。iOS 核对专注模式，并在业务推送和登记仍有效时单独验证关闭普通通知后的系统来电。 |
 | 去重、收起与收尾 | 接听页已显示时，同一通不重复弹系统横幅。收起后从通知栏或支持的 App 页面返回，媒体继续。分别测两端挂断、拒接、取消、超时、另一个设备接听与资源释放。 |
 | 主动退出和重启 | 系统回收、上滑移除任务、Android 强行停止、重启后首次解锁前后单独记结果，有进程或普通通知结果不写为原生冷启动通过。 |

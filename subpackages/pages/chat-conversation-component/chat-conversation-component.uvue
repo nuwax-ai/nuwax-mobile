@@ -401,6 +401,7 @@
           :page-home-index="inputPageHomeIndex"
           :expand-page-area="inputExpandPageArea"
           :whole-disabled="inputWholeDisabled"
+          :defer-send-draft-clear="!isTempChat"
           :manual-components="inputManualComponents"
           :conversation-files="contextFileList"
           :conversation-files-loading="contextFileLoading"
@@ -408,7 +409,7 @@
           :default-selected-components="selectedComponents"
           :is-conversation-active="isConversationActive"
           :is-stopping-conversation="isStoppingConversation"
-          @onSendMessage="handleSendMessage"
+          @onSendMessage="handleComposerSend"
           @onSelectedComponentsChange="handleSelectedComponentsChange"
           @onStopConversation="handleStopConversation"
           @onOpenPagePreview="(uri:string)=>openPagePreviewByUri(uri)"
@@ -517,6 +518,29 @@
       @message="handleMarkdownProxyMessage"
     ></web-view>
     <!-- #endif -->
+    <uni-modal-popup
+      ref="firstSendSettingsPopup"
+      position="center"
+      width="90%"
+      :show-header="false"
+      :mask-click="false"
+      :body-scroll="false"
+      :lazy-mount="true"
+      @update-visible="handleFirstSendSettingsVisible"
+    >
+      <view v-if="pendingFirstSend != null">
+        <new-conversation-set
+          ref="firstSendSettingsForm"
+          :variables="variables"
+          :user-fill-variables="firstSendInitialValues"
+          :disabled="false"
+        />
+        <view class="first-send-settings-actions">
+          <button size="mini" @click="closeFirstSendSettings()">{{ t('Mobile.Common.cancel') }}</button>
+          <button size="mini" type="primary" @click="confirmFirstSendSettings()">{{ t('Mobile.Common.ok') }}</button>
+        </view>
+      </view>
+    </uni-modal-popup>
     <!-- #ifdef H5 || WEB -->
     <app-webview-image-preview />
     <!-- #endif -->
@@ -549,13 +573,14 @@
   } from "./layers/AgentDetailService.uts";
   import ComponentManager from "./layers/ComponentManager.uts";
   import { readRawField } from "@/subpackages/utils/messageInfoClass.uts";
+  import { hasMissingConversationSettings } from "@/subpackages/utils/conversationSettings.uts";
+  import UniModalPopup from "@/components/uni-modal-popup/uni-modal-popup.uvue";
   import ScrollManager from "./layers/ScrollManager.uts";
   import AgentDetailUtils from "./layers/AgentDetailUtils.uts";
   import { isStreamPerfMockEnabled } from "./layers/mockStreamPerf.uts";
   // #ifdef APP
   // App 端 image 无法渲染 GIF/CSS 动画，用 spin-loading（与 ai-msg 会话加载图标一致）
   import SpinLoading from "@/subpackages/components/spin-loading/spin-loading.uvue";
-  import UniModalPopup from "@/components/uni-modal-popup/uni-modal-popup.uvue";
   // #endif
   import { ttsWebSocketPlayer } from "@/utils/voice/ttsWebSocketPlayer";
   import { audioPlayerManager } from "@/utils/voice/audioPlayerManager";
@@ -2311,7 +2336,7 @@
 
   /** 当前模型 ID / 名称（Android 模板传参用 computed） */
   const inputWholeDisabled = computed((): boolean => {
-    return data.wholeDisabled.value == true;
+    return props.isTempChat == true && data.wholeDisabled.value == true;
   });
 
   const inputCurrentModelId = computed((): number => {
@@ -2676,8 +2701,52 @@
     }
   }
 
-  // 发送消息
-  const handleSendMessage = (_data: any) => {
+  const pendingFirstSend = ref<any | null>(null);
+  const firstSendInitialValues = ref<any | null>(null);
+  const firstSendSettingsPopup = ref<any | null>(null);
+  const firstSendSettingsForm = ref<any | null>(null);
+  let firstSendFromComposer = false;
+
+  const closeFirstSendSettings = (): void => {
+    const popup = firstSendSettingsPopup.value;
+    if (popup != null) (popup as ComponentPublicInstance).$callMethod("close");
+  };
+
+  const handleFirstSendSettingsVisible = (visible: boolean): void => {
+    const pending = pendingFirstSend.value;
+    if (visible || pending == null) return;
+    pendingFirstSend.value = null;
+    const input = agentDetailInputRef.value;
+    if (!firstSendFromComposer && input != null) {
+      (input as ComponentPublicInstance).$callMethod("restoreSendDraft", JSON.stringify(pending));
+    }
+  };
+
+  watch(data.conversationId, () => {
+    if (pendingFirstSend.value == null) return;
+    pendingFirstSend.value = null;
+    closeFirstSendSettings();
+  });
+
+  // 手动发送、引导词及首页首发都在写入发送台账前校验。
+  const handleSendMessage = (_data: any, confirmedValues: any | null = null, fromComposer: boolean = false) => {
+    if (pendingFirstSend.value != null) return;
+    const sendVariables = confirmedValues ?? getConvSetVariableParams() ??
+      (props.isTempChat == true ? null : data.userFillVariables.value);
+    if (props.isTempChat != true && hasMissingConversationSettings(data.variables.value, sendVariables)) {
+      if (data.isSendMessageRef.value == true) {
+        uni.showToast({ title: t("Mobile.Chat.fillRequiredParams"), icon: "none" });
+        return;
+      }
+      pendingFirstSend.value = _data;
+      firstSendFromComposer = fromComposer;
+      firstSendInitialValues.value = sendVariables;
+      uni.hideKeyboard();
+      const popup = firstSendSettingsPopup.value;
+      if (popup != null) (popup as ComponentPublicInstance).$callMethod("open");
+      return;
+    }
+
     // H5：SSE 流式播报在发送后的合成/网络往返后才异步播放，离手势较远；
     // 发送按钮点击在用户手势内，这里同步解锁 TTS 音频通道（幂等，复用同一 InnerAudioContext），
     // 后续 SSE 播放即被移动端浏览器放行。App / 小程序为 no-op。
@@ -2765,7 +2834,6 @@
       if (dataSkillIdsVal != null) {
         dataSkillIds = dataSkillIdsVal as number[];
       }
-      const variableParams = getConvSetVariableParams();
       let modelId = dataObj["modelId"];
       if (modelId == null) {
         modelId = otherModelId;
@@ -2809,7 +2877,7 @@
         const k = dataKeys[dk2] as string;
         paramsObj[k] = dataObj[k];
       }
-      paramsObj["variableParams"] = variableParams;
+      paramsObj["variableParams"] = sendVariables;
       paramsObj["files"] = mergedFiles;
       paramsObj["selectedComponents"] = mergedSelected;
       paramsObj["skillIds"] = mergedSkillIds;
@@ -2817,9 +2885,8 @@
       paramsObj["sandboxId"] = sandboxId;
       params = paramsObj;
     } else {
-      const variableParamsElse = getConvSetVariableParams();
       const paramsObjElse = AgentDetailUtils.toSendMessageParamsObject(_data);
-      paramsObjElse["variableParams"] = variableParamsElse;
+      paramsObjElse["variableParams"] = sendVariables;
       params = paramsObjElse;
     }
 
@@ -2846,6 +2913,10 @@
       );
     }
 
+    if (fromComposer && props.isTempChat != true) {
+      const input = agentDetailInputRef.value;
+      if (input != null) (input as ComponentPublicInstance).$callMethod("clearSentDraft");
+    }
     service.handleSendMessage(params, props.isTempChat, () => {
       data.isStoppingConversation.value = false;
       resumePollingAfterStream();
@@ -2868,6 +2939,25 @@
       ensureHeadlessStreamSpeak(newSpeakId, "");
     }
   };
+  const handleComposerSend = (payload: any): void => {
+    handleSendMessage(payload, null, true);
+  };
+
+  const confirmFirstSendSettings = (): void => {
+    const payload = pendingFirstSend.value;
+    const settingsForm = firstSendSettingsForm.value;
+    if (payload == null || settingsForm == null) return;
+    const values = (settingsForm as ComponentPublicInstance).$callMethod("getVariableParams");
+    if (values == null || hasMissingConversationSettings(data.variables.value, values)) {
+      uni.showToast({ title: t("Mobile.Chat.fillRequiredParams"), icon: "none" });
+      return;
+    }
+    pendingFirstSend.value = null;
+    data.userFillVariables.value = AgentDetailUtils.utsObjToRecord(values as UTSJSONObject);
+    closeFirstSendSettings();
+    handleSendMessage(payload, values, firstSendFromComposer);
+  };
+
   sendInterventionResumeMessage = handleSendMessage;
 
   /**
@@ -3009,7 +3099,7 @@
    * 处理功能按钮点击
    */
   const handleButtonClick = (guideQuestion: string): void => {
-    if (data.wholeDisabled.value == true) {
+    if (props.isTempChat == true && data.wholeDisabled.value == true) {
       uni.showToast({
         title: t("Mobile.Chat.fillRequiredParams"),
         icon: "none",
@@ -4772,6 +4862,12 @@
 </script>
 
 <style lang="scss" scoped>
+  .first-send-settings-actions {
+    display: flex;
+    flex-direction: row;
+    justify-content: flex-end;
+    padding: 12px;
+  }
   @import "./styles/index.scss";
 
   .perf-overlay {

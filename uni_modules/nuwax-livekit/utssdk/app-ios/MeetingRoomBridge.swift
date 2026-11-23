@@ -31,7 +31,9 @@ import ReplayKit
  */
 public class MeetingRoomBridge: NSObject {
   /// 与页面诊断配套；只有重新制作原生基座才会更新。
-  private static let probeBuild = "ios-share-20261121-p2"
+  private static let probeBuild = "ios-share-20261123-p4"
+  /// iOS → Android 共享流参数。写入 diag，方便仅凭真机日志确认新基座是否生效。
+  private static let screenSharePublishProfile = "bounded720p30-3Mbps-single-h264"
 
   private static var room: Room?
   private static var videoView: VideoView?
@@ -51,6 +53,8 @@ public class MeetingRoomBridge: NSObject {
   private static var meetingMessages: [[String: Any]] = []
   private static let meetingMessagesLock = NSLock()
   private static var screenShareTrack: LocalVideoTrack?
+  // SDK 的 processor 是弱引用；共享期间必须由桥接层持有。
+  private static var screenShareProcessor: MeetingScreenShareProcessor?
   private static var screenShareErrorText = ""
   private static var screenShareRequestID = 0
   private static let screenShareLock = NSLock()
@@ -212,7 +216,29 @@ public class MeetingRoomBridge: NSObject {
     let cam = (room?.localParticipant.firstCameraVideoTrack != nil) ? 1 : 0
     let conn = connectedFlag ? 1 : 0
     // 原生基座版本标记：页面据此避开旧基座的 UIView 返回值桥接路径。
-    return "bridge=ios-native-view-v2 probe=\(probeBuild) main=\(main) view=\(view) cam=\(cam) conn=\(conn) remotes=\(remoteViews.count) remotePub=\(remoteVideoPublicationDiag()) dev=\(deviceErrorText)"
+    return "bridge=ios-native-view-v2 probe=\(probeBuild) main=\(main) view=\(view) cam=\(cam) conn=\(conn) remotes=\(remoteViews.count) remotePub=\(remoteVideoPublicationDiag()) shareCfg=\(screenSharePublishProfile) \(localScreenShareDiag()) dev=\(deviceErrorText)"
+  }
+
+  /// 配置值不能代表实际编码结果；输出 SDK 统计中的真实尺寸、帧率、编码器和限速原因。
+  private static func localScreenShareDiag() -> String {
+    screenShareLock.lock()
+    let track = screenShareTrack
+    let processor = screenShareProcessor
+    screenShareLock.unlock()
+    guard let track else { return "shareTx=off" }
+    let capture = processor?.diag() ?? "unavailable"
+    guard let stats = track.statistics, let tx = stats.outboundRtpStream.first else {
+      return "shareCapture[\(capture)] shareTx=waiting-stats"
+    }
+    let codec = stats.codec.first(where: { $0.id == tx.codecId })?.mimeType ?? "unknown"
+    let width = tx.frameWidth.map { String($0) } ?? "na"
+    let height = tx.frameHeight.map { String($0) } ?? "na"
+    let fps = tx.framesPerSecond.map { String(format: "%.1f", $0) } ?? "na"
+    let frames = tx.framesEncoded.map { String($0) } ?? "na"
+    let bytes = tx.bytesSent.map { String($0) } ?? "na"
+    let limit = tx.qualityLimitationReason?.rawValue ?? "unknown"
+    let encoder = tx.encoderImplementation ?? "unknown"
+    return "shareCapture[\(capture)] shareTx[codec=\(codec),size=\(width)x\(height),fps=\(fps),frames=\(frames),bytes=\(bytes),limit=\(limit),encoder=\(encoder)]"
   }
 
   /// 一行式诊断快照（页面每 3 秒打一次，闪退时看最后一行就知道卡在哪一步）。
@@ -345,10 +371,10 @@ public class MeetingRoomBridge: NSObject {
           screenShareErrorText = "replaykit_unavailable"
           return
         }
-        // ★15fps 在对方屏幕上会明显一顿一顿（PC 端共享是 30fps）。采集提到 30fps；
-        //   分辨率仍走 1080p 档，再高会明显吃带宽/电量。
+        // InAppScreenCapturer 的 options 不执行缩放；实际尺寸由下方 processor 限制。
+        // 30fps/3Mbps 是上限，实际发送帧率由 shareTx 统计核对，不能以配置值当作实测值。
         let options = ScreenShareCaptureOptions(
-          dimensions: .h1080_169,
+          dimensions: .h720_169,
           fps: 30,
           showCursor: false,
           appAudio: false,
@@ -356,7 +382,9 @@ public class MeetingRoomBridge: NSObject {
           useScreenCaptureKit: false,
           includeCurrentApplication: true
         )
-        let track = await LocalVideoTrack.createInAppScreenShareTrack(options: options)
+        let track = await LocalVideoTrack.createInAppScreenShareTrack(options: options, reportStatistics: true)
+        let processor = MeetingScreenShareProcessor()
+        track.processor = processor
         screenShareLock.lock()
         let requestStillActive = requestID == screenShareRequestID
         screenShareLock.unlock()
@@ -364,19 +392,18 @@ public class MeetingRoomBridge: NSObject {
           _ = try? await track.capturer.stopCapture()
           return
         }
-        // 屏幕共享不能沿用 SDK 默认的 simulcast 分层：1080p 默认会同时发布
-        // 低帧率层（3/5fps），Android 全屏订阅到低层时会出现画面分块刷新、操作卡顿。
-        // 移动端先固定为单层 1080p/30fps，并提高带宽分配优先级；网络不足时
-        // 优先保持帧率，允许分辨率适度下降，避免共享操作界面一顿一顿。
+        // 与 PC 端保持单层共享策略；显式优先 H.264，让 iOS/Android 使用各自支持的
+        // H.264 编解码路径。实际协商的 codec/encoder 由统计输出，不假定一定启用硬编。
         let publishOptions = VideoPublishOptions(
           screenShareEncoding: VideoEncoding(
-            maxBitrate: 8_000_000,
+            maxBitrate: 3_000_000,
             maxFps: 30,
             bitratePriority: .high,
             networkPriority: nil
           ),
           simulcast: false,
           screenShareSimulcastLayers: [],
+          preferredCodec: .h264,
           degradationPreference: .maintainFramerate
         )
         _ = try await current.localParticipant.publish(
@@ -395,9 +422,10 @@ public class MeetingRoomBridge: NSObject {
         }
         screenShareLock.lock()
         screenShareTrack = track
+        screenShareProcessor = processor
         screenShareLock.unlock()
         screenShareErrorText = ""
-        bridgeLog("in-app screen share published: single-layer 1080p 30fps 8Mbps priority=high degradation=maintain-framerate")
+        bridgeLog("in-app screen share published: \(screenSharePublishProfile) priority=high degradation=maintain-framerate")
       } catch {
         screenShareLock.lock()
         let requestStillActive = requestID == screenShareRequestID
@@ -405,6 +433,7 @@ public class MeetingRoomBridge: NSObject {
         guard requestStillActive else { return }
         screenShareLock.lock()
         screenShareTrack = nil
+        screenShareProcessor = nil
         screenShareLock.unlock()
         screenShareErrorText = error.localizedDescription
         bridgeLog("in-app screen share failed: \(error)")
@@ -416,19 +445,25 @@ public class MeetingRoomBridge: NSObject {
   private static func stopScreenShareInternal(room current: Room?) {
     screenShareLock.lock()
     let track = screenShareTrack
+    let processor = screenShareProcessor
     screenShareTrack = nil
+    screenShareProcessor = nil
     screenShareLock.unlock()
     guard let track = track else { return }
     Task { @MainActor in
+      // SDK 弱持有 processor；直到停止采集才释放，收尾过程中仍保持相同的帧处理。
+      defer { withExtendedLifetime(processor) {} }
       do {
         if let current = current,
            let publication = current.localParticipant.firstScreenSharePublication as? LocalTrackPublication {
           try await current.localParticipant.unpublish(publication: publication)
         }
-        _ = try await track.capturer.stopCapture()
       } catch {
-        bridgeLog("in-app screen share stop failed: \(error)")
+        bridgeLog("in-app screen share unpublish failed: \(error)")
       }
+      // 取消发布失败也必须停止 ReplayKit，避免录屏继续占用系统资源。
+      do { _ = try await track.capturer.stopCapture() }
+      catch { bridgeLog("in-app screen share stop failed: \(error)") }
     }
   }
 

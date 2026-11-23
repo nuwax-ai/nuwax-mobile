@@ -117,12 +117,15 @@ object VoipBridge {
     @JvmStatic fun presentationStatus(ctx: Context): String {
         val manager = ctx.getSystemService(NotificationManager::class.java)
         val channel = VoipNotificationChannels.incoming(manager)
+        val presented = manager.getNotificationChannel(VoipNotificationChannels.PRESENTED_INCOMING)
         val audio = ctx.getSystemService(AudioManager::class.java)
+        val interruptionFilter = manager.currentInterruptionFilter
         return JSONObject().put("supported", true)
             .put("bundleId", ctx.packageName)
             .put("developmentListener", VoipDevControlService.running)
             .put("uniPushConfigured", ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA).metaData?.getBoolean("nuwax.voip.uniPush", false) == true)
             .put("notificationsAllowed", NotificationManagerCompat.from(ctx).areNotificationsEnabled())
+            .put("overlayAllowed", Settings.canDrawOverlays(ctx))
             .put("fullScreenAllowed", Build.VERSION.SDK_INT < 34 || manager.canUseFullScreenIntent())
             .put("fullScreenPermissionChecked", Build.VERSION.SDK_INT >= 34)
             .put("sdk", Build.VERSION.SDK_INT).put("manufacturer", Build.MANUFACTURER)
@@ -130,17 +133,48 @@ object VoipBridge {
             .put("channelId", channel?.id ?: VoipNotificationChannels.INCOMING)
             .put("channelImportance", channel?.importance ?: -1)
             .put("channelSoundEnabled", channel?.sound != null)
+            .put("presentedChannelExists", presented != null && channel != null && channel.importance > NotificationManager.IMPORTANCE_DEFAULT)
+            .put("presentedChannelAudible", presented != null && presented.importance >= NotificationManager.IMPORTANCE_DEFAULT && presented.sound != null)
             .put("ringerMode", audio.ringerMode).put("ringVolume", audio.getStreamVolume(AudioManager.STREAM_RING))
-            .put("interruptionFilter", manager.currentInterruptionFilter)
+            .put("interruptionFilter", interruptionFilter)
+            .put("doNotDisturbActive", interruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL &&
+                interruptionFilter != NotificationManager.INTERRUPTION_FILTER_UNKNOWN)
+            .put("ringerAudible", audio.ringerMode == AudioManager.RINGER_MODE_NORMAL && audio.getStreamVolume(AudioManager.STREAM_RING) > 0)
             .put("keyguardLocked", ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked).toString()
     }
     @JvmStatic fun openPresentationSettings(ctx: Context) {
-        val intent = if (Build.VERSION.SDK_INT >= 34) Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:" + ctx.packageName))
-            else Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
-        ctx.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        openAlertSettings(ctx, if (Build.VERSION.SDK_INT >= 34) "fullScreen" else "notifications")
+    }
+    @JvmStatic fun openAlertSettings(ctx: Context, setting: String): Boolean {
+        val packageUri = Uri.fromParts("package", ctx.packageName, null)
+        val notifications = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+        val intent = when (setting) {
+            "notifications" -> notifications
+            "channel", "presentedChannel" -> {
+                val manager = ctx.getSystemService(NotificationManager::class.java)
+                val channel = if (setting == "channel") {
+                    runCatching { ensureNotificationChannels(ctx) }
+                    VoipNotificationChannels.incoming(manager)
+                } else manager.getNotificationChannel(VoipNotificationChannels.PRESENTED_INCOMING)
+                if (channel != null) Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+                    .putExtra(Settings.EXTRA_CHANNEL_ID, channel.id)
+                else notifications
+            }
+            "overlay" -> Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, packageUri)
+            "fullScreen" -> Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, packageUri)
+            else -> return false
+        }
+        if (startSettings(ctx, intent)) return true
+        if ((setting == "channel" || setting == "presentedChannel") && intent !== notifications && startSettings(ctx, notifications)) return true
+        return startSettings(ctx, Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri))
     }
     @JvmStatic fun openAppSettings(ctx: Context) {
-        ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + ctx.packageName)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        startSettings(ctx, Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", ctx.packageName, null)))
+    }
+    private fun startSettings(ctx: Context, intent: Intent): Boolean {
+        return runCatching { ctx.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }.isSuccess
     }
     internal fun label(key: String): String = config.optJSONObject("labels")?.optString(key, key) ?: key
     internal suspend fun loadPeerAvatar(raw: String, sizePx: Int): Bitmap? {

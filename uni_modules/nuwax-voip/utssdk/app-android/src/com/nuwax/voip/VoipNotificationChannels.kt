@@ -12,7 +12,7 @@ import android.provider.Settings
 internal object VoipNotificationChannels {
     private const val LEGACY = "nuwax-voip"
     private const val PREVIOUS_INCOMING = "nuwax-voip-incoming-v1"
-    private const val PRESENTED_INCOMING = "nuwax-voip-incoming-presented-v1"
+    const val PRESENTED_INCOMING = "nuwax-voip-incoming-presented-v1"
     const val INCOMING = "nuwax-voip-incoming-v2"
     const val ONGOING = "nuwax-voip-ongoing-v1"
 

@@ -23,6 +23,7 @@ public class VoiceNoteM4aBridge {
     private var interruptObserver: NSObjectProtocol?
     private var interruptHold = false
     private var pendingEvent = ""
+    private var inputLevel = 0
     private var ignoreBeganUntil = Date()
 
     public init() {
@@ -149,6 +150,51 @@ public class VoiceNoteM4aBridge {
         return event
     }
 
+    /// 最近一小段输入的音量，0 到 100。面板用来画左侧音波。
+    public func takeLevel() -> String {
+        return String(inputLevel)
+    }
+
+    private func noteLevel(_ buffer: AVAudioPCMBuffer) {
+        let frames = Int(buffer.frameLength)
+        if frames <= 0 {
+            return
+        }
+        var sum: Float = 0
+        var count = 0
+        if let src = buffer.floatChannelData {
+            let data = src[0]
+            var i = 0
+            while i < frames {
+                let value = data[i]
+                sum += value * value
+                count += 1
+                i += 16
+            }
+        } else if let src = buffer.int16ChannelData {
+            let data = src[0]
+            var i = 0
+            while i < frames {
+                let value = Float(data[i]) / 32768
+                sum += value * value
+                count += 1
+                i += 16
+            }
+        }
+        if count == 0 {
+            return
+        }
+        let rms = sqrt(sum / Float(count))
+        var level = Int(rms / 0.08 * 100)
+        if level < 0 {
+            level = 0
+        }
+        if level > 100 {
+            level = 100
+        }
+        inputLevel = level
+    }
+
     private func handleInterruption(_ notification: Notification) {
         guard let info = notification.userInfo,
               let typeRaw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
@@ -230,6 +276,7 @@ public class VoiceNoteM4aBridge {
         } else {
             return
         }
+        noteLevel(buffer)
         queue.async { [weak self] in
             self?.consume(copy)
         }

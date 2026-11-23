@@ -40,6 +40,7 @@ class VoiceNoteM4aBridge {
     private var focusRequest: AudioFocusRequest? = null
     private var interruptHold: Boolean = false
     @Volatile private var pendingEvent: String = ""
+    @Volatile private var inputLevel: Int = 0
 
     private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
         if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
@@ -155,6 +156,37 @@ class VoiceNoteM4aBridge {
         }
         abandonFocus()
         return "1"
+    }
+
+    /** 最近一小段输入的音量，0 到 100。面板用来画左侧音波。 */
+    fun takeLevel(): String {
+        return inputLevel.toString()
+    }
+
+    private fun noteLevel(buf: ByteArray, size: Int) {
+        var sum = 0L
+        var count = 0
+        var i = 0
+        while (i + 1 < size) {
+            val lo = buf[i].toInt() and 0xff
+            val hi = buf[i + 1].toInt()
+            val sample = (lo or (hi shl 8)).toShort().toInt()
+            sum += sample.toLong() * sample.toLong()
+            count += 1
+            i += 32
+        }
+        if (count == 0) {
+            return
+        }
+        val rms = Math.sqrt((sum / count).toDouble())
+        var level = (rms / 2800.0 * 100.0).toInt()
+        if (level < 0) {
+            level = 0
+        }
+        if (level > 100) {
+            level = 100
+        }
+        inputLevel = level
     }
 
     fun takeInterruption(): String {
@@ -288,6 +320,7 @@ class VoiceNoteM4aBridge {
                 }
                 continue
             }
+            noteLevel(buf, read)
             synchronized(lock) {
                 if (!paused && codec != null) {
                     feed(buf, read)

@@ -6,6 +6,39 @@
 import { media } from '@kit.MediaKit'
 import { fileIo as fs } from '@kit.CoreFileKit'
 
+/**
+ * 读当前这次录音的振幅。方法在系统 AVRecorder 上，编译用的声明里没有，所以单独挂出来再调用。
+ */
+interface AmplitudeRecorder {
+  getAudioCapturerMaxAmplitude(): Promise<number>
+}
+
+function amplitudeToLevel(amp: number): number {
+  if (!(amp > 0)) {
+    return 0
+  }
+  let unit = amp
+  if (amp > 1) {
+    unit = amp / 32767
+  }
+  // 正常说话的峰值大约是满幅的 15%，再高才顶到最高柱。
+  unit = unit / 0.15
+  if (unit > 1) {
+    unit = 1
+  }
+  if (unit < 0) {
+    unit = 0
+  }
+  let level = Math.round(Math.pow(unit, 0.8) * 100)
+  if (level < 0) {
+    level = 0
+  }
+  if (level > 100) {
+    level = 100
+  }
+  return level
+}
+
 export class VoiceNoteM4aBridge {
   private recorder: media.AVRecorder | null = null
   private file: fs.File | null = null
@@ -18,6 +51,9 @@ export class VoiceNoteM4aBridge {
   private selfActionUntil: number = 0
   private interruptHold: boolean = false
   private pendingEvent: string = ''
+  private inputLevel: number = 0
+  private levelBusy: boolean = false
+  private levelStartedAt: number = 0
 
   private markSelfAction(): void {
     this.selfActionUntil = Date.now() + 800
@@ -146,6 +182,49 @@ export class VoiceNoteM4aBridge {
     const event = this.pendingEvent
     this.pendingEvent = ''
     return event
+  }
+
+  /**
+   * 当前输入音量，0 到 100。
+   * 读这次 AVRecorder 自己的采集振幅，不读系统输入设备。
+   */
+  takeLevel(): string {
+    if (!this.fileOpen) {
+      this.inputLevel = 0
+      return '0'
+    }
+    this.pollLevel()
+    return `${this.inputLevel}`
+  }
+
+  private pollLevel(): void {
+    const now = Date.now()
+    if (this.levelBusy && now - this.levelStartedAt < 800) {
+      return
+    }
+    this.levelBusy = true
+    this.levelStartedAt = now
+    this.readAmplitude().then((level: number): void => {
+      this.inputLevel = level
+      this.levelBusy = false
+    }).catch((): void => {
+      this.levelBusy = false
+    })
+  }
+
+  private async readAmplitude(): Promise<number> {
+    const av = this.recorder
+    if (av == null || !this.fileOpen) {
+      return 0
+    }
+    try {
+      const meter = av as AmplitudeRecorder
+      const amp = await meter.getAudioCapturerMaxAmplitude()
+      return amplitudeToLevel(amp)
+    } catch (eAmp) {
+      console.warn('[voice-note] amplitude failed', eAmp)
+      return 0
+    }
   }
 
   /**

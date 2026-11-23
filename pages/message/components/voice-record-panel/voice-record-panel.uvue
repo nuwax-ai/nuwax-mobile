@@ -20,18 +20,11 @@
       <text class="vr-timer">{{ timerText }}</text>
       <text v-if="statusText.length > 0" class="vr-status">{{ statusText }}</text>
       <view class="vr-wave">
-        <view class="vr-wave__clip" :class="phase == 'idle' ? '' : 'vr-wave__clip--live'">
+        <view class="vr-wave__clip">
           <view class="vr-wave__base"></view>
-          <view class="vr-wave__track" :style="waveTrackStyle">
-            <view v-for="n in waveBarIndexes" :key="n" class="vr-wave__mark" :style="waveMarkStyle(n)">
-              <view class="vr-wave__bar" :style="waveBarHeight(n)"></view>
-            </view>
-          </view>
-          <view class="vr-wave__gold">
-            <view class="vr-wave__track" :style="waveTrackStyle">
-              <view v-for="n in waveBarIndexes" :key="n" class="vr-wave__mark" :style="waveMarkStyle(n)">
-                <view class="vr-wave__bar vr-wave__bar--gold" :style="waveBarHeight(n)"></view>
-              </view>
+          <view class="vr-wave__track">
+            <view v-for="index in waveSlotIndexes" :key="slotKey(index, waveTick)" class="vr-wave__mark" :style="slotMarkStyle(index, waveTick)">
+              <view class="vr-wave__bar" :style="slotBarStyle(index, waveTick)"></view>
             </view>
           </view>
         </view>
@@ -106,6 +99,7 @@ import {
   finishVoiceNote,
   getPanelVoiceNote,
   playableLocalVoiceFile,
+  readVoiceNoteInputLevel,
   startVoiceNote,
   stopVoiceNote,
 } from "@/utils/voice-note/voiceNoteEngine.uts";
@@ -181,34 +175,23 @@ const emit = defineEmits<{
 
 /** 音波左右各留出的宽度（rpx）。左侧留给播放按钮，右侧留出对称空白。 */
 const WAVE_SIDE_RPX = 112;
-/** 音柱间距（px）。整段音波按这个间距从右往左滑。 */
-const WAVE_PITCH = 12;
-/** 录音时音波向左滑动的速度（px/秒）。 */
-const WAVE_SPEED = 22;
-/** 循环波形的柱数。拼三份，平移一整段后两边仍然盖住画面。 */
-const WAVE_PATTERN = 32;
-const WAVE_COPIES = 3;
-const waveLoopPx = WAVE_PATTERN * WAVE_PITCH;
+/** 音柱间距（px）。细柱靠拢，看起来才像一条连续的音波。 */
+const WAVE_PITCH = 4;
+/** 大约每 0.14 秒记一柱。界面定时器是 80ms，实际会落在下一次刷新。 */
+const WAVE_SAMPLE_MS = 140;
 
-const waveBarIndexes: number[] = [];
-const waveMarkStyles: string[] = [];
-const waveBarHeights: string[] = [];
-
-function buildWaveStrip(): void {
-  const heights: number[] = [];
-  for (let i = 0; i < WAVE_PATTERN; i++) {
-    heights.push(8 + Math.floor(Math.random() * 54));
-  }
-  const count = WAVE_PATTERN * WAVE_COPIES;
-  for (let i = 0; i < count; i++) {
-    waveBarIndexes.push(i);
-    waveMarkStyles.push("left: " + (i * WAVE_PITCH).toString() + "px;");
-    const height = heights[i % WAVE_PATTERN];
-    waveBarHeights.push("height: " + height.toString() + "px;");
-  }
+/** 竖线左边固定这些位置。新的音量从最右边进入，旧的依次向左挪。 */
+const WAVE_SLOT_COUNT = 48;
+const waveSlotIndexes: number[] = [];
+for (let waveSlot = 0; waveSlot < WAVE_SLOT_COUNT; waveSlot++) {
+  waveSlotIndexes.push(waveSlot);
 }
-
-buildWaveStrip();
+/** 下标 0 是最旧的一柱，最后一格是刚采样的一柱。 */
+let waveLevels: number[] = [];
+let waveSampleAt = -1;
+let waveSessionId = "";
+/** 模板直接读它，鸿蒙才会在高度变化后重画柱子。 */
+const waveTick = ref<number>(0);
 
 const elapsedMs = ref<number>(0);
 /** 录音进度和播放进度分开记，切换时各自回到自己的波浪线位置。 */
@@ -216,15 +199,9 @@ let recordWaveMs = 0;
 let playWaveMs = 0;
 /** 当前波浪线跟随播放进度。继续录音时改回录音进度。 */
 let waveFollowsPlay = false;
-/** 中间竖线的横坐标（px）。 */
+/** 中间竖线的横坐标（px）。音柱只画在它左边。 */
 const waveHeadLeft = ref<number>(187);
-/** 整条波形的横坐标和位移动画。只改这一处，柱子本身不再逐根重画。 */
-const waveTrackStyle = ref<string>("left: 0px; transform: translateX(0px);");
-/** 竖线在裁切区域中的位置。波形从这里向左铺一段循环。 */
-let waveTrackBase = 0;
 let waveLayoutWidth = 0;
-/** 上一拍已经移到的距离。用来分辨正常滑动和循环段首相接。 */
-let waveShownShift = -1;
 /** 当前这条录音已经有过封口分段。满足一次后保持显示，不再每次刷新重判。 */
 const canPlay = ref<boolean>(false);
 /** 播放图标属于哪一条录音。换一条时重新判断一次。 */
@@ -327,51 +304,126 @@ function ensureWaveLayout(): void {
   waveLayoutWidth = view;
   const head = Math.round(view * 0.5);
   waveHeadLeft.value = waveSidePx() + head;
-  waveTrackBase = head - waveLoopPx;
 }
 
-/** 竖线停在中间。整条循环波形按时间向左滑，两拍之间用线性动画连上。移完一段后直接从段首接上。 */
+function resetWaveSession(id: string): void {
+  if (waveSessionId == id) {
+    return;
+  }
+  waveSessionId = id;
+  waveLevels = [];
+  for (let i = 0; i < WAVE_SLOT_COUNT; i++) {
+    waveLevels.push(0);
+  }
+  waveSampleAt = -1;
+  waveTick.value = waveTick.value + 1;
+}
+
+/** 高度变了就换 key，鸿蒙才会把新的柱高画出来。 */
+function slotKey(index: number, tick: number): number {
+  let height = 0;
+  if (tick >= 0 && index >= 0 && index < waveLevels.length) {
+    height = waveLevels[index];
+  }
+  return tick * 100000 + index * 500 + height;
+}
+
+/** 最右边一格贴着竖线，其余按间距向左排。tick 传进来是为了让模板依赖它。 */
+function slotMarkStyle(index: number, tick: number): string {
+  if (tick < 0) {
+    return "left: 0px;";
+  }
+  const head = waveHeadLeft.value - waveSidePx();
+  const fromNewest = WAVE_SLOT_COUNT - 1 - index;
+  const left = Math.round(head - 6 - fromNewest * WAVE_PITCH);
+  if (left < 0) {
+    return "left: 0px; opacity: 0;";
+  }
+  return "left: " + left.toString() + "px; opacity: 1;";
+}
+
+function slotBarStyle(index: number, tick: number): string {
+  let height = 0;
+  if (tick >= 0 && index >= 0 && index < waveLevels.length) {
+    height = waveLevels[index];
+  }
+  return "height: " + height.toString() + "px;";
+}
+
+/** 波浪线区域的高度。音量满格时柱子用到这块高度的大约六成。 */
+function waveAreaPx(): number {
+  const height = Math.round(windowWidthPx() * 280 / 750);
+  if (height < 48) {
+    return 48;
+  }
+  return height;
+}
+
+/** 把 0 到 100 的音量收成柱高。没有声音时保持 6px，大声大约到波浪线高度的六成。 */
+function levelBarHeight(level: number): number {
+  let value = level;
+  if (value < 0) {
+    value = 0;
+  }
+  if (value > 100) {
+    value = 100;
+  }
+  const span = Math.round((waveAreaPx() - 6) * 62 / 100);
+  return 6 + Math.round(value * span / 100);
+}
+
+/** 录音时按音量往竖线左边追加一柱。暂停、播放不再追加。 */
+function sampleRecordingWave(): void {
+  if (waveFrozen || phase.value != "recording") {
+    return;
+  }
+  const now = Date.now();
+  if (waveSampleAt >= 0 && now - waveSampleAt < WAVE_SAMPLE_MS) {
+    return;
+  }
+  waveSampleAt = now;
+  if (waveLevels.length != WAVE_SLOT_COUNT) {
+    waveLevels = [];
+    for (let i = 0; i < WAVE_SLOT_COUNT; i++) {
+      waveLevels.push(0);
+    }
+  }
+  for (let i = 0; i < WAVE_SLOT_COUNT - 1; i++) {
+    waveLevels[i] = waveLevels[i + 1];
+  }
+  const step = waveTick.value + 1;
+  const base = levelBarHeight(readVoiceNoteInputLevel());
+  let room = base - 6;
+  if (room < 0) {
+    room = 0;
+  }
+  let mixed = (step * 37) % 100;
+  if (mixed < 0) {
+    mixed = 0;
+  }
+  let height = base + Math.round((mixed - 50) * room / 55);
+  if (height < 6) {
+    height = 6;
+  }
+  const cap = waveAreaPx() - 6;
+  if (height > cap) {
+    height = cap;
+  }
+  waveLevels[WAVE_SLOT_COUNT - 1] = height;
+  waveTick.value = step;
+}
+
+/** 竖线停在中间。录音时只在左边按音量往外走，右边不画柱子。 */
 function syncLevels(): void {
+  const before = waveLayoutWidth;
   ensureWaveLayout();
-  let shift = 0;
-  if (phase.value != "idle") {
-    const travel = elapsedMs.value / 1000 * WAVE_SPEED;
-    shift = travel % waveLoopPx;
-    if (shift < 0) {
-      shift = 0;
-    }
+  if (phase.value == "recording") {
+    sampleRecordingWave();
+    return;
   }
-  const previous = waveShownShift;
-  waveShownShift = shift;
-  let duration = 80;
-  if (waveFrozen || previous < 0 || phase.value == "idle") {
-    duration = 0;
-  } else {
-    const delta = shift - previous;
-    const wrapped = delta < -waveLoopPx * 0.5;
-    const jumped = delta > WAVE_PITCH * 2 || delta < -WAVE_PITCH * 2;
-    if (wrapped || jumped) {
-      duration = 0;
-    }
+  if (before != waveLayoutWidth) {
+    waveTick.value = waveTick.value + 1;
   }
-  const next = "left: " + waveTrackBase.toString() + "px; transform: translateX(-" + shift.toString() + "px); transition-property: transform; transition-duration: " + duration.toString() + "ms; transition-timing-function: linear;";
-  if (waveTrackStyle.value != next) {
-    waveTrackStyle.value = next;
-  }
-}
-
-function waveMarkStyle(index: number): string {
-  if (index >= 0 && index < waveMarkStyles.length) {
-    return waveMarkStyles[index];
-  }
-  return "left: 0px;";
-}
-
-function waveBarHeight(index: number): string {
-  if (index >= 0 && index < waveBarHeights.length) {
-    return waveBarHeights[index];
-  }
-  return "height: 8px;";
 }
 
 const waveHeadStyle = computed((): string => {
@@ -526,9 +578,11 @@ function applySnapshot(): void {
     statusText.value = "";
     canPlay.value = false;
     playIconLocalId = "";
+    resetWaveSession("");
     syncLevels();
     return;
   }
+  resetWaveSession(record.localId);
   rememberPlayIcon(record);
   statusText.value = statusOf(record);
   if (record.phase == "recording") {
@@ -1056,24 +1110,10 @@ onUnmounted(() => {
 .vr-wave__track {
   position: absolute;
   top: 0;
-  left: 0;
-  width: 1152px;
-  height: 100%;
-  transition-property: transform;
-  transition-timing-function: linear;
-}
-
-.vr-wave__gold {
-  position: absolute;
-  top: 0;
+  right: 0;
   bottom: 0;
   left: 0;
-  width: 0;
-  overflow: hidden;
-}
-
-.vr-wave__clip--live .vr-wave__gold {
-  width: 50%;
+  overflow: visible;
 }
 
 .vr-wave__mark {
@@ -1086,13 +1126,9 @@ onUnmounted(() => {
 }
 
 .vr-wave__bar {
-  width: 3px;
-  border-radius: 2px;
-  background-color: #e4e4e8;
-}
-
-.vr-wave__bar--gold {
-  background-color: #f0b429;
+  width: 2px;
+  border-radius: 1px;
+  background-color: #c2c2c6;
 }
 
 .vr-wave__base {

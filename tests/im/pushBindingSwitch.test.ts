@@ -54,6 +54,18 @@ describe('App push binding handoff', () => {
     expect(getApiBaseUrl()).toBe(origin);
   });
 
+  it('blocks ordinary push registration from the signing-out session if the managed release fails', async () => {
+    request.mockRejectedValueOnce(new Error('offline'));
+    expect(await revokeManagedImPushBinding(origin, true, false, true)).toBe(false);
+    await expect(apiImDeviceRegister('outgoing-cid')).rejects.toThrow('IM device session changed');
+    expect(request).toHaveBeenCalledOnce();
+
+    invalidateImSession();
+    request.mockResolvedValueOnce({ code: SUCCESS_CODE, data: {} });
+    await expect(apiImDeviceRegister('incoming-cid')).resolves.toMatchObject({ code: SUCCESS_CODE });
+    expect(request.mock.lastCall?.[0]).toMatchObject({ method: 'POST', data: expect.objectContaining({ pushToken: 'incoming-cid' }) });
+  });
+
   it('uses the outgoing origin’s active receipt and preserves a different origin’s release', async () => {
     const production = 'https://agent.nuwax.com';
     const productionRelease = '481ea175-210e-45d3-90d0-0282ab7bca6a';

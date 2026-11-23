@@ -3,6 +3,13 @@ import XCTest
 @testable import VoipPush
 
 final class CallPolicyTests: XCTestCase {
+    func testSystemAnswerPreservesTheInvitationMediaUnlessAudioWasRequested() {
+        XCTAssertEqual(NuwaxVoipCallPolicy.answerMediaType(invited: "video", requested: nil), "video")
+        XCTAssertEqual(NuwaxVoipCallPolicy.answerMediaType(invited: "audio", requested: nil), "audio")
+        XCTAssertEqual(NuwaxVoipCallPolicy.answerMediaType(invited: "video", requested: "video"), "video")
+        XCTAssertEqual(NuwaxVoipCallPolicy.answerMediaType(invited: "video", requested: "audio"), "audio")
+        XCTAssertEqual(NuwaxVoipCallPolicy.answerMediaType(invited: "audio", requested: "video"), "audio")
+    }
     func testRingTimeUsesTheAcceptedInvitationAndDoesNotExtendExpiredRetries() {
         XCTAssertEqual(NuwaxVoipCallPolicy.ringDeadline(sendTime: 120_000, acknowledgedAt: 120_500), 180_000)
         XCTAssertEqual(NuwaxVoipCallPolicy.ringDeadline(sendTime: nil, acknowledgedAt: 120_500), 180_500)

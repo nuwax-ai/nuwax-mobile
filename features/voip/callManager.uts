@@ -12,6 +12,9 @@ import { getImSessionStamp } from "@/utils/im/imSessionScope";
 import { hasAppPrivacyConsent } from "@/utils/appPrivacyConsent";
 import { isAppInBackground } from "@/utils/appLifecycle";
 import { executeVoip, drainVoipEvents, ensureVoipPermissions, openVoipAppSettings } from "@/uni_modules/nuwax-voip";
+// #ifdef APP-IOS
+import { revokeVoipPushBeforeLogout } from "@/uni_modules/nuwax-voip";
+// #endif
 // #ifdef APP-ANDROID
 import { isVoipReleaseOrigin } from "@/uni_modules/nuwax-voip";
 // #endif
@@ -38,6 +41,11 @@ let userId = "", deviceId = "", sessionStamp = "", nativeScope = "", sessionApiB
 let timer = 0, creating = false, routeOpening = false;
 let bootstrapSerial = 0, createSerial = 0;
 let answeringCallId = "";
+let pendingIncomingPageId = "";
+// #ifdef APP-IOS
+let voipLogoutStamp = "";
+let voipLogoutRevocation: Promise<boolean> | null = null;
+// #endif
 
 /** 开发联调只记录阶段；不输出账号、会话、平台 token 或 RTC 凭据。 */
 function traceCall(stage: string): void {
@@ -96,6 +104,20 @@ export function openVoipPage(): void {
   uni.navigateTo({ url: "/subpackages/pages/voip-call/voip-call", complete: () => { routeOpening = false; } });
 }
 
+function openPendingIncomingPage(): void {
+  if (pendingIncomingPageId.length == 0) return;
+  const call = store.current;
+  if (call == null || call.callId != pendingIncomingPageId || call.state == "ended" ||
+      (call.state == "ringing" && call.expiresAt <= Date.now())) {
+    pendingIncomingPageId = "";
+    return;
+  }
+  if (isAppInBackground() || routeOpening || getCurrentPages().length == 0) return;
+  pendingIncomingPageId = "";
+  traceCall("opening incoming call page");
+  openVoipPage();
+}
+
 function consumeNative(): void {
   try {
     const events = JSON.parse(drainVoipEvents()) as UTSJSONObject[];
@@ -121,8 +143,12 @@ function consumeNative(): void {
         if (next.state != "ended") {
           if (next.state == "connecting") voipCamera.value = next.mediaType == "video";
           occupyAudio();
-          const showIncomingPage = event["nativeIncomingUI"] !== true || (firstSnapshot && event["foregroundIncomingPage"] === true);
-          if (next.state == "ringing" && next.calleeId == userId && !isAppInBackground() && showIncomingPage) openVoipPage();
+          if (next.calleeId == userId) {
+            if (event["foregroundIncomingPage"] === true) {
+              // A system call can reach the App before its first foreground page is ready.
+              if (firstSnapshot) pendingIncomingPageId = next.callId;
+            } else if (next.state == "ringing" && !voipNativeIncomingUI.value && !isAppInBackground()) openVoipPage();
+          }
         } else { voipNativeIncomingUI.value = false; resetCallControls(); releaseVoipAudio(); }
         if (next.calleeId == userId && next.acceptedDeviceId.length > 0 && next.acceptedDeviceId != deviceId) {
           store.endLocal("answeredElsewhere", Date.now()); releaseVoipAudio();
@@ -186,6 +212,7 @@ function consumeNative(): void {
       store.syncActiveClock(Date.now());
       voipRevision.value += 1;
     }
+    openPendingIncomingPage();
   } catch (_e) { /* Native event decoding cannot break App/IM initialization. */ }
 }
 
@@ -194,12 +221,31 @@ function resetCallControls(): void {
   voipAudioRoutes.value = []; voipAudioRoute.value = "";
 }
 
+// #ifdef APP-IOS
+export async function prepareIosVoipLogout(): Promise<void> {
+  const stamp = getImSessionStamp();
+  try {
+    if (voipLogoutStamp != stamp) {
+      voipLogoutStamp = stamp;
+      bootstrapSerial += 1; createSerial += 1;
+      voipLogoutRevocation = revokeVoipPushBeforeLogout();
+    }
+    const pending = voipLogoutRevocation;
+    if (pending != null) await pending;
+  } catch (_error) { /* 离线或使用旧基座时继续完成本地退出。 */ }
+}
+// #endif
+
 export function clearVoipSession(): void {
+  // #ifdef APP-IOS
+  voipLogoutStamp = ""; voipLogoutRevocation = null;
+  // #endif
   bootstrapSerial += 1; createSerial += 1;
   setVoipDevSession(null);
   try { send({ op: "reset" } as UTSJSONObject); } catch (_e) { /* Older bases must still be able to log out. */ }
   if (timer != 0) { clearInterval(timer); timer = 0; }
   store.reset(); creating = false; answeringCallId = ""; userId = ""; deviceId = ""; sessionStamp = ""; nativeScope = ""; sessionApiBase = "";
+  pendingIncomingPageId = "";
   voipError.value = ""; voipRevision.value += 1;
   voipNativeIncomingUI.value = false;
   resetCallControls(); voipHistory.value = [];
@@ -216,6 +262,9 @@ export async function bootstrapVoip(): Promise<void> {
   const dev = readVoipDevSession();
   if (!isVoipBusinessEnabled() && !isVoipPlatformAccepted() && dev == null) return;
   const stamp = getImSessionStamp();
+  // #ifdef APP-IOS
+  if (voipLogoutStamp == stamp) return;
+  // #endif
   const serial = bootstrapSerial;
   const config = voipSessionConfig();
   let uid = `${config["userId"] ?? ""}`;
@@ -231,7 +280,7 @@ export async function bootstrapVoip(): Promise<void> {
   // Do not reset the native singleton here: it may already own a cold-start system call.
   if (timer != 0) { clearInterval(timer); timer = 0; }
   const sameIdentity = userId == uid && deviceId == `${config["deviceId"]}` && sessionApiBase == `${config["apiBaseUrl"]}`;
-  if (!sameIdentity) { store.reset(); resetCallControls(); voipHistory.value = []; releaseVoipAudio(); }
+  if (!sameIdentity) { store.reset(); pendingIncomingPageId = ""; resetCallControls(); voipHistory.value = []; releaseVoipAudio(); }
   sessionStamp = currentScope; userId = uid; deviceId = `${config["deviceId"]}`;
   sessionApiBase = `${config["apiBaseUrl"]}`;
   nativeScope = generateUUID();

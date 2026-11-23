@@ -81,6 +81,16 @@ import LiveKitClient
     @objc public nonisolated static func syncGetuiPushRoute() {
         DispatchQueue.main.async { shared.refreshGetuiPushRoute() }
     }
+    @objc public nonisolated static func revokeBeforeLogout(_ completion: @escaping @Sendable (Bool) -> Void) {
+        DispatchQueue.main.async {
+            let revocation = shared.reset()
+            Task { @MainActor in
+                let released = await revocation?.value ?? true
+                shared.trace("PushKit logout revoke acknowledged=\(released)")
+                completion(released)
+            }
+        }
+    }
     @objc public nonisolated static func execute(_ raw: String) {
         DispatchQueue.main.async {
             guard let data = raw.data(using: .utf8), let command = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
@@ -123,15 +133,19 @@ import LiveKitClient
     }
     private func emitSnapshot(_ value: [String: Any]) {
         var nativeIncoming = false
+        var foregroundIncomingPage = false
+        let state = value["state"] as? String
         if let system = systemBridge,
            value["calleeId"] as? String == configuration["userId"] as? String,
-           value["state"] as? String == "ringing", let id = value["callId"] as? String {
+           state != "ended", let id = value["callId"] as? String {
+            let presented = system.isPresented(uuid: uuid(id))
             // A failed system report must not open an ended-only incoming page.
-            guard system.isPresented(uuid: uuid(id)) else { return }
-            nativeIncoming = true
+            guard state != "ringing" || presented else { return }
+            nativeIncoming = state == "ringing" && presented
+            foregroundIncomingPage = presented
         }
-        // Once the system can answer this call, the foreground App can present its own controls using the same call.
-        emit("snapshot", ["snapshot": value, "nativeIncomingUI": nativeIncoming, "foregroundIncomingPage": nativeIncoming])
+        // The App can also open the call after the system UI has already answered it.
+        emit("snapshot", ["snapshot": value, "nativeIncomingUI": nativeIncoming, "foregroundIncomingPage": foregroundIncomingPage])
     }
     fileprivate func systemIncomingReady(_ uuid: UUID) {
         // Meeting invites have no business snapshot; they open the meeting page from the
@@ -647,7 +661,12 @@ import LiveKitClient
                         if self.audioActive || Task.isCancelled { break }
                         try await Task.sleep(nanoseconds: 50_000_000)
                     }
-                    guard self.audioActive else { throw VoipError.invalid }
+                    if !self.audioActive && !Task.isCancelled && run == self.generation && self.room === next && self.snapshot?["callId"] as? String == id {
+                        self.trace("system audio activation timed out")
+                        self.emit("error", ["code": "CALL_AUDIO_ROUTE_UNAVAILABLE"])
+                        self.finish("systemUnavailable")
+                        return
+                    }
                 } else {
                     AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = true
                     let session = AVAudioSession.sharedInstance(); try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth]); try session.setActive(true)
@@ -780,10 +799,10 @@ import LiveKitClient
             URLSession.shared.dataTask(with: request).resume()
         }
     }
-    private func reset() {
+    @discardableResult private func reset() -> Task<Bool, Never>? {
         closeServerCall()
         generation += 1; imSocket?.cancel(with: .goingAway, reason: nil); imSocket = nil; stream?.cancel(); stream = nil; finish("sessionChanged")
-        pushRegistration?.stop(revoke: true); pushRegistration = nil
+        let revocation = pushRegistration?.stop(revoke: true); pushRegistration = nil
         getuiBindingTask?.cancel(); getuiBindingTask = nil; getuiBinding = nil
         for work in Array(pushWork.values) { work.cancel() }; pushWork = [:]
         for task in pendingPushExpiry.values { task.cancel() }; pendingPushExpiry = [:]; pendingPushes = [:]
@@ -794,6 +813,7 @@ import LiveKitClient
         audioLifecycle?.stop(); audioLifecycle = nil; history = NuwaxVoipCallHistory(); historyStorage = nil
         UserDefaults.standard.removeObject(forKey: "nuwax-voip-install-session")
         SecItemDelete([kSecClass: kSecClassGenericPassword, kSecAttrService: service] as CFDictionary)
+        return revocation
     }
     private func removePendingPush(_ uuid: UUID) {
         pendingPushExpiry.removeValue(forKey: uuid)?.cancel()
@@ -880,6 +900,20 @@ import LiveKitClient
         guard let current = systemBridge else { return false }
         return current === manager
     }
+    fileprivate func prepareSystemAudio() -> Bool {
+        // Set the category before fulfilling the system action. Starting audio remains
+        // the system's responsibility and the media engine waits for didActivate.
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
+            trace("system audio session configured")
+            return true
+        } catch {
+            let failure = error as NSError
+            trace("system audio configuration failed domain=\(failure.domain) code=\(failure.code)")
+            emit("error", ["code": "CALL_AUDIO_ROUTE_UNAVAILABLE"])
+            return false
+        }
+    }
     fileprivate func audioActivated(_ active: Bool) {
         let id = snapshot?["callId"] as? String ?? ""
         let outgoing = snapshot?["callerId"] as? String == configuration["userId"] as? String
@@ -888,11 +922,11 @@ import LiveKitClient
             audioActive = false; try? AudioManager.shared.setEngineAvailability(.none); return
         }
         audioActive = active
-        if active {
-            audioInterrupted = false
-            try? AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
-        }
+        if active { audioInterrupted = false }
         updateAudioEngine(); emitAudioRoutes()
+    }
+    fileprivate func incomingAnswerMediaType(_ requested: String?) -> String {
+        NuwaxVoipCallPolicy.answerMediaType(invited: snapshot?["mediaType"] as? String, requested: requested)
     }
     fileprivate func permissionPlan(_ media: String) -> NuwaxVoipPermissionPlan {
         func status(_ type: AVMediaType) -> NuwaxVoipPermission {
@@ -905,14 +939,18 @@ import LiveKitClient
         return NuwaxVoipClientPolicy.permissionPlan(microphone: status(.audio), camera: status(.video), video: media == "video", foreground: UIApplication.shared.applicationState == .active)
     }
     fileprivate func mediaControlFailed() { emit("error", ["code": "CALL_MEDIA_FAILED"]) }
-    fileprivate func permissionPending() {
+    fileprivate func permissionPending(mediaType: String) {
         guard let id = snapshot?["callId"] as? String else { return }
         emit("permissionPending")
         if UIApplication.shared.applicationState == .active { emit("openPage"); return }
         let content = UNMutableNotificationContent()
         let labels = configuration["labels"] as? [String: String] ?? [:]
         content.title = configuration["callLabel"] as? String ?? "Nuwax"
-        content.body = labels["permissionForeground"] ?? "Open Nuwax to grant microphone access and answer."
+        if mediaType == "video" {
+            content.body = labels["permissionRequired"] ?? "Open Nuwax to grant microphone and camera access and answer."
+        } else {
+            content.body = labels["permissionForeground"] ?? "Open Nuwax to grant microphone access and answer."
+        }
         // Default notification action opens the App. UniPush retains delegate ownership.
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "voip-permission-\(id)", content: content, trigger: nil))
     }
@@ -1153,12 +1191,25 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
     }
     public func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType) async {
         guard type == .voIP else { return }
+        await receiveVoipPush(payload, mustReport: true)
+    }
+    #if compiler(>=6.3)
+    @available(iOS 26.4, *)
+    public func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingVoIPPushWith payload: PKPushPayload, metadata: PKVoIPPushMetadata) async {
+        await receiveVoipPush(payload, mustReport: metadata.mustReport)
+    }
+    #endif
+    private func receiveVoipPush(_ payload: PKPushPayload, mustReport: Bool) async {
         restore()
         let run = generation
         let route = requiredPushRegistration
         let invitation = NuwaxVoipPushInvitation(payload.dictionaryPayload, userId: configuration["userId"] as? String ?? "",
             business: business, now: Date().timeIntervalSince1970 * 1000, requiredRegistrationId: route,
             pushBusinessEnvironment: configuration["pushBusinessEnvironment"] as? String)
+        if invitation == nil && !mustReport {
+            trace("PushKit ignored invitation outside current registration")
+            return
+        }
         let systemUUID = invitation.map { uuid($0.callId) } ?? UUID()
         trace("PushKit received callId=\(invitation?.callId ?? "invalid") systemUUID=\(systemUUID.uuidString)")
         let system: NuwaxSystemCalling
@@ -1197,7 +1248,7 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         // PushKit requires the system call to be reported before network validation.
         do {
             try await work.reportThenValidate(report: {
-                try await system.reportIncoming(invitation?.report(labels: self.configuration["labels"] as? [String: Any] ?? [:]) ?? ["displayName": "Nuwax", "mediaType": "audio"], uuid: systemUUID, requiredByPushKit: true)
+                try await system.reportIncoming(invitation?.report(labels: self.configuration["labels"] as? [String: Any] ?? [:]) ?? ["displayName": "Nuwax", "mediaType": "audio"], uuid: systemUUID, requiredByPushKit: mustReport)
             }, validate: { [weak self] in
                 guard let self, run == self.generation, let invitation, !self.configuration.isEmpty else { system.end(uuid: systemUUID); return }
                 await self.validatePush(invitation, systemUUID: systemUUID, system: system, run: run, duplicate: duplicate, route: route)
@@ -1423,39 +1474,44 @@ private enum VoipError: Error { case invalid }
     }
 
     func invitationReady(uuid: UUID) {
-        guard owner?.ownsSystemManager(self) == true, owner?.validatedSystemUUID(uuid) == true,
-              let answer = answers[uuid], !registry.hasEnded(uuid), !permissionRequests.contains(uuid) else { return }
-        if owner?.isMeetingSystemCall(uuid) == true {
+        guard let owner, owner.ownsSystemManager(self), owner.validatedSystemUUID(uuid),
+              answers[uuid] != nil, !registry.hasEnded(uuid), !permissionRequests.contains(uuid) else { return }
+        if owner.isMeetingSystemCall(uuid) {
             answers.removeValue(forKey: uuid)?.fulfill()
             answerModes.removeValue(forKey: uuid)
-            owner?.meetingAccepted(uuid)
+            owner.meetingAccepted(uuid)
             return
         }
-        let media = answerModes[uuid] ?? "audio"
-        switch owner?.permissionPlan(media) {
-        case .foreground: permissionWaiting.insert(uuid); owner?.permissionPending(); return
-        case .settings: owner?.permissionFailed(); return
+        let media = owner.incomingAnswerMediaType(answerModes[uuid])
+        switch owner.permissionPlan(media) {
+        case .foreground: permissionWaiting.insert(uuid); owner.permissionPending(mediaType: media); return
+        case .settings: owner.permissionFailed(); return
         case .request:
-            permissionRequests.insert(uuid); permissionWaiting.insert(uuid); owner?.permissionPending()
+            permissionRequests.insert(uuid); permissionWaiting.insert(uuid); owner.permissionPending(mediaType: media)
             NuwaxVoipBridge.requestPermissions(media) { [weak self] granted in
                 Task { @MainActor in
                     guard let self else { return }
                     self.permissionRequests.remove(uuid)
+                    guard self.owner?.ownsSystemManager(self) == true, self.owner?.validatedSystemUUID(uuid) == true, self.answers[uuid] != nil, !self.registry.hasEnded(uuid) else { return }
                     if granted { self.invitationReady(uuid: uuid) } else { self.owner?.permissionFailed() }
                 }
             }
             return
         case .ready: break
-        case nil: return
         }
         permissionWaiting.remove(uuid)
         Task {
-            guard owner?.validatedSystemUUID(uuid) == true else { answers.removeValue(forKey: uuid)?.fail(); return }
-            if await owner?.action("accept", answerMediaType: media) == true {
+            guard owner.validatedSystemUUID(uuid) else { answers.removeValue(forKey: uuid)?.fail(); return }
+            guard owner.prepareSystemAudio() else {
+                answers.removeValue(forKey: uuid)?.fail()
+                owner.finish("systemUnavailable")
+                return
+            }
+            if await owner.action("accept", answerMediaType: media) {
                 answers.removeValue(forKey: uuid)?.fulfill()
             } else {
                 answers.removeValue(forKey: uuid)?.fail()
-                if owner?.validatedSystemUUID(uuid) == true { owner?.finish("actionFailed") }
+                if owner.validatedSystemUUID(uuid) { owner.finish("actionFailed") }
             }
         }
     }
@@ -1463,6 +1519,8 @@ private enum VoipError: Error { case invalid }
     func resumePendingAnswer() { for uuid in Array(answers.keys) { invitationReady(uuid: uuid) } }
 
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
+        guard let owner, owner.ownsSystemManager(self), owner.ownsSystemUUID(action.callUUID), !registry.hasEnded(action.callUUID) else { action.fail(); return }
+        guard owner.prepareSystemAudio() else { action.fail(); owner.finish("systemUnavailable"); return }
         action.fulfill(); provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: Date())
     }
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
@@ -1657,22 +1715,22 @@ private enum VoipError: Error { case invalid }
         }
     }
     func invitationReady(uuid: UUID) {
-        guard owner?.ownsSystemManager(self) == true, owner?.validatedSystemUUID(uuid) == true,
+        guard let owner, owner.ownsSystemManager(self), owner.validatedSystemUUID(uuid),
               let join = joining[uuid], !registry.hasEnded(uuid), !answering.contains(uuid), !permissionRequests.contains(uuid) else { return }
-        guard join.timeoutDate > Date() else { owner?.finish("permissionRequired"); return }
-        if owner?.isMeetingSystemCall(uuid) == true {
+        guard join.timeoutDate > Date() else { owner.finish("permissionRequired"); return }
+        if owner.isMeetingSystemCall(uuid) {
             // Meeting answer opens the meeting page; it does not start a 1:1 call.
             answering.insert(uuid); permissionWaiting.remove(uuid); answerModes.removeValue(forKey: uuid)
             joining.removeValue(forKey: uuid)?.fulfill(dateConnected: Date())
-            owner?.meetingAccepted(uuid)
+            owner.meetingAccepted(uuid)
             return
         }
-        let media = answerModes[uuid] ?? "audio"
-        switch owner?.permissionPlan(media) {
-        case .foreground: permissionWaiting.insert(uuid); owner?.permissionPending(); return
-        case .settings: owner?.permissionFailed(); return
+        let media = owner.incomingAnswerMediaType(answerModes[uuid])
+        switch owner.permissionPlan(media) {
+        case .foreground: permissionWaiting.insert(uuid); owner.permissionPending(mediaType: media); return
+        case .settings: owner.permissionFailed(); return
         case .request:
-            permissionRequests.insert(uuid); permissionWaiting.insert(uuid); owner?.permissionPending()
+            permissionRequests.insert(uuid); permissionWaiting.insert(uuid); owner.permissionPending(mediaType: media)
             NuwaxVoipBridge.requestPermissions(media) { [weak self] granted in
                 Task { @MainActor in
                     guard let self else { return }
@@ -1683,15 +1741,19 @@ private enum VoipError: Error { case invalid }
             }
             return
         case .ready: break
-        case nil: return
         }
         answering.insert(uuid); permissionWaiting.remove(uuid)
         answerModes.removeValue(forKey: uuid)
         Task {
-            guard owner?.validatedSystemUUID(uuid) == true else { joining.removeValue(forKey: uuid)?.fail(); answering.remove(uuid); return }
-            if await owner?.action("accept", answerMediaType: media) != true {
+            guard owner.validatedSystemUUID(uuid) else { joining.removeValue(forKey: uuid)?.fail(); answering.remove(uuid); return }
+            guard owner.prepareSystemAudio() else {
+                joining.removeValue(forKey: uuid)?.fail()
+                owner.finish("systemUnavailable")
+                return
+            }
+            if await owner.action("accept", answerMediaType: media) != true {
                 joining.removeValue(forKey: uuid)?.fail(); answering.remove(uuid); answerRequested.remove(uuid)
-                if owner?.validatedSystemUUID(uuid) == true { owner?.finish("actionFailed") }
+                if owner.validatedSystemUUID(uuid) { owner.finish("actionFailed") }
             }
         }
     }
@@ -1716,7 +1778,10 @@ private enum VoipError: Error { case invalid }
             guard joining[join.conversationUUID] == nil, !answering.contains(join.conversationUUID) else { action.fail(); return }
             joining[join.conversationUUID] = join
             invitationReady(uuid: join.conversationUUID)
-        } else if let start = action as? StartConversationAction { start.fulfill(dateStarted: Date()) }
+        } else if let start = action as? StartConversationAction {
+            guard let owner, owner.prepareSystemAudio() else { start.fail(); owner?.finish("systemUnavailable"); return }
+            start.fulfill(dateStarted: Date())
+        }
         else if let mute = action as? MuteConversationAction { Task {
             guard owner?.ownsSystemUUID(action.conversationUUID) == true else { action.fail(); return }
             if await owner?.setMicrophone(!mute.isMuted) == true { action.fulfill() } else { action.fail() }

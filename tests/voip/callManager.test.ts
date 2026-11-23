@@ -42,7 +42,7 @@ vi.mock('../../features/voip/audioFocus.uts', () => ({ claimVoipAudio: fake.clai
 vi.mock('../../utils/voice/stopAllSpeechPlayback.uts', () => ({ stopAllSpeechPlayback: vi.fn() }));
 vi.mock('../../utils/i18n.uts', () => ({ t: (key: string) => key }));
 
-import { bootstrapVoip, clearVoipSession, getVoipSnapshot, startVoipCall, answerVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioInterrupted, voipPermissionPending, voipPushRegistration } from '../../features/voip/callManager.uts';
+import { bootstrapVoip, clearVoipSession, getVoipSnapshot, startVoipCall, answerVoipCall, endVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioInterrupted, voipPermissionPending, voipPushRegistration } from '../../features/voip/callManager.uts';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -200,6 +200,38 @@ describe('incoming actions and event isolation', () => {
       snapshot: { ...getVoipSnapshot(), version: 2 } });
     await vi.advanceTimersByTimeAsync(100);
     expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+  });
+
+  it('opens a still-ringing iOS call after the App returns to the foreground', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    fake.background = true;
+    await deliverIncoming({ nativeIncomingUI: true, foregroundIncomingPage: true });
+    expect(navigate).not.toHaveBeenCalled();
+    fake.background = false;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+    endVoipCall();
+    expect(fake.commands.at(-1)).toMatchObject({ op: 'action', action: 'reject', callId: 'incoming' });
+    await vi.advanceTimersByTimeAsync(300);
+    expect(navigate).toHaveBeenCalledOnce();
+  });
+
+  it('waits for the root page after the system answered a cold-start iOS call', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    vi.stubGlobal('getCurrentPages', () => []);
+    event({ type: 'snapshot', foregroundIncomingPage: true, snapshot: {
+      callId: 'accepted', convId: 'chat', version: 2, state: 'connecting',
+      callerId: 'bob', calleeId: 'alice', callerDeviceId: 'b1', acceptedDeviceId: 'a1', mediaType: 'audio',
+    } });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).not.toHaveBeenCalled();
+    vi.stubGlobal('getCurrentPages', () => [{ route: 'pages/tab-shell/tab-shell' }]);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+    endVoipCall();
+    expect(fake.commands.at(-1)).toMatchObject({ op: 'action', action: 'end', callId: 'accepted' });
   });
 
   it('leaves background calls and native-only incoming activities to the system', async () => {

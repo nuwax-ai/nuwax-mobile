@@ -148,7 +148,7 @@ struct NuwaxVoipApnsDevice: Equatable {
         }
     }
     /// Best-effort conditional revoke, using this instance's captured former account transport.
-    @discardableResult func stop(revoke: Bool) -> Task<Void, Never>? {
+    @discardableResult func stop(revoke: Bool) -> Task<Bool, Never>? {
         pause()
         let device = current; current = nil; changed("stopped", false)
         guard revoke, let device else { return nil }
@@ -158,9 +158,10 @@ struct NuwaxVoipApnsDevice: Equatable {
                 do {
                     if attempt > 0 { try await sleep(UInt64(1 << (attempt - 1)) * 1_000_000_000) }
                     let result = try await transport(device.body("revoke"))
-                    if device.acknowledges(result, registered: false) { return }
+                    if device.acknowledges(result, registered: false) { return true }
                 } catch { /* bounded; backend logout/device revocation is the authoritative fallback */ }
             }
+            return false
         }
     }
 }

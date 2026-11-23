@@ -138,7 +138,8 @@ import LiveKitClient
             guard system.isPresented(uuid: uuid(id)) else { return }
             nativeIncoming = true
         }
-        emit("snapshot", ["snapshot": value, "nativeIncomingUI": nativeIncoming])
+        // Once the system can answer this call, the foreground App can present its own controls using the same call.
+        emit("snapshot", ["snapshot": value, "nativeIncomingUI": nativeIncoming, "foregroundIncomingPage": nativeIncoming])
     }
     fileprivate func systemIncomingReady(_ uuid: UUID) {
         // Meeting invites have no business snapshot; they open the meeting page from the

@@ -7,7 +7,7 @@ object VoipCallPolicyTest {
         standaloneQaCannotRestoreProductionIdentity()
         releaseOriginRequiresAnExplicitMatchingHttpsPin()
         incomingSoundHonorsSilenceAndExplicitChoices()
-        unlockedBackgroundUiRequiresAColdPush()
+        unlockedBackgroundUiOpensForAudioAndVideo()
         duplicatedInvitationsCannotRestartOrStopTheRingingNotification()
         showingTheCallUiReplacesTheAlertWithoutRearmingIt()
         endingOrAnsweringReleasesTheIncomingNotificationSlot()
@@ -64,13 +64,12 @@ object VoipCallPolicyTest {
         check(gate.publish("call-b", true))
         check(!gate.publish("call-b", true))
     }
-    private fun unlockedBackgroundUiRequiresAColdPush() {
-        for (mediaType in listOf("audio", "video")) {
-            check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, coldPush = true, mediaType = mediaType))
-            check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, coldPush = false, mediaType = mediaType))
-        }
-        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, coldPush = false, mediaType = "audio"))
-        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, coldPush = true, mediaType = "video"))
+    private fun unlockedBackgroundUiOpensForAudioAndVideo() {
+        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = "audio"))
+        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = "video"))
+        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = ""))
+        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, mediaType = "audio"))
+        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, mediaType = "video"))
     }
     private fun showingTheCallUiReplacesTheAlertWithoutRearmingIt() {
         val gate = VoipIncomingNotificationGate()

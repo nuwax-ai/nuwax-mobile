@@ -10,6 +10,7 @@ const fake = vi.hoisted(() => ({
   create: vi.fn(),
   claimAudio: vi.fn(),
   settings: vi.fn(),
+  background: false,
   token: 'fixture',
 }));
 
@@ -31,7 +32,7 @@ vi.mock('../../utils/apiResponse.uts', () => ({ apiResData: vi.fn() }));
 vi.mock('../../utils/common.uts', () => ({ generateUUID: () => `fixture-${++fake.sequence}` }));
 vi.mock('../../utils/im/imSessionScope.uts', () => ({ getImSessionStamp: () => 'fixture-session' }));
 vi.mock('../../utils/appPrivacyConsent.uts', () => ({ hasAppPrivacyConsent: () => true }));
-vi.mock('../../utils/appLifecycle.uts', () => ({ isAppInBackground: () => false }));
+vi.mock('../../utils/appLifecycle.uts', () => ({ isAppInBackground: () => fake.background }));
 vi.mock('../../utils/meeting/meetingInviteNavigation.uts', () => ({
   openMeetingInvite: vi.fn(), clearMeetingInviteNavigation: vi.fn(), flushMeetingInviteNavigation: vi.fn(),
 }));
@@ -67,7 +68,7 @@ beforeEach(() => {
   });
   clearVoipSession();
   fake.nativeFails = false;
-  fake.commands = []; fake.events = []; fake.token = 'fixture';
+  fake.commands = []; fake.events = []; fake.token = 'fixture'; fake.background = false;
   fake.capabilities.mockReset().mockResolvedValue({ enabled: true, audio: true, video: true });
   fake.permissions.mockReset().mockResolvedValue(true);
   fake.create.mockReset().mockRejectedValue(new Error('UNEXPECTED_CREATE'));
@@ -77,9 +78,9 @@ beforeEach(() => {
 
 afterEach(() => { clearVoipSession(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
-async function deliverIncoming() {
+async function deliverIncoming(presentation: { nativeIncomingUI: boolean; foregroundIncomingPage: boolean } | null = null) {
   const initialized = fake.commands.find(command => command.op === 'initialize');
-  fake.events.push({ type: 'snapshot', scope: initialized.scope, snapshot: {
+  fake.events.push({ type: 'snapshot', scope: initialized.scope, ...presentation, snapshot: {
     callId: 'incoming', convId: 'chat', version: 1, state: 'ringing',
     callerId: 'bob', calleeId: 'alice', callerDeviceId: 'b1', mediaType: 'audio',
     expiresAt: Date.now() + 45_000,
@@ -198,6 +199,34 @@ describe('outgoing call races', () => {
 describe('incoming actions and event isolation', () => {
   async function incoming() { await bootstrapVoip(); await deliverIncoming(); }
   function event(value: any) { fake.events.push({ scope: fake.commands.find(c => c.op === 'initialize').scope, ...value }); }
+
+  it('opens the foreground call page once for a reported iOS call', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    await deliverIncoming({ nativeIncomingUI: true, foregroundIncomingPage: true });
+    event({ type: 'snapshot', nativeIncomingUI: true, foregroundIncomingPage: true,
+      snapshot: { ...getVoipSnapshot(), version: 2 } });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+  });
+
+  it('leaves background calls and native-only incoming activities to the system', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    fake.background = true;
+    await deliverIncoming({ nativeIncomingUI: true, foregroundIncomingPage: true });
+    event({ type: 'localEnded', callId: 'incoming', reason: 'remoteCancelled' });
+    await vi.advanceTimersByTimeAsync(100);
+    fake.background = false;
+    event({ type: 'snapshot', nativeIncomingUI: true, snapshot: {
+      callId: 'native', convId: 'chat', version: 1, state: 'ringing',
+      callerId: 'bob', calleeId: 'alice', callerDeviceId: 'b1', mediaType: 'audio',
+      expiresAt: Date.now() + 45_000,
+    } });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(getVoipSnapshot()?.callId).toBe('native');
+    expect(navigate).not.toHaveBeenCalled();
+  });
 
   it('recovers the reserved incoming call after native rejects a conflicting outgoing watch', async () => {
     fake.create.mockResolvedValue({ callId: 'outgoing', convId: 'chat', version: 1, state: 'ringing', callerId: 'alice', calleeId: 'bob', callerDeviceId: 'a1', mediaType: 'audio', expiresAt: Date.now() + 45_000 });

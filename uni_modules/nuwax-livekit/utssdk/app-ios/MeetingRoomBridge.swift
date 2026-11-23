@@ -32,7 +32,7 @@ import Combine
  */
 public class MeetingRoomBridge: NSObject {
   /// 与页面诊断配套；只有重新制作原生基座才会更新。
-  private static let probeBuild = "ios-broadcast-auto-pip-20261123-p6"
+  private static let probeBuild = "ios-share-fallback-pip-20261123-p7"
   /// iOS → Android 共享流参数。写入 diag，方便仅凭真机日志确认新基座是否生效。
   private static let screenSharePublishProfile = "bounded720p30-3Mbps-single-h264"
 
@@ -60,6 +60,8 @@ public class MeetingRoomBridge: NSObject {
   private static var screenShareErrorText = ""
   private static var screenShareRequestID = 0
   private static var broadcastPending = false
+  private static var usingBroadcastExtension = false
+  private static weak var shareScopeAlert: UIAlertController?
   private static var broadcastObserver: AnyCancellable?
   private static var broadcastTimeout: DispatchWorkItem?
   private static let screenShareLock = NSLock()
@@ -256,8 +258,9 @@ public class MeetingRoomBridge: NSObject {
     let view = videoView != nil ? 1 : 0
     let cam = (room?.localParticipant.firstCameraVideoTrack != nil) ? 1 : 0
     let conn = connectedFlag ? 1 : 0
+    let pip = MeetingPictureInPicture.shared.diag()
     // 原生基座版本标记：页面据此避开旧基座的 UIView 返回值桥接路径。
-    return "bridge=ios-native-view-v2 probe=\(probeBuild) main=\(main) view=\(view) cam=\(cam) conn=\(conn) remotes=\(remoteViews.count) remotePub=\(remoteVideoPublicationDiag()) shareCfg=\(screenSharePublishProfile) \(localScreenShareDiag()) dev=\(deviceErrorText)"
+    return "bridge=ios-native-view-v2 probe=\(probeBuild) main=\(main) view=\(view) cam=\(cam) conn=\(conn) remotes=\(remoteViews.count) remotePub=\(remoteVideoPublicationDiag()) shareCfg=\(screenSharePublishProfile) \(localScreenShareDiag()) \(pip) dev=\(deviceErrorText)"
   }
 
   /// 配置值不能代表实际编码结果；输出 SDK 统计中的真实尺寸、帧率、编码器和限速原因。
@@ -433,8 +436,16 @@ public class MeetingRoomBridge: NSObject {
         return
       }
       if broadcastPending || screenShareTrack != nil { return }
+      screenShareLock.lock()
+      screenShareRequestID += 1
+      let requestID = screenShareRequestID
+      screenShareLock.unlock()
       MeetingShareLease.shared.acquired()
-      guard let bundleID = Bundle.main.bundleIdentifier else { return }
+      guard let bundleID = Bundle.main.bundleIdentifier else {
+        screenShareErrorText = "broadcast_extension_missing"
+        MeetingShareLease.shared.release()
+        return
+      }
       let extensionID = Bundle.main.object(forInfoDictionaryKey: "RTCScreenSharingExtension") as? String ?? "\(bundleID).broadcast"
       let groupID = Bundle.main.object(forInfoDictionaryKey: "RTCAppGroupIdentifier") as? String ?? "group.\(bundleID)"
       let extensions = Bundle.main.builtInPlugInsURL.flatMap {
@@ -442,12 +453,13 @@ public class MeetingRoomBridge: NSObject {
       } ?? []
       guard extensions.contains(where: { Bundle(url: $0)?.bundleIdentifier == extensionID }),
             FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID) != nil else {
-        screenShareErrorText = "broadcast_extension_missing"
-        MeetingShareLease.shared.release()
+        offerInAppScreenShare()
         return
       }
       screenShareErrorText = ""
+      usingBroadcastExtension = true
       broadcastPending = true
+      MeetingPictureInPicture.shared.setCapturePromptVisible(true)
       // SDK 自动发布会跳过本项目的缩放/编码策略，因此由桥接层按真实广播状态发布。
       BroadcastManager.shared.shouldPublishTrack = false
       if broadcastObserver == nil {
@@ -455,12 +467,12 @@ public class MeetingRoomBridge: NSObject {
           .removeDuplicates().dropFirst().receive(on: DispatchQueue.main)
           .sink { started in
             if started {
-              guard broadcastPending, connectedFlag else {
+              guard usingBroadcastExtension, broadcastPending, connectedFlag else {
                 BroadcastManager.shared.requestStop()
                 return
               }
-              publishBroadcastTrack()
-            } else if broadcastPending || screenShareTrack != nil {
+              publishScreenTrack(useBroadcastExtension: true)
+            } else if usingBroadcastExtension && (broadcastPending || screenShareTrack != nil) {
               stopScreenShare()
               screenShareErrorText = "stopped"
             }
@@ -468,7 +480,7 @@ public class MeetingRoomBridge: NSObject {
       }
       // 系统 picker 没有取消回调；原生超时收回占位，晚到的广播事件也不能误发布。
       let timeout = DispatchWorkItem {
-        if broadcastPending {
+        if requestID == screenShareRequestID && broadcastPending {
           stopScreenShare()
           screenShareErrorText = "cancelled"
         }
@@ -479,13 +491,51 @@ public class MeetingRoomBridge: NSObject {
     }
   }
 
-  private static func publishBroadcastTrack() {
+  /// 未嵌入扩展的云基座仍可使用原来的应用内录屏；先说明范围，不能冒充整屏共享。
+  private static func offerInAppScreenShare() {
+    let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+      .first { $0.activationState == .foregroundActive }
+    var presenter = scene?.windows.first(where: { $0.isKeyWindow })?.rootViewController
+    while let next = presenter?.presentedViewController { presenter = next }
+    guard let presenter, !presenter.isBeingDismissed else {
+      screenShareErrorText = "broadcast_extension_missing"
+      MeetingShareLease.shared.release()
+      return
+    }
+    broadcastPending = true
+    usingBroadcastExtension = false
+    MeetingPictureInPicture.shared.setCapturePromptVisible(true)
+    screenShareErrorText = ""
+    let requestID = screenShareRequestID
+    let alert = UIAlertController(title: "共享当前应用", message: "当前安装包暂不支持共享整个手机屏幕。可继续共享本应用中的画面；切换到桌面或其他应用后，对方看不到这些内容。", preferredStyle: .alert)
+    alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in
+      guard requestID == screenShareRequestID else { return }
+      stopScreenShare()
+      screenShareErrorText = "cancelled"
+    })
+    alert.addAction(UIAlertAction(title: "共享本应用", style: .default) { _ in
+      guard requestID == screenShareRequestID, broadcastPending, connectedFlag else { return }
+      shareScopeAlert = nil
+      publishScreenTrack(useBroadcastExtension: false)
+    })
+    shareScopeAlert = alert
+    presenter.present(alert, animated: true)
+    let timeout = DispatchWorkItem {
+      guard requestID == screenShareRequestID, broadcastPending, !usingBroadcastExtension else { return }
+      stopScreenShare()
+      screenShareErrorText = "cancelled"
+    }
+    broadcastTimeout = timeout
+    DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: timeout)
+  }
+
+  private static func publishScreenTrack(useBroadcastExtension: Bool) {
     screenShareLock.lock()
-    screenShareRequestID += 1
     let requestID = screenShareRequestID
     screenShareLock.unlock()
     onMain {
       guard connectedFlag, let current = room else {
+        stopScreenShare()
         screenShareErrorText = "not_connected"
         return
       }
@@ -504,11 +554,16 @@ public class MeetingRoomBridge: NSObject {
           fps: 30,
           showCursor: false,
           appAudio: false,
-          useBroadcastExtension: true,
+          useBroadcastExtension: useBroadcastExtension,
           useScreenCaptureKit: false,
           includeCurrentApplication: true
         )
-        let track = await LocalVideoTrack.createBroadcastScreenCapturerTrack(options: options, reportStatistics: true)
+        let track: LocalVideoTrack
+        if useBroadcastExtension {
+          track = await LocalVideoTrack.createBroadcastScreenCapturerTrack(options: options, reportStatistics: true)
+        } else {
+          track = await LocalVideoTrack.createInAppScreenShareTrack(options: options, reportStatistics: true)
+        }
         candidate = track
         let processor = MeetingScreenShareProcessor()
         track.processor = processor
@@ -550,9 +605,11 @@ public class MeetingRoomBridge: NSObject {
         screenShareProcessor = processor
         screenShareLock.unlock()
         broadcastPending = false
+        MeetingPictureInPicture.shared.setCapturePromptVisible(false)
+        if UIApplication.shared.applicationState == .background { _ = MeetingPictureInPicture.shared.start() }
         broadcastTimeout?.cancel()
         screenShareErrorText = ""
-        bridgeLog("broadcast screen share published: \(screenSharePublishProfile)")
+        bridgeLog("screen share published mode=\(useBroadcastExtension ? "broadcast" : "in-app") profile=\(screenSharePublishProfile)")
       } catch {
         if let candidate { _ = try? await candidate.capturer.stopCapture() }
         screenShareLock.lock()
@@ -560,14 +617,17 @@ public class MeetingRoomBridge: NSObject {
         screenShareLock.unlock()
         guard requestStillActive else { return }
         broadcastPending = false
-        BroadcastManager.shared.requestStop()
+        broadcastTimeout?.cancel()
+        MeetingPictureInPicture.shared.setCapturePromptVisible(false)
+        if useBroadcastExtension { BroadcastManager.shared.requestStop() }
+        usingBroadcastExtension = false
         MeetingShareLease.shared.release()
         screenShareLock.lock()
         screenShareTrack = nil
         screenShareProcessor = nil
         screenShareLock.unlock()
         screenShareErrorText = error.localizedDescription
-        bridgeLog("in-app screen share failed: \(error)")
+        bridgeLog("screen share failed: \(error)")
       }
     }
     }
@@ -575,9 +635,13 @@ public class MeetingRoomBridge: NSObject {
 
   private static func stopScreenShareInternal(room current: Room?) {
     broadcastPending = false
+    MeetingPictureInPicture.shared.setCapturePromptVisible(false)
     broadcastTimeout?.cancel()
     broadcastTimeout = nil
-    BroadcastManager.shared.requestStop()
+    shareScopeAlert?.dismiss(animated: false)
+    shareScopeAlert = nil
+    if usingBroadcastExtension { BroadcastManager.shared.requestStop() }
+    usingBroadcastExtension = false
     MeetingShareLease.shared.release()
     screenShareLock.lock()
     let track = screenShareTrack
@@ -617,7 +681,7 @@ public class MeetingRoomBridge: NSObject {
   public static func isScreenShareOn() -> Bool {
     screenShareLock.lock()
     defer { screenShareLock.unlock() }
-    return screenShareTrack != nil && BroadcastManager.shared.isBroadcasting
+    return screenShareTrack != nil && (usingBroadcastExtension ? BroadcastManager.shared.isBroadcasting : RPScreenRecorder.shared().isRecording)
   }
 
   public static func isScreenShareStopping() -> Bool { MeetingShareLease.shared.isReleasing }

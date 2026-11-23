@@ -70,7 +70,7 @@ class MeetingRoomBridge(context: Context) {
   @Volatile private var screenShareOn = false
   private val shareLease = MeetingShareLease()
   private var shareRequestID = 0
-  private var sharePending = false
+  @Volatile private var sharePending = false
   private var pipTrack: VideoTrack? = null
   private var pipRenderer: SurfaceViewRenderer? = null
   private val floatingWindow = MeetingFloatingWindow(this)
@@ -220,7 +220,7 @@ class MeetingRoomBridge(context: Context) {
     if (sharePending || screenShareOn) return
     shareLease.acquired()
     shareRequestID += 1
-    sharePending = true
+    updateSharePending(true)
     try {
       screenShareError = ""
       val intent = Intent(context, MediaProjectionPermissionActivity::class.java)
@@ -236,7 +236,7 @@ class MeetingRoomBridge(context: Context) {
         }
       }
     } catch (e: Throwable) {
-      sharePending = false
+      updateSharePending(false)
       shareLease.release()
       screenShareError = e.message ?: "screen_capture_request"
     }
@@ -249,7 +249,7 @@ class MeetingRoomBridge(context: Context) {
       screenShareOn = false
       screenShareError = "cancelled"
       screenShareDiag = "cancelled"
-      sharePending = false
+      updateSharePending(false)
       shareLease.release()
       return
     }
@@ -273,7 +273,7 @@ class MeetingRoomBridge(context: Context) {
           }),
         )
         screenShareDiag = "started=${started}"
-        sharePending = false
+        updateSharePending(false)
         if (requestID != shareRequestID || room !== r) {
           r.localParticipant.setScreenShareEnabled(false)
           return@launch
@@ -306,7 +306,7 @@ class MeetingRoomBridge(context: Context) {
         screenShareOn = false
         screenShareError = e.message ?: "screen_share_publish"
         screenShareDiag = "throw=${e.javaClass.simpleName}"
-        sharePending = false
+        updateSharePending(false)
         shareLease.release()
       }
     }
@@ -314,7 +314,7 @@ class MeetingRoomBridge(context: Context) {
 
   fun stopScreenShare() {
     shareRequestID += 1
-    sharePending = false
+    updateSharePending(false)
     shareLease.release()
     val r = room ?: return
     val s = scope ?: return
@@ -348,13 +348,20 @@ class MeetingRoomBridge(context: Context) {
     return refreshScreenShareState(r)
   }
 
-  fun diag(): String = "probe=android-display-auto-pip-20261123-p6 share[${screenShareDiag}]"
+  fun diag(): String = "probe=android-edge-pip-20261123-p7 share[${screenShareDiag}] ${floatingWindow.diag()}"
 
   fun configureBackgroundSession(endpoint: String, token: String) { shareLease.configure(endpoint, token) }
 
+  private fun updateSharePending(pending: Boolean) {
+    sharePending = pending
+    // 录屏权限 Activity 弹出前先关闭 auto-enter，避免授权弹窗触发小窗。
+    if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) floatingWindow.refreshAutoEnter()
+    else android.os.Handler(android.os.Looper.getMainLooper()).post { floatingWindow.refreshAutoEnter() }
+  }
+
   fun isScreenSharePending(): Boolean = sharePending
-  fun setMeetingPresentation(activity: Activity, pageVisible: Boolean, foreground: Boolean) {
-    activity.runOnUiThread {
+  fun setMeetingPresentation(activity: Activity?, pageVisible: Boolean, foreground: Boolean) {
+    android.os.Handler(android.os.Looper.getMainLooper()).post {
       if (connectedFlag) floatingWindow.setPresentation(activity, pageVisible, foreground)
     }
   }
@@ -780,7 +787,7 @@ class MeetingRoomBridge(context: Context) {
   private fun disconnectInternal(notify: Boolean) {
     android.os.Handler(android.os.Looper.getMainLooper()).post { floatingWindow.stop() }
     shareRequestID += 1
-    sharePending = false
+    updateSharePending(false)
     shareLease.clear()
     pipRenderer?.let { releasePipRenderer(it) }
     MeetingForegroundService.stop(appContext)

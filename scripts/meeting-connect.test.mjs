@@ -5,7 +5,7 @@ import { stripTypeScriptTypes } from 'node:module';
 import vm from 'node:vm';
 
 // 执行业务状态机，原生桥和网络为桩；不调用 HBuilderX/设备或真实接口。
-function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = false } = {}) {
+function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = false, preCode = '0', tokenCode = '0' } = {}) {
   const raw = readFileSync(new URL('../utils/meeting/meetingMedia.uts', import.meta.url), 'utf8');
   const stack = [true];
   const lines = [];
@@ -24,8 +24,8 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
   const globals = {
     console: { error: value => logs.push(String(value)) },
     SUCCESS_CODE: '0', eventBus: { emit() {} },
-    apiImMeetingPublicRoomSafe: async () => ({ code: '0', data: { active: true } }),
-    apiImMeetingIssueToken: async () => ({ code: '0', data: { wsUrl: 'wss://rtc.test', token: 'secret-seat-token' } }),
+    apiImMeetingPublicRoomSafe: async () => ({ code: preCode, data: { active: true } }),
+    apiImMeetingIssueToken: async () => ({ code: tokenCode, data: { wsUrl: 'wss://rtc.test', token: 'secret-seat-token' } }),
     apiResCode: response => response.code,
     apiResData: response => response.data,
     meetingShareReleaseEndpoint: room => 'https://api.test/rooms/' + room + '/release',
@@ -198,6 +198,87 @@ function pageFunctions(names) {
     return source.slice(start, end + 4);
   }).join('\n');
 }
+
+for (const code of ['IM_50001', 'IM_50002']) {
+  for (const stage of ['preCode', 'tokenCode']) test(`${stage} ${code}：已结束或不存在的会议不再连接原生`, async () => {
+    const h = harness({ [stage]: code });
+    assert.equal(await h.join(), false);
+    assert.equal(h.api.meetingMediaState().errorText, 'ended');
+    assert.equal(h.api.meetingMediaState().connecting, false);
+    assert.equal(h.operations.includes('connect'), false);
+  });
+}
+
+test('预检网络错误仍尝试签令牌，不把临时失败当作会议结束', async () => {
+  const h = harness({ preCode: '500' });
+  await h.join();
+  assert.ok(h.operations.includes('connect'));
+  assert.notEqual(h.api.meetingMediaState().errorText, 'ended');
+});
+
+for (const root of [false, true]) test(`失效会议仅退出一次，根页面=${root}`, () => {
+  const timers = [], navigations = [], toasts = [];
+  let disconnects = 0;
+  const context = vm.createContext({
+    pageUnmounted: false, meetingClosing: false, preserveMeetingOnUnmount: true,
+    t: key => key, console: { error() {} }, eventBus: { emit() {} }, IM_MEETING_CHANGED_EVENT: 'meeting',
+    meetingMediaDisconnect() { disconnects++; },
+    setTimeout(fn) { timers.push(fn); },
+    uni: {
+      showToast(value) { toasts.push(value); },
+      navigateBack(value) { navigations.push('back'); if (root) value.fail({}); },
+      reLaunch(value) { navigations.push(value.url); },
+    },
+  });
+  vm.runInContext(stripTypeScriptTypes(pageFunctions(['returnFromClosedMeeting', 'handleConnectFailure'])), context);
+  context.handleConnectFailure('exception');
+  assert.equal(timers.length, 0, '临时错误不自动退栈');
+  context.handleConnectFailure('ended');
+  context.handleConnectFailure('ended');
+  assert.equal(disconnects, 1);
+  assert.equal(context.preserveMeetingOnUnmount, false);
+  assert.equal(timers.length, 1);
+  timers[0]();
+  assert.deepEqual(navigations, root ? ['back', '/pages/tab-shell/tab-shell'] : ['back']);
+  context.pageUnmounted = true;
+  context.returnFromClosedMeeting();
+  assert.equal(navigations.length, root ? 2 : 1, '卸载后的迟到回调不能退出上一页');
+});
+
+test('双箭头备用入口：拖动不误触返回、上下边界限制、回会后隐藏', () => {
+  const raw = readFileSync(new URL('../components/meeting-active-banner/meeting-active-banner.uvue', import.meta.url), 'utf8');
+  const source = raw.split('<script setup lang="uts">')[1].split('</script>')[0].replace(/^\s*import[^;]+;/gm, '');
+  let now = 1000, returned = 0, minimized = true, native = false;
+  const context = vm.createContext({
+    ref: value => ({ value }), onMounted: fn => fn(), onUnmounted() {},
+    eventBus: { on() {}, off() {} }, MEETING_MEDIA_CHANGED_EVENT: 'changed', Date: { now: () => now },
+    meetingMediaIsMinimized: () => minimized, meetingMediaHasNativeWindow: () => native,
+    meetingMediaResume() { returned++; }, uni: { getWindowInfo: () => ({ windowHeight: 800 }) },
+  });
+  vm.runInContext(stripTypeScriptTypes(source) + '; globalThis.inspect = () => ({ top: top.value, visible: visible.value }); globalThis.refreshEntry = refresh;', context);
+  const touch = (x, y) => ({ touches: [{ clientX: x, clientY: y }] });
+  assert.equal(context.inspect().visible, true);
+  context.handleTouchStart(touch(370, 450));
+  context.handleTouchMove(touch(370, -1000));
+  assert.equal(context.inspect().top, 28);
+  context.handleTouchEnd(touch(370, -1000));
+  context.resume();
+  assert.equal(returned, 0);
+  now += 600;
+  context.handleTouchStart(touch(370, 28));
+  context.handleTouchMove(touch(370, 2000));
+  assert.equal(context.inspect().top, 708);
+  context.handleTouchEnd(touch(370, 2000));
+  now += 600;
+  context.handleTouchStart(touch(370, 708));
+  context.handleTouchEnd(touch(370, 708));
+  context.resume();
+  assert.equal(returned, 1);
+  minimized = false; context.refreshEntry(null);
+  assert.equal(context.inspect().visible, false);
+  minimized = true; native = true; context.refreshEntry(null);
+  assert.equal(context.inspect().visible, false, '原生入口可用时不重复展示');
+});
 
 test('实际页面聊天、举手和共享入口先校准连接，返回不再弹小窗/最小化选择', async () => {
   const h = harness({ configThrows: true });

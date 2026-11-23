@@ -1196,7 +1196,7 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         // PushKit requires the system call to be reported before network validation.
         do {
             try await work.reportThenValidate(report: {
-                try await system.reportIncoming(invitation?.report ?? ["displayName": "Nuwax", "mediaType": "audio"], uuid: systemUUID, requiredByPushKit: true)
+                try await system.reportIncoming(invitation?.report(labels: self.configuration["labels"] as? [String: Any] ?? [:]) ?? ["displayName": "Nuwax", "mediaType": "audio"], uuid: systemUUID, requiredByPushKit: true)
             }, validate: { [weak self] in
                 guard let self, run == self.generation, let invitation, !self.configuration.isEmpty else { system.end(uuid: systemUUID); return }
                 await self.validatePush(invitation, systemUUID: systemUUID, system: system, run: run, duplicate: duplicate, route: route)
@@ -1340,7 +1340,7 @@ private enum VoipError: Error { case invalid }
         let generation = registry.beginIncomingReport(uuid, requiredByPushKit: requiredByPushKit)
         guard generation != nil || (requiredByPushKit && registry.hasEnded(uuid)) else { return }
         let update = CXCallUpdate()
-        update.remoteHandle = CXHandle(type: .generic, value: payload["callId"] as? String ?? uuid.uuidString)
+        update.remoteHandle = CXHandle(type: .generic, value: payload["handle"] as? String ?? payload["callId"] as? String ?? uuid.uuidString)
         update.localizedCallerName = payload["displayName"] as? String ?? "Nuwax"
         update.hasVideo = payload["mediaType"] as? String == "video"
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -1526,7 +1526,7 @@ private enum VoipError: Error { case invalid }
             else { owner?.systemIncomingReady(uuid) }
             return
         }
-        let handle = Handle(type: .generic, value: payload["callId"] as? String ?? uuid.uuidString, displayName: payload["displayName"] as? String ?? "Nuwax")
+        let handle = Handle(type: .generic, value: payload["handle"] as? String ?? payload["callId"] as? String ?? uuid.uuidString, displayName: payload["displayName"] as? String ?? "Nuwax")
         trace("incoming report requested")
         do {
             try await manager.reportNewIncomingConversation(uuid: uuid, update: .init(members: [handle], capabilities: payload["mediaType"] as? String == "video" ? [.video, .pausing] : [.pausing]))

@@ -53,6 +53,7 @@ internal class VoipNativeCallView(
     }
 
     private val kind = label(13f, LABEL)
+    private val minimizeText = label(12f, LABEL)
     private val initials = label(44f, Color.rgb(240, 245, 242))
     private var avatarUrl = ""
     private var avatarJob: Job? = null
@@ -74,7 +75,8 @@ internal class VoipNativeCallView(
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         maxLines = 2
     }
-    private val status = label(15f, LABEL)
+    private val status = label(15f, LABEL).apply { maxLines = 2 }
+    private val meetingNumber = label(15f, LABEL).apply { visibility = GONE }
     private val statusDot = View(context).apply { importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO }
     private val identity = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
@@ -88,6 +90,7 @@ internal class VoipNativeCallView(
             addView(statusDot, LinearLayout.LayoutParams(dp(5), dp(5)).apply { marginEnd = dp(9) })
             addView(status)
         }, LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(10) })
+        addView(meetingNumber, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) })
     }
 
     private val reject = control("hangup", large = true, action = end)
@@ -150,7 +153,7 @@ internal class VoipNativeCallView(
         val minimizeControl = LinearLayout(context).apply {
             gravity = Gravity.CENTER_VERTICAL
             addView(icon("minimize"), LinearLayout.LayoutParams(dp(20), dp(20)))
-            val text = label(12f, LABEL)
+            val text = minimizeText
             text.text = VoipBridge.label("minimize")
             text.maxLines = 2
             text.importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
@@ -168,25 +171,34 @@ internal class VoipNativeCallView(
 
     fun render(value: JSONObject, ringing: Boolean, hasVideo: Boolean, answering: Boolean) {
         val incoming = value.optBoolean("incoming")
+        val meeting = value.optString("scene") == "meeting"
+        minimizeText.text = VoipBridge.label(if (meeting) "meetingMinimize" else "minimize")
+        (minimizeText.parent as? View)?.contentDescription = minimizeText.text
         val active = value.optString("state") == "active" && value.optBoolean("mediaReady")
         val reconnecting = value.optBoolean("reconnecting")
         val displayName = value.optString(if (incoming) "callerDisplayName" else "calleeDisplayName").trim()
             .ifEmpty { VoipBridge.label("title") }
-        val kindKey = if (hasVideo) "video" else "audio"
+        val kindKey = if (meeting) "meetingInvitation" else if (hasVideo) "video" else "audio"
         val mediaLabel = VoipBridge.label(kindKey)
         kind.text = if (mediaLabel == kindKey) VoipBridge.label("title") else mediaLabel
-        name.text = displayName
+        name.text = if (meeting) value.optString("title").ifBlank { VoipBridge.label("meetingInvitation") } else displayName
+        meetingNumber.visibility = if (meeting) VISIBLE else GONE
+        val room = value.optString("roomName")
+        val formattedRoom = if (room.matches(Regex("[0-9]{9}"))) room.chunked(3).joinToString(" ") else room
+        meetingNumber.text = if (meeting) "${VoipBridge.label("meetingNumber")} $formattedRoom" else ""
         initials.text = displayName.substring(0, Character.charCount(displayName.codePointAt(0)))
         updateAvatar((value.opt(if (incoming) "callerAvatar" else "calleeAvatar") as? String)?.trim().orEmpty())
         val connectedAt = value.optLong("connectedAt", System.currentTimeMillis())
         val seconds = ((System.currentTimeMillis() - connectedAt) / 1000).coerceAtLeast(0)
         status.text = when {
+            meeting && answering -> VoipBridge.label("meetingJoining")
+            meeting -> VoipBridge.label("meetingInvitedBy").replace("{name}", displayName)
             reconnecting -> VoipBridge.label("reconnecting")
             active -> "%02d:%02d".format(seconds / 60, seconds % 60)
             ringing -> VoipBridge.label(if (incoming) "incoming" else "dialing")
             else -> VoipBridge.label("connecting")
         }
-        val showVideo = !ringing && hasVideo
+        val showVideo = !meeting && !ringing && hasVideo
         val cameraOn = value.optBoolean("camera")
         updateIdentity(showVideo, active && !reconnecting)
         remote.visibility = if (showVideo) VISIBLE else INVISIBLE
@@ -196,10 +208,10 @@ internal class VoipNativeCallView(
         audioActions.visibility = if (!ringing && !hasVideo) VISIBLE else GONE
         videoActions.visibility = if (showVideo) VISIBLE else GONE
         if (ringing) {
-            reject.update(if (incoming) "reject" else "hangup", color = DANGER)
+            reject.update(if (meeting) "meetingIgnore" else if (incoming) "reject" else "hangup", color = DANGER)
             audio.visibility = if (incoming) VISIBLE else GONE
-            video.visibility = if (incoming && hasVideo) VISIBLE else GONE
-            audio.update("answerAudio", color = if (hasVideo) NEUTRAL else SUCCESS)
+            video.visibility = if (incoming && hasVideo && !meeting) VISIBLE else GONE
+            audio.update(if (meeting) "meetingJoin" else "answerAudio", iconName = if (meeting) "meeting" else "phone", color = if (hasVideo && !meeting) NEUTRAL else SUCCESS)
             video.update("answerVideo", color = SUCCESS)
             audio.isEnabled = !answering
             video.isEnabled = !answering

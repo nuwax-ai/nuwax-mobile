@@ -176,7 +176,19 @@ object VoipBridge {
     private fun startSettings(ctx: Context, intent: Intent): Boolean {
         return runCatching { ctx.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }.isSuccess
     }
-    internal fun label(key: String): String = config.optJSONObject("labels")?.optString(key, key) ?: key
+    internal fun label(key: String): String {
+        val fallback = when (key) {
+            "meetingInvitation" -> "会议邀请"
+            "meetingNumber" -> "会议号"
+            "meetingInvitedBy" -> "{name} 邀请你加入会议"
+            "meetingJoin" -> "加入会议"
+            "meetingIgnore" -> "忽略"
+            "meetingJoining" -> "正在加入会议…"
+            "meetingMinimize" -> "收起"
+            else -> key
+        }
+        return config.optJSONObject("labels")?.optString(key, fallback) ?: fallback
+    }
     internal suspend fun loadPeerAvatar(raw: String, sizePx: Int): Bitmap? {
         val base = config.optString("apiBaseUrl").toHttpUrlOrNull() ?: return null
         val url = base.resolve(raw) ?: return null
@@ -1145,7 +1157,10 @@ object VoipBridge {
         val open = VoipIncomingActivity.intent(ctx, s.optString("callId"))
         val content = PendingIntent.getActivity(ctx, 9091, open, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val answer = PendingIntent.getActivity(ctx, 9092, VoipIncomingActivity.intent(ctx, s.optString("callId")).putExtra("answer", true), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val person = Person.Builder().setName(s.optString(if (s.optString("callerId") == config.optString("userId")) "calleeDisplayName" else "callerDisplayName", "Nuwax")).setImportant(true).build()
+        val meeting = s.optString("scene") == "meeting"
+        val personName = if (meeting) "${label("meetingInvitation")} · ${s.optString("title")}" else
+            s.optString(if (s.optString("callerId") == config.optString("userId")) "calleeDisplayName" else "callerDisplayName", "Nuwax")
+        val person = Person.Builder().setName(personName).setImportant(true).build()
         val style = if (incoming) NotificationCompat.CallStyle.forIncomingCall(person, intent("reject"), answer)
             else NotificationCompat.CallStyle.forOngoingCall(person, intent(if (s.optString("state") == "ringing") "cancel" else "end"))
         val channel = when {
@@ -1160,7 +1175,7 @@ object VoipBridge {
         }
         val builder = NotificationCompat.Builder(ctx, channel)
             .setSmallIcon(android.R.drawable.sym_call_incoming).setContentIntent(content)
-            .setContentTitle(person.name).setContentText(if (s.optString("state") == "active") config.optString("callLabel", "Nuwax")
+            .setContentTitle(person.name).setContentText(if (meeting) "${label("meetingNumber")} ${s.optString("roomName")}" else if (s.optString("state") == "active") config.optString("callLabel", "Nuwax")
                 else label(if (incoming) "incoming" else if (s.optString("state") == "ringing") "dialing" else "connecting"))
             .setCategory(NotificationCompat.CATEGORY_CALL).setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_ALL)

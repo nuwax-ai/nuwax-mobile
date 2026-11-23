@@ -11,8 +11,15 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
   private var placeholder: UILabel?
   private var source: UIView?
   private weak var sourceAnchor: UIView?
-  private var inlineVideo: VideoView?
-  private var inlineLabel: UILabel?
+  private var edgePosition: CGFloat = 0.68
+  private var starting = false
+  private var capturePromptVisible = false
+  private var lastFailure = ""
+  private let diagnosticLock = NSLock()
+  private var diagnosticSnapshot = "pip[unprepared]"
+  private var backgroundObserver: NSObjectProtocol?
+  private var foregroundObserver: NSObjectProtocol?
+  private var orientationObserver: NSObjectProtocol?
   private var restoreRequested = false
   private var pageVisible = true
   private var foreground = true
@@ -20,29 +27,34 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
 
   func makeSourceView() -> UIView {
     stop()
-    let source = UIView(frame: CGRect(x: 0, y: 0, width: 160, height: 100))
-    source.backgroundColor = .black
-    source.layer.cornerRadius = 12
+    let source = MeetingEdgeHandle(frame: CGRect(x: 0, y: 0, width: 36, height: 64))
+    source.backgroundColor = UIColor(white: 0.11, alpha: 0.96)
+    source.layer.cornerRadius = 16
+    source.layer.maskedCorners = [.layerMinXMinYCorner, .layerMinXMaxYCorner]
     source.clipsToBounds = true
-    source.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(restoreMeeting)))
-    source.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(dragWindow(_:))))
+    source.autoresizingMask = [.flexibleLeftMargin, .flexibleTopMargin, .flexibleBottomMargin]
+    source.isAccessibilityElement = true
+    source.accessibilityLabel = "返回会议"
+    source.accessibilityHint = "可上下拖动"
+    source.accessibilityTraits = .button
+    let tap = UITapGestureRecognizer(target: self, action: #selector(restoreMeeting))
+    let pan = UIPanGestureRecognizer(target: self, action: #selector(dragWindow(_:)))
+    tap.require(toFail: pan)
+    source.addGestureRecognizer(tap)
+    source.addGestureRecognizer(pan)
     self.source = source
-    let inlineLabel = UILabel(frame: source.bounds)
-    inlineLabel.text = "会议进行中"
-    inlineLabel.textColor = .white
-    inlineLabel.font = .systemFont(ofSize: 13)
-    inlineLabel.textAlignment = .center
-    inlineLabel.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    source.addSubview(inlineLabel)
-    self.inlineLabel = inlineLabel
-    let inlineVideo = VideoView()
-    inlineVideo.frame = source.bounds
-    inlineVideo.layoutMode = .fit
-    inlineVideo.mirrorMode = .off
-    inlineVideo.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    inlineVideo.isUserInteractionEnabled = false
-    source.addSubview(inlineVideo)
-    self.inlineVideo = inlineVideo
+    backgroundObserver = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+      guard let self else { return }
+      self.foreground = false
+      _ = self.start()
+    }
+    foregroundObserver = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+      guard let self else { return }
+      self.setPresentation(pageVisible: self.pageVisible, foreground: true)
+    }
+    orientationObserver = NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+      self?.layoutEdgeHandle()
+    }
     guard AVPictureInPictureController.isPictureInPictureSupported() else { return source }
     let content = AVPictureInPictureVideoCallViewController()
     content.preferredContentSize = CGSize(width: 320, height: 180)
@@ -55,6 +67,8 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     content.view.addSubview(label)
     let video = VideoView()
+    // PiP 使用 SampleBuffer 渲染，不能依赖进入后台后可能暂停的 Metal 视图。
+    video.renderMode = .sampleBuffer
     video.layoutMode = .fit
     video.mirrorMode = .off
     video.frame = content.view.bounds
@@ -72,7 +86,7 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     sourceAnchor = source
     possibilityObservation = controller.observe(\.isPictureInPicturePossible, options: [.new]) { [weak self] _, _ in
       DispatchQueue.main.async {
-        guard let self, !self.foreground else { return }
+        guard let self, !self.foreground, UIApplication.shared.applicationState == .background else { return }
         _ = self.start()
       }
     }
@@ -90,20 +104,30 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
       window.addSubview(source)
     }
     guard let window = source.window else { return }
-    if foreground && pageVisible {
-      controller?.stopPictureInPicture()
-      // 来源必须是真正可见的视图，不能用 1px 隐藏占位造成 isPictureInPicturePossible=false。
-      source.isHidden = true
+    if foreground && UIApplication.shared.applicationState == .active {
+      starting = false
+      if controller?.isPictureInPictureActive == true { controller?.stopPictureInPicture() }
+      source.isHidden = pageVisible
+      layoutEdgeHandle()
+      if !pageVisible { window.bringSubviewToFront(source) }
+      // 在前台准备稳定、可见的来源。不能在 Home / onHide 时换来源，
+      // 否则系统正在检查 PiP 能力时又重新初始化 contentSource，自动启动会失效。
       updateSourceAnchor(window.rootViewController?.view ?? window)
-    } else {
-      source.isHidden = false
-      source.frame = CGRect(x: max(12, window.bounds.width - 172),
-        y: max(window.safeAreaInsets.top + 12, window.bounds.height - window.safeAreaInsets.bottom - 210), width: 160, height: 100)
-      source.isUserInteractionEnabled = true
-      window.bringSubviewToFront(source)
-      updateSourceAnchor(source)
-      if !foreground { _ = start() }
+    } else if !foreground {
+      _ = start()
     }
+  }
+
+  func setCapturePromptVisible(_ visible: Bool) {
+    capturePromptVisible = visible
+    controller?.canStartPictureInPictureAutomaticallyFromInline = !visible
+  }
+
+  private func layoutEdgeHandle() {
+    guard let source, let window = source.window else { return }
+    let top = window.safeAreaInsets.top + 12
+    let available = max(0, window.bounds.height - top - window.safeAreaInsets.bottom - 76)
+    source.frame = CGRect(x: max(0, window.bounds.width - 36), y: top + available * edgePosition, width: 36, height: 64)
   }
 
   private func updateSourceAnchor(_ anchor: UIView) {
@@ -121,9 +145,10 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
   @objc private func dragWindow(_ recognizer: UIPanGestureRecognizer) {
     guard let source, let window = source.window else { return }
     let delta = recognizer.translation(in: window)
-    source.frame.origin = CGPoint(
-      x: min(max(0, source.frame.minX + delta.x), window.bounds.width - source.bounds.width),
-      y: min(max(window.safeAreaInsets.top, source.frame.minY + delta.y), window.bounds.height - window.safeAreaInsets.bottom - source.bounds.height))
+    let top = window.safeAreaInsets.top + 12
+    let available = max(1, window.bounds.height - top - window.safeAreaInsets.bottom - 76)
+    edgePosition = min(1, max(0, (source.frame.minY + delta.y - top) / available))
+    layoutEdgeHandle()
     recognizer.setTranslation(.zero, in: window)
   }
 
@@ -131,24 +156,32 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     if video?.track !== track { video?.track = track }
     video?.isHidden = track == nil
     placeholder?.isHidden = track != nil
-    if inlineVideo?.track !== track { inlineVideo?.track = track }
-    inlineVideo?.isHidden = track == nil
-    inlineLabel?.isHidden = track != nil
   }
 
   func start() -> Bool {
-    guard source?.window != nil, let controller, controller.isPictureInPicturePossible else { return false }
+    guard !capturePromptVisible, sourceAnchor?.window != nil, let controller else { return false }
+    if controller.isPictureInPictureActive || starting { return true }
+    guard controller.isPictureInPicturePossible else {
+      if lastFailure != "not_possible" { NSLog("[MeetingPiP] not possible yet; %@", diag()) }
+      lastFailure = "not_possible"
+      return false
+    }
+    starting = true
     controller.startPictureInPicture()
     return true
   }
 
   func stop() {
+    for observer in [backgroundObserver, foregroundObserver, orientationObserver].compactMap({ $0 }) {
+      NotificationCenter.default.removeObserver(observer)
+    }
+    backgroundObserver = nil
+    foregroundObserver = nil
+    orientationObserver = nil
     possibilityObservation = nil
+    controller?.delegate = nil
     controller?.stopPictureInPicture()
     video?.track = nil
-    inlineVideo?.track = nil
-    inlineVideo = nil
-    inlineLabel = nil
     source?.removeFromSuperview()
     restoreRequested = false
     controller = nil
@@ -157,6 +190,38 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     placeholder = nil
     source = nil
     sourceAnchor = nil
+    starting = false
+    capturePromptVisible = false
+    lastFailure = ""
+  }
+
+  func diag() -> String {
+    // 诊断轮询不能同步等待主线程，避免日志本身卡住会议页面/媒体桥接。
+    if Thread.isMainThread { refreshDiagnostics() }
+    else { DispatchQueue.main.async { [weak self] in self?.refreshDiagnostics() } }
+    diagnosticLock.lock()
+    defer { diagnosticLock.unlock() }
+    return diagnosticSnapshot
+  }
+
+  private func refreshDiagnostics() {
+    let value = "pip[possible=\(controller?.isPictureInPicturePossible == true ? 1 : 0),active=\(controller?.isPictureInPictureActive == true ? 1 : 0),source=\(sourceAnchor?.window == nil ? 0 : 1),err=\(lastFailure)]"
+    diagnosticLock.lock()
+    diagnosticSnapshot = value
+    diagnosticLock.unlock()
+  }
+
+  func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+    starting = false
+    lastFailure = ""
+  }
+
+  func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
+    failedToStartPictureInPictureWithError error: Error) {
+    starting = false
+    let failure = error as NSError
+    lastFailure = "\(failure.domain):\(failure.code)"
+    NSLog("[MeetingPiP] failed: %@", lastFailure)
   }
 
   func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
@@ -164,5 +229,23 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     // 原页面可能已返回退栈；交给业务层恢复路由，复用原 Room 而不是重新入会。
     restoreRequested = true
     completionHandler(source?.window != nil)
+  }
+}
+
+/// 固定几何路径，避免字体差异把双左箭头显示成不同大小的字符。
+private final class MeetingEdgeHandle: UIView {
+  override func draw(_ rect: CGRect) {
+    UIColor.white.setStroke()
+    let path = UIBezierPath()
+    path.lineWidth = 2
+    path.lineCapStyle = .round
+    path.lineJoinStyle = .round
+    for offset in [CGFloat(-4.5), CGFloat(4.5)] {
+      let x = bounds.midX + offset
+      path.move(to: CGPoint(x: x + 2.5, y: bounds.midY - 5))
+      path.addLine(to: CGPoint(x: x - 2.5, y: bounds.midY))
+      path.addLine(to: CGPoint(x: x + 2.5, y: bounds.midY + 5))
+    }
+    path.stroke()
   }
 }

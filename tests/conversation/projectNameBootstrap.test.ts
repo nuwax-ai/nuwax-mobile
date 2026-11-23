@@ -61,7 +61,7 @@ function fragment(startMarker: string, endMarker: string): string {
 const handlerCode = transformSync([
   fragment("  function readPositiveNumber(", "  function captureProjectChatQuery("),
   fragment("  function readNormalProjectIdFromConversation(", "  // ==================== 干预审批"),
-  fragment("  const handleSendMessage = ", "  sendInterventionResumeMessage = handleSendMessage;"),
+  fragment("  const dispatchChatMessage = ", "  sendInterventionResumeMessage = handleSendMessage;"),
   "handleSendMessage;",
 ].join("\n"), { loader: "ts" }).code;
 
@@ -82,12 +82,18 @@ function setup(
     },
     data: {
       urlOtherParams: { value: null }, chatSuggestList: { value: [] },
+      variables: { value: [] },
+      conversationId: { value: 9527 }, agentId: { value: 1596 },
       autoToLastMsg: { value: false }, needSetLockAutoToLastMsg: { value: false },
       isSendMessageRef: { value: false }, isStoppingConversation: { value: false },
     },
     props: { isTempChat: false },
     AgentDetailUtils: { toSendMessageParamsObject: (payload: Record<string, unknown>) => ({ ...payload }) },
     getConvSetVariableParams: () => ({}),
+    pendingFirstSend: { value: null },
+    hasMissingConversationSettings: () => false,
+    chatSendJournalScope: () => "",
+    saveChatSendJournal: vi.fn(),
     service: { abortSubConversation: vi.fn(), handleSendMessage: vi.fn((_params, _temp, _timeout, started) => started?.()) },
     ttsWebSocketPlayer: { unlockInGesture: vi.fn() },
     asrWebSocketClient: { disableWarmupAndDisconnect: vi.fn() },

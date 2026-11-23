@@ -37,6 +37,8 @@ nuwax-mobile-offline-sdk/              # 本机统一入口
 
 ## 3. 环境变量
 
+本地打包脚本使用 PATH 中的 `python3`，兼容 Python 3.9.6，仅使用标准库。可运行 `python3 --version` 确认当前解释器。
+
 统一入口：`source scripts/local-base-env.sh`。
 
 | 变量 | 默认 | 含义 |

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Own all Android test-host additions, including cleanup when leaving test mode."""
+from __future__ import annotations
+
 import os
 import json
 import xml.etree.ElementTree as ET

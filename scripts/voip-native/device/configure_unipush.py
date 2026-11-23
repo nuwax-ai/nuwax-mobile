@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Restore uni-push dependencies and client configuration for an opted-in local build."""
+from __future__ import annotations
+
 import json
 import os
 import re

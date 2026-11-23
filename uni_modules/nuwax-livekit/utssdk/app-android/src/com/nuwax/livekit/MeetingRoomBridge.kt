@@ -348,7 +348,7 @@ class MeetingRoomBridge(context: Context) {
     return refreshScreenShareState(r)
   }
 
-  fun diag(): String = "probe=android-edge-pip-20261123-p7 share[${screenShareDiag}] ${floatingWindow.diag()}"
+  fun diag(): String = "probe=android-meeting-20261123-p8 share[${screenShareDiag}] ${floatingWindow.diag()}"
 
   fun configureBackgroundSession(endpoint: String, token: String) { shareLease.configure(endpoint, token) }
 
@@ -365,7 +365,11 @@ class MeetingRoomBridge(context: Context) {
       if (connectedFlag) floatingWindow.setPresentation(activity, pageVisible, foreground)
     }
   }
-  fun consumeMeetingRestoreRequest(): Boolean = floatingWindow.consumeRestoreRequest()
+  fun consumeMeetingRestoreRequest(): Boolean {
+    val notification = MeetingReturnRequest.consume()
+    val window = floatingWindow.consumeRestoreRequest()
+    return connectedFlag && (notification || window)
+  }
 
   fun createPipRenderer(context: Context): SurfaceViewRenderer? {
     val r = room ?: return null

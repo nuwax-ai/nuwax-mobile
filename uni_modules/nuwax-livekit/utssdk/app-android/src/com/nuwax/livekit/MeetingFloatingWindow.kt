@@ -40,14 +40,13 @@ class MeetingFloatingWindow(private val bridge: MeetingRoomBridge) {
   private var pageVisible = true
   private var foreground = true
   private var wasInPip = false
+  private val visibleActivities = mutableSetOf<Activity>()
   @Volatile private var restoreRequested = false
   private val handler = Handler(Looper.getMainLooper())
   private val leaveListener = Runnable { requestPip("user_leave") }
   private val lifecycle = object : Application.ActivityLifecycleCallbacks {
-    override fun onActivityPaused(host: Activity) {
-      // 旧宿主没有 user-leave 监听时，在 onStop / App.onHide 之前请求 PiP。
-      if (host === activity && !leaveListenerAttached && Build.VERSION.SDK_INT < 31) requestPip("pause")
-    }
+    // 权限弹窗、锁屏和 App 内 Activity 切换也会 pause，不能据此启动系统 PiP。
+    override fun onActivityPaused(host: Activity) {}
     override fun onActivityResumed(host: Activity) {
       if (host !== activity) return
       foreground = true
@@ -57,8 +56,11 @@ class MeetingFloatingWindow(private val bridge: MeetingRoomBridge) {
     }
     override fun onActivityDestroyed(host: Activity) { if (host === activity) stop() }
     override fun onActivityCreated(host: Activity, state: Bundle?) {}
-    override fun onActivityStarted(host: Activity) {}
-    override fun onActivityStopped(host: Activity) {}
+    override fun onActivityStarted(host: Activity) { visibleActivities.add(host) }
+    override fun onActivityStopped(host: Activity) {
+      visibleActivities.remove(host)
+      if (host === activity) requestBackgroundPip()
+    }
     override fun onActivitySaveInstanceState(host: Activity, state: Bundle) {}
   }
   private val parentLayoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> layout() }
@@ -88,6 +90,7 @@ class MeetingFloatingWindow(private val bridge: MeetingRoomBridge) {
     if (activity !== host) {
       stop()
       activity = host
+      visibleActivities.add(host)
       host.application.registerActivityLifecycleCallbacks(lifecycle)
       // 部分 HX 宿主基于 ComponentActivity；反射让旧宿主无需升级 AndroidX 仍可运行。
       leaveListenerAttached = try {
@@ -100,7 +103,15 @@ class MeetingFloatingWindow(private val bridge: MeetingRoomBridge) {
     if (root == null) attach(host)
     layout()
     refreshAutoEnter()
-    if (!foreground) requestPip("app_hide")
+    if (!foreground) requestBackgroundPip()
+  }
+
+  private fun requestBackgroundPip() {
+    handler.postDelayed({
+      val host = activity
+      // user-leave / Android 12+ auto-enter 为主；旧宿主仅在真正退后台时兜底。
+      if (host != null && visibleActivities.isEmpty() && !host.hasWindowFocus()) requestPip("background")
+    }, 250)
   }
 
   fun refreshAutoEnter() {
@@ -137,32 +148,38 @@ class MeetingFloatingWindow(private val bridge: MeetingRoomBridge) {
     pipStatus = reason
   }
 
-  fun diag(): String = "pip[state=$pipStatus,leaveHook=${if (leaveListenerAttached) 1 else 0}]"
+  fun diag(): String = "pip[state=$pipStatus,page=$pageVisible,foreground=$foreground,inPip=${if (Build.VERSION.SDK_INT >= 26) activity?.isInPictureInPictureMode else false},leaveHook=${if (leaveListenerAttached) 1 else 0}]"
 
   private class EdgeHandle(context: Context) : View(context) {
     private val pen = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-      color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 2f * resources.displayMetrics.density
+      color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 1.8f
       strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
     }
     override fun onDraw(canvas: Canvas) {
       super.onDraw(canvas)
-      val unit = resources.displayMetrics.density
-      for (offset in floatArrayOf(-4.5f, 4.5f)) {
-        val x = width / 2f + offset * unit
-        canvas.drawPath(Path().apply {
-          moveTo(x + 2.5f * unit, height / 2f - 5f * unit)
-          lineTo(x - 2.5f * unit, height / 2f)
-          lineTo(x + 2.5f * unit, height / 2f + 5f * unit)
-        }, pen)
-      }
+      val size = 22f * resources.displayMetrics.density
+      canvas.save()
+      canvas.translate((width - size) / 2f, (height - size) / 2f)
+      canvas.scale(size / 24f, size / 24f)
+      canvas.drawCircle(9f, 7f, 4f, pen)
+      canvas.drawPath(Path().apply {
+        moveTo(16f, 21f); lineTo(16f, 19f)
+        cubicTo(16f, 16.79f, 14.21f, 15f, 12f, 15f); lineTo(6f, 15f)
+        cubicTo(3.79f, 15f, 2f, 16.79f, 2f, 19f); lineTo(2f, 21f)
+        moveTo(22f, 21f); lineTo(22f, 19f)
+        cubicTo(22f, 17.17f, 20.77f, 15.58f, 19f, 15.13f)
+        moveTo(16f, 3.13f); cubicTo(20f, 4.16f, 20f, 9.84f, 16f, 10.87f)
+      }, pen)
+      canvas.restore()
     }
   }
 
   private fun attach(host: Activity) {
     val parent = host.window.decorView as? ViewGroup ?: return
     val box = FrameLayout(host)
+    box.visibility = View.GONE
     box.elevation = 32f
-    val content = FrameLayout(host).apply { setBackgroundColor(Color.BLACK) }
+    val content = FrameLayout(host).apply { setBackgroundColor(Color.BLACK); visibility = View.GONE }
     content.addView(TextView(host).apply {
       text = "会议进行中"; setTextColor(Color.WHITE); textSize = 13f; gravity = Gravity.CENTER
     }, FrameLayout.LayoutParams(-1, -1))
@@ -219,7 +236,7 @@ class MeetingFloatingWindow(private val bridge: MeetingRoomBridge) {
     val box = root ?: return
     val parent = box.parent as? ViewGroup ?: return
     val inPip = Build.VERSION.SDK_INT >= 26 && host.isInPictureInPictureMode
-    val show = inPip || !pageVisible
+    val show = inPip || (foreground && !pageVisible)
     box.visibility = if (show) View.VISIBLE else View.GONE
     pipContent?.visibility = if (inPip) View.VISIBLE else View.GONE
     edgeHandle?.visibility = if (inPip) View.GONE else View.VISIBLE
@@ -249,6 +266,7 @@ class MeetingFloatingWindow(private val bridge: MeetingRoomBridge) {
       catch (_: ReflectiveOperationException) {}
     }
     leaveListenerAttached = false
+    visibleActivities.clear()
     pipRequestPending = false
     if (Build.VERSION.SDK_INT >= 31) {
       try { activity?.setPictureInPictureParams(PictureInPictureParams.Builder().setAutoEnterEnabled(false).build()) } catch (_: Exception) {}

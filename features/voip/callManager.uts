@@ -11,6 +11,7 @@ import { generateUUID } from "@/utils/common";
 import { getImSessionStamp } from "@/utils/im/imSessionScope";
 import { hasAppPrivacyConsent } from "@/utils/appPrivacyConsent";
 import { isAppInBackground } from "@/utils/appLifecycle";
+import { openMeetingInvite, clearMeetingInviteNavigation, flushMeetingInviteNavigation } from "@/utils/meeting/meetingInviteNavigation";
 import { executeVoip, drainVoipEvents, ensureVoipPermissions, openVoipAppSettings } from "@/uni_modules/nuwax-voip";
 // #ifdef APP-IOS
 import { revokeVoipPushBeforeLogout } from "@/uni_modules/nuwax-voip";
@@ -167,10 +168,7 @@ function consumeNative(): void {
           if (convId.length > 0 && msgId.length > 0 && inviteId.length > 0) {
             apiImMeetingInviteHandled(convId, msgId, inviteId, room, true);
           }
-          uni.navigateTo({
-            url: "/subpackages/pages/im-meeting/im-meeting-room?room=" + encodeURIComponent(room) +
-              "&title=" + encodeURIComponent(title) + "&status=1&host=0&call=1&video=" + (media == "video" ? "1" : "0"),
-          });
+          openMeetingInvite(inviteId, room, title, media, `${event["passcode"] ?? ""}`);
         } else if ((action == "reject" || action == "timeout") && convId.length > 0 && msgId.length > 0 && inviteId.length > 0) {
           apiImMeetingInviteHandled(convId, msgId, inviteId, room, false);
         }
@@ -240,6 +238,7 @@ export function clearVoipSession(): void {
   // #ifdef APP-IOS
   voipLogoutStamp = ""; voipLogoutRevocation = null;
   // #endif
+  clearMeetingInviteNavigation();
   bootstrapSerial += 1; createSerial += 1;
   setVoipDevSession(null);
   try { send({ op: "reset" } as UTSJSONObject); } catch (_e) { /* Older bases must still be able to log out. */ }
@@ -280,7 +279,10 @@ export async function bootstrapVoip(): Promise<void> {
   // Do not reset the native singleton here: it may already own a cold-start system call.
   if (timer != 0) { clearInterval(timer); timer = 0; }
   const sameIdentity = userId == uid && deviceId == `${config["deviceId"]}` && sessionApiBase == `${config["apiBaseUrl"]}`;
-  if (!sameIdentity) { store.reset(); pendingIncomingPageId = ""; resetCallControls(); voipHistory.value = []; releaseVoipAudio(); }
+  if (!sameIdentity) {
+    if (userId.length > 0) clearMeetingInviteNavigation();
+    store.reset(); pendingIncomingPageId = ""; resetCallControls(); voipHistory.value = []; releaseVoipAudio();
+  }
   sessionStamp = currentScope; userId = uid; deviceId = `${config["deviceId"]}`;
   sessionApiBase = `${config["apiBaseUrl"]}`;
   nativeScope = generateUUID();
@@ -300,7 +302,14 @@ export async function bootstrapVoip(): Promise<void> {
   inviterParams.set("name", "{name}");
   labels["meetingInvitedBy"] = t("Mobile.Voip.meetingInvitedBy", inviterParams as Record<string, string | number>);
   config["labels"] = labels;
-  send(config);
+  try {
+    send(config);
+  } catch (error) {
+    // 初始化失败不能留下“已经初始化”的会话戳，否则下次回前台也不会重试。
+    sessionStamp = "";
+    voipError.value = "CALL_SYSTEM_UNAVAILABLE";
+    throw error;
+  }
   timer = setInterval((): void => { consumeNative(); }, 100);
 }
 
@@ -405,7 +414,16 @@ export function setVoipMicrophone(enabled: boolean): void { send({ op: "micropho
 export function setVoipCamera(enabled: boolean): void { send({ op: "camera", enabled } as UTSJSONObject); }
 export function setVoipSpeaker(enabled: boolean): void { send({ op: "speaker", enabled } as UTSJSONObject); }
 export function switchVoipCamera(): void { send({ op: "switchCamera" } as UTSJSONObject); }
-export function setVoipBackground(hidden: boolean): void { send({ op: "background", hidden } as UTSJSONObject); }
+export function setVoipBackground(hidden: boolean): void {
+  if (!hidden) flushMeetingInviteNavigation();
+  try {
+    send({ op: "background", hidden } as UTSJSONObject);
+  } catch (_e) {
+    // 原生插件异常不能打断 App.onHide 后续的角标清理、轮询停止和 IM 退后台。
+    voipError.value = "CALL_SYSTEM_UNAVAILABLE";
+    console.error("[VoipCall] native background notification unavailable");
+  }
+}
 // #ifdef APP-ANDROID
 export function setVoipCallPageVisible(callId: string, visible: boolean): void {
   send({ op: "callPageVisibility", callId, visible } as UTSJSONObject);

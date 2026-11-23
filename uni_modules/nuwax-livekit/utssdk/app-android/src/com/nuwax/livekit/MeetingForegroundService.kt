@@ -17,9 +17,12 @@ class MeetingForegroundService : Service() {
     if (Build.VERSION.SDK_INT >= 26) {
       manager.createNotificationChannel(NotificationChannel(CHANNEL, "进行中的会议", NotificationManager.IMPORTANCE_LOW))
     }
-    val launch = packageManager.getLaunchIntentForPackage(packageName)
-    val pending = launch?.let { PendingIntent.getActivity(this, 0, it,
-      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE) }
+    val session = MeetingReturnRequest.begin()
+    val launch = Intent(this, MeetingReturnActivity::class.java)
+      .putExtra("meetingSession", session)
+      .setData(android.net.Uri.parse("nuwax-meeting://resume/" + session))
+    val pending = PendingIntent.getActivity(this, NOTIFICATION_ID, launch,
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     val builder = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL) else Notification.Builder(this)
     val notification = builder.setSmallIcon(android.R.drawable.ic_menu_call)
       .setContentTitle("会议进行中").setContentText("点击返回会议")
@@ -48,6 +51,9 @@ class MeetingForegroundService : Service() {
         android.util.Log.w("MeetingBridge", "background meeting service unavailable")
       }
     }
-    fun stop(context: Context) { context.stopService(Intent(context, MeetingForegroundService::class.java)) }
+    fun stop(context: Context) {
+      MeetingReturnRequest.clear()
+      context.stopService(Intent(context, MeetingForegroundService::class.java))
+    }
   }
 }

@@ -1,8 +1,12 @@
 import { apiResData } from "@/utils/apiResponse";
 import type { RequestResponse } from "@/types/interfaces/request";
+import eventBus from "@/utils/eventBus";
+import { getImSessionStamp } from "@/utils/im/imSessionScope";
+
+export const IM_CONV_READ_LOCAL = "im_conv_read_local";
 
 /**
- * 本端 read 上报回包 → 消息列表行角标本地纠正（模块单例，单槽标记）。
+ * 本端 read 回包立即通知列表；各列表独立消费，兼容晚回包和隐藏页面。
  *
  * 后端 ReadReportResult.unreadCleared 的设计用途就是「来源端本地立即清红点」：
  * 来源端被 deviceId 排除、收不到自己的 CONV_UNREAD 帧（02 §7.5），全靠回包回显。
@@ -18,15 +22,27 @@ export class ConvReadMark {
   cleared: number;
   /** readSeqAfter >= lastMsgSeq：已读到最新（本 App 上报恒为 maxSeq，常态 true）。 */
   caughtUp: boolean;
+  readSeq: number;
 
-  constructor(convId: string, cleared: number, caughtUp: boolean) {
+  constructor(convId: string, cleared: number, caughtUp: boolean, readSeq: number) {
     this.convId = convId;
     this.cleared = cleared;
     this.caughtUp = caughtUp;
+    this.readSeq = readSeq;
   }
 }
 
-let pendingMark: ConvReadMark | null = null;
+let messageMarks: ConvReadMark[] = [];
+let unionMarks: ConvReadMark[] = [];
+let markSession = "";
+let viewedMarks: ConvReadMark[] = [];
+
+function syncMarkSession(): void {
+  const current = getImSessionStamp();
+  if (markSession == current) return;
+  markSession = current;
+  messageMarks = []; unionMarks = []; viewedMarks = [];
+}
 
 function readMarkNumber(obj: UTSJSONObject, key: string, fallback: number): number {
   const raw = obj[key];
@@ -43,9 +59,9 @@ function readMarkBool(obj: UTSJSONObject, key: string): boolean {
 }
 
 /**
- * read 上报成功回包（调用方须先校验 SUCCESS_CODE）→ 解析并落单槽标记。
- * advanced != true（水位未推进/被 clamp 的重复上报）与 redisDegraded=true
- * （未读书目可能不实）都不做本地纠正，回落全量 pull 兜底。
+ * read 上报成功回包（调用方须先校验 SUCCESS_CODE）→ 解析并通知各列表。
+ * 水位未前进也可能清除了残余未读，不能只判断 advanced。
+ * 限流或 Redis 降级时不伪造清零，仍由全量 pull 兜底。
  * convId 用调用方本地值，不读回包（int64 雪花号 H5/小程序 JSON.parse 丢精度）。
  */
 export function noteConvReadFromReadReport(
@@ -56,19 +72,64 @@ export function noteConvReadFromReadReport(
   const dataRaw = apiResData<any>(response);
   const obj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
   if (obj == null) return;
-  if (!readMarkBool(obj, "advanced")) return;
-  if (readMarkBool(obj, "redisDegraded")) return;
+  if (readMarkBool(obj, "rateLimited") || readMarkBool(obj, "redisDegraded")) return;
   const cleared = readMarkNumber(obj, "unreadCleared", 0);
   const after = readMarkNumber(obj, "readSeqAfter", 0);
   const last = readMarkNumber(obj, "lastMsgSeq", 0);
   const caughtUp = last > 0 && after >= last;
   if (cleared <= 0 && !caughtUp) return;
-  pendingMark = new ConvReadMark(convId, cleared, caughtUp);
+  syncMarkSession();
+  const mark = new ConvReadMark(convId, cleared, caughtUp, after);
+  messageMarks.push(mark); unionMarks.push(mark);
+  if (messageMarks.length > 128) messageMarks.shift();
+  if (unionMarks.length > 128) unionMarks.shift();
+  eventBus.emit(IM_CONV_READ_LOCAL, {});
 }
 
-/** 消息列表 onShow 消费（取出即清）。单槽够用：两次进聊天页之间必经列表 onShow。 */
-export function consumeConvReadMark(): ConvReadMark | null {
-  const mark = pendingMark;
-  pendingMark = null;
-  return mark;
+/** 真正展示会话后立即清行角标，不等待 read 请求。服务端确认水位仍单独维护。 */
+export function noteConvViewedLocally(convId: string, seq: number): void {
+  if (convId.length == 0 || seq <= 0) return;
+  syncMarkSession();
+  const index = viewedMarks.findIndex((mark: ConvReadMark): boolean => mark.convId == convId);
+  if (index >= 0 && viewedMarks[index].readSeq >= seq) return;
+  const mark = new ConvReadMark(convId, 0, true, seq);
+  if (index >= 0) viewedMarks.splice(index, 1);
+  viewedMarks.push(mark);
+  if (viewedMarks.length > 128) viewedMarks.shift();
+  messageMarks.push(mark); unionMarks.push(mark);
+  if (messageMarks.length > 128) messageMarks.shift();
+  if (unionMarks.length > 128) unionMarks.shift();
+  eventBus.emit(IM_CONV_READ_LOCAL, {});
+}
+
+/** 已查看水位覆盖旧列表回包；更高水位的新消息仍保留服务端未读数。 */
+export function unreadAfterLocalView(convId: string, unread: number, latestSeq: number): number {
+  syncMarkSession();
+  if (latestSeq <= 0) return unread;
+  for (let i = 0; i < viewedMarks.length; i++) {
+    const mark = viewedMarks[i];
+    if (mark.convId == convId && latestSeq <= mark.readSeq) return 0;
+  }
+  return unread;
+}
+
+/** 两个常驻列表分别消费，不能由另一列表抢走标记。 */
+export function consumeConvReadMark(consumer: string = "message"): ConvReadMark | null {
+  syncMarkSession();
+  const mark = consumer == "union" ? unionMarks.shift() : messageMarks.shift();
+  return mark ?? null;
+}
+
+/** 旧回包不能清掉后来收到的新消息；这种情况由列表刷新返回权威数。 */
+export function unreadAfterConvRead(mark: ConvReadMark, unread: number, latestSeq: number): number {
+  if (latestSeq > mark.readSeq) return unread;
+  return mark.caughtUp ? 0 : Math.max(0, unread - mark.cleared);
+}
+
+export function confirmedConvReadSeq(response: RequestResponse<any>, requested: number): number {
+  const data = apiResData<any>(response);
+  if (data == null) return requested;
+  const obj = data as UTSJSONObject;
+  if (readMarkBool(obj, "rateLimited")) return 0;
+  return readMarkNumber(obj, "readSeqAfter", requested);
 }

@@ -32,7 +32,8 @@ import Combine
  */
 public class MeetingRoomBridge: NSObject {
   /// 与页面诊断配套；只有重新制作原生基座才会更新。
-  private static let probeBuild = "ios-share-fallback-pip-20261123-p7"
+  private static let probeBuild = "ios-meeting-20261123-p8"
+  private static var broadcastConfigurationText = "unchecked"
   /// iOS → Android 共享流参数。写入 diag，方便仅凭真机日志确认新基座是否生效。
   private static let screenSharePublishProfile = "bounded720p30-3Mbps-single-h264"
 
@@ -260,7 +261,7 @@ public class MeetingRoomBridge: NSObject {
     let conn = connectedFlag ? 1 : 0
     let pip = MeetingPictureInPicture.shared.diag()
     // 原生基座版本标记：页面据此避开旧基座的 UIView 返回值桥接路径。
-    return "bridge=ios-native-view-v2 probe=\(probeBuild) main=\(main) view=\(view) cam=\(cam) conn=\(conn) remotes=\(remoteViews.count) remotePub=\(remoteVideoPublicationDiag()) shareCfg=\(screenSharePublishProfile) \(localScreenShareDiag()) \(pip) dev=\(deviceErrorText)"
+    return "bridge=ios-native-view-v2 probe=\(probeBuild) main=\(main) view=\(view) cam=\(cam) conn=\(conn) remotes=\(remoteViews.count) remotePub=\(remoteVideoPublicationDiag()) broadcastCfg=\(broadcastConfigurationText) shareCfg=\(screenSharePublishProfile) \(localScreenShareDiag()) \(pip) dev=\(deviceErrorText)"
   }
 
   /// 配置值不能代表实际编码结果；输出 SDK 统计中的真实尺寸、帧率、编码器和限速原因。
@@ -441,21 +442,25 @@ public class MeetingRoomBridge: NSObject {
       let requestID = screenShareRequestID
       screenShareLock.unlock()
       MeetingShareLease.shared.acquired()
-      guard let bundleID = Bundle.main.bundleIdentifier else {
-        screenShareErrorText = "broadcast_extension_missing"
-        MeetingShareLease.shared.release()
-        return
-      }
-      let extensionID = Bundle.main.object(forInfoDictionaryKey: "RTCScreenSharingExtension") as? String ?? "\(bundleID).broadcast"
-      let groupID = Bundle.main.object(forInfoDictionaryKey: "RTCAppGroupIdentifier") as? String ?? "group.\(bundleID)"
-      let extensions = Bundle.main.builtInPlugInsURL.flatMap {
-        try? FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)
-      } ?? []
-      guard extensions.contains(where: { Bundle(url: $0)?.bundleIdentifier == extensionID }),
-            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID) != nil else {
+      guard let extensionID = Bundle.main.object(forInfoDictionaryKey: "RTCScreenSharingExtension") as? String, !extensionID.isEmpty,
+            let groupID = Bundle.main.object(forInfoDictionaryKey: "RTCAppGroupIdentifier") as? String, !groupID.isEmpty else {
+        broadcastConfigurationText = "missing_plist_keys"
+        bridgeLog("broadcast unavailable: missing_plist_keys")
         offerInAppScreenShare()
         return
       }
+      let extensions = Bundle.main.builtInPlugInsURL.flatMap {
+        try? FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)
+      } ?? []
+      let hasExtension = extensions.contains(where: { Bundle(url: $0)?.bundleIdentifier == extensionID })
+      let hasGroup = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID) != nil
+      guard hasExtension && hasGroup else {
+        broadcastConfigurationText = !hasExtension ? "missing_extension" : "missing_app_group"
+        bridgeLog("broadcast unavailable: \(broadcastConfigurationText)")
+        offerInAppScreenShare()
+        return
+      }
+      broadcastConfigurationText = "ready"
       screenShareErrorText = ""
       usingBroadcastExtension = true
       broadcastPending = true
@@ -492,13 +497,27 @@ public class MeetingRoomBridge: NSObject {
   }
 
   /// 未嵌入扩展的云基座仍可使用原来的应用内录屏；先说明范围，不能冒充整屏共享。
-  private static func offerInAppScreenShare() {
+  private static func offerInAppScreenShare(attempt: Int = 0) {
+    let requestID = screenShareRequestID
+    broadcastPending = true
     let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
       .first { $0.activationState == .foregroundActive }
-    var presenter = scene?.windows.first(where: { $0.isKeyWindow })?.rootViewController
+    // HX 宿主可能仍使用 AppDelegate 窗口，不能只查 UIScene 而丢失授权提示。
+    let window = scene?.windows.first(where: { $0.isKeyWindow })
+      ?? UIApplication.shared.windows.first(where: { $0.isKeyWindow && !$0.isHidden })
+    var presenter = window?.rootViewController
     while let next = presenter?.presentedViewController { presenter = next }
-    guard let presenter, !presenter.isBeingDismissed else {
-      screenShareErrorText = "broadcast_extension_missing"
+    guard UIApplication.shared.applicationState == .active, let presenter,
+          !presenter.isBeingDismissed, presenter.viewIfLoaded?.window != nil else {
+      if attempt < 3 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+          guard requestID == screenShareRequestID, broadcastPending, connectedFlag else { return }
+          offerInAppScreenShare(attempt: attempt + 1)
+        }
+        return
+      }
+      broadcastPending = false
+      screenShareErrorText = "share_ui_unavailable"
       MeetingShareLease.shared.release()
       return
     }
@@ -506,7 +525,6 @@ public class MeetingRoomBridge: NSObject {
     usingBroadcastExtension = false
     MeetingPictureInPicture.shared.setCapturePromptVisible(true)
     screenShareErrorText = ""
-    let requestID = screenShareRequestID
     let alert = UIAlertController(title: "共享当前应用", message: "当前安装包暂不支持共享整个手机屏幕。可继续共享本应用中的画面；切换到桌面或其他应用后，对方看不到这些内容。", preferredStyle: .alert)
     alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in
       guard requestID == screenShareRequestID else { return }

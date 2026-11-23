@@ -61,7 +61,7 @@ function fragment(startMarker: string, endMarker: string): string {
 const handlerCode = transformSync([
   fragment("  function readPositiveNumber(", "  function captureProjectChatQuery("),
   fragment("  function readNormalProjectIdFromConversation(", "  // ==================== 干预审批"),
-  fragment("  const handleSendMessage = ", "  sendInterventionResumeMessage = handleSendMessage;"),
+  fragment("  const dispatchChatMessage = ", "  sendInterventionResumeMessage = handleSendMessage;"),
   "handleSendMessage;",
 ].join("\n"), { loader: "ts" }).code;
 

@@ -23,7 +23,7 @@
  */
 
 import { SUCCESS_CODE } from "@/constants/codes.constants";
-import { apiImMeetingIssueToken, apiImMeetingPublicRoomSafe, apiImMeetingTakeShareHolder, apiImMeetingReleaseShareHolder } from "@/servers/imMeeting";
+import { apiImMeetingIssueToken, apiImMeetingPublicRoomSafe, apiImMeetingTakeShareHolder, apiImMeetingGuestReleaseShareHolder, meetingShareReleaseEndpoint } from "@/servers/imMeeting";
 import { apiResCode, apiResData } from "@/utils/apiResponse";
 // 会议媒体状态变更广播走仓内 eventBus（App-Android 上 uni.$on 的订阅者有零触发前科）
 import eventBus from "@/utils/eventBus";
@@ -53,6 +53,11 @@ import {
   stopScreenShare as livekitStopScreenShare,
   isScreenShareOn as livekitIsScreenShareOn,
   screenShareError as livekitScreenShareError,
+  configureBackgroundSession as livekitConfigureBackgroundSession,
+  releaseMeetingPageViews as livekitReleaseMeetingPageViews,
+  isScreenShareStopping as livekitIsScreenShareStopping,
+  setMeetingPresentation as livekitSetMeetingPresentation,
+  consumeMeetingRestoreRequest as livekitConsumeMeetingRestoreRequest,
 } from "@/uni_modules/nuwax-livekit";
 // #endif
 
@@ -110,6 +115,26 @@ export class MeetingRoomMetadata {
 // ---------------------------------------------------------------- 内部状态
 
 let state = new MeetingMediaState();
+let activeRoom = "";
+// 仅内存中保存入会凭据，禁止写 storage/日志或广播扩展共享目录。
+let activeMeetingToken = "";
+let resumeURL = "";
+let minimized = false;
+let sessionPollTimer = -1;
+let shareRequested = false;
+let shareObservedOn = false;
+let shareAttemptStartedAt = 0;
+let shareGeneration = 0;
+let shareNativeRequested = false;
+let shareRequestInFlight = false;
+let shareStopping = false;
+let connectGeneration = 0;
+// 后台扩展是独立能力。旧基座普通入会仍可用，不能因新增导出缺失误报连接失败。
+let backgroundSessionReady = false;
+let meetingPageVisible = true;
+let appForeground = true;
+let nativePresentationReady = false;
+let resumeNavigating = false;
 
 function readStr(obj: UTSJSONObject, key: string): string {
   const value = obj[key];
@@ -146,6 +171,22 @@ function changed(): void {
 
 function resetState(): void {
   state = new MeetingMediaState();
+  activeRoom = "";
+  activeMeetingToken = "";
+  backgroundSessionReady = false;
+  nativePresentationReady = false;
+  meetingPageVisible = true;
+  resumeNavigating = false;
+  resumeURL = "";
+  minimized = false;
+  shareRequested = false;
+  shareNativeRequested = false;
+  shareObservedOn = false;
+  shareAttemptStartedAt = 0;
+  if (sessionPollTimer != -1) {
+    clearInterval(sessionPollTimer);
+    sessionPollTimer = -1;
+  }
 }
 
 /** 连接结果轮询句柄（-1 = 没在轮询）。 */
@@ -157,6 +198,46 @@ function stopConnectPoll(): void {
     connectPollTimer = -1;
   }
 }
+
+/** 原生确认入会后再配置后台能力；Android connect 内部也会清理旧会话配置。 */
+function configureConnectedBackgroundSession(): void {
+  backgroundSessionReady = false;
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    livekitConfigureBackgroundSession(meetingShareReleaseEndpoint(activeRoom), activeMeetingToken);
+    backgroundSessionReady = true;
+  } catch (_error) {
+    // 不输出异常原文：跨桥调用参数可能含 JWT。真实基座标记由既有 diag 提供。
+    console.error("[Meeting] background session unavailable; native connection remains active. Check installed custom base probe.");
+  }
+  // #endif
+  syncMeetingPresentation();
+}
+
+function syncMeetingPresentation(): void {
+  if (!state.connected) return;
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    livekitSetMeetingPresentation(meetingPageVisible && !minimized, appForeground);
+    nativePresentationReady = true;
+  } catch (_e) {
+    // 旧基座继续使用 App 内返回会议提示，不牵连聊天、举手和原有共享。
+    nativePresentationReady = false;
+  }
+  // #endif
+}
+
+export function meetingMediaSetPageVisible(visible: boolean): void {
+  meetingPageVisible = visible;
+  if (visible) minimized = false;
+  syncMeetingPresentation();
+  changed();
+}
+export function meetingMediaSetAppForeground(foreground: boolean): void {
+  appForeground = foreground;
+  syncMeetingPresentation();
+}
+export function meetingMediaHasNativeWindow(): boolean { return nativePresentationReady; }
 
 /**
  * 连接结果轮询：每 500ms 问一次原生层「连上了吗/出错了吗」，最多约 20 秒。
@@ -186,6 +267,8 @@ function startConnectPoll(): void {
       // 入会默认设备状态（麦克风关、摄像头关），与 connect 入参一致
       state.micOn = false;
       state.cameraOn = false;
+      configureConnectedBackgroundSession();
+      meetingMediaReconcile();
       changed();
       return;
     }
@@ -199,6 +282,10 @@ function startConnectPoll(): void {
     }
     if (ticks > 40) {
       stopConnectPoll();
+      // 超时后不能让原生稍后再连成一个无人管理的后台会议。
+      // #ifdef APP-ANDROID || APP-IOS
+      try { livekitDisconnect(); } catch (_e) {}
+      // #endif
       state.connecting = false;
       state.errorText = "connect";
       changed();
@@ -282,6 +369,28 @@ export function meetingMediaState(): MeetingMediaState {
   return copy;
 }
 
+export function meetingMediaActiveRoom(): string { return state.connected || state.connecting ? activeRoom : ""; }
+export function meetingMediaIsMinimized(): boolean { return minimized && state.connected; }
+export function meetingMediaSetResumeURL(url: string): void { resumeURL = url; }
+export function meetingMediaSetMinimized(on: boolean): void {
+  minimized = on;
+  meetingPageVisible = !on;
+  syncMeetingPresentation();
+  changed();
+}
+export function meetingMediaResume(): void {
+  if (resumeURL.length == 0 || !state.connected || resumeNavigating) return;
+  const pages = getCurrentPages();
+  if (pages.length > 0 && pages[pages.length - 1].route == "subpackages/pages/im-meeting/im-meeting-room") return;
+  resumeNavigating = true;
+  uni.navigateTo({ url: resumeURL, complete: (_res) => { resumeNavigating = false; } });
+}
+export function meetingMediaReleasePageViews(): void {
+  // #ifdef APP-ANDROID || APP-IOS
+  try { livekitReleaseMeetingPageViews(); } catch (_e) {}
+  // #endif
+}
+
 // ---------------------------------------------------------------- 连接 / 断开
 
 /**
@@ -291,7 +400,9 @@ export function meetingMediaState(): MeetingMediaState {
  */
 export async function meetingMediaConnect(options: MeetingMediaOptions): Promise<boolean> {
   if (state.connected) {
-    return true;
+    if (activeRoom == options.room) return true;
+    // 最小化后也只允许一场会议，不能把旧 Room 当作新会议的连接成功。
+    return false;
   }
   if (state.connecting) {
     return false;
@@ -301,6 +412,10 @@ export async function meetingMediaConnect(options: MeetingMediaOptions): Promise
     return false;
   }
   state.connecting = true;
+  backgroundSessionReady = false;
+  activeRoom = options.room;
+  connectGeneration += 1;
+  const generation = connectGeneration;
   state.errorText = "";
   changed();
   try {
@@ -309,6 +424,7 @@ export async function meetingMediaConnect(options: MeetingMediaOptions): Promise
     //   ★预检请求本身失败（网络/500）时放行连接：宁可偶尔多一次连接尝试，也不要把
     //     刚建好的会议挡在门外。
     const pre = await apiImMeetingPublicRoomSafe(options.room);
+    if (generation != connectGeneration) return false;
     if (apiResCode(pre) == SUCCESS_CODE) {
       const preRaw = apiResData<any>(pre);
       const preObj = preRaw != null ? (preRaw as UTSJSONObject) : null;
@@ -339,6 +455,7 @@ export async function meetingMediaConnect(options: MeetingMediaOptions): Promise
     }
 
     const res = await apiImMeetingIssueToken(options.room, options.displayName, "", options.passcode);
+    if (generation != connectGeneration) return false;
     if (apiResCode(res) != SUCCESS_CODE) {
       state.connecting = false;
       // ★按错误码给人话：被移出/密码错如果只说「连接失败」，用户会一直重试
@@ -384,6 +501,7 @@ export async function meetingMediaConnect(options: MeetingMediaOptions): Promise
     // 状态经回调持续回报（连上/断开/人数变化），这里不等同步结果
     // 入会默认：**麦克风关**（由用户主动点开）、摄像头关
     // ★不传回调（UTS 回调跨到 Swift 会变成 UTSCallback 编不过），改为轮询状态
+    activeMeetingToken = token;
     livekitConnect(wsUrl, token, options.room, options.displayName, false, false);
     startConnectPoll();
     // #endif
@@ -397,6 +515,8 @@ export async function meetingMediaConnect(options: MeetingMediaOptions): Promise
 
     return state.connected;
   } catch (_error) {
+    if (generation != connectGeneration) return false;
+    console.error("[Meeting] connect setup failed before polling; check token response and native bridge availability");
     state.connecting = false;
     state.errorText = "exception";
     changed();
@@ -408,11 +528,11 @@ export async function meetingMediaConnect(options: MeetingMediaOptions): Promise
  * 离开会议：只断自己，不删房（对齐 PC「仅退出」；结束会议是主持人动作，走服务端删房）。
  */
 export async function meetingMediaDisconnect(): Promise<void> {
+  connectGeneration += 1;
   // 停掉连接结果轮询，避免退房后还把状态改回 connected
   stopConnectPoll();
-  if (!state.connected && !state.connecting) {
-    resetState();
-    return;
+  if (shareRequested || shareObservedOn) {
+    void meetingMediaStopScreenShare(activeRoom);
   }
   // Android/iOS：交给插件退房（停采集、停前台服务/通知、归还音频会话）
   // #ifdef APP-ANDROID || APP-IOS
@@ -607,30 +727,112 @@ export function meetingMediaDrainMessages(): string {
 /** Acquire server ownership before prompting the platform screen-capture consent UI. */
 export async function meetingMediaStartScreenShare(room: string): Promise<boolean> {
   if (!state.connected || (meetingMediaPlatform() != "android" && meetingMediaPlatform() != "ios")) return false;
+  // 后台整屏共享是新增能力；旧基座仍走原有 requestScreenShare，不能禁用已验证的应用内共享。
+  if (shareRequested || shareRequestInFlight || shareStopping) return false;
+  // #ifdef APP-ANDROID || APP-IOS
+  if (backgroundSessionReady) {
+    try { if (livekitIsScreenShareStopping()) return false; } catch (_e) {}
+  }
+  // #endif
+  shareRequestInFlight = true;
+  shareGeneration += 1;
+  const attempt = shareGeneration;
+  const generation = connectGeneration;
+  const seatToken = activeMeetingToken;
+  shareRequested = true;
+  shareAttemptStartedAt = Date.now();
   try {
     const response = await apiImMeetingTakeShareHolder(room);
+    if (generation != connectGeneration || activeRoom != room || attempt != shareGeneration) {
+      // 申请占位过程中退出，迟到的成功结果也要归还原席位。
+      if (apiResCode(response) == SUCCESS_CODE && seatToken.length > 0) {
+        void apiImMeetingGuestReleaseShareHolder(room, seatToken);
+      }
+      return false;
+    }
     if (apiResCode(response) != SUCCESS_CODE) {
       // 共享失败定位口：服务端拒绝（限流/权限）与端上授权失败要能分开
       console.error(`[Meeting] takeShareHolder failed code=${apiResCode(response)}`);
+      shareRequested = false;
       return false;
     }
     // #ifdef APP-ANDROID || APP-IOS
     console.error(`[Meeting] takeShareHolder ok, request native capture platform=${meetingMediaPlatform()}`);
     livekitRequestScreenShare();
+    shareNativeRequested = true;
     // #endif
     return true;
   } catch (_e) {
+    if (generation == connectGeneration) {
+      shareRequested = false;
+      if (seatToken.length > 0) void apiImMeetingGuestReleaseShareHolder(room, seatToken);
+    }
     console.error(`[Meeting] takeShareHolder threw: ${_e}`);
     return false;
+  } finally {
+    shareRequestInFlight = false;
   }
 }
 
 /** Stop local capture first even if releasing server ownership fails. */
 export async function meetingMediaStopScreenShare(room: string): Promise<void> {
+  if (shareStopping) return;
+  shareStopping = true;
+  const seatToken = activeMeetingToken;
+  shareGeneration += 1;
+  shareRequested = false;
+  shareNativeRequested = false;
+  shareObservedOn = false;
+  shareAttemptStartedAt = 0;
   // #ifdef APP-ANDROID || APP-IOS
   try { livekitStopScreenShare(); } catch (_e) {}
   // #endif
-  try { await apiImMeetingReleaseShareHolder(room); } catch (_e) {}
+  // 使用席位凭据仅释放自己，主持人也不能误释放刚接管共享的其他成员。
+  if (seatToken.length > 0 && room.length > 0) {
+    try { await apiImMeetingGuestReleaseShareHolder(room, seatToken); } catch (_e) {}
+  }
+  shareStopping = false;
+}
+
+/** 页面最小化后仍在应用级校准；真正后台采集/接管/停止由原生负责。 */
+export function meetingMediaReconcile(expectedRoom: string = ""): void {
+  // 仅恢复本次仍持有的会话。主动离会已清空 room/token，绝不能把迟到状态当成重新入会。
+  if (activeRoom.length == 0 || activeMeetingToken.length == 0) return;
+  if (expectedRoom.length > 0 && activeRoom != expectedRoom) return;
+  let restored = false;
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    if (!livekitIsConnected()) {
+      if (state.connected) void meetingMediaDisconnect();
+      return;
+    }
+    // 原生已连接而业务状态落成 exception：按真实连接恢复，不重新签票、断会或重建 Room。
+    if (!state.connected) {
+      stopConnectPoll();
+      state.connected = true;
+      state.connecting = false;
+      state.errorText = "";
+      configureConnectedBackgroundSession();
+      restored = true;
+    }
+    const on = livekitIsScreenShareOn();
+    const error = livekitScreenShareError();
+    if (on) shareObservedOn = true;
+    else if (shareObservedOn || (shareNativeRequested && error.length > 0) ||
+      (shareRequested && shareAttemptStartedAt > 0 && Date.now() - shareAttemptStartedAt > 65000)) {
+      void meetingMediaStopScreenShare(activeRoom);
+    }
+  } catch (_e) {}
+  // #endif
+  if (sessionPollTimer == -1) sessionPollTimer = setInterval(() => { meetingMediaReconcile(); }, 2000);
+  // #ifdef APP-ANDROID || APP-IOS
+  if (appForeground && nativePresentationReady) {
+    try {
+      if (livekitConsumeMeetingRestoreRequest()) meetingMediaResume();
+    } catch (_e) {}
+  }
+  // #endif
+  if (restored) changed();
 }
 
 export function meetingMediaScreenShareOn(): boolean {

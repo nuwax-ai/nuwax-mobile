@@ -68,6 +68,12 @@ class MeetingRoomBridge(context: Context) {
   private val remoteTracks = HashMap<String, VideoTrack>()
   private val meetingMessages = ConcurrentLinkedQueue<String>()
   @Volatile private var screenShareOn = false
+  private val shareLease = MeetingShareLease()
+  private var shareRequestID = 0
+  private var sharePending = false
+  private var pipTrack: VideoTrack? = null
+  private var pipRenderer: SurfaceViewRenderer? = null
+  private val floatingWindow = MeetingFloatingWindow(this)
   @Volatile private var screenShareError = ""
   /** 本地共享发布诊断：授权成功不等于 LiveKit 已经发布出可订阅视频轨。 */
   @Volatile private var screenShareDiag = "off"
@@ -76,11 +82,8 @@ class MeetingRoomBridge(context: Context) {
 
   companion object {
     @Volatile private var activeBridge: MeetingRoomBridge? = null
+    @JvmStatic fun current(): MeetingRoomBridge? = activeBridge
 
-    @JvmStatic
-    fun completeScreenCapture(resultCode: Int, data: Intent?) {
-      activeBridge?.onScreenCaptureResult(resultCode, data)
-    }
   }
 
   /**
@@ -96,6 +99,7 @@ class MeetingRoomBridge(context: Context) {
   ) {
     disconnectInternal(false)
     activeBridge = this
+    MeetingForegroundService.start(appContext)
     meetingMessages.clear()
     screenShareOn = false
     screenShareError = ""
@@ -113,6 +117,18 @@ class MeetingRoomBridge(context: Context) {
           created.events.collect { event ->
             if (event is RoomEvent.DataReceived) {
               acceptMeetingData(event)
+            }
+            if (event is RoomEvent.RoomMetadataChanged) {
+              val holder = try { JSONObject(created.metadata ?: "{}").optString("shareHolder") } catch (_: Exception) { "" }
+              if ((screenShareOn || sharePending) && holder != created.localParticipant.identity?.value) {
+                stopScreenShare()
+                screenShareError = "taken_over"
+              }
+            }
+            if (event is RoomEvent.Disconnected && room === created) {
+              connectedFlag = false
+              shareLease.clear()
+              MeetingForegroundService.stop(appContext)
             }
           }
         }
@@ -135,6 +151,7 @@ class MeetingRoomBridge(context: Context) {
         // 连接失败：置错误码，业务层轮询 lastError() 得知（无回调，见文件头说明）
         connectedFlag = false
         lastErrorText = "connect"
+        MeetingForegroundService.stop(appContext)
       }
     }
   }
@@ -200,21 +217,40 @@ class MeetingRoomBridge(context: Context) {
   }
 
   fun requestScreenCapture(context: Context) {
+    if (sharePending || screenShareOn) return
+    shareLease.acquired()
+    shareRequestID += 1
+    sharePending = true
     try {
       screenShareError = ""
       val intent = Intent(context, MediaProjectionPermissionActivity::class.java)
+      intent.putExtra("requestID", shareRequestID)
       intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
       context.startActivity(intent)
+      val requestID = shareRequestID
+      scope?.launch {
+        delay(60000)
+        if (sharePending && shareRequestID == requestID) {
+          stopScreenShare()
+          screenShareError = "cancelled"
+        }
+      }
     } catch (e: Throwable) {
+      sharePending = false
+      shareLease.release()
       screenShareError = e.message ?: "screen_capture_request"
     }
   }
 
-  private fun onScreenCaptureResult(resultCode: Int, data: Intent?) {
+  fun completeScreenCapture(requestID: Int, resultCode: Int, data: Intent?) {
+    // 离会/取消后的迟到授权不得重新开始采集。
+    if (!sharePending || requestID != shareRequestID || activeBridge !== this) return
     if (resultCode != Activity.RESULT_OK || data == null) {
       screenShareOn = false
       screenShareError = "cancelled"
       screenShareDiag = "cancelled"
+      sharePending = false
+      shareLease.release()
       return
     }
     val r = room ?: return
@@ -223,16 +259,29 @@ class MeetingRoomBridge(context: Context) {
       try {
         val started = r.localParticipant.setScreenShareEnabled(
           true,
-          ScreenCaptureParams(mediaProjectionPermissionResultData = data, onStop = {
+          ScreenCaptureParams(mediaProjectionPermissionResultData = data, onStop = captureStopped@{
+            if (requestID != shareRequestID) return@captureStopped
             screenShareOn = false
             screenShareError = "stopped"
             screenShareDiag = "stopped"
+            shareLease.release()
+            s.launch {
+              if (room === r && requestID == shareRequestID) {
+                try { r.localParticipant.setScreenShareEnabled(false) } catch (_: Throwable) {}
+              }
+            }
           }),
         )
         screenShareDiag = "started=${started}"
+        sharePending = false
+        if (requestID != shareRequestID || room !== r) {
+          r.localParticipant.setScreenShareEnabled(false)
+          return@launch
+        }
         if (!started) {
           screenShareOn = false
           screenShareError = "screen_share_publish"
+          shareLease.release()
           return@launch
         }
         // SDK 返回 true 只表示启动请求成功；publication/track 可能稍后才创建。
@@ -248,6 +297,8 @@ class MeetingRoomBridge(context: Context) {
         if (!ready) {
           refreshScreenShareState(r)
           screenShareError = "screen_share_no_track"
+          r.localParticipant.setScreenShareEnabled(false)
+          shareLease.release()
         } else {
           screenShareError = ""
         }
@@ -255,11 +306,16 @@ class MeetingRoomBridge(context: Context) {
         screenShareOn = false
         screenShareError = e.message ?: "screen_share_publish"
         screenShareDiag = "throw=${e.javaClass.simpleName}"
+        sharePending = false
+        shareLease.release()
       }
     }
   }
 
   fun stopScreenShare() {
+    shareRequestID += 1
+    sharePending = false
+    shareLease.release()
     val r = room ?: return
     val s = scope ?: return
     s.launch {
@@ -287,13 +343,58 @@ class MeetingRoomBridge(context: Context) {
   }
 
   fun isScreenShareOn(): Boolean {
+    if (screenShareError == "stopped" || screenShareError == "cancelled") return false
     val r = room ?: return false
     return refreshScreenShareState(r)
   }
 
-  fun diag(): String = "share[${screenShareDiag}]"
+  fun diag(): String = "probe=android-display-auto-pip-20261123-p6 share[${screenShareDiag}]"
+
+  fun configureBackgroundSession(endpoint: String, token: String) { shareLease.configure(endpoint, token) }
+
+  fun isScreenSharePending(): Boolean = sharePending
+  fun setMeetingPresentation(activity: Activity, pageVisible: Boolean, foreground: Boolean) {
+    activity.runOnUiThread {
+      if (connectedFlag) floatingWindow.setPresentation(activity, pageVisible, foreground)
+    }
+  }
+  fun consumeMeetingRestoreRequest(): Boolean = floatingWindow.consumeRestoreRequest()
+
+  fun createPipRenderer(context: Context): SurfaceViewRenderer? {
+    val r = room ?: return null
+    val view = SurfaceViewRenderer(context)
+    r.initVideoRenderer(view)
+    applyRemoteScaling(view, true)
+    pipRenderer = view
+    updatePipRenderer(view)
+    return view
+  }
+
+  fun updatePipRenderer(view: SurfaceViewRenderer) {
+    val r = room ?: return
+    val participants = r.remoteParticipants.values.filter { !isEgressParticipant(it) }
+    val target = participants.firstOrNull { hasActiveScreenShare(it) }
+      ?: participants.firstOrNull { preferredVideoTrack(it) != null }
+    // 不回显本机共享，避免整屏录制包含自己的小窗造成无限镜像。
+    val next = target?.let { preferredVideoTrack(it) }
+    if (pipTrack !== next) {
+      pipTrack?.removeRenderer(view)
+      pipTrack = next
+      next?.addRenderer(view)
+    }
+    view.visibility = if (next == null) android.view.View.INVISIBLE else android.view.View.VISIBLE
+  }
+
+  fun releasePipRenderer(view: SurfaceViewRenderer) {
+    if (pipRenderer !== view) return
+    try { pipTrack?.removeRenderer(view) } catch (_: Exception) {}
+    pipTrack = null
+    try { view.release() } catch (_: Exception) {}
+    if (pipRenderer === view) pipRenderer = null
+  }
 
   fun screenShareError(): String = screenShareError
+  fun isScreenShareStopping(): Boolean = shareLease.isReleasing
 
   /** 最近一次连接失败原因（空串=无错）。 */
   fun lastError(): String {
@@ -309,6 +410,7 @@ class MeetingRoomBridge(context: Context) {
   fun setMicEnabled(enabled: Boolean) {
     val r = room ?: return
     val s = scope ?: return
+    if (enabled) MeetingForegroundService.start(appContext)
     s.launch {
       try {
         r.localParticipant.setMicrophoneEnabled(enabled)
@@ -676,6 +778,12 @@ class MeetingRoomBridge(context: Context) {
 
 
   private fun disconnectInternal(notify: Boolean) {
+    android.os.Handler(android.os.Looper.getMainLooper()).post { floatingWindow.stop() }
+    shareRequestID += 1
+    sharePending = false
+    shareLease.clear()
+    pipRenderer?.let { releasePipRenderer(it) }
+    MeetingForegroundService.stop(appContext)
     screenShareOn = false
     meetingMessages.clear()
     if (activeBridge === this) activeBridge = null

@@ -8,7 +8,8 @@ import LiveKitClient
 /// ScreenShareCaptureOptions.dimensions 并未在该路径执行缩放。
 /// 在 SDK 的串行 processingQueue 上缩放整帧，不操作 UIKit、不占用主线程。
 final class MeetingScreenShareProcessor: NSObject, VideoProcessor {
-  private let context = CIContext(options: [.cacheIntermediates: false])
+  // 广播时主 App 可在后台，禁止依赖后台不可用的 GPU 渲染。
+  private let context = CIContext(options: [.cacheIntermediates: false, .useSoftwareRenderer: true])
   private var pool: CVPixelBufferPool?
   private var poolWidth = 0
   private var poolHeight = 0

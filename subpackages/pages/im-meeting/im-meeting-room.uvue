@@ -12,8 +12,8 @@
       补成员与服务端权威值；id 缺失时按会议号在首页记录里反查一次。
 
     ★当前页面已接入 Android/iOS LiveKit 会中聊天；屏幕共享接入 Android MediaProjection
-      与 iOS ReplayKit 本 App 画面采集。iOS 跨 App/控制中心广播仍需 Broadcast Upload
-      Extension；鸿蒙仍按媒体能力未接入处理。其它未接通能力继续如实提示。
+      与 iOS ReplayKit 广播扩展整屏采集；基座必须包含对应原生能力。
+      鸿蒙仍按媒体能力未接入处理。其它未接通能力继续如实提示。
   -->
   <view class="mr-page">
     <safety-zone />
@@ -619,7 +619,7 @@
 <script setup lang="uts">
   // ★onUnmounted 是 Vue 的 API；onLoad/onBackPress 是 uni-app 的页面钩子
   import { computed, onUnmounted, ref } from "vue";
-  import { onBackPress, onLoad } from "@dcloudio/uni-app";
+  import { onBackPress, onLoad, onShow, onHide } from "@dcloudio/uni-app";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import {
     apiImMeetingDeleteRoom,
@@ -680,6 +680,12 @@
     meetingMediaState,
     meetingMediaSupported,
     meetingMediaSwitchCamera,
+    meetingMediaActiveRoom,
+    meetingMediaSetMinimized,
+    meetingMediaSetResumeURL,
+    meetingMediaReleasePageViews,
+    meetingMediaSetPageVisible,
+    meetingMediaReconcile,
   } from "@/utils/meeting/meetingMedia";
   // 会议数据变更广播（列表在会议 tab 内监听，见 meeting-pane 的 handleMeetingChanged）
   import { IM_MEETING_CHANGED_EVENT } from "@/servers/imMeeting";
@@ -1684,7 +1690,7 @@
     }
   }
 
-  /** 共享授权等待起点（0 = 没在等）：超过 12 秒没结果就按失败收口，避免按钮一直「处理中」。 */
+  /** 与原生授权等待窗口一致；不能在用户操作系统授权页时提前释放共享权。 */
   let sharePendingAt = 0;
   /** 本次共享开始时的原生错误快照：只把「之后新出现的错误」当本次失败。 */
   let shareErrorBaseline = "";
@@ -1696,6 +1702,8 @@
 
   /** 共享失败原因 → 人话（原生给的是 error code / 英文 message，不能原样丢给用户）。 */
   function screenShareErrorText(code: string): string {
+    if (code == "background_session_unavailable") return "当前音视频组件不支持整屏共享，请更新应用";
+    if (code == "broadcast_extension_missing") return "当前安装包未配置整屏共享，请更新应用";
     const low = code.toLowerCase();
     if (low.indexOf("permission") >= 0 || low.indexOf("security") >= 0 || low.indexOf("foreground") >= 0) {
       return t("Mobile.Meeting.sharePermissionDenied");
@@ -1764,8 +1772,8 @@
         if (nativeShareError != "cancelled" && nativeShareError != "stopped") {
           uni.showToast({ title: screenShareErrorText(nativeShareError), icon: "none" });
         }
-      } else if (sharePendingAt > 0 && Date.now() - sharePendingAt > 12000) {
-        // 授权弹窗没回来 / 原生没回新状态：不能让按钮一直「处理中」，12 秒兜底。
+      } else if (sharePendingAt > 0 && Date.now() - sharePendingAt > 65000) {
+        // iOS 系统广播 picker 没有取消回调，原生 60 秒后收尾，此处仅兜底。
         localSharePending.value = false;
         shareHolder.value = "";
         shareHolderName.value = "";
@@ -1817,6 +1825,16 @@
   /** 仅保留给尚未接入的其它媒体能力使用。 */
   function showMoreNativePending(): void {
     uni.showToast({ title: t("Mobile.Meeting.moreNativePending"), icon: "none" });
+  }
+
+  /** 点操作前校准原生连接，避免残留 exception 将已入会用户拦在聊天/举手/共享之外。 */
+  function syncConnectionBeforeAction(): void {
+    meetingMediaReconcile(roomRaw.value);
+    if (meetingMediaActiveRoom().length > 0 && meetingMediaActiveRoom() != roomRaw.value) return;
+    const snapshot = meetingMediaState();
+    mediaConnected.value = snapshot.connected;
+    mediaConnecting.value = snapshot.connecting;
+    mediaError.value = snapshot.errorText;
   }
 
   /** 设备按钮在「还不能动」时的提示：能力未接入 / 连接中 / 连接失败分别提示。 */
@@ -2125,11 +2143,15 @@
   }
 
   function handleShareTap(): void {
+    syncConnectionBeforeAction();
     if (!mediaSupported.value || !mediaConnected.value || roomRaw.value.length == 0) {
       mediaUnavailableToast("share");
       return;
     }
     if (localSharePending.value) {
+      localSharePending.value = false;
+      sharePendingAt = 0;
+      void meetingMediaStopScreenShare(roomRaw.value);
       return;
     }
     if (meetingMediaScreenShareOn()) {
@@ -2147,19 +2169,21 @@
     shareErrorBaseline = meetingMediaScreenShareError();
     void meetingMediaStartScreenShare(roomRaw.value).then((started: boolean) => {
       moreBusy.value = "";
+      if (started) shareErrorBaseline = "";
       if (!started) {
         // 走到这里说明「拿共享权」这步就失败了（系统授权弹窗之后失败由轮询兜）
         localSharePending.value = false;
         sharePendingAt = 0;
         console.error("[MeetingUI] screen share holder request failed");
-        uni.showToast({ title: t("Mobile.Meeting.shareStartFailed"), icon: "none" });
+        uni.showToast({ title: screenShareErrorText(meetingMediaScreenShareError()), icon: "none" });
       }
     });
   }
 
   function handleRaiseHandTap(): void {
+    syncConnectionBeforeAction();
     if (!mediaSupported.value || !mediaConnected.value) {
-      showMoreNativePending();
+      mediaUnavailableToast("hand");
       return;
     }
     const next = !handRaised.value;
@@ -2168,6 +2192,7 @@
   }
 
   function handleMeetingChatTap(): void {
+    syncConnectionBeforeAction();
     if (!mediaSupported.value || !mediaConnected.value) {
       mediaUnavailableToast("chat");
       return;
@@ -2825,6 +2850,7 @@
       return;
     }
     diagTimer = setInterval(() => {
+      meetingMediaReconcile();
       console.error(`[MeetingUI] diag ${meetingMediaDebugLine()}`);
     }, 3000);
   }
@@ -3148,6 +3174,7 @@
   /** 先完成我的资料水合，再签令牌入会，避免把“我”写成跨端可见昵称。 */
   async function prepareIdentityAndConnect(): Promise<void> {
     await ensureMyInfo();
+    if (pageUnmounted) return;
     connectMedia();
   }
 
@@ -3316,21 +3343,32 @@
     });
   }
 
-  /** 返回键不应静默退会：普通参会人先确认，主持人复用结束/仅退出逻辑。 */
+  let preserveMeetingOnUnmount = false;
+
+  function minimizeMeetingPage(): void {
+    preserveMeetingOnUnmount = true;
+    meetingMediaSetMinimized(true);
+    uni.navigateBack({
+      delta: 1,
+      fail: (_error) => {
+        preserveMeetingOnUnmount = false;
+        meetingMediaSetMinimized(false);
+      },
+    });
+  }
+
+  /** 返回可保留会议，右上角退出仍沿用原来的离会/结束确认。 */
   function handleBack(): void {
     if (sheet.value.length > 0) {
       closeSheet();
       return;
     }
-    if (meetingClosing || status.value != 1 || !mediaConnected.value) {
+    syncConnectionBeforeAction();
+    if (meetingClosing || status.value != 1 || (!mediaConnected.value && !mediaConnecting.value)) {
       uni.navigateBack({ delta: 1 });
       return;
     }
-    if (isHost.value) {
-      handleLeaveOrEnd();
-      return;
-    }
-    confirmLeaveMeeting();
+    minimizeMeetingPage();
   }
 
   /** 切换摄像头节流时间戳：SDK 切摄像头本身要重启采集，连点会明显卡顿。 */
@@ -3559,6 +3597,7 @@
    * ★连房是异步回调回来的，页面不订阅就永远停在「未连接」，按钮点了也只会提示未连接。
    */
   const onMediaChanged = (_payload: any): void => {
+    if (meetingMediaActiveRoom().length > 0 && meetingMediaActiveRoom() != roomRaw.value) return;
     refreshMediaState();
   };
 
@@ -3591,6 +3630,23 @@
     groupCallVideoRequested = readStr(obj, "video") == "1";
     // 「加入会议」页带过来的入会密码（其余入口没有这个参数）
     joinPasscode.value = readStr(obj, "pc");
+    if (meetingMediaActiveRoom().length > 0 && meetingMediaActiveRoom() != roomRaw.value) {
+      preserveMeetingOnUnmount = true;
+      uni.showModal({
+        title: "已有进行中的会议",
+        content: "请先返回并退出当前会议，再加入另一场会议。",
+        showCancel: false,
+        success: (_res) => { uni.navigateBack({ delta: 1 }); },
+      });
+      return;
+    }
+    meetingMediaSetResumeURL(
+      `/subpackages/pages/im-meeting/im-meeting-room?room=${encodeURIComponent(roomRaw.value)}` +
+      `&id=${encodeURIComponent(meetingId.value)}&title=${encodeURIComponent(titleRaw.value)}` +
+      `&status=1&host=${isHost.value ? "1" : "0"}&pc=${encodeURIComponent(joinPasscode.value)}`
+    );
+    meetingMediaSetMinimized(false);
+    meetingMediaSetPageVisible(true);
     nowMs.value = Date.now();
     syncClock();
     // 媒体能力：Android/iOS 由插件 isSupported 决定，鸿蒙占位恒 false
@@ -3611,6 +3667,20 @@
     prepareIdentityAndConnect();
   });
 
+  onShow(() => {
+    if (roomRaw.value.length == 0 || meetingMediaActiveRoom() != roomRaw.value) return;
+    meetingMediaReconcile();
+    meetingMediaSetPageVisible(true);
+    refreshMediaState();
+    refreshRoomMetadata();
+  });
+
+  onHide(() => {
+    if (!meetingClosing && meetingMediaActiveRoom() == roomRaw.value) {
+      meetingMediaSetPageVisible(false);
+    }
+  });
+
   onUnmounted(() => {
     pageUnmounted = true;
     stopClock();
@@ -3618,6 +3688,14 @@
     stopDiagPoll();
     stopChatPolling();
     eventBus.off(MEETING_MEDIA_CHANGED_EVENT, onMediaChanged);
+    if (meetingMediaActiveRoom().length > 0 && meetingMediaActiveRoom() != roomRaw.value) return;
+    meetingMediaReleasePageViews();
+    if (preserveMeetingOnUnmount || (!meetingClosing && (mediaConnected.value || mediaConnecting.value))) {
+      meetingMediaSetPageVisible(false);
+      meetingMediaSetMinimized(true);
+      eventBus.emit(IM_MEETING_CHANGED_EVENT, {});
+      return;
+    }
     // 只断自己，不删房（结束会议是主持人动作）
     console.error(`[MeetingUI] onUnmounted disconnect ${meetingMediaDebugLine()}`);
     if ((localShareWasOn.value || localSharePending.value) && roomRaw.value.length > 0) {

@@ -5,6 +5,7 @@ import UIKit
 // （`import LiveKit` 是 SPM 的模块名，云打包实测解析不到）
 import LiveKitClient
 import ReplayKit
+import Combine
 
 /**
  * 会议房间桥（iOS，LiveKit Swift SDK 2.19.x）。
@@ -26,12 +27,12 @@ import ReplayKit
  * <h2>当前限制</h2>
  * <p>切前后摄像头（`CameraCapturer`/`LocalVideoTrack` 的入口名待核实）、远端画面订阅、
  * 音量（`audioLevel`）—— 这三项目前返回"无操作/0"，不影响入会与互相看见。
- * 屏幕共享采用 ReplayKit 应用内采集；跨 App/控制中心共享需要额外的 Broadcast Upload
- * Extension target，当前 uni-app 插件不包含该 target。</p>
+ * 整屏共享使用 ReplayKit Broadcast Upload Extension；扩展源码在 native/ios-broadcast，
+ * 签名与云打包配置见 docs/engineering/meeting-whole-screen-sharing.md。</p>
  */
 public class MeetingRoomBridge: NSObject {
   /// 与页面诊断配套；只有重新制作原生基座才会更新。
-  private static let probeBuild = "ios-share-20261123-p4"
+  private static let probeBuild = "ios-broadcast-auto-pip-20261123-p6"
   /// iOS → Android 共享流参数。写入 diag，方便仅凭真机日志确认新基座是否生效。
   private static let screenSharePublishProfile = "bounded720p30-3Mbps-single-h264"
 
@@ -39,6 +40,7 @@ public class MeetingRoomBridge: NSObject {
   private static var videoView: VideoView?
   /// 连接状态由业务层轮询（UTS 回调类型跨到 Swift 会变成 UTSCallback，编译不过）
   private static var connectedFlag = false
+  private static var connectionGeneration = 0
   private static var lastErrorText = ""
   /// 设备层失败原因（`mic_denied` / `camera_denied` / `set_device`；空串=无错）。
   /// ★与 `lastErrorText` 分开：那个只表达「连不上」，设备失败不该让页面以为入会失败。
@@ -57,10 +59,42 @@ public class MeetingRoomBridge: NSObject {
   private static var screenShareProcessor: MeetingScreenShareProcessor?
   private static var screenShareErrorText = ""
   private static var screenShareRequestID = 0
+  private static var broadcastPending = false
+  private static var broadcastObserver: AnyCancellable?
+  private static var broadcastTimeout: DispatchWorkItem?
   private static let screenShareLock = NSLock()
   private static var dataDelegate: MeetingDataDelegate?
 
   private final class MeetingDataDelegate: NSObject, RoomDelegate, @unchecked Sendable {
+    func room(_ current: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {
+      MeetingRoomBridge.updatePictureInPicture()
+    }
+
+    func room(_ current: Room, participant: RemoteParticipant, didUnsubscribeTrack publication: RemoteTrackPublication) {
+      MeetingRoomBridge.updatePictureInPicture()
+    }
+    func room(_ current: Room, didUpdateMetadata metadata: String?) {
+      MeetingRoomBridge.onMain {
+        guard MeetingRoomBridge.room === current,
+              let data = metadata?.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let holder = object["shareHolder"] as? String,
+              holder != current.localParticipant.identity?.stringValue else { return }
+        if MeetingRoomBridge.broadcastPending || MeetingRoomBridge.screenShareTrack != nil {
+          MeetingRoomBridge.stopScreenShare()
+          MeetingRoomBridge.screenShareErrorText = "taken_over"
+        }
+      }
+    }
+
+    func room(_ current: Room, didDisconnectWithError error: LiveKitError?) {
+      MeetingRoomBridge.onMain {
+        guard MeetingRoomBridge.room === current else { return }
+        MeetingRoomBridge.connectedFlag = false
+        MeetingRoomBridge.stopScreenShare()
+        MeetingPictureInPicture.shared.stop()
+      }
+    }
     func room(
       _ room: Room,
       participant: RemoteParticipant?,
@@ -152,6 +186,8 @@ public class MeetingRoomBridge: NSObject {
     lastErrorText = ""
     deviceErrorText = ""
     onMain {
+      connectionGeneration += 1
+      let generation = connectionGeneration
       // 上一场没断干净时先收尾（业务层一般会先 disconnect，这里兜底防两个 Room 抢音频会话）
       if let stale = room {
         room = nil
@@ -167,6 +203,10 @@ public class MeetingRoomBridge: NSObject {
           let created = Room(delegate: delegate)
           room = created
           try await created.connect(url: serverUrl, token: token)
+          guard generation == connectionGeneration, room === created else {
+            await created.disconnect()
+            return
+          }
           // ★先置 connected：设备开关可能弹权限框停留十几秒，不能让它把「入会成功」拖成超时
           connectedFlag = true
           bridgeLog("connect ok people=\(debugSnapshot())")
@@ -190,6 +230,7 @@ public class MeetingRoomBridge: NSObject {
             }
           }
         } catch {
+          guard generation == connectionGeneration else { return }
           connectedFlag = false
           lastErrorText = "connect"
           bridgeLog("connect failed: \(error)")
@@ -266,9 +307,12 @@ public class MeetingRoomBridge: NSObject {
     screenShareRequestID += 1
     screenShareLock.unlock()
     onMain {
+      connectionGeneration += 1
       releaseVideoView()
       releaseRemoteVideoViews()
       stopScreenShareInternal(room: room)
+      MeetingPictureInPicture.shared.stop()
+      MeetingShareLease.shared.clear()
       meetingMessagesLock.lock()
       meetingMessages.removeAll()
       meetingMessagesLock.unlock()
@@ -348,9 +392,94 @@ public class MeetingRoomBridge: NSObject {
     return result
   }
 
-  // MARK: - ReplayKit 应用内屏幕共享
+  // MARK: - ReplayKit 跨 App 广播
+
+  public static func configureBackgroundSession(_ releaseURL: String, _ token: String) {
+    onMain { MeetingShareLease.shared.configure(releaseURL, token: token) }
+  }
+
+  public static func setMeetingPresentation(_ pageVisible: Bool, _ foreground: Bool) {
+    onMain {
+      guard connectedFlag else { return }
+      MeetingPictureInPicture.shared.setPresentation(pageVisible: pageVisible, foreground: foreground)
+      updatePictureInPicture()
+    }
+  }
+
+  public static func consumeMeetingRestoreRequest() -> Bool {
+    var restore = false
+    doOnMainSync { restore = MeetingPictureInPicture.shared.consumeRestoreRequest() }
+    return restore
+  }
+
+  private static func updatePictureInPicture() {
+    onMain {
+      guard let current = room else { return }
+      let participants = current.remoteParticipants.values.filter {
+        !($0.identity?.stringValue ?? "").hasPrefix("EG_")
+      }
+      let sharer = participants.first { participant in
+        participant.trackPublications.values.contains { $0.source == .screenShareVideo && !$0.isMuted }
+      }
+      let track = sharer.flatMap { firstVideoTrack($0) } ?? participants.compactMap { firstVideoTrack($0) }.first
+      MeetingPictureInPicture.shared.update(track)
+    }
+  }
 
   public static func requestScreenShare() {
+    onMain {
+      guard connectedFlag, room != nil else {
+        screenShareErrorText = "not_connected"
+        return
+      }
+      if broadcastPending || screenShareTrack != nil { return }
+      MeetingShareLease.shared.acquired()
+      guard let bundleID = Bundle.main.bundleIdentifier else { return }
+      let extensionID = Bundle.main.object(forInfoDictionaryKey: "RTCScreenSharingExtension") as? String ?? "\(bundleID).broadcast"
+      let groupID = Bundle.main.object(forInfoDictionaryKey: "RTCAppGroupIdentifier") as? String ?? "group.\(bundleID)"
+      let extensions = Bundle.main.builtInPlugInsURL.flatMap {
+        try? FileManager.default.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)
+      } ?? []
+      guard extensions.contains(where: { Bundle(url: $0)?.bundleIdentifier == extensionID }),
+            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID) != nil else {
+        screenShareErrorText = "broadcast_extension_missing"
+        MeetingShareLease.shared.release()
+        return
+      }
+      screenShareErrorText = ""
+      broadcastPending = true
+      // SDK 自动发布会跳过本项目的缩放/编码策略，因此由桥接层按真实广播状态发布。
+      BroadcastManager.shared.shouldPublishTrack = false
+      if broadcastObserver == nil {
+        broadcastObserver = BroadcastManager.shared.isBroadcastingPublisher
+          .removeDuplicates().dropFirst().receive(on: DispatchQueue.main)
+          .sink { started in
+            if started {
+              guard broadcastPending, connectedFlag else {
+                BroadcastManager.shared.requestStop()
+                return
+              }
+              publishBroadcastTrack()
+            } else if broadcastPending || screenShareTrack != nil {
+              stopScreenShare()
+              screenShareErrorText = "stopped"
+            }
+          }
+      }
+      // 系统 picker 没有取消回调；原生超时收回占位，晚到的广播事件也不能误发布。
+      let timeout = DispatchWorkItem {
+        if broadcastPending {
+          stopScreenShare()
+          screenShareErrorText = "cancelled"
+        }
+      }
+      broadcastTimeout = timeout
+      DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: timeout)
+      BroadcastManager.shared.requestActivation()
+    }
+  }
+
+  private static func publishBroadcastTrack() {
     screenShareLock.lock()
     screenShareRequestID += 1
     let requestID = screenShareRequestID
@@ -366,11 +495,8 @@ public class MeetingRoomBridge: NSObject {
       if alreadySharing { return }
       screenShareErrorText = ""
     Task { @MainActor in
+      var candidate: LocalVideoTrack?
       do {
-        guard RPScreenRecorder.shared().isAvailable else {
-          screenShareErrorText = "replaykit_unavailable"
-          return
-        }
         // InAppScreenCapturer 的 options 不执行缩放；实际尺寸由下方 processor 限制。
         // 30fps/3Mbps 是上限，实际发送帧率由 shareTx 统计核对，不能以配置值当作实测值。
         let options = ScreenShareCaptureOptions(
@@ -378,11 +504,12 @@ public class MeetingRoomBridge: NSObject {
           fps: 30,
           showCursor: false,
           appAudio: false,
-          useBroadcastExtension: false,
+          useBroadcastExtension: true,
           useScreenCaptureKit: false,
           includeCurrentApplication: true
         )
-        let track = await LocalVideoTrack.createInAppScreenShareTrack(options: options, reportStatistics: true)
+        let track = await LocalVideoTrack.createBroadcastScreenCapturerTrack(options: options, reportStatistics: true)
+        candidate = track
         let processor = MeetingScreenShareProcessor()
         track.processor = processor
         screenShareLock.lock()
@@ -406,7 +533,7 @@ public class MeetingRoomBridge: NSObject {
           preferredCodec: .h264,
           degradationPreference: .maintainFramerate
         )
-        _ = try await current.localParticipant.publish(
+        let publication = try await current.localParticipant.publish(
           videoTrack: track,
           options: publishOptions
         )
@@ -414,9 +541,7 @@ public class MeetingRoomBridge: NSObject {
         let publishStillActive = requestID == screenShareRequestID
         screenShareLock.unlock()
         guard publishStillActive, connectedFlag, room === current else {
-          if let publication = current.localParticipant.firstScreenSharePublication as? LocalTrackPublication {
-            try? await current.localParticipant.unpublish(publication: publication)
-          }
+          try? await current.localParticipant.unpublish(publication: publication)
           _ = try? await track.capturer.stopCapture()
           return
         }
@@ -424,13 +549,19 @@ public class MeetingRoomBridge: NSObject {
         screenShareTrack = track
         screenShareProcessor = processor
         screenShareLock.unlock()
+        broadcastPending = false
+        broadcastTimeout?.cancel()
         screenShareErrorText = ""
-        bridgeLog("in-app screen share published: \(screenSharePublishProfile) priority=high degradation=maintain-framerate")
+        bridgeLog("broadcast screen share published: \(screenSharePublishProfile)")
       } catch {
+        if let candidate { _ = try? await candidate.capturer.stopCapture() }
         screenShareLock.lock()
         let requestStillActive = requestID == screenShareRequestID
         screenShareLock.unlock()
         guard requestStillActive else { return }
+        broadcastPending = false
+        BroadcastManager.shared.requestStop()
+        MeetingShareLease.shared.release()
         screenShareLock.lock()
         screenShareTrack = nil
         screenShareProcessor = nil
@@ -443,6 +574,11 @@ public class MeetingRoomBridge: NSObject {
   }
 
   private static func stopScreenShareInternal(room current: Room?) {
+    broadcastPending = false
+    broadcastTimeout?.cancel()
+    broadcastTimeout = nil
+    BroadcastManager.shared.requestStop()
+    MeetingShareLease.shared.release()
     screenShareLock.lock()
     let track = screenShareTrack
     let processor = screenShareProcessor
@@ -450,20 +586,22 @@ public class MeetingRoomBridge: NSObject {
     screenShareProcessor = nil
     screenShareLock.unlock()
     guard let track = track else { return }
+    let publication = current?.localParticipant.trackPublications.values.first {
+      $0.track === track
+    } as? LocalTrackPublication
     Task { @MainActor in
       // SDK 弱持有 processor；直到停止采集才释放，收尾过程中仍保持相同的帧处理。
       defer { withExtendedLifetime(processor) {} }
       do {
-        if let current = current,
-           let publication = current.localParticipant.firstScreenSharePublication as? LocalTrackPublication {
+        if let current = current, let publication = publication {
           try await current.localParticipant.unpublish(publication: publication)
         }
       } catch {
-        bridgeLog("in-app screen share unpublish failed: \(error)")
+        bridgeLog("broadcast screen share unpublish failed: \(error)")
       }
       // 取消发布失败也必须停止 ReplayKit，避免录屏继续占用系统资源。
       do { _ = try await track.capturer.stopCapture() }
-      catch { bridgeLog("in-app screen share stop failed: \(error)") }
+      catch { bridgeLog("broadcast screen share stop failed: \(error)") }
     }
   }
 
@@ -479,8 +617,10 @@ public class MeetingRoomBridge: NSObject {
   public static func isScreenShareOn() -> Bool {
     screenShareLock.lock()
     defer { screenShareLock.unlock() }
-    return screenShareTrack != nil
+    return screenShareTrack != nil && BroadcastManager.shared.isBroadcasting
   }
+
+  public static func isScreenShareStopping() -> Bool { MeetingShareLease.shared.isReleasing }
 
   public static func screenShareError() -> String {
     screenShareLock.lock()
@@ -696,6 +836,7 @@ public class MeetingRoomBridge: NSObject {
       }
     }
     syncRemoteVideoViews(room)
+    updatePictureInPicture()
     return ids.joined(separator: ",")
   }
 

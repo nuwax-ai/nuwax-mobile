@@ -4,6 +4,7 @@ const fake = vi.hoisted(() => ({
   commands: [] as any[],
   events: [] as any[],
   sequence: 0,
+  nativeFails: false,
   capabilities: vi.fn(),
   permissions: vi.fn(),
   create: vi.fn(),
@@ -31,8 +32,14 @@ vi.mock('../../utils/common.uts', () => ({ generateUUID: () => `fixture-${++fake
 vi.mock('../../utils/im/imSessionScope.uts', () => ({ getImSessionStamp: () => 'fixture-session' }));
 vi.mock('../../utils/appPrivacyConsent.uts', () => ({ hasAppPrivacyConsent: () => true }));
 vi.mock('../../utils/appLifecycle.uts', () => ({ isAppInBackground: () => false }));
+vi.mock('../../utils/meeting/meetingInviteNavigation.uts', () => ({
+  openMeetingInvite: vi.fn(), clearMeetingInviteNavigation: vi.fn(), flushMeetingInviteNavigation: vi.fn(),
+}));
 vi.mock('../../uni_modules/nuwax-voip/utssdk/web/index.uts', () => ({
-  executeVoip: (raw: string) => fake.commands.push(JSON.parse(raw)),
+  executeVoip: (raw: string) => {
+    if (fake.nativeFails) throw new Error("uts plugin unavailable");
+    fake.commands.push(JSON.parse(raw));
+  },
   drainVoipEvents: () => JSON.stringify(fake.events.splice(0)),
   ensureVoipPermissions: fake.permissions,
   openVoipAppSettings: fake.settings,
@@ -41,7 +48,7 @@ vi.mock('../../features/voip/audioFocus.uts', () => ({ claimVoipAudio: fake.clai
 vi.mock('../../utils/voice/stopAllSpeechPlayback.uts', () => ({ stopAllSpeechPlayback: vi.fn() }));
 vi.mock('../../utils/i18n.uts', () => ({ t: (key: string) => key }));
 
-import { bootstrapVoip, clearVoipSession, getVoipSnapshot, startVoipCall, answerVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioInterrupted, voipPermissionPending, voipPushRegistration } from '../../features/voip/callManager.uts';
+import { bootstrapVoip, clearVoipSession, getVoipSnapshot, startVoipCall, answerVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioInterrupted, voipPermissionPending, voipPushRegistration, setVoipBackground } from '../../features/voip/callManager.uts';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -59,6 +66,7 @@ beforeEach(() => {
     navigateTo: (options: any) => options.complete(),
   });
   clearVoipSession();
+  fake.nativeFails = false;
   fake.commands = []; fake.events = []; fake.token = 'fixture';
   fake.capabilities.mockReset().mockResolvedValue({ enabled: true, audio: true, video: true });
   fake.permissions.mockReset().mockResolvedValue(true);
@@ -274,5 +282,22 @@ describe('incoming actions and event isolation', () => {
     event({ type: 'localEnded', callId: 'incoming', reason: 'permissionRequired' });
     await vi.advanceTimersByTimeAsync(100);
     expect(voipAudioRoutes.value).toEqual([]); expect(voipPermissionPending.value).toBe(false); expect(voipAudioInterrupted.value).toBe(false);
+  });
+});
+
+
+describe('native plugin unavailable', () => {
+  it('does not interrupt App background/foreground lifecycle', () => {
+    fake.nativeFails = true;
+    expect(() => setVoipBackground(true)).not.toThrow();
+    expect(() => setVoipBackground(false)).not.toThrow();
+    expect(voipError.value).toBe('CALL_SYSTEM_UNAVAILABLE');
+  });
+  it('retries initialization after a failed native call for the same session', async () => {
+    fake.nativeFails = true;
+    await expect(bootstrapVoip()).rejects.toThrow('uts plugin unavailable');
+    fake.nativeFails = false;
+    await bootstrapVoip();
+    expect(fake.commands.filter(command => command.op === 'initialize')).toHaveLength(1);
   });
 });

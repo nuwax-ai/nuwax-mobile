@@ -181,7 +181,7 @@ object VoipBridge {
             "meetingInvitation" -> "会议邀请"
             "meetingNumber" -> "会议号"
             "meetingInvitedBy" -> "{name} 邀请你加入会议"
-            "meetingJoin" -> "加入会议"
+            "meetingJoin" -> "入会"
             "meetingIgnore" -> "忽略"
             "meetingJoining" -> "正在加入会议…"
             "meetingMinimize" -> "收起"
@@ -319,6 +319,14 @@ object VoipBridge {
         val same = config.optString("userId") == value.optString("userId") && config.optString("apiBaseUrl") == value.optString("apiBaseUrl") && config.optString("deviceId") == value.optString("deviceId")
         if (!same) reset()
         config = value
+        if (same) {
+            // 锁屏入会唤醒 UTS 后会更换 scope；同一账号的已确认入会意图不能因此丢失。
+            queue.forEach { event ->
+                if (event.optString("type") == "meetingInvite" && event.optString("action") == "accept") {
+                    event.put("scope", config.optString("scope"))
+                }
+            }
+        }
         trace(if (business()) "business session accepted" else "development session accepted")
         hidden = activity.get() == null || value.optBoolean("background")
         saveConfig()
@@ -510,6 +518,7 @@ object VoipBridge {
         val sender = message.optString("senderId")
         val next = JSONObject().put("protocol", "im-voip-v1").put("scene", "meeting")
             .put("callId", inviteId).put("inviteId", inviteId).put("roomName", room).put("title", title)
+            .put("passcode", body.optString("passcode"))
             .put("msgId", msg).put("convId", conv).put("version", 1).put("state", "ringing")
             .put("callerId", sender).put("calleeId", config.optString("userId")).put("acceptedDeviceId", "")
             .put("mediaType", media)
@@ -537,6 +546,7 @@ object VoipBridge {
             .put("action", action).put("callId", meeting.optString("callId"))
             .put("inviteId", meeting.optString("inviteId")).put("roomName", meeting.optString("roomName"))
             .put("title", meeting.optString("title")).put("mediaType", meeting.optString("mediaType"))
+            .put("passcode", meeting.optString("passcode"))
             .put("convId", meeting.optString("convId")).put("msgId", meeting.optString("msgId"))
         queue.add(event)
         while (queue.size > 256) queue.poll()
@@ -1180,7 +1190,12 @@ object VoipBridge {
             .setCategory(NotificationCompat.CATEGORY_CALL).setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_ALL)
             .setPriority(priority).setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .setOngoing(true).setOnlyAlertOnce(!incoming).setStyle(style)
+            .setOngoing(true).setOnlyAlertOnce(!incoming)
+        if (meeting && incoming) {
+            // CallStyle 的接听文案由系统生成；会议用明确的「入会」动作。
+            builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, label("meetingIgnore"), intent("reject"))
+                .addAction(android.R.drawable.ic_menu_call, label("meetingJoin"), answer)
+        } else builder.setStyle(style)
         if (alert) builder.setFullScreenIntent(content, true)
         if (!incoming) builder.setSilent(true)
         return builder.build().also {

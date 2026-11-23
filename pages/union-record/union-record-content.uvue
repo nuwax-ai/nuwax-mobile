@@ -218,7 +218,7 @@
   import type { RequestResponse } from "@/types/interfaces/request";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import { refreshImUnreadBadge, clearImUnreadBadge } from "@/utils/imUnreadBadge";
-  import { consumeConvReadMark } from "@/utils/im/imConvReadLocal";
+  import { consumeConvReadMark, IM_CONV_READ_LOCAL, unreadAfterConvRead, unreadAfterLocalView } from "@/utils/im/imConvReadLocal";
   // 伙伴页列表缓存（SWR）：进页先水合缓存秒出，网络回包整表替换后回写
   import {
     clearImListCache,
@@ -1136,6 +1136,8 @@
     }
     // unreadCount：服务端没算时键整个不存在（非 0），整表刷新下只能按 0 展示。
     row.unreadCount = readNumber(obj, "unreadCount", 0);
+    row.lastMsgSeq = readNumber(obj, "lastMsgSeq", 0);
+    row.unreadCount = unreadAfterLocalView(row.convId, row.unreadCount, row.lastMsgSeq);
     row.lastMsgAt = readNumber(obj, "lastMsgAt", 0);
     // memberCount：群聊行在智联录「我的群组」里展示
     row.memberCount = readNumber(obj, "memberCount", 0);
@@ -3383,6 +3385,17 @@
     }
     convRevision += 1;
     scheduleConvRefresh();
+    // 隐藏列表也要记住新消息水位，避免迟到的旧已读回包清掉新消息。
+    const previousRow = findConvRowById(convId);
+    const receivedSeq = readNumber(obj, "seq", 0);
+    if (previousRow != null && receivedSeq > previousRow.lastMsgSeq) {
+      const rowIndex = conversations.value.indexOf(previousRow);
+      if (rowIndex >= 0) {
+        const latestRow = cloneConvRow(previousRow);
+        latestRow.lastMsgSeq = receivedSeq;
+        conversations.value.splice(rowIndex, 1, latestRow);
+      }
+    }
     if (!messagePageVisible || isAppInBackground()) return;
     const existing = findConvRowById(convId);
     const sendTime = readNumber(obj, "sendTime", 0);
@@ -3458,23 +3471,27 @@
 
   }
 
-  /** 消费本端 read 标记（imConvReadLocal）：read 回包 unreadCleared 本地清行角标。
-   *  来源端收不到自己的 CONV_UNREAD 帧（deviceId 排除），后端回显 unreadCleared 就是
-   *  为来源端本地清红点设计的；行口径含免打扰，advanced=true 时置 0/按量减恒对，
-   *  权威值由 onShow 300ms 去抖的 loadConversations 回包覆盖纠正。
-   *  克隆换身份仅重渲该行（同 handleImConvUnread 机制，不吃整表重排）。 */
+  /** 已读回包立即更新列表，不依赖返回页面与网络回包的先后顺序。 */
   function applyPendingConvReadMark(): void {
-    const mark = consumeConvReadMark();
-    if (mark == null) return;
-    if (!mark.caughtUp && mark.cleared <= 0) return;
-    const existing = findConvRowById(mark.convId);
-    if (existing == null || existing.unreadCount <= 0) return;
-    const idx = conversations.value.indexOf(existing);
-    if (idx < 0) return;
-    const updated = cloneConvRow(existing);
-    updated.unreadCount = mark.caughtUp ? 0 : Math.max(0, existing.unreadCount - mark.cleared);
-    conversations.value.splice(idx, 1, updated);
+    if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+    let mark = consumeConvReadMark("union");
+    let changed = false;
+    while (mark != null) {
+      const existing = findConvRowById(mark.convId);
+      if (existing != null && existing.unreadCount > 0) {
+        const idx = conversations.value.indexOf(existing);
+        if (idx >= 0) {
+          const updated = cloneConvRow(existing);
+          updated.unreadCount = unreadAfterConvRead(mark, existing.unreadCount, existing.lastMsgSeq);
+          conversations.value.splice(idx, 1, updated);
+        }
+      }
+      changed = true;
+      mark = consumeConvReadMark("union");
+    }
+    if (changed) { convRevision += 1; scheduleConvRefresh(); }
   }
+  const onLocalConvRead = (_payload: any): void => { applyPendingConvReadMark(); };
 
   function handleImConvUpdated(payload: any): void {
     if (payload == null) {
@@ -3572,6 +3589,7 @@
     // 里补跑——联系人原本就随页面首拉，供智联录角标与展示名索引）
     initWorkGate();
     eventBus.on(IM_SESSION_CLEARED, onImSessionCleared);
+    eventBus.on(IM_CONV_READ_LOCAL, onLocalConvRead);
     // 订阅 IM WS 事件
     eventBus.on(`${EVENT_TYPE.ImMessagesSynced}`, onImMessagesSynced);
     eventBus.on(`${EVENT_TYPE.ImMessageReceived}`, onImMessageReceived);
@@ -3615,6 +3633,7 @@
 
   onUnload((): void => {
     eventBus.off(IM_SESSION_CLEARED, onImSessionCleared);
+    eventBus.off(IM_CONV_READ_LOCAL, onLocalConvRead);
     // 浮层开着时卸载：收起浮层（注销返回拦截经 watch）
     closeRowMenu();
     cancelRowLongPress();

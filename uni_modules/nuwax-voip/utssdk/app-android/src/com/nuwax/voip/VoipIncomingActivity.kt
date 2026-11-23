@@ -79,8 +79,23 @@ class VoipIncomingActivity : Activity() {
         if (!value.optBoolean("incoming") || value.optString("state") != "ringing" || actionPending) return
         // 会议接听只负责打开会议页，麦克风/摄像头由会议页按需申请，不在锁屏强行弹权限。
         if (value.optString("scene") == "meeting") {
+            val keyguard = getSystemService(KeyguardManager::class.java)
             actionPending = true
-            VoipBridge.uiCommand(callId, "action", mediaType = type)
+            if (keyguard.isKeyguardLocked) {
+                keyguard.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+                    override fun onDismissSucceeded() { actionPending = false; answer(type) }
+                    override fun onDismissCancelled() { actionPending = false; render() }
+                    override fun onDismissError() { actionPending = false; render() }
+                })
+            } else {
+                // 显式拉起主 App，业务层等前台恢复后消费入会路由。
+                packageManager.getLaunchIntentForPackage(packageName)?.let { launch ->
+                    launch.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    startActivity(launch)
+                }
+                VoipBridge.uiCommand(callId, "action", mediaType = type)
+                finish()
+            }
             return
         }
         // Video and runtime permission prompts require the user to unlock. Audio with an

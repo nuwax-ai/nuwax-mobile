@@ -5,13 +5,15 @@
 - Android：MediaProjection 默认显示器采集，Android 14+ 显式使用 `createConfigForDefaultDisplay()`，最终授权范围仍以系统界面为准。每次共享重新授权。SDK 的 mediaProjection 前台服务承载录屏；独立会议前台服务承载会议音频。
 - iOS：ReplayKit Broadcast Upload Extension → LiveKit IPC → 主 App 原有 Room 发布屏幕轨。扩展不建第二个参会席位，也不接触 JWT。扩展在 IPC 前将整帧等比缩到最长边 1280、最短边不超过 720，上限 30fps；主 App 保留单层 H.264 优先、3Mbps 上限及实际编码诊断。这些是配置上限，不是已实测帧率。
 - 用户点击系统开始广播、原生发布完成后才显示共享开启。取消、系统停止、断会或共享被接管均由原生收尾，不依赖页面轮询。后台释放占位复用现有 `POST /api/instant-message/meetings/public/rooms/{room}/share-holder/release`，服务端校验入会 JWT，仅允许释放本人席位。
-- 不提供“小窗”按钮或“最小化”选择。返回其他页面自动保留会议并显示贴右边沿的双左箭头（36×64、仅左侧圆角），可以上下拖动，点击回到会议。会议页不显示该入口，会议列表不再重复显示顶部返回横条；旧基座使用相同外形的业务组件备用入口。
-- 退后台请求系统 PiP：Android 在宿主可用时注册 user-leave 监听，Android 12+ 开启 auto-enter，旧宿主补充生命周期/应用后台回调；授权录屏期间暂停 auto-enter。iOS 在前台准备稳定的来源视图，后台通知补充启动，并使用 SampleBuffer 视频渲染。系统 PiP 的窗口外形由系统管理，不能做成 App 内相同的窄边双箭头。没有申请 SYSTEM_ALERT_WINDOW。系统关闭 PiP 权限/自动画中画时，会议继续，但不能保证窗口展示。原生日志包含 PiP 可能性、启动结果或失败原因，需真机核对。
+- 不提供“小窗”按钮或“最小化”选择。返回其他页面自动保留会议并显示贴右边沿的白色会议图标（36×64、仅左侧圆角），可以上下拖动，点击回到会议。会议页不显示该入口，会议列表不再重复显示顶部返回横条；旧基座使用相同外形的业务组件备用入口。
+- 退后台请求系统 PiP：Android 在宿主可用时注册 user-leave 监听，Android 12+ 开启 auto-enter，旧宿主补充生命周期/应用后台回调；授权录屏期间暂停 auto-enter。iOS 在前台准备稳定的来源视图，后台通知补充启动，并使用 SampleBuffer 视频渲染。系统 PiP 的窗口外形由系统管理，不能做成 App 内相同的窄边会议图标。没有申请 SYSTEM_ALERT_WINDOW。系统关闭 PiP 权限/自动画中画时，会议继续，但不能保证窗口展示。原生日志包含 PiP 可能性、启动结果或失败原因，需真机核对。
 - 小窗由原生会话持有，不随会议页面销毁；不回显本端共享屏幕以避免镜像递归。右上角退出仍按主持人/参会人权限处理。另一场会议不能覆盖尚未离开的会议。
 - 旧基座缺少后台配置/自动小窗导出时，仍保留原有入会、聊天、举手和 `requestScreenShare`（iOS 旧实现仅共享本 App），App 内保留返回会议提示。原生已连接但页面残留 exception 时按真实状态校准，不能误报要求更新组件。
 - 录屏不包含其他应用的内部音频；会议麦克风继续使用原音轨。受系统保护内容可能不可录制，强制终止 App 不承诺继续会议。
 
 ## iOS 首次配置（HBuilderX 5.34）
+
+交给负责 Apple 账号与打包的同事：[首次配置交接步骤](ios-broadcast-first-setup.md)。包含实际 Bundle ID、Team、两份描述文件和最终 IPA 检查。
 
 源码位于 `native/ios-broadcast/`。预编译的 `.appex` 不能由单独一份 UTS 源码自动生成，必须先在 Xcode 导出一次；之后 HBuilderX 云打包按下述配置嵌入并签名。Android 无需此步骤。
 
@@ -61,12 +63,14 @@ python3 scripts/ios-broadcast/prepare_cloud.py \
 
 ```bash
 git diff --check
+pnpm meeting:ios:check
+pnpm meeting:ios:check-base
 python3 -m unittest discover -s scripts/ios-broadcast -p 'test_*.py'
 ruby -c scripts/ios-broadcast/generate.rb
 node --test scripts/meeting-connect.test.mjs
 ```
 
-真机需验证：授权取消/等待超过 60 秒、共享后 Home/切换其他 App、横竖屏、系统停止录屏、返回上一页双箭头与上下拖动（拖动结束不能误入会）、点击回会、其他端接管共享、后台被结束会议、离会时仍在授权弹窗、权限拒绝、断网重连、小窗关闭/恢复、系统关闭自动 PiP 后仍能继续会议。Android 与 iOS 对看时同时记录实际 codec/尺寸/fps，不能只看 `nativeOn=true` 判定传输流畅。预期基座诊断标记：Android `android-edge-pip-20261123-p7`，iOS `ios-share-fallback-pip-20261123-p7`。
+真机需验证：授权取消/等待超过 60 秒、共享后 Home/切换其他 App、横竖屏、系统停止录屏、返回上一页会议图标与上下拖动（拖动结束不能误入会）、点击回会、其他端接管共享、后台被结束会议、离会时仍在授权弹窗、权限拒绝、断网重连、小窗关闭/恢复、系统关闭自动 PiP 后仍能继续会议。Android 与 iOS 对看时同时记录实际 codec/尺寸/fps，不能只看 `nativeOn=true` 判定传输流畅。预期基座诊断标记：Android `android-meeting-20261123-p8`，iOS `ios-meeting-20261123-p8`。
 
 后台释放请求失败会记录简短诊断，回前台由媒体层再次校准；网络中断或 JWT 过期期间不能保证服务端占位立即释放。
 

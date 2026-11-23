@@ -47,6 +47,8 @@ import LiveKitClient
     private var meetingPushUUIDs = Set<UUID>()
     private var meetingValidatedUUIDs = Set<UUID>()
     private var meetingInvites: [UUID: NuwaxVoipPushInvitation] = [:]
+    private var meetingPasscodes: [UUID: String] = [:]
+    private var pendingMeetingAccept: [String: Any]?
     private var pendingPushExpiry: [UUID: Task<Void, Never>] = [:]
     private var pushWork: [UUID: NuwaxVoipPushWork] = [:]
     private var pushRegistration: NuwaxVoipApnsRegistration?
@@ -89,7 +91,13 @@ import LiveKitClient
     }
     @objc public nonisolated static func drainEvents() -> String {
         let read = { @MainActor () -> String in
+            shared.deliverPendingMeetingAccept()
             let result = shared.events; shared.events = []
+            if let pending = shared.pendingMeetingAccept, result.contains(where: {
+                $0["type"] as? String == "meetingInvite" && $0["action"] as? String == "accept" &&
+                $0["inviteId"] as? String == pending["inviteId"] as? String &&
+                $0["scope"] as? String == shared.configuration["scope"] as? String
+            }) { shared.pendingMeetingAccept = nil }
             return String(data: (try? JSONSerialization.data(withJSONObject: result)) ?? Data("[]".utf8), encoding: .utf8) ?? "[]"
         }
         return Thread.isMainThread ? MainActor.assumeIsolated(read) : DispatchQueue.main.sync(execute: read)
@@ -780,6 +788,8 @@ import LiveKitClient
         }
     }
     private func reset() {
+        pendingMeetingAccept = nil
+        meetingPasscodes.removeAll()
         closeServerCall()
         generation += 1; imSocket?.cancel(with: .goingAway, reason: nil); imSocket = nil; stream?.cancel(); stream = nil; finish("sessionChanged")
         pushRegistration?.stop(revoke: true); pushRegistration = nil
@@ -834,6 +844,7 @@ import LiveKitClient
     fileprivate func isMeetingSystemCall(_ uuid: UUID) -> Bool { meetingInvites[uuid] != nil }
 
     private func clearMeeting(_ uuid: UUID) {
+        meetingPasscodes.removeValue(forKey: uuid)
         meetingPushUUIDs.remove(uuid)
         meetingValidatedUUIDs.remove(uuid)
         meetingInvites.removeValue(forKey: uuid)
@@ -842,13 +853,25 @@ import LiveKitClient
     /// Meeting answer/reject never enters the 1:1 call state machine. The JS layer
     /// opens the meeting room or reports `meeting-invite-handled`.
     fileprivate func meetingAccepted(_ uuid: UUID) {
-        guard let invitation = meetingInvites[uuid] else { return }
+        guard meetingValidatedUUIDs.contains(uuid), let invitation = meetingInvites[uuid] else { return }
+        let passcode = meetingPasscodes[uuid] ?? ""
         clearMeeting(uuid)
-        emit("meetingInvite", ["action": "accept", "callId": invitation.callId,
+        pendingMeetingAccept = ["action": "accept", "callId": invitation.callId,
             "inviteId": invitation.inviteId ?? "", "roomName": invitation.roomName ?? "",
             "title": invitation.title ?? "", "mediaType": invitation.mediaType,
-            "convId": invitation.convId ?? "", "msgId": invitation.msgId ?? ""])
+            "passcode": passcode, "convId": invitation.convId ?? "", "msgId": invitation.msgId ?? ""]
+        deliverPendingMeetingAccept()
         systemBridge?.end(uuid: uuid)
+    }
+
+    /// 锁屏时不消费业务导航；解锁回前台后按最新 UTS scope 重放，直到业务层读取。
+    private func deliverPendingMeetingAccept() {
+        guard UIApplication.shared.applicationState == .active, UIApplication.shared.isProtectedDataAvailable,
+              let pending = pendingMeetingAccept, let scope = configuration["scope"] as? String, !scope.isEmpty else { return }
+        if events.contains(where: { $0["type"] as? String == "meetingInvite" &&
+            $0["action"] as? String == "accept" && $0["scope"] as? String == scope &&
+            $0["inviteId"] as? String == pending["inviteId"] as? String }) { return }
+        emit("meetingInvite", pending)
     }
 
     fileprivate func endSystemCall(_ uuid: UUID) {
@@ -870,6 +893,8 @@ import LiveKitClient
         finish(NuwaxVoipCallPolicy.endReason(action: "end", state: wireString(call["state"]), callee: call["calleeId"] as? String == configuration["userId"] as? String))
     }
     fileprivate func systemReset() {
+        pendingMeetingAccept = nil
+        meetingPasscodes.removeAll()
         for pending in pendingPushes.values { rememberTerminal(pending.invitation.callId) }
         for task in pendingPushExpiry.values { task.cancel() }; pendingPushExpiry = [:]; pendingPushes = [:]
         meetingPushUUIDs.removeAll(); meetingValidatedUUIDs.removeAll(); meetingInvites.removeAll()
@@ -919,6 +944,7 @@ import LiveKitClient
         emit("error", ["code": "CALL_PERMISSION_REQUIRED"]); emit("openPage"); finish("permissionDenied")
     }
     private func becameActive() {
+        deliverPendingMeetingAccept()
         refreshGetuiPushRoute()
         systemBridge?.resumePendingAnswer()
         guard snapshot != nil else { return }
@@ -1248,6 +1274,8 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
                     system.end(uuid: systemUUID); return
                 }
                 meetingValidatedUUIDs.insert(systemUUID)
+                // 只使用鉴权消息接口返回的密码，不信任推送里的凭据。
+                meetingPasscodes[systemUUID] = (message["body"] as? [String: Any])?["passcode"] as? String ?? ""
                 system.invitationReady(uuid: systemUUID)
             } catch {
                 clearMeeting(systemUUID)

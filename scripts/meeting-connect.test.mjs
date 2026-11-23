@@ -20,6 +20,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
   const source = lines.join('\n').replace(/^import[\s\S]*?;\s*$/gm, '');
   const timers = new Map(), logs = [], operations = [], presentations = [], navigations = [];
   let restoreRequested = false;
+  let pageReady = true, navigationFails = false;
   let nextTimer = 0, connected = false, configured = false, claims = 0;
   const globals = {
     console: { error: value => logs.push(String(value)) },
@@ -61,8 +62,10 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
       presentations.push({ visible, foreground });
     },
     livekitConsumeMeetingRestoreRequest() { const value = restoreRequested; restoreRequested = false; return value; },
-    getCurrentPages: () => [{ route: 'pages/tab-shell/tab-shell' }],
-    uni: { navigateTo(options) { navigations.push(options.url); options.complete?.({}); } },
+    getCurrentPages: () => pageReady ? [{ route: 'pages/tab-shell/tab-shell' }] : [],
+    uni: { navigateTo(options) { navigations.push(options.url);
+      if (navigationFails) options.fail?.({}); else options.success?.({});
+      options.complete?.({}); } },
     setInterval(callback) { timers.set(++nextTimer, callback); return nextTimer; },
     clearInterval(id) { timers.delete(id); },
   };
@@ -78,6 +81,8 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     },
     nativeConnected(value) { connected = value; },
     requestRestore() { restoreRequested = true; },
+    pageReady(value) { pageReady = value; },
+    navigationFails(value) { navigationFails = value; },
   };
 }
 
@@ -245,7 +250,7 @@ for (const root of [false, true]) test(`失效会议仅退出一次，根页面=
   assert.equal(navigations.length, root ? 2 : 1, '卸载后的迟到回调不能退出上一页');
 });
 
-test('双箭头备用入口：拖动不误触返回、上下边界限制、回会后隐藏', () => {
+test('会议图标备用入口：拖动不误触返回、上下边界限制、回会后隐藏', () => {
   const raw = readFileSync(new URL('../components/meeting-active-banner/meeting-active-banner.uvue', import.meta.url), 'utf8');
   const source = raw.split('<script setup lang="uts">')[1].split('</script>')[0].replace(/^\s*import[^;]+;/gm, '');
   let now = 1000, returned = 0, minimized = true, native = false;
@@ -315,4 +320,27 @@ test('实际页面聊天、举手和共享入口先校准连接，返回不再�
   assert.deepEqual(navigated, ['back']);
   assert.equal(h.api.meetingMediaState().connected, true);
   assert.equal(h.api.meetingMediaIsMinimized(), true);
+});
+
+test('通知返回会议：页面未就绪或导航失败时保留请求，成功后不重复打开', async () => {
+  const h = harness();
+  await h.join(); h.complete();
+  h.api.meetingMediaSetResumeURL('/subpackages/pages/im-meeting/im-meeting-room?room=123456789');
+  h.pageReady(false); h.requestRestore(); h.api.meetingMediaReconcile();
+  assert.equal(h.navigations.length, 0);
+  h.pageReady(true); h.navigationFails(true); h.api.meetingMediaReconcile();
+  assert.equal(h.navigations.length, 1);
+  h.navigationFails(false); h.api.meetingMediaReconcile(); h.api.meetingMediaReconcile();
+  assert.equal(h.navigations.length, 2);
+  assert.equal(h.operations.filter(op => op === 'connect').length, 1);
+  assert.equal(h.operations.includes('disconnect'), false);
+});
+
+test('离会会清除尚未完成的通知返回请求', async () => {
+  const h = harness(); await h.join(); h.complete();
+  h.api.meetingMediaSetResumeURL('/subpackages/pages/im-meeting/im-meeting-room?room=123456789');
+  h.pageReady(false); h.requestRestore(); h.api.meetingMediaReconcile();
+  await h.api.meetingMediaDisconnect(); h.pageReady(true);
+  await h.join(); h.complete(); h.api.meetingMediaReconcile();
+  assert.equal(h.navigations.length, 0);
 });

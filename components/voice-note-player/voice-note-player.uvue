@@ -40,11 +40,12 @@
       <!-- 控制行：±15s 快进快退 -->
       <view class="atp__player-ctl">
         <view class="atp__seek-btn" hover-class="atp__seek-btn--active" @click="seekBy(-15000)">
-          <text class="atp__seek-icon">↺</text>
+          <!-- 安卓 <text> 画 ↺/↻ 依赖系统字体，字形缺失时整颗图标空白，改用固定尺寸位图 -->
+          <image class="atp__seek-icon" src="/static/images/icon-voice-rewind.png" mode="aspectFit" />
           <text class="atp__seek-label">15</text>
         </view>
         <view class="atp__seek-btn" hover-class="atp__seek-btn--active" @click="seekBy(15000)">
-          <text class="atp__seek-icon">↻</text>
+          <image class="atp__seek-icon" src="/static/images/icon-voice-forward.png" mode="aspectFit" />
           <text class="atp__seek-label">15</text>
         </view>
       </view>
@@ -169,6 +170,8 @@
   let audioLoadVersion: number = 0;
   let audioLoading: boolean = false;
   let autoplayWhenReady: boolean = false;
+  /** 用户点了播放之后才允许弹出播放失败。进页面只拉地址，不创建播放器。 */
+  let playbackRequested: boolean = false;
 
   /**
    * 分段连播运行时（NW-269 audio-files 新口径）：
@@ -497,6 +500,7 @@
     audioLoadVersion++;
     audioLoading = false;
     autoplayWhenReady = false;
+    playbackRequested = false;
     // #ifdef APP
     if (audioCtx != null) {
       audioCtx!!.destroy();
@@ -518,9 +522,75 @@
     audioSegmentCount.value = 0;
   };
 
+  /** 播放器等到真正开始播再创建。提前设置地址会让系统立刻加载，失败时进页面就弹提示。 */
+  const ensureAudioContext = () => {
+    // #ifdef APP
+    if (audioCtx != null) return;
+    audioCtx = uni.createInnerAudioContext();
+    audioCtx!!.onTimeUpdate(() => updateProgress());
+    audioCtx!!.onEnded(() => {
+      if (!playing.value) return;
+      advanceSegment();
+    });
+    audioCtx!!.onCanplay(() => {
+      if (segPendingSeekMs >= 0) {
+        audioCtx!!.seek(segPendingSeekMs / 1000);
+        segPendingSeekMs = -1;
+      }
+      if (switchingSeg && playing.value) {
+        audioCtx!!.play();
+      }
+    });
+    audioCtx!!.onError((err) => {
+      console.error("audio-transcript-player audio error", err);
+      const shouldToast = playbackRequested;
+      playing.value = false;
+      playbackRequested = false;
+      const failed = audioCtx;
+      audioCtx = null;
+      if (failed != null) {
+        failed.stop();
+        failed.destroy();
+      }
+      if (!shouldToast) return;
+      uni.showToast({ title: t("Mobile.Terminal.audioPlayFailed"), icon: "none" });
+    });
+    // #endif
+  };
+
+  /** 用户点击播放，或明确要求自动播放时，才设置地址并开始。 */
+  const beginPlayback = () => {
+    // #ifdef APP
+    if (audioSegments.length == 0) return;
+    if (currentSegIndex < 0) currentSegIndex = 0;
+    playbackRequested = true;
+    ensureAudioContext();
+    if (audioCtx == null) return;
+    enableFollowTranscript();
+    const url = audioSegments[currentSegIndex].audioUrl;
+    if (audioCtx!!.src != url) {
+      audioCtx!!.src = url;
+    }
+    // #ifndef APP-HARMONY
+    audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
+    // #endif
+    playing.value = true;
+    if (pendingSeekMs >= 0) {
+      const target = pendingSeekMs;
+      pendingSeekMs = -1;
+      applySeekToAudio(target);
+    }
+    audioCtx!!.play();
+    emit("play");
+    setTimeout(() => {
+      syncActiveFromTime(currentTimeMs.value, true);
+    }, 80);
+    // #endif
+  };
+
   /**
-   * 拉取录音分段列表并绑定 InnerAudioContext（仅 App；NW-269 audio-files 新口径）。
-   * 一次分页拉全所有段（预签名 24h，进页面一次即可）；total=1 退化为旧单文件行为。
+   * 拉取录音分段列表（NW-269 audio-files）。
+   * 进页面只保存地址，不创建播放器。total=1 时退化为单文件。
    */
   const initAudio = async (doAutoplay: boolean) => {
     const sourceId = audioSourceId();
@@ -596,51 +666,12 @@
       currentSegIndex = 0;
       segBaseMs = 0;
       rebuildTranscriptSegIndex();
-      // #ifdef APP
-      if (audioCtx == null) {
-        audioCtx = uni.createInnerAudioContext();
-        audioCtx!!.onTimeUpdate(() => updateProgress());
-        audioCtx!!.onEnded(() => {
-          // 单段自然结束与旧口径一致；多段由 advanceSegment 连播/收尾
-          advanceSegment();
-        });
-        audioCtx!!.onCanplay(() => {
-          if (segPendingSeekMs >= 0) {
-            audioCtx!!.seek(segPendingSeekMs / 1000);
-            segPendingSeekMs = -1;
-          }
-          if (switchingSeg && playing.value) {
-            audioCtx!!.play();
-          }
-        });
-        audioCtx!!.onError((err) => {
-          console.error("audio-transcript-player audio error", err);
-          playing.value = false;
-          uni.showToast({ title: t("Mobile.Terminal.audioPlayFailed"), icon: "none" });
-        });
-      }
-      audioCtx!!.src = audioSegments[0].audioUrl;
-      // #ifndef APP-HARMONY
-      audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
-      // #endif
       initedSourceId = sourceId;
       syncDisplayDuration();
       syncActiveFromTime(0, false);
-      if (pendingSeekMs >= 0) {
-        const target = pendingSeekMs;
-        pendingSeekMs = -1;
-        applySeekToAudio(target);
-      }
       if (autoplayWhenReady) {
-        enableFollowTranscript();
-        audioCtx!!.play();
-        playing.value = true;
-        emit("play");
-        setTimeout(() => {
-          syncActiveFromTime(currentTimeMs.value, true);
-        }, 80);
+        beginPlayback();
       }
-      // #endif
     } catch (e) {
       console.error("audio-transcript-player initAudio error", e);
     } finally {
@@ -653,20 +684,11 @@
 
   const play = () => {
     // #ifdef APP
-    if (audioCtx == null) {
+    if (!audioLoaded.value || audioSegments.length == 0) {
       initAudio(true);
       return;
     }
-    enableFollowTranscript();
-    // #ifndef APP-HARMONY
-    audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
-    // #endif
-    audioCtx!!.play();
-    playing.value = true;
-    emit("play");
-    setTimeout(() => {
-      syncActiveFromTime(currentTimeMs.value, true);
-    }, 80);
+    beginPlayback();
     // #endif
   };
 
@@ -982,8 +1004,9 @@
     }
 
     &__seek-icon {
-      font-size: 28rpx;
-      color: #5147ff;
+      width: 28rpx;
+      height: 28rpx;
+      flex-shrink: 0;
     }
 
     &__seek-label {

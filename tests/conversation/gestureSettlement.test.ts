@@ -97,7 +97,7 @@ async function finishDrawer(offset: number, velocity: number, age: number, cance
   const { code } = await transformWithOxc(body, "drawer.ts", { lang: "ts" });
   const settleDrawer = vi.fn();
   const finish = runInNewContext(`${code}\nfinishDrawerDrag`, {
-    drawerOffset: { value: offset }, drawerWidth: { value: 320 }, drawerVelocity: velocity,
+    drawerLastOffset: offset, drawerWidth: { value: 320 }, drawerVelocity: velocity,
     drawerLastTime: Date.now() - age, settleDrawer, Date, ...(await gestureModule()),
   });
   finish(cancelled, wasOpen);
@@ -105,6 +105,52 @@ async function finishDrawer(offset: number, velocity: number, age: number, cance
 }
 
 describe("菜单拖动收尾", () => {
+  it("任务短拖回弹时不打开长按菜单，落定后仍可长按", async () => {
+    const source = readFileSync("components/conversation-history-list/conversation-history-list.uvue", "utf8");
+    const start = source.indexOf("  function handleTaskLongPress(");
+    const method = source.slice(start, source.indexOf("\n  }", start) + 4);
+    const { code } = await transformWithOxc(method, "task-long-press.ts", { lang: "ts" });
+    const props = { drawerDragging: true };
+    const showActionSheet = vi.fn();
+    const longPress = runInNewContext(`${code}\nhandleTaskLongPress`, {
+      props, uni: { showActionSheet }, toBool: Boolean, t: (key: string) => key,
+    });
+    longPress({});
+    expect(showActionSheet).not.toHaveBeenCalled();
+    props.drawerDragging = false;
+    longPress({});
+    expect(showActionSheet).toHaveBeenCalledTimes(1);
+  });
+
+  it("同一帧内的多个触点只绘制最新位移", async () => {
+    const source = readFileSync("components/project-task-drawer/project-task-drawer.uvue", "utf8");
+    const methods = ["paintDrawerDragFrame", "updateDrawerOffset"].map(name => {
+      const start = source.indexOf(`  function ${name}(`);
+      return source.slice(start, source.indexOf("\n  }", start) + 4);
+    });
+    const androidOnly = methods.join("\n").replace(/\/\/ #ifndef APP-ANDROID \|\| H5 \|\| WEB[\s\S]*?\/\/ #endif/, "");
+    const { code } = await transformWithOxc(androidOnly, "drawer-drag.ts", { lang: "ts" });
+    const frames: (() => void)[] = [];
+    const requestAnimationFrame = vi.fn((callback: () => void) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const paintDrawer = vi.fn();
+    const updateOffset = runInNewContext(`${code}\nupdateDrawerOffset`, {
+      drawerWidth: { value: 320 }, drawerLastOffset: 0, drawerLastTime: 0, drawerVelocity: 0,
+      drawerFrameId: 0, requestAnimationFrame, paintDrawer, Date,
+    });
+    updateOffset(-20);
+    updateOffset(-40);
+    updateOffset(-85);
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(1);
+    expect(paintDrawer).not.toHaveBeenCalled();
+    frames[0]();
+    expect(paintDrawer).toHaveBeenCalledExactlyOnceWith(-85, 0);
+    updateOffset(-100);
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(2);
+  });
+
   it("慢拖按开关方向使用一致的三成距离阈值", async () => {
     expect(await finishDrawer(-260, 0, 200)).toHaveBeenCalledWith(false);
     expect(await finishDrawer(-100, 0, 200)).toHaveBeenCalledWith(true);

@@ -97,5 +97,5 @@ if __name__ == "__main__":
         raise SystemExit("Android VoIP release origin cannot be combined with the device test host")
     configure_qa_manifest(project, Path(qa_path) if qa_path else None, release_origin)
     configure_test_host(project, enabled)
-    configure(project, Path(config_path) if config_path else None, enable_vivo_voip=bool(qa_path))
+    configure(project, Path(config_path) if config_path else None, enable_vivo_voip=bool(qa_path or release_origin))
     configure_resources(project, Path(qa_path) if qa_path else Path(__file__).resolve().parents[3])

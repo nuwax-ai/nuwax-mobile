@@ -23,7 +23,7 @@ class VivoVoipPushMessageReceiver : VivoPushMessageReceiver() {
 
 internal const val CALL_PAYLOAD = "com.nuwax.voip.VIVO_CALL_PAYLOAD"
 
-/** Internal only, compiled into the signed test-environment package. */
+/** Receives the app-private relay in the main process for both calls and meeting invitations. */
 class VivoVoipCallReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val payload = intent.getStringExtra(CALL_PAYLOAD)?.let(VoipPushPayload::invitation) ?: return

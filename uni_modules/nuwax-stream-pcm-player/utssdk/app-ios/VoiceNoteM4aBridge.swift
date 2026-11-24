@@ -5,6 +5,7 @@
 //  segmentKey 格式：localId|index。单字符串跨桥，避免多参数转换失败。
 //
 import AVFoundation
+import CallKit
 import Foundation
 
 public class VoiceNoteM4aBridge {
@@ -17,6 +18,10 @@ public class VoiceNoteM4aBridge {
     private var interruptBeganAt = Date()
     private var pendingEvents: [String] = []
     private var ignoreBeganUntil = Date()
+    /// 用户自己点的暂停。这种停止不能当成电话打断，否则挂断后又会自动录。
+    private var userPaused = false
+    private var resumeNotBefore = Date()
+    private let callObserver = CXCallObserver()
 
     public init() {
         let center = NotificationCenter.default
@@ -70,6 +75,10 @@ public class VoiceNoteM4aBridge {
 
     private func startSegmentOnMain(_ segmentKey: String) -> String {
         lastError = ""
+        if phoneBusy() {
+            lastError = "音频仍被占用"
+            return ""
+        }
         let session = AVAudioSession.sharedInstance()
         if session.recordPermission == .denied {
             lastError = "没有麦克风权限"
@@ -81,6 +90,7 @@ public class VoiceNoteM4aBridge {
         }
         ignoreBeganUntil = Date().addingTimeInterval(1.5)
         interruptHold = false
+        userPaused = false
         guard activateSession() else {
             return ""
         }
@@ -103,6 +113,7 @@ public class VoiceNoteM4aBridge {
                 self.lastError = "录音器不存在"
                 return "0"
             }
+            userPaused = true
             if recorder.isRecording {
                 recorder.pause()
             }
@@ -116,21 +127,28 @@ public class VoiceNoteM4aBridge {
                 self.lastError = "录音器不存在"
                 return "0"
             }
+            if Date() < self.resumeNotBefore || self.sessionBusy() {
+                self.lastError = "音频仍被占用"
+                return "0"
+            }
             // 电话挂断后会话是停用的，要先激活再继续写同一个文件。
             if !recorder.isRecording {
                 _ = self.activateSession()
             }
             if recorder.record() {
+                self.userPaused = false
                 self.interruptHold = false
                 self.pendingEvents.removeAll()
                 return "1"
             }
             _ = self.activateSession()
             if recorder.record() {
+                self.userPaused = false
                 self.interruptHold = false
                 self.pendingEvents.removeAll()
                 return "1"
             }
+            self.resumeNotBefore = Date().addingTimeInterval(1.5)
             self.lastError = "继续录音失败"
             return "0"
         }
@@ -138,6 +156,7 @@ public class VoiceNoteM4aBridge {
 
     public func stopSegment() -> String {
         return onMain {
+            self.userPaused = false
             self.interruptHold = false
             self.pendingEvents.removeAll()
             return self.closeRecorder()
@@ -163,7 +182,17 @@ public class VoiceNoteM4aBridge {
     /// 结束后系统经常不发 interruption ended，会话空出来后补一次结束。
     public func takeInterruption() -> String {
         return onMain {
-            if self.interruptHold && self.interruptGraceDone() && !self.otherAudioBusy() {
+            // 电话进来时经常没有 interruption 通知，录音器已经被系统停掉。页面仍在计时。
+            let ready = Date() >= self.ignoreBeganUntil || self.sessionBusy()
+            if !self.userPaused && !self.interruptHold && !self.currentPath.isEmpty && ready {
+                if let recorder = self.recorder, !recorder.isRecording {
+                    self.interruptBeganAt = Date()
+                    self.interruptHold = true
+                    self.pushEvent("began")
+                    NSLog("[voice-note] m4a recorder stopped without interruption")
+                }
+            }
+            if self.interruptHold && self.interruptGraceDone() && !self.sessionBusy() {
                 self.pushEvent("ended")
             }
             if self.pendingEvents.isEmpty {
@@ -207,7 +236,10 @@ public class VoiceNoteM4aBridge {
                     return
                 }
                 // 开录时会话激活会自己发一次中断。真有电话或语音占用时不能忽略。
-                if Date() < self.ignoreBeganUntil && !self.otherAudioBusy() {
+                if self.userPaused {
+                    return
+                }
+                if Date() < self.ignoreBeganUntil && !self.sessionBusy() {
                     return
                 }
                 // 系统经常先停掉录音器再发通知。这时 isRecording 已经是 false，仍然要通知页面暂停。
@@ -223,7 +255,7 @@ public class VoiceNoteM4aBridge {
             return
         }
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, self.interruptHold, self.interruptGraceDone(), !self.otherAudioBusy() else {
+            guard let self = self, self.interruptHold, self.interruptGraceDone(), !self.sessionBusy() else {
                 return
             }
             self.pushEvent("ended")
@@ -232,6 +264,21 @@ public class VoiceNoteM4aBridge {
 
     private func interruptGraceDone() -> Bool {
         return Date().timeIntervalSince(interruptBeganAt) >= 0.8
+    }
+
+    /// 系统电话、FaceTime 还在通话中。
+    private func phoneBusy() -> Bool {
+        for call in callObserver.calls {
+            if !call.hasEnded {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// 电话或第三方语音还占着会话时不要恢复。
+    private func sessionBusy() -> Bool {
+        return phoneBusy() || otherAudioBusy()
     }
 
     /// 电话或第三方语音还占着会话时不要恢复。

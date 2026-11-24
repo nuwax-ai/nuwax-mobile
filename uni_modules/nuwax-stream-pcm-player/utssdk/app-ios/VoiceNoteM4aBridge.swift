@@ -132,6 +132,11 @@ public class VoiceNoteM4aBridge {
         }
     }
 
+    /// 进程被杀掉后，给没有 moov 的 m4a 补封口。已经封口的文件原样返回成功。
+    public func sealFile(_ path: String) -> String {
+        return VoiceNoteM4aSeal.sealFile(path)
+    }
+
     public func takeClosedDurationMs() -> String {
         let duration = String(lastClosedDurationMs)
         lastClosedDurationMs = 0

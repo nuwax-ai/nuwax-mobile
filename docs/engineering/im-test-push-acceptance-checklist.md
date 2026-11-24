@@ -75,16 +75,38 @@
 
 - **业务数据已核对。** 云端日志确认 `callId`、被叫、会话和消息 ID、媒体类型及有效期齐全，会议响铃校验通过。用回下载的云函数和本机 UniPush 扩展库 `1.2.0` 离线回放，三端的业务邀请关键字段一致。vivo 生成了 `settings.strategy.vv=2`、`message-type=3`、与业务邀请一致的 `extraData` 和 5 秒 TTL。回放验证到 UniPush 请求生成，个推发给 vivo 的报文和实际下发结果待核对。
 - **锁屏唤醒未通过。** 两次拨号前 Y77 均熄屏锁屏、主进程和推送进程已退出、应用未被强停。个推均返回 `successed_offline`，Y77 未亮屏、未启动女娲进程，也未出现接听页。两个任务的单推实时统计均返回 `30017`，逐设备消息轨迹均返回 `10004`，当前账号缺少查询权限。[UniPush 返回码说明](https://doc.dcloud.net.cn/uniCloud/uni-cloud-push/api.html)
-- **设备展示条件。** Y77 的悬浮窗已允许、勿扰已关闭，来电通知渠道重要度为 3。单聊主动打开锁屏接听页要求重要度至少为 4。恢复验收时，在确认厂商回调到达后单独核对全屏展示。[Android 开页条件](../../uni_modules/nuwax-voip/utssdk/app-android/src/com/nuwax/voip/VoipBridge.kt#L657)
+- **设备展示条件。** Y77 的悬浮窗已允许、勿扰已关闭。11 月 21 日 10:44，开启「音视频通话邀请通知」类别内的「悬浮通知」后，系统回读渠道重要度从 3 升至 4，满足单聊主动打开锁屏接听页的渠道条件。后续在确认厂商回调到达后实测全屏展示，并在接听时核对麦克风权限。[Android 开页条件](../../uni_modules/nuwax-voip/utssdk/app-android/src/com/nuwax/voip/VoipBridge.kt#L657)
+
+11 月 21 日 10:53 起，按两笔日志中同一 CID 从 UniPush 获取 vivo RegID，在 AppID `106129284` 的 vivo「在线诊断」查得该设备当时在线。两个任务的普通报表均返回成功但没有统计明细，实时统计和逐设备轨迹仍分别返回 `30017`、`10004`。vivo「消息追踪」还需要厂商发送响应中的 `message.name`。测试云函数传入的 `appMessageId` 是请求去重标识，两笔厂商消息 ID 仍待个推提供。[vivo 发送接口](https://dev.vivo.com.cn/documentCenter/doc/979)
+
+同一 vivo 账号的历史工单和工单站内信均为空，13 条审核消息与 2 条平台通知均未见 VoIP 批复。应用信息页单列的「APP 消息回执地址」显示未开通，该项只反映回执配置。最近一次专用发送权益的直接证据仍为 11 月 20 日 23:32 的未授权错误。
 
 本机证据目录为 `out/voip-android-qa-20261121/vivo-standard-redial.I6EPoI4Z`，内有云端字段回读、离线回放和两个任务的查询回执。
 
 ### vivo 暂停与恢复条件
 
-暂停 Y77 的锁屏唤醒实拨，以下两项确认后恢复。来电投递继续统一走 UniPush，华为 Android 与 iOS 沿用各自已通过的链路。
+首次核对后暂停了 Y77 实拨。11 月标准包已按更新后的验收安排，在覆盖安装后各复拨一次，结果见下表。后续复验等待厂商权益和下发回执。
 
-- [ ] **确认 vivo VoIP 发送权益。** 在 vivo 开放平台核对 AppID `106129284`、包名 `com.nuwax.app` 对应的 `message-type=3` 权益。11 月 21 日 10:28 后台显示普通推送为「正式／已通过」，当前账号历史工单无 VoIP 审批记录。11 月 20 日的厂商探针返回未授权。[vivo 申请指南](https://dev.vivo.com.cn/documentCenter/doc/983)
-- [ ] **确认个推实际下发。** 请个推按上表两个任务号回查 `VV` 通道的 VoIP 下发结果，记录 vivo 消息 ID、厂商回执或拒因。权益或通道配置确认后，按需要用新任务核对实际下发，再恢复 Y77 锁屏唤醒验收。
+- [ ] **确认 vivo VoIP 发送权益。** 11 月 21 日 11:10:13 已提交权益查询，工单号 `2026112111100128696`，提交后在历史工单回读为「待处理」。正文已写明己方链路及字段配置已核对，请 vivo 确认 AppID `106129284`（`com.nuwax.app`）的 `message-type=3` 权益是否已生效、是否覆盖 DCloud UniPush。收到权益答复后更新此项。[vivo 工单详情](https://bps.vivo.com.cn/detail?id=173922)
+- [ ] **确认 UniPush 到 vivo 的实际下发。** vivo 确认权益后，按上表两笔任务号核对厂商回执。如果控制台仍查不到明细，由 DCloud／UniPush 支持追查 vivo 消息 ID（`message.name`）或具体拒因。若旧任务在权益开通前被拒，用生效后的新任务核实下发。取得实际下发证据后，再验 Y77 无进程锁屏来电。
+
+### 11 月 21 日标准提测包覆盖安装后的实拨
+
+在 `feat-2026.11` 的 `c3122e68e` 上用标准入口重新出包。基座和提测 APK 的 Manifest 与 DEX 均已回读，vivo 回调从推送进程转交主进程，进入现有 `VoipBridge.receiveUniPush`。11:27:39 在 Y77 覆盖安装签名 Release `1.4.0 (140)`，机上 APK 的 SHA-256 为 `c459e30851136a731d8fa42a9391151569dd725aafbf4f29d5d8d5a94ffcc4f9`，与交付文件一致。
+
+以下为北京时间。每行均按测试空间 `push-send-test` 的同一云调用核对入参、选路和任务返回值。
+
+| 场景及入参时间 | 云函数 RequestID | 业务 callId | UniPush 任务号 |
+|---|---|---|---|
+| 单聊语音 11:29:11 | `0a4b4e7917952317515096000170` | `call-mwpumppe-j5c7l7` | `RASS_1121_71949821b1b62f4bbf5c91bd985c2120` |
+| 会议响铃 11:30:52 | `0a4b09ec17952318525442619192` | `mi-mwpuovzr-205556-0` | `RASS_1121_a9638a9b0f64eff3f62c7fa158ba4332` |
+
+- 共同入参为 `type=voip`、`payload.type=voip`、`mediaType=audio`、`convType=1`。会话和被叫相同，各有独立的字符串消息 ID，分别为 `249737873199206400`、`249738295137800192`。两笔 `expiresAt - sendTime` 均为 60 秒，到达函数时均有效。各命中一个 CID，无重复，入参与投递目标的 CID 指纹均为 `d7a4a02be2d9`。
+- 单聊为 `scene=call`，`inviteId=null`。会议为 `scene=meeting`，`inviteId=callId`，有房间号，`silent=false`、`groupCall=false`。云函数记录 `ringRequested=true`、`meetingRinging=true`、`ringExpired=false`、`ringError=null`。
+- 两笔入参均为 `callRoute=null`、`forceNotification=true`。随后均记录 `call route auto`，查得 `brand=vv`、`hasVendorToken=true`，实际 `call transport` 为 `android-vivo`，业务 callId 与入参一致。两笔均返回 `errCode=0`、`successed_offline`；这两次调用未记录普通通知回退。厂商消息 ID 和 vivo 实际下发结果仍待确认。
+- 拨入前手机均已锁屏熄屏，应用进程和推送进程均已退出，`stopped=false`。两次各采样 53 次，覆盖 60 秒邀请有效期，均未观察到亮屏、应用进程启动或全屏接听页，采样结束时未见对应通知。锁屏唤醒未通过。vivo 权益查询工单 `2026112111100128696` 详情页显示「工单处理中」。
+
+本机证据目录为 `out/vivo-standard-acceptance.bWqTMmYg/`。其中 `cloud-call.json` 和 `cloud-meeting.json` 保留了各阶段脱敏字段，可按表中云函数 RequestID 回查。
 
 ### 恢复验收步骤
 

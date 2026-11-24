@@ -343,10 +343,14 @@ async function sendNativeVoip(body, route, nativeVoip, invocationId) {
     if (huaweiTransmission || harmony) {
       const transmission = JSON.stringify({ unipush_version: '2.0', payload: nativeVoip.payload })
       const pushChannel = harmony
-        ? { harmony: { custom: { HW: {
-            type: 'voip_call',
-            payload: JSON.stringify({ extraData: JSON.stringify(nativeVoip.payload) })
-          } } } }
+        ? { harmony: {
+            custom: { HW: {
+              type: 'voip_call',
+              payload: JSON.stringify({ extraData: JSON.stringify(nativeVoip.payload) })
+            } },
+            // Huawei requires the test marker while the calling entitlement is in commissioning.
+            options: { HW: { '/pushOptions/testMessage': true } }
+          } }
         : { android: { ups: { transmission } } }
       // sendMessage builds ups.notification even when force_notification is false.
       result = await uniPush.request({
@@ -388,6 +392,7 @@ async function sendNativeVoip(body, route, nativeVoip, invocationId) {
     console.log('[push-send] call transport', JSON.stringify({
       invocationId, transport: route.transport, cid: route.cid, callId: nativeVoip.payload.callId,
       requestId: nativeVoip.requestId, scene: nativeVoip.payload.scene, errCode, tasks,
+      ...(harmony ? { testMessage: true } : {}),
     }))
     return { errCode, data: { requestId: nativeVoip.requestId, tasks } }
   } catch {

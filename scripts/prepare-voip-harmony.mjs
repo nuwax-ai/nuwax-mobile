@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir, copyFile, cp, realpath } from 'node:fs/prom
 import { resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSON5 from 'json5';
+import { stageVoiceQa, verifyVoiceQaTarget } from './voip-native/harmony-voice-qa/stage.mjs';
 
 function prepareEntryAbility(source) {
   const marker = '// nuwax-voip-entry-hook';
@@ -37,6 +38,8 @@ function prepareEntryAbility(source) {
 const root = await realpath(fileURLToPath(new URL('../', import.meta.url)));
 const project = await realpath(resolve(process.argv[2] ?? `${root}/unpackage/dist/dev/app-harmony`));
 if (!['out/', 'unpackage/'].some(prefix => relative(root, project).startsWith(prefix))) throw new Error('Refusing to modify a project outside this worktree ignored output');
+const voiceQaLibrary = process.env.NUWAX_HARMONY_VOICE_LIBRARY;
+if (voiceQaLibrary) await verifyVoiceQaTarget(root, project);
 const entry = `${project}/entry/src/main`;
 const modulePath = `${entry}/module.json5`;
 const config = JSON5.parse(await readFile(modulePath, 'utf8'));
@@ -47,6 +50,9 @@ if (!relative(entry, abilityPath).startsWith('ets/')) throw new Error('EntryAbil
 const abilitySource = (await readFile(abilityPath, 'utf8')).replace(
   "from '../../../../../uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge'", "from '@uni_modules/nuwax-voip'");
 const preparedAbility = prepareEntryAbility(abilitySource);
+if (!voiceQaLibrary && preparedAbility.includes('VoipBridge.nativeVoiceStart = HarmonyNativeVoice.start')) {
+  throw new Error('Generated QA output contains native voice. Supply NUWAX_HARMONY_VOICE_LIBRARY or regenerate the standard project.');
+}
 const receiverOwners = config.module.abilities.filter(value => value.name !== 'EntryAbility' && value.skills?.some(skill => skill.actions?.includes('action.ohos.push.listener')));
 if (receiverOwners.length) throw new Error('Native push listener already belongs to another Ability; reconcile it before building');
 main.skills ??= [];
@@ -72,13 +78,18 @@ for (const permission of permissions) {
   if (!old) config.module.requestPermissions.push(permission);
   else if (permission.usedScene) old.usedScene = { ...old.usedScene, abilities: [...new Set([...(old.usedScene?.abilities ?? []), ...permission.usedScene.abilities])], when: 'inuse' };
 }
-await writeFile(modulePath, JSON.stringify(config, null, 2) + '\n');
 const source = `${root}/scripts/voip-native/harmony`;
 await mkdir(`${entry}/ets/voip`, { recursive: true });
 await mkdir(`${entry}/ets/pages`, { recursive: true });
 await copyFile(`${source}/NuwaxVoipMediaAbility.ets`, `${entry}/ets/voip/NuwaxVoipMediaAbility.ets`);
 await copyFile(`${source}/NuwaxVoipMedia.ets`, `${entry}/ets/pages/NuwaxVoipMedia.ets`);
 await cp(`${root}/static/app/voip`, `${entry}/resources/rawfile/voip`, { recursive: true });
+const media = `${entry}/resources/rawfile/voip`;
+await cp(`${root}/static/voip/call-icons`, `${media}/call-icons`, { recursive: true });
+await copyFile(`${source}/media.css`, `${media}/harmony.css`);
+const mediaHtml = await readFile(`${media}/media.html`, 'utf8');
+if (!mediaHtml.includes('</head>')) throw new Error('Cannot find the head of the generated VoIP media page');
+await writeFile(`${media}/media.html`, mediaHtml.replace('</head>', '<link rel="stylesheet" href="harmony.css"></head>'));
 const pagesFile = `${entry}/resources/base/profile/main_pages.json`;
 const pages = JSON5.parse(await readFile(pagesFile, 'utf8'));
 if (!pages.src.includes('pages/NuwaxVoipMedia')) pages.src.push('pages/NuwaxVoipMedia');
@@ -92,5 +103,7 @@ for (const locale of ['base', 'en_US', 'zh_CN', 'zh_TW', 'zh_HK']) {
   for (const [name, value] of Object.entries(values)) { const old = strings.string.find(item => item.name === name); if (old) old.value = value; else strings.string.push({ name, value }); }
   await writeFile(path, JSON.stringify(strings, null, 2) + '\n');
 }
-await writeFile(abilityPath, preparedAbility);
+if (voiceQaLibrary) await stageVoiceQa(project, resolve(voiceQaLibrary), abilityPath, preparedAbility, main);
+else await writeFile(abilityPath, preparedAbility);
+await writeFile(modulePath, JSON.stringify(config, null, 2) + '\n');
 console.log('[voip] Harmony native call host / push / background configuration regenerated');

@@ -117,6 +117,14 @@ describe('Harmony system call cold start', () => {
     expect(VoipBridge.queue).toContainEqual(expect.objectContaining({ type: 'snapshot', nativeIncomingUI: true }));
   });
 
+  it.each([undefined, { source: 'vendor' }])('uses the envelope call ID regardless of header metadata (%j)', async (header) => {
+    setup();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    await VoipBridge.incoming({ type: 'VoIP', callId: '', data: JSON.stringify({ header, callId: systemId, data: JSON.stringify(invite()) }) });
+    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ callId: systemId }));
+    expect(VoipBridge.current?.callId).toBe(callId);
+  });
+
   it('reports the system call before IM validation and processes an early locked-screen voice answer once', async () => {
     setup();
     let resolveMessage!: (value: any) => void;

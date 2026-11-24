@@ -130,6 +130,7 @@ describe('native call delivery', () => {
     });
     const channel = args.requestData.push_channel.harmony.custom.HW;
     expect(channel.type).toBe('voip_call');
+    expect(args.requestData.push_channel.harmony.options.HW).toEqual({ '/pushOptions/testMessage': true });
     expect(JSON.parse(JSON.parse(channel.payload).extraData)).toEqual({ ...payload, calleeId: '10002' });
     expect(Object.keys(args.requestData.push_channel)).toEqual(['harmony']);
     await call({ ...invitation, push_clientid: cid });

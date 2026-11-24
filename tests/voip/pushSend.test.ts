@@ -112,6 +112,43 @@ describe('native call delivery', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it('sends one Huawei HarmonyOS VoIP request through the dedicated vendor channel', async () => {
+    const { call, send, request } = load();
+    const { payload, ...body } = makeBody();
+    const invitation = { ...body, push_clientid: [cid],
+      callRoute: { cid, platform: 'harmonyos', transport: 'harmony-huawei' },
+      payload: { ...payload, scene: 'call', calleeId: '10002', roomName: 'call-same-call', token: 'omitted' },
+      options: { ios: { type: 'voip' } }, settings: { ttl: 30000 },
+    };
+    expect((await call(invitation)).errCode).toBe(0);
+    expect(send).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledOnce();
+    const args = request.mock.calls[0][0];
+    expect(args).toMatchObject({
+      method: 'POST', module: '/push/single/cid',
+      requestData: { audience: { cid: [cid] }, settings: { ttl: 30000, strategy: { hoshw: 2 } } },
+    });
+    const channel = args.requestData.push_channel.harmony.custom.HW;
+    expect(channel.type).toBe('voip_call');
+    expect(JSON.parse(JSON.parse(channel.payload).extraData)).toEqual({ ...payload, calleeId: '10002' });
+    expect(Object.keys(args.requestData.push_channel)).toEqual(['harmony']);
+    await call({ ...invitation, push_clientid: cid });
+    expect(request.mock.calls[1][0].requestData.request_id).toBe(args.requestData.request_id);
+  });
+
+  it('rejects malformed HarmonyOS routes and skips expired calls without falling back to a notification', async () => {
+    const { call, send, request } = load();
+    const { payload, ...body } = makeBody();
+    const route = { cid, platform: 'harmonyos', transport: 'harmony-huawei' };
+    const invitation = { ...body, callRoute: route, payload: { ...payload, scene: 'call', calleeId: '10002' } };
+    expect((await call({ ...invitation, push_clientid: [cid, 'other-cid'] })).errCode).toBe(400);
+    expect((await call({ ...invitation, callRoute: { ...route, platform: 'android' } })).errCode).toBe(400);
+    expect(await call({ ...invitation, payload: { ...invitation.payload, expiresAt: Date.now() - 1 } }))
+      .toEqual({ errCode: 0, data: { skipped: true } });
+    expect(request).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it.each(notificationOnlyTransports)('delivers an explicit %s route by notification', async (transport) => {
     const { call, send, request } = load();
     const body = makeBody();
@@ -131,14 +168,6 @@ describe('native call delivery', () => {
       .toEqual({ errCode: 400, errMsg: 'one matching call device is required' });
     expect(await call({ ...makeBody(Date.now() - 1), callRoute }))
       .toEqual({ errCode: 0, data: { skipped: true } });
-    expect(send).not.toHaveBeenCalled();
-    expect(request).not.toHaveBeenCalled();
-  });
-
-  it('keeps the deferred HarmonyOS route unavailable for native calls', async () => {
-    const { call, send, request } = load();
-    expect(await call({ ...makeBody(), callRoute: { cid, platform: 'harmonyos', transport: 'harmony-huawei' } }))
-      .toEqual({ errCode: 400, errMsg: 'native call transport unavailable' });
     expect(send).not.toHaveBeenCalled();
     expect(request).not.toHaveBeenCalled();
   });
@@ -619,11 +648,30 @@ describe('automatic vendor route resolution', () => {
     expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({ delivery: 'android-native' });
   });
 
+  it.each([[7, 'hoshw'], ['7', 'HW']])('routes only single-chat calls to Harmony (%s, %s)', async (phoneType, brand) => {
+    const cid = 'harmony-registry-cid';
+    const { call, send, request } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand, phone_type: phoneType },
+    });
+    const body = makeCall(cid);
+    const result = await call({ ...body, push_clientid: [cid] });
+    expect(result.data.results).toMatchObject([{ cid, transport: 'harmony-huawei', delivery: 'native', errCode: 0 }]);
+    expect(request.mock.calls[0][0].requestData.push_channel).toMatchObject({
+      harmony: { custom: { HW: { type: 'voip_call' } } },
+    });
+    expect(send).not.toHaveBeenCalled();
+
+    await call({ ...body, payload: { ...body.payload, scene: 'meeting', convType: 2,
+      inviteId: 'qa-meeting', roomName: 'qa-room', title: '测试会议', silent: false, groupCall: true } });
+    expect(request).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledOnce();
+  });
+
   it.each([
     ['no vendor token', { device_token: '', brand: 'hw', phone_type: 1 }],
     ['no vivo vendor token', { device_token: ' ', brand: 'vv', phone_type: 1 }],
     ['unknown brand', { device_token: 'vendor-token', brand: 'unknown', phone_type: 1 }],
-    ['HarmonyOS reported as Huawei', { device_token: 'vendor-token', brand: 'hw', phone_type: 7 }],
+    ['HarmonyOS without a vendor token', { device_token: '', brand: 'hw', phone_type: 7 }],
     ['missing registry entry', undefined],
   ])('keeps the ordinary notification when the registry says %s', async (_name, entry) => {
     const cid = 'registry-cid';

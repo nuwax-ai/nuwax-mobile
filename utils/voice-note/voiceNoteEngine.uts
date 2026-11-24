@@ -540,6 +540,21 @@ async function splitLongHarmonySegment(record: VoiceNoteRecord): Promise<void> {
   // #endif
 }
 
+// #ifdef APP-IOS
+/** 杀掉进程后补写 moov。成功才允许这段进入上传。 */
+async function sealUnfinishedM4a(filePath: string): Promise<boolean> {
+  if (filePath.length == 0) return false;
+  try {
+    const sealer = new VoiceNoteM4aRecorder();
+    const result = await sealer.seal(filePath);
+    return result == "1";
+  } catch (e) {
+    console.warn("[voice-note] m4a 封口失败 " + e);
+    return false;
+  }
+}
+// #endif
+
 async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<number> {
   const index = record.openSegmentIndex;
   const endedAt = Date.now();
@@ -556,6 +571,28 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
   let filePath = tempPath;
   // #ifndef APP
   filePath = await copySegmentFile(tempPath, record.localId, index);
+  // #endif
+  // #ifdef APP
+  // stop() 才会写 moov。进程被杀掉时先补封口，封好才收成一段。封不了就留着路径，下次再试。
+  if (isM4aPath(filePath)) {
+    let gate = await segmentUploadReady(filePath);
+    // #ifdef APP-IOS
+    if (gate == "unsealed") {
+      const sealedNow = await sealUnfinishedM4a(filePath);
+      if (sealedNow) {
+        gate = await segmentUploadReady(filePath);
+      }
+    }
+    // #endif
+    if (gate == "unsealed") {
+      if (record.segments.length == 0) {
+        record.error = "录音文件未封口";
+      }
+      touch(record);
+      console.warn("[voice-note] m4a 未封口，先不上传");
+      return -1;
+    }
+  }
   // #endif
   const segment = new VoiceNoteSegmentRecord();
   segment.segmentIndex = index;
@@ -1075,6 +1112,127 @@ export async function deleteCachedVoiceNoteFiles(noteId: string): Promise<void> 
   }
 }
 
+// #ifdef APP
+/** App 分段是 m4a。小程序是 aac，没有 moov。 */
+function isM4aPath(filePath: string): boolean {
+  if (filePath.length < 4) return false;
+  const tail = filePath.substring(filePath.length - 4);
+  return tail == ".m4a" || tail == ".M4A";
+}
+
+function waitMs(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(() => {
+      resolve();
+    }, ms);
+  });
+}
+
+function readBe32(bytes: Uint8Array, offset: number): number {
+  return bytes[offset] * 16777216 + bytes[offset + 1] * 65536 + bytes[offset + 2] * 256 + bytes[offset + 3];
+}
+
+function segmentFileSize(filePath: string): Promise<number> {
+  if (filePath.length == 0) {
+    return Promise.resolve(0);
+  }
+  return new Promise<number>((resolve) => {
+    uni.getFileSystemManager().getFileInfo({
+      filePath: filePath,
+      success: (res) => {
+        resolve(res.size);
+      },
+      fail: (_err) => {
+        resolve(0);
+      },
+    });
+  });
+}
+
+/**
+ * 只读顶层 box 头，确认 m4a 已经写过 moov。
+ * moov 由 stop() 落在文件末尾；没走到 stop() 的文件只有 ftyp 和 mdat。
+ */
+function m4aHasMoov(filePath: string, size: number): boolean {
+  if (size < 16) return false;
+  const fs = uni.getFileSystemManager();
+  let fd = "";
+  let sealed = false;
+  try {
+    fd = fs.openSync({
+      filePath: filePath,
+      flag: "r",
+    });
+    const header = new ArrayBuffer(16);
+    let pos = 0;
+    let steps = 0;
+    while (pos + 8 <= size && steps < 64) {
+      steps = steps + 1;
+      const read = fs.readSync({
+        fd: fd,
+        arrayBuffer: header,
+        offset: 0,
+        length: 8,
+        position: pos,
+      });
+      if (read.bytesRead < 8) break;
+      const bytes = new Uint8Array(header);
+      if (bytes[4] == 0x6d && bytes[5] == 0x6f && bytes[6] == 0x6f && bytes[7] == 0x76) {
+        sealed = true;
+        break;
+      }
+      const boxSize32 = readBe32(bytes, 0);
+      let boxSize = boxSize32;
+      if (boxSize32 == 1) {
+        const wide = fs.readSync({
+          fd: fd,
+          arrayBuffer: header,
+          offset: 0,
+          length: 8,
+          position: pos + 8,
+        });
+        if (wide.bytesRead < 8) break;
+        const wideBytes = new Uint8Array(header);
+        const high = readBe32(wideBytes, 0);
+        if (high != 0) break;
+        boxSize = readBe32(wideBytes, 4);
+      } else if (boxSize32 == 0) {
+        boxSize = size - pos;
+      }
+      if (boxSize < 8 || pos + boxSize > size) break;
+      pos = pos + boxSize;
+    }
+  } catch (e) {
+    console.warn("[voice-note] 读取 m4a 封口失败 " + e);
+    sealed = false;
+  }
+  if (fd.length > 0) {
+    try {
+      fs.closeSync({ fd: fd });
+    } catch (_e) {
+      // 描述符关掉失败不影响这次是否上传。
+    }
+  }
+  return sealed;
+}
+
+/**
+ * 上传前的文件结论：ready 可以传，missing 不在或是空文件，unsealed 有数据但没有 moov。
+ * moov 偶尔会比 stop() 返回晚一拍落盘，缺 moov 时再读一次。
+ */
+async function segmentUploadReady(filePath: string): Promise<string> {
+  const size = await segmentFileSize(filePath);
+  if (size <= 0) return "missing";
+  if (!isM4aPath(filePath)) return "ready";
+  if (m4aHasMoov(filePath, size)) return "ready";
+  await waitMs(300);
+  const sizeAgain = await segmentFileSize(filePath);
+  if (sizeAgain > 0 && m4aHasMoov(filePath, sizeAgain)) return "ready";
+  return "unsealed";
+}
+// #endif
+
+// #ifndef APP
 /** 异步确认本地文件还在。iOS 上 accessSync 对不存在的文件也会判成存在，所以只信 getFileInfo 回调。 */
 function segmentFileExists(filePath: string): Promise<boolean> {
   if (filePath.length == 0) {
@@ -1092,6 +1250,7 @@ function segmentFileExists(filePath: string): Promise<boolean> {
     });
   });
 }
+// #endif
 
 function segmentIndexUsed(indexes: number[], index: number): boolean {
   for (let i = 0; i < indexes.length; i++) {
@@ -1318,13 +1477,29 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
       guard = guard + 1;
       const sessionId = open.localId;
       const missingPath = pending.filePath;
-      const fileExists = await segmentFileExists(missingPath);
-      if (!fileExists) {
+      let gate = "missing";
+      // #ifdef APP
+      gate = await segmentUploadReady(missingPath);
+      // #ifdef APP-IOS
+      if (gate == "unsealed") {
+        const sealedNow = await sealUnfinishedM4a(missingPath);
+        if (sealedNow) {
+          gate = "ready";
+        }
+      }
+      // #endif
+      // #endif
+      // #ifndef APP
+      if (await segmentFileExists(missingPath)) {
+        gate = "ready";
+      }
+      // #endif
+      if (gate != "ready") {
         const left = removeMissingSegment(sessionId, pending.segmentIndex);
         if (left != null && left.segments.length == 0 && left.awaitComplete && left.phase != "recording" && left.phase != "paused") {
           left.phase = "failed";
           left.awaitComplete = false;
-          left.error = "录音文件已删除";
+          left.error = gate == "unsealed" ? "录音文件未封口" : "录音文件已删除";
           touch(left);
           break;
         }
@@ -1996,8 +2171,8 @@ function markInterruptedComplete(record: VoiceNoteRecord): void {
 }
 
 /**
- * 进程被杀掉后，录音中或暂停中的这一次按用户点了完成来结束。
- * 正在写的文件收成一段。不在这里上传，下次点开始录音再补传。
+ * 进程被杀掉后，先给没封口的 m4a 补上 moov，再按完成结束并上传。
+ * 文件里还有音频但暂时封不上时，保留本地记录和下次再试的路径，不删。
  */
 async function recoverAbandonedRecording(): Promise<void> {
   try {
@@ -2011,6 +2186,22 @@ async function recoverAbandonedRecording(): Promise<void> {
     const latest = findVoiceNoteByLocalId(localId);
     if (latest == null) return;
     if (latest.segments.length <= 0) {
+      // #ifdef APP
+      const keptPath = latest.openSegmentPath.length > 0 ? latest.openSegmentPath : path;
+      const keptSize = keptPath.length > 0 ? await segmentFileSize(keptPath) : 0;
+      if (keptSize > 0) {
+        latest.openSegmentPath = keptPath;
+        latest.phase = "failed";
+        latest.awaitComplete = false;
+        latest.error = "录音文件未封口";
+        touch(latest);
+        endBackground();
+        stopTicker();
+        releaseRecorderCallbacks();
+        console.warn("[voice-note] m4a 仍未封口，保留本地记录");
+        return;
+      }
+      // #endif
       const noteId = latest.noteId;
       latest.phase = "discarded";
       touch(latest);
@@ -2023,10 +2214,46 @@ async function recoverAbandonedRecording(): Promise<void> {
       releaseRecorderCallbacks();
       return;
     }
+    const pendingPath = latest.openSegmentPath;
     markInterruptedComplete(latest);
+    if (pendingPath.length > 0) {
+      const again = findVoiceNoteByLocalId(localId);
+      if (again != null) {
+        again.openSegmentPath = pendingPath;
+        again.error = "录音文件未封口";
+        touch(again);
+      }
+    }
+    void pumpQueue(localId, false);
   } finally {
     recoveringAbandoned = false;
   }
+}
+
+/** 上次没封上的文件留在 openSegmentPath。再次进入时继续补封口，封好再上传。 */
+async function sealLeftoverOpenFiles(): Promise<void> {
+  // #ifdef APP-IOS
+  const rows = loadVoiceNotes();
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.phase == "recording" || row.phase == "paused") continue;
+    if (row.openSegmentPath.length == 0) continue;
+    const path = row.openSegmentPath;
+    const sealedNow = await sealUnfinishedM4a(path);
+    if (!sealedNow) continue;
+    const current = findVoiceNoteByLocalId(row.localId);
+    if (current == null || current.openSegmentPath != path) continue;
+    await closeSegment(current, path);
+    const latest = findVoiceNoteByLocalId(row.localId);
+    if (latest == null) continue;
+    latest.phase = "uploading";
+    latest.awaitComplete = true;
+    latest.error = "";
+    touch(latest);
+    void pumpQueue(latest.localId, false);
+  }
+  // #endif
+  return;
 }
 
 /** 回前台：本进程仍在录就继续计时和切段。从最近任务划掉或进程已被杀掉，则把这次按完成结束，不在这里上传。 */
@@ -2053,6 +2280,7 @@ export function voiceNoteOnAppShow(): void {
     }
     return;
   }
+  void sealLeftoverOpenFiles();
   if (record != null) {
     beginBackground();
     ensureTicker();

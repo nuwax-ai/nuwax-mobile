@@ -161,6 +161,8 @@
   const FOLLOW_RESUME_MS = 3000;
 
   let audioCtx: InnerAudioContext | null = null;
+  /** 播放器换代。错误回调延后处理时，用来确认还是同一个实例。 */
+  let audioEpoch = 0;
   /** 避免重复 init 同一笔记。 */
   let initedSourceId: string = "";
 
@@ -296,10 +298,10 @@
     }
   }
 
-  /** 跳转完成后再播。地址已经在播时立刻播，不再额外空等。 */
+  /** 跳转完成后再播。地址还没就绪时不播。 */
   function playAfterSeekReady(): void {
     clearSeekReadyTimer();
-    if (audioCtx == null || seekPlayIssued) {
+    if (audioCtx == null || !sourceReady || seekPlayIssued) {
       return;
     }
     seekPlayIssued = true;
@@ -368,9 +370,10 @@
         seekSent = false;
         setBuffering(true);
         audioCtx!!.src = src;
-        // #ifndef APP-HARMONY
-        audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
-        // #endif
+        return;
+      }
+      if (!sourceReady) {
+        setBuffering(true);
         return;
       }
       setBuffering(false);
@@ -387,9 +390,6 @@
       seekSent = false;
       setBuffering(true);
       audioCtx!!.src = src;
-      // #ifndef APP-HARMONY
-      audioCtx!!.playbackRate = PLAYBACK_RATES[playbackRateIndex.value];
-      // #endif
       return;
     }
     if (!sourceReady) {
@@ -633,8 +633,19 @@
     autoplayWhenReady = false;
     playbackRequested = false;
     if (audioCtx != null) {
-      audioCtx!!.destroy();
+      const retiring = audioCtx;
+      audioEpoch = audioEpoch + 1;
       audioCtx = null;
+      setTimeout(() => {
+        try {
+          retiring.stop();
+        } catch (_stop) {
+        }
+        try {
+          retiring.destroy();
+        } catch (_destroy) {
+        }
+      }, 0);
     }
     initedSourceId = "";
     playing.value = false;
@@ -659,9 +670,39 @@
     audioSegmentCount.value = 0;
   };
 
+  /**
+   * 播放失败后收掉播放器。stop 和 destroy 放到下一拍，避免 iOS 在错误回调栈里重入。
+   */
+  function failPlayback(failed: InnerAudioContext, epoch: number): void {
+    if (audioEpoch != epoch) {
+      return;
+    }
+    setBuffering(false);
+    playing.value = false;
+    playbackRequested = false;
+    pendingAutoplay = false;
+    holdSeekOffsetMs = -1;
+    seekSent = false;
+    seekPlayIssued = false;
+    sourceReady = false;
+    audioCtx = null;
+    audioEpoch = audioEpoch + 1;
+    setTimeout(() => {
+      try {
+        failed.stop();
+      } catch (_stop) {
+      }
+      try {
+        failed.destroy();
+      } catch (_destroy) {
+      }
+    }, 0);
+  }
+
   /** 播放器等到真正开始播再创建。提前设置地址会让系统立刻加载，失败时进页面就弹提示。 */
   const ensureAudioContext = () => {
     if (audioCtx != null) return;
+    audioEpoch = audioEpoch + 1;
     audioCtx = uni.createInnerAudioContext();
     audioCtx!!.onTimeUpdate(() => updateProgress());
     audioCtx!!.onEnded(() => {
@@ -707,47 +748,44 @@
     });
     audioCtx!!.onError((err) => {
       console.error("audio-transcript-player audio error", err);
-      // 进度条还在等目标位置。这期间的报错只说明还没准备好，保持转圈，不提示失败。
-      if (holdSeekOffsetMs > 0) {
-        if (audioCtx == null) {
-          return;
-        }
-        seekPlayIssued = false;
-        if (!sourceReady) {
-          seekSent = false;
-          return;
-        }
-        if (bufferRetries >= 1) {
-          setBuffering(false);
-          return;
-        }
-        bufferRetries = bufferRetries + 1;
-        seekSent = false;
-        issueHoldSeek();
+      const failed = audioCtx;
+      if (failed == null) {
         return;
       }
-      // 从头播放还在缓冲时，再准备一次，不提示失败。
-      if (buffering.value && bufferRetries < 1 && currentSegIndex >= 0 && currentSegIndex < audioSegments.length) {
-        bufferRetries = bufferRetries + 1;
-        const src = audioSegments[currentSegIndex].audioUrl;
-        if (src.length > 0 && audioCtx != null) {
-          audioCtx!!.src = src;
+      const epoch = audioEpoch;
+      // 地址还没就绪。这次报错只说明还不能播，不重设地址，也不在回调栈里销毁。
+      // onCanplay 到达后才会 seek 或播放。一直没就绪再按失败收掉。
+      if (!sourceReady) {
+        seekSent = false;
+        seekPlayIssued = false;
+        setBuffering(true);
+        if (bufferRetries >= 1) {
           return;
         }
+        bufferRetries = bufferRetries + 1;
+        setTimeout(() => {
+          if (audioEpoch != epoch || audioCtx == null || sourceReady) {
+            return;
+          }
+          failPlayback(failed, epoch);
+        }, 400);
+        return;
       }
-      setBuffering(false);
-      const shouldToast = playbackRequested;
-      playing.value = false;
-      playbackRequested = false;
-      pendingAutoplay = false;
-      const failed = audioCtx;
-      audioCtx = null;
-      if (failed != null) {
-        failed.stop();
-        failed.destroy();
+      // 已经就绪的跳转失败，只再 seek 一次，不重新设置地址。
+      if (holdSeekOffsetMs > 0 && bufferRetries < 1) {
+        bufferRetries = bufferRetries + 1;
+        seekSent = false;
+        seekPlayIssued = false;
+        setBuffering(true);
+        setTimeout(() => {
+          if (audioEpoch != epoch || audioCtx == null || !sourceReady) {
+            return;
+          }
+          issueHoldSeek();
+        }, 0);
+        return;
       }
-      if (!shouldToast) return;
-      uni.showToast({ title: t("Mobile.Terminal.audioPlayFailed"), icon: "none" });
+      failPlayback(failed, epoch);
     });
   };
 

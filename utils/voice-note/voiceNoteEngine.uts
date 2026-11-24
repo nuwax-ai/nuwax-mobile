@@ -51,7 +51,7 @@ import {
  * 伙伴页录音切片时长（毫秒）。当前段累计超过这个时间才落盘并上传。
  * 上线用 3600000（1 小时）。测试可改成 120000（2 分钟）。只改这一处。
  */
-const segmentMs = 3600000;
+const segmentMs = 120000;
 
 let recorderBound = false;
 // #ifdef APP
@@ -82,7 +82,6 @@ let captureLocalId = "";
 /** 一次开始还没返回。连点开始不会并行打开两个录音器。 */
 let captureStarting = false;
 let tickTimer = 0;
-let lastPersistAt = 0;
 /** 本次录音自己的上传是否在进行。不占用补传。 */
 let uploadRunning = false;
 /** 本次录音上传过程中又落下新分段时，这一轮结束后立刻再传这一次。 */
@@ -100,9 +99,50 @@ let noteCreateLocalIds: string[] = [];
 /** 这一次录音已经申请过后台录音。前台、后台、继续录音都不再重复申请。 */
 let backgroundOn = false;
 
+/**
+ * 面板正在显示的这一次录音。
+ * 计数和波浪只读这份内存，不在每一拍解析本地存储。
+ * 分段、阶段变了，由 touch 换成当前这份。
+ */
+let panelMemory: VoiceNoteRecord | null = null;
+
+function panelPhaseVisible(phase: string): boolean {
+  return phase == "recording" || phase == "paused" || phase == "stopped";
+}
+
+function rememberPanelMemory(record: VoiceNoteRecord): void {
+  if (panelPhaseVisible(record.phase)) {
+    panelMemory = record;
+    return;
+  }
+  const current = panelMemory;
+  if (current != null && current.localId == record.localId) {
+    panelMemory = null;
+  }
+}
+
+function forgetPanelMemory(localId: string): void {
+  const current = panelMemory;
+  if (current != null && current.localId == localId) {
+    panelMemory = null;
+  }
+}
+
+function deleteVoiceNote(localId: string): void {
+  forgetPanelMemory(localId);
+  removeVoiceNote(localId);
+}
+
 function activeRecord(): VoiceNoteRecord | null {
+  const current = panelMemory;
+  if (current != null && current.phase == "recording") {
+    return current;
+  }
   const open = findOpenVoiceNote();
-  if (open != null && open.phase == "recording") return open;
+  if (open != null && open.phase == "recording") {
+    panelMemory = open;
+    return open;
+  }
   return null;
 }
 
@@ -134,6 +174,7 @@ function keepLiveRecording(record: VoiceNoteRecord): void {
 
 function touch(record: VoiceNoteRecord): void {
   keepLiveRecording(record);
+  rememberPanelMemory(record);
   upsertVoiceNote(record);
 }
 
@@ -383,7 +424,6 @@ function openSegmentMs(record: VoiceNoteRecord, now: number): number {
 function freezeOpenSegment(record: VoiceNoteRecord): void {
   const now = Date.now();
   record.openElapsedMs = openSegmentMs(record, now);
-  record.elapsedMs = record.accumulatedMs + record.openElapsedMs;
   record.segmentStartedAt = 0;
 }
 
@@ -420,13 +460,7 @@ function onTick(): void {
     onInterruptTick!();
   }
   // #endif
-  const now = Date.now();
-  const segmentElapsed = openSegmentMs(record, now);
-  record.elapsedMs = record.accumulatedMs + segmentElapsed;
-  if (now - lastPersistAt >= 2000) {
-    lastPersistAt = now;
-    touch(record);
-  }
+  const segmentElapsed = openSegmentMs(record, Date.now());
   if (segmentElapsed >= segmentMs && stopIntent.length == 0) {
     // 鸿蒙切段要先停掉 AVRecorder 再 start。后台不允许重新 start，文件继续写，回前台再切。
     // #ifdef APP-HARMONY
@@ -475,7 +509,6 @@ async function splitLongHarmonySegment(record: VoiceNoteRecord): Promise<void> {
     row.filePath = filePath;
     row.durationMs = durationMs;
     row.startedAt = cursor;
-    row.endedAt = cursor + durationMs;
     row.uploadStatus = "pending";
     row.uploadAttempts = 0;
     pieces.push(row);
@@ -497,7 +530,6 @@ async function splitLongHarmonySegment(record: VoiceNoteRecord): Promise<void> {
     added = added + pieces[i].durationMs;
   }
   record.accumulatedMs = record.accumulatedMs + added;
-  record.elapsedMs = record.accumulatedMs;
   touch(record);
   pushVoiceNoteDebug("录音", "超长文件拆成 " + pieces.length.toString() + " 段");
   // #endif
@@ -526,7 +558,6 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
   const duration = durationMs > 0 ? durationMs : 0;
   segment.durationMs = duration;
   segment.startedAt = startedAt;
-  segment.endedAt = endedAt;
   segment.uploadStatus = "pending";
   segment.uploadAttempts = 0;
   record.segments.push(segment);
@@ -535,7 +566,6 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
   record.openElapsedMs = 0;
   record.openSegmentPath = "";
   record.accumulatedMs = record.accumulatedMs + duration;
-  record.elapsedMs = record.accumulatedMs;
   touch(record);
   await splitLongHarmonySegment(record);
   return index;
@@ -587,7 +617,7 @@ function abandonUnstartedRecording(reason: string): void {
     record.awaitComplete = false;
     record.openSegmentPath = "";
     touch(record);
-    removeVoiceNote(record.localId);
+    deleteVoiceNote(record.localId);
     if (noteId.length > 0) {
       void forgetUnstartedNote(noteId);
     }
@@ -702,7 +732,7 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     endingLocalId = "";
     record.phase = "discarded";
     touch(record);
-    removeVoiceNote(record.localId);
+    deleteVoiceNote(record.localId);
     const noteId = record.noteId;
     endBackground();
     stopTicker();
@@ -865,7 +895,6 @@ function writeSegmentUpload(
     const row = record.segments[i];
     if (row.segmentIndex != segmentIndex) continue;
     if (segmentId.length > 0) row.segmentId = segmentId;
-    row.error = error;
     row.uploadStatus = status;
     if (attempts >= 0) row.uploadAttempts = attempts;
     if (error.length > 0) {
@@ -1007,7 +1036,7 @@ export async function deleteCachedVoiceNoteFiles(noteId: string): Promise<void> 
     for (let p = 0; p < paths.length; p++) {
       await unlinkVoiceFile(paths[p]);
     }
-    removeVoiceNote(row.localId);
+    deleteVoiceNote(row.localId);
   }
 }
 
@@ -1107,7 +1136,7 @@ async function ensureNoteId(localId: string): Promise<VoiceNoteRecord | null> {
   if (noteCreateBusy(localId)) return null;
   rememberNoteCreate(localId);
   try {
-    const noteId = await apiVoiceNoteCreate(current.title, true);
+    const noteId = await apiVoiceNoteCreate("", true);
     if (noteId.length == 0) {
       throw new Error("创建笔记未返回 noteId");
     }
@@ -1156,13 +1185,24 @@ function segmentSkipped(indexes: number[], segmentIndex: number): boolean {
  * 历史补传不能收尾这一次：播放时采集已暂停，阶段不再是录音中。
  */
 function panelVoiceNote(): VoiceNoteRecord | null {
+  const current = panelMemory;
+  if (current != null && panelPhaseVisible(current.phase)) {
+    return current;
+  }
+  panelMemory = null;
   const rows = loadVoiceNotes();
   for (let i = 0; i < rows.length; i++) {
-    if (rows[i].phase == "recording") return rows[i];
+    if (rows[i].phase == "recording") {
+      panelMemory = rows[i];
+      return panelMemory;
+    }
   }
   for (let i = 0; i < rows.length; i++) {
     const phase = rows[i].phase;
-    if (phase == "paused" || phase == "stopped") return rows[i];
+    if (phase == "paused" || phase == "stopped") {
+      panelMemory = rows[i];
+      return panelMemory;
+    }
   }
   return null;
 }
@@ -1425,9 +1465,8 @@ async function completeRecord(record: VoiceNoteRecord): Promise<void> {
   record.phase = "uploading";
   touch(record);
   try {
-    const status = await apiVoiceNoteComplete(record.noteId, total, true);
+    await apiVoiceNoteComplete(record.noteId, total, true);
     record.phase = "processing";
-    record.serverStatus = status;
     record.awaitComplete = false;
     record.error = "";
     touch(record);
@@ -1444,7 +1483,7 @@ function dropStoredSuccessNotes(): void {
   for (let i = 0; i < rows.length; i++) {
     if (rows[i].phase == "success") {
       deleteVoiceNoteFiles(rows[i]);
-      removeVoiceNote(rows[i].localId);
+      deleteVoiceNote(rows[i].localId);
     }
   }
 }
@@ -1509,7 +1548,7 @@ async function runBackfillPass(ids: string[]): Promise<void> {
       const latest = findVoiceNoteByLocalId(localId);
       if (latest != null && !backfillSkips(latest) && allSegmentsUploaded(latest)) {
         deleteVoiceNoteFiles(latest);
-        removeVoiceNote(latest.localId);
+        deleteVoiceNote(latest.localId);
       }
     }
   } finally {
@@ -1645,10 +1684,8 @@ export async function startVoiceNote(): Promise<void> {
         const record = new VoiceNoteRecord();
         record.localId = `${now}`;
         record.phase = "recording";
-        record.startedAt = now;
         record.segmentStartedAt = now;
         record.openSegmentIndex = 0;
-        record.title = "";
         saveRecordQuiet(record);
         stopIntent = "";
         ensureTicker();
@@ -1834,7 +1871,7 @@ export function discardVoiceNote(): void {
   }
   record.phase = "discarded";
   touch(record);
-  removeVoiceNote(record.localId);
+  deleteVoiceNote(record.localId);
   const noteId = record.noteId;
   if (noteId.length > 0) {
     void deleteNoteQuiet(noteId);
@@ -1932,7 +1969,7 @@ async function recoverAbandonedRecording(): Promise<void> {
       const noteId = latest.noteId;
       latest.phase = "discarded";
       touch(latest);
-      removeVoiceNote(latest.localId);
+      deleteVoiceNote(latest.localId);
       if (noteId.length > 0) {
         void deleteNoteQuiet(noteId);
       }

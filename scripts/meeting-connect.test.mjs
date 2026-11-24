@@ -19,11 +19,19 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
   }
   const source = lines.join('\n').replace(/^import[\s\S]*?;\s*$/gm, '');
   const timers = new Map(), logs = [], operations = [], presentations = [], navigations = [];
-  let restoreRequested = false;
-  let pageReady = true, navigationFails = false;
+  let restoreRequested = false, persistentRestore = false;
+  let restoreAcks = 0;
+  let pageReady = true, navigationFails = false, deferNavigation = false;
+  let routes = ['pages/tab-shell/tab-shell'];
+  let nativeSnapshot = '';
+  const backDeltas = [];
+  const navigationObservers = new Map();
+  let now = 10000;
   let nextTimer = 0, connected = false, configured = false, claims = 0;
   const globals = {
     console: { error: value => logs.push(String(value)) },
+    Date: { now: () => now },
+    JSON: { parseObject: JSON.parse, parse: JSON.parse, stringify: JSON.stringify },
     SUCCESS_CODE: '0', eventBus: { emit() {} },
     apiImMeetingPublicRoomSafe: async () => ({ code: preCode, data: { active: true } }),
     apiImMeetingIssueToken: async () => ({ code: tokenCode, data: { wsUrl: 'wss://rtc.test', token: 'secret-seat-token' } }),
@@ -61,18 +69,40 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
       if (configThrows) throw new Error('旧基座没有自动小窗');
       presentations.push({ visible, foreground });
     },
-    livekitConsumeMeetingRestoreRequest() { const value = restoreRequested; restoreRequested = false; return value; },
-    getCurrentPages: () => pageReady ? [{ route: 'pages/tab-shell/tab-shell' }] : [],
-    uni: { navigateTo(options) { navigations.push(options.url);
-      if (navigationFails) options.fail?.({}); else options.success?.({});
-      options.complete?.({}); } },
+    livekitConsumeMeetingRestoreRequest() { const value = restoreRequested; if (!persistentRestore) restoreRequested = false; return value; },
+    acknowledgeMeetingRestoreRequest() { restoreRequested = false; restoreAcks++; },
+    restoreMeetingResumeState: () => nativeSnapshot,
+    rememberMeetingResumeState(room, url, token) {
+      nativeSnapshot = JSON.stringify({ room, url, token, mic: true, camera: false, speaker: true });
+    },
+    getCurrentPages: () => pageReady ? routes.map(route => ({ route })) : [],
+    uni: { addInterceptor(method, observer) {
+      assert.equal(navigationObservers.has(method), false, '全局导航监听不能重复安装');
+      navigationObservers.set(method, observer);
+    }, navigateTo(options) { navigations.push(options.url);
+      if (navigationFails) options.fail?.({}); else {
+        if (!deferNavigation) routes.push(options.url.split('?')[0].replace(/^\//, ''));
+        options.success?.({});
+      }
+      options.complete?.({}); },
+      navigateBack(options) {
+        backDeltas.push(options.delta);
+        routes = routes.slice(0, -options.delta);
+        options.success?.({}); options.complete?.({});
+      },
+      redirectTo(options) {
+        navigations.push(options.url);
+        routes[routes.length - 1] = options.url.split('?')[0].replace(/^\//, '');
+        options.success?.({}); options.complete?.({});
+      },
+    },
     setInterval(callback) { timers.set(++nextTimer, callback); return nextTimer; },
     clearInterval(id) { timers.delete(id); },
   };
   const context = vm.createContext(globals);
   vm.runInContext(stripTypeScriptTypes(source).replace(/^export /gm, ''), context);
   return {
-    api: context, operations, logs, presentations, navigations,
+    api: context, operations, logs, presentations, navigations, backDeltas,
     join: () => context.meetingMediaConnect({ room: '123456789', displayName: 'Test', passcode: '' }),
     complete() { connected = true; for (const callback of [...timers.values()]) callback(); },
     claims: () => claims,
@@ -80,9 +110,15 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
       vm.runInContext('state.connected = false; state.connecting = false; state.errorText = "exception";', context);
     },
     nativeConnected(value) { connected = value; },
-    requestRestore() { restoreRequested = true; },
+    advance(ms = 1000) { now += ms; },
+    requestRestore(persistent = false) { restoreRequested = true; persistentRestore = persistent; },
+    restoreAcks: () => restoreAcks,
     pageReady(value) { pageReady = value; },
     navigationFails(value) { navigationFails = value; },
+    routes(value) { routes = value; },
+    deferNavigation(value) { deferNavigation = value; },
+    nativeSnapshot(value) { nativeSnapshot = value; },
+    navigationSucceeded(method) { navigationObservers.get(method).success({}); },
   };
 }
 
@@ -330,7 +366,7 @@ test('通知返回会议：页面未就绪或导航失败时保留请求，成�
   assert.equal(h.navigations.length, 0);
   h.pageReady(true); h.navigationFails(true); h.api.meetingMediaReconcile();
   assert.equal(h.navigations.length, 1);
-  h.navigationFails(false); h.api.meetingMediaReconcile(); h.api.meetingMediaReconcile();
+  h.navigationFails(false); h.advance(); h.api.meetingMediaReconcile(); h.api.meetingMediaReconcile();
   assert.equal(h.navigations.length, 2);
   assert.equal(h.operations.filter(op => op === 'connect').length, 1);
   assert.equal(h.operations.includes('disconnect'), false);
@@ -343,4 +379,135 @@ test('离会会清除尚未完成的通知返回请求', async () => {
   await h.api.meetingMediaDisconnect(); h.pageReady(true);
   await h.join(); h.complete(); h.api.meetingMediaReconcile();
   assert.equal(h.navigations.length, 0);
+});
+
+const meetingRoute = 'subpackages/pages/im-meeting/im-meeting-room';
+const meetingURL = '/' + meetingRoute + '?room=123456789';
+
+for (const platform of ['APP-ANDROID', 'APP-IOS']) {
+  test(`${platform} 全局页面切换：所有业务页展示入口，点击回当前会议`, async () => {
+    const h = harness({ platform }); await h.join(); h.complete();
+    h.api.meetingMediaSetResumeURL(meetingURL);
+    for (const route of ['pages/message/chat', 'subpackages/pages/settings/settings', 'subpackages/pages/im-meeting/im-meeting-detail']) {
+      h.routes([route]); h.api.meetingMediaPageDidShow();
+      assert.equal(h.api.meetingMediaIsMinimized(), true);
+      assert.deepEqual(h.presentations.at(-1), { visible: false, foreground: true });
+      h.api.meetingMediaResume(); h.api.meetingMediaPageDidShow();
+      assert.equal(h.navigations.at(-1), meetingURL);
+      assert.equal(h.api.meetingMediaIsMinimized(), false);
+      assert.deepEqual(h.presentations.at(-1), { visible: true, foreground: true });
+    }
+    assert.equal(h.operations.filter(op => op === 'connect').length, 1);
+    assert.equal(h.operations.includes('disconnect'), false);
+  });
+}
+
+test('导航成功回调先于会议页显示：消息页仍保留返回请求', async () => {
+  const h = harness(); await h.join(); h.complete();
+  h.api.meetingMediaSetResumeURL(meetingURL);
+  h.deferNavigation(true); h.requestRestore(); h.api.meetingMediaReconcile();
+  assert.equal(h.navigations.length, 1);
+  // 首次导航成功但宿主仍停留消息页，下一次就绪通知必须重试。
+  h.deferNavigation(false); h.advance(); h.api.meetingMediaPageDidShow();
+  assert.equal(h.navigations.length, 2);
+  h.api.meetingMediaPageDidShow(); h.api.meetingMediaReconcile();
+  assert.equal(h.navigations.length, 2);
+});
+
+test('旧会议页残留在页面列表：回会只向前导航，不能按旧栈退到桌面', async () => {
+  const h = harness(); await h.join(); h.complete();
+  h.api.meetingMediaSetResumeURL(meetingURL);
+  h.routes(['pages/tab-shell/tab-shell', meetingRoute, 'pages/message/chat', 'pages/detail']);
+  h.requestRestore(); h.api.meetingMediaReconcile(); h.api.meetingMediaPageDidShow();
+  assert.deepEqual(h.backDeltas, []);
+  assert.deepEqual(h.navigations, [meetingURL]);
+  assert.equal(h.api.meetingMediaIsMinimized(), false);
+});
+
+test('原生窗口配置失败也能消费通知返回请求', async () => {
+  const h = harness({ configThrows: true }); await h.join(); h.complete();
+  h.api.meetingMediaSetResumeURL(meetingURL);
+  h.requestRestore(); h.api.meetingMediaReconcile();
+  assert.deepEqual(h.navigations, [meetingURL]);
+});
+
+test('Android 业务运行时重建：恢复存活的原生会议并处理桌面入口，不重新连接', () => {
+  const h = harness({ platform: 'APP-ANDROID' });
+  h.nativeConnected(true);
+  h.nativeSnapshot(JSON.stringify({ room: '123456789', url: meetingURL, token: 'secret-seat-token', mic: true, camera: false, speaker: true }));
+  h.pageReady(false); h.requestRestore(); h.api.meetingMediaReconcile();
+  assert.equal(h.api.meetingMediaState().connected, true);
+  assert.equal(h.api.meetingMediaState().micOn, true);
+  assert.equal(h.navigations.length, 0);
+  h.pageReady(true); h.api.meetingMediaPageDidShow(); h.api.meetingMediaReconcile();
+  assert.deepEqual(h.navigations, [meetingURL]);
+  assert.equal(h.operations.includes('connect'), false);
+  assert.equal(h.operations.includes('disconnect'), false);
+});
+
+test('Android 主动离会后不从迟到原生快照恢复；进程已结束无快照时不伪造会议', async () => {
+  const h = harness({ platform: 'APP-ANDROID' });
+  h.api.meetingMediaReconcile(); assert.equal(h.api.meetingMediaState().connected, false);
+  await h.join(); h.complete(); h.api.meetingMediaSetResumeURL(meetingURL);
+  await h.api.meetingMediaDisconnect();
+  h.nativeConnected(true); h.requestRestore(); h.api.meetingMediaReconcile();
+  assert.equal(h.api.meetingMediaState().connected, false);
+  assert.equal(h.navigations.length, 0);
+});
+
+test('全局导航监听只安装一次，五种路由变更均同步浮窗', async () => {
+  const h = harness();
+  h.api.installMeetingNavigationObservers(); h.api.installMeetingNavigationObservers();
+  await h.join(); h.complete();
+  for (const method of ['navigateTo', 'navigateBack', 'redirectTo', 'reLaunch', 'switchTab']) {
+    h.routes([meetingRoute]); h.navigationSucceeded(method);
+    assert.equal(h.api.meetingMediaIsMinimized(), false);
+    h.routes(['pages/any/' + method]); h.navigationSucceeded(method);
+    assert.equal(h.api.meetingMediaIsMinimized(), true);
+    assert.deepEqual(h.presentations.at(-1), { visible: false, foreground: true });
+  }
+});
+
+test('页面栈已满时回会使用替换当前页，不遗留消息页', async () => {
+  const h = harness(); await h.join(); h.complete();
+  h.api.meetingMediaSetResumeURL(meetingURL);
+  h.routes(Array.from({ length: 10 }, (_, i) => 'pages/detail/' + i));
+  h.navigationFails(true); h.requestRestore(); h.api.meetingMediaReconcile();
+  h.api.meetingMediaPageDidShow();
+  assert.deepEqual(h.navigations, [meetingURL, meetingURL]);
+  assert.equal(h.api.meetingMediaIsMinimized(), false);
+});
+
+
+test('Android 桌面点击后经过消息页/运行时恢复：实际会议页 onShow 才确认返回', async () => {
+  const h = harness({ platform: 'APP-ANDROID' }); await h.join(); h.complete();
+  h.api.meetingMediaSetResumeURL(meetingURL);
+  h.requestRestore(true); h.deferNavigation(true);
+  h.api.meetingMediaReconcile();
+  assert.equal(h.restoreAcks(), 0, '导航成功回调不能确认返回');
+  h.api.meetingMediaConfirmPageVisible('other-room');
+  assert.equal(h.restoreAcks(), 0, '其他会议不能确认当前返回请求');
+  h.deferNavigation(false); h.advance(); h.api.meetingMediaReconcile();
+  assert.equal(h.restoreAcks(), 0, '页面栈出现路由还不等于 onShow');
+  h.api.meetingMediaConfirmPageVisible('123456789');
+  assert.equal(h.restoreAcks(), 1);
+  // 已成功回会，之后用户主动返回聊天页，不能被残留请求再拉回会议。
+  const navigated = h.navigations.length;
+  h.routes(['pages/message/chat']); h.api.meetingMediaSetPageVisible(false);
+  h.api.meetingMediaPageDidShow(); h.api.meetingMediaReconcile();
+  assert.equal(h.navigations.length, navigated);
+  assert.equal(h.api.meetingMediaIsMinimized(), true);
+  assert.deepEqual(h.backDeltas, []);
+});
+
+
+test('原生页面切换尚未完成：短间隔轮询不能重复压入会议页', async () => {
+  const h = harness({ platform: 'APP-ANDROID' }); await h.join(); h.complete();
+  h.api.meetingMediaSetResumeURL(meetingURL); h.deferNavigation(true);
+  h.requestRestore(true); h.api.meetingMediaReconcile();
+  for (let i = 0; i < 3; i++) { h.advance(250); h.api.meetingMediaReconcile(); }
+  assert.equal(h.navigations.length, 1);
+  h.advance(250); h.api.meetingMediaReconcile();
+  assert.equal(h.navigations.length, 2, '超时仍未显示才重试');
+  assert.deepEqual(h.backDeltas, []);
 });

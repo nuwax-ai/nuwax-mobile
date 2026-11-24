@@ -27,6 +27,9 @@ import { apiImMeetingIssueToken, apiImMeetingPublicRoomSafe, apiImMeetingTakeSha
 import { apiResCode, apiResData } from "@/utils/apiResponse";
 // 会议媒体状态变更广播走仓内 eventBus（App-Android 上 uni.$on 的订阅者有零触发前科）
 import eventBus from "@/utils/eventBus";
+// #ifdef APP-ANDROID
+import { rememberMeetingResumeState, restoreMeetingResumeState, acknowledgeMeetingRestoreRequest } from "@/uni_modules/nuwax-livekit";
+// #endif
 
 // ★只在 Android/iOS 引原生桥接插件：鸿蒙没有 LiveKit 客户端（插件内是占位实现，
 //   本文件连都不连），H5/小程序更没有——条件编译保证这些平台不解析该 import。
@@ -136,6 +139,12 @@ let appForeground = true;
 let nativePresentationReady = false;
 let resumeNavigating = false;
 let resumeRequested = false;
+let resumeRetryAfter = 0;
+let resumePollTimer = -1;
+let presentedRoute = "";
+let nativeResumeAllowed = true;
+let navigationObserversInstalled = false;
+const MEETING_ROOM_ROUTE = "subpackages/pages/im-meeting/im-meeting-room";
 
 function readStr(obj: UTSJSONObject, key: string): string {
   const value = obj[key];
@@ -179,6 +188,10 @@ function resetState(): void {
   meetingPageVisible = true;
   resumeNavigating = false;
   resumeRequested = false;
+  resumeRetryAfter = 0;
+  presentedRoute = "";
+  nativeResumeAllowed = false;
+  if (resumePollTimer != -1) { clearInterval(resumePollTimer); resumePollTimer = -1; }
   resumeURL = "";
   minimized = false;
   shareRequested = false;
@@ -214,6 +227,102 @@ function configureConnectedBackgroundSession(): void {
   }
   // #endif
   syncMeetingPresentation();
+  rememberNativeResumeState();
+  startMeetingResumePoll();
+}
+
+function rememberNativeResumeState(): void {
+  // 仅原生内存：Activity/业务运行时重建后复用仍存活的 Room，绝不把令牌落盘。
+  // #ifdef APP-ANDROID
+  if (state.connected && resumeURL.length > 0 && activeMeetingToken.length > 0) {
+    try { rememberMeetingResumeState(activeRoom, resumeURL, activeMeetingToken); } catch (_e) {}
+  }
+  // #endif
+}
+
+function restoreNativeResumeState(): void {
+  // #ifdef APP-ANDROID
+  if (!nativeResumeAllowed || activeRoom.length > 0) return;
+  try {
+    const raw = restoreMeetingResumeState();
+    if (raw.length == 0) return;
+    const saved = JSON.parseObject(raw);
+    if (saved == null) return;
+    const room = readStr(saved, "room");
+    const url = readStr(saved, "url");
+    const token = readStr(saved, "token");
+    if (room.length == 0 || token.length == 0 || !url.startsWith("/" + MEETING_ROOM_ROUTE + "?")) return;
+    activeRoom = room;
+    activeMeetingToken = token;
+    resumeURL = url;
+    nativeResumeAllowed = false;
+    state.connected = true;
+    state.micOn = readBool(saved, "mic");
+    state.cameraOn = readBool(saved, "camera");
+    state.speakerOn = readBool(saved, "speaker");
+    minimized = true;
+    meetingPageVisible = false;
+    connectGeneration += 1;
+    configureConnectedBackgroundSession();
+    changed();
+  } catch (_e) {}
+  // #endif
+}
+
+/** 全局导航成功后同步，手势返回和原生宿主切换由轻量轮询兜底。 */
+export function installMeetingNavigationObservers(): void {
+  if (navigationObserversInstalled) return;
+  navigationObserversInstalled = true;
+  const methods = ["navigateTo", "navigateBack", "redirectTo", "reLaunch", "switchTab"];
+  for (let i = 0; i < methods.length; i++) {
+    uni.addInterceptor(methods[i], {
+      success: (_res: any): void => { meetingMediaPageDidShow(); },
+    } as AddInterceptorOptions);
+  }
+}
+
+/** 不依赖每个业务页面单独挂载浮窗组件。 */
+export function meetingMediaPageDidShow(): void {
+  if (!state.connected) return;
+  syncMeetingRoute();
+  pollMeetingResume();
+}
+
+function syncMeetingRoute(): void {
+  if (!appForeground || !state.connected) return;
+  const pages = getCurrentPages();
+  if (pages.length == 0) return;
+  const route = pages[pages.length - 1].route;
+  const wasVisible = meetingPageVisible;
+  const wasMinimized = minimized;
+  meetingPageVisible = route == MEETING_ROOM_ROUTE;
+  minimized = !meetingPageVisible;
+  if (route != presentedRoute || wasVisible != meetingPageVisible || wasMinimized != minimized) {
+    presentedRoute = route;
+    syncMeetingPresentation();
+    changed();
+  }
+}
+
+function startMeetingResumePoll(): void {
+  if (!appForeground || !state.connected || resumePollTimer != -1) return;
+  // 原生入口点击只查询轻量标记，不重复拉接口或读取媒体轨道。
+  resumePollTimer = setInterval(() => { pollMeetingResume(); }, 250);
+}
+
+function pollMeetingResume(): void {
+  if (!appForeground || !state.connected) return;
+  syncMeetingRoute();
+  // 返回请求独立于浮窗配置结果，避免新宿主尚未挂窗时丢失通知/PiP 返回。
+  // #ifdef APP-ANDROID || APP-IOS
+  try {
+    if (livekitConsumeMeetingRestoreRequest()) {
+      if (!resumeRequested) resumeRetryAfter = 0;
+      resumeRequested = true;
+    }
+  } catch (_e) {}
+  // #endif
+  flushMeetingResume();
 }
 
 function syncMeetingPresentation(): void {
@@ -235,9 +344,22 @@ export function meetingMediaSetPageVisible(visible: boolean): void {
   syncMeetingPresentation();
   changed();
 }
+/** 只由实际会议页 onShow 确认，不能在 App.onShow 或导航成功回调中提前消费。 */
+export function meetingMediaConfirmPageVisible(room: string): void {
+  if (!state.connected || room != activeRoom) return;
+  meetingMediaSetPageVisible(true);
+  resumeRequested = false;
+  resumeRetryAfter = 0;
+  // #ifdef APP-ANDROID
+  try { acknowledgeMeetingRestoreRequest(); } catch (_e) {}
+  // #endif
+  console.error("[MeetingResume] confirmed meeting page visible");
+}
 export function meetingMediaSetAppForeground(foreground: boolean): void {
   appForeground = foreground;
+  if (!foreground && resumePollTimer != -1) { clearInterval(resumePollTimer); resumePollTimer = -1; }
   syncMeetingPresentation();
+  if (foreground) startMeetingResumePoll();
 }
 export function meetingMediaHasNativeWindow(): boolean { return nativePresentationReady; }
 
@@ -373,7 +495,7 @@ export function meetingMediaState(): MeetingMediaState {
 
 export function meetingMediaActiveRoom(): string { return state.connected || state.connecting ? activeRoom : ""; }
 export function meetingMediaIsMinimized(): boolean { return minimized && state.connected; }
-export function meetingMediaSetResumeURL(url: string): void { resumeURL = url; }
+export function meetingMediaSetResumeURL(url: string): void { resumeURL = url; rememberNativeResumeState(); }
 export function meetingMediaSetMinimized(on: boolean): void {
   minimized = on;
   meetingPageVisible = !on;
@@ -382,6 +504,7 @@ export function meetingMediaSetMinimized(on: boolean): void {
 }
 export function meetingMediaResume(): void {
   if (!state.connected) return;
+  if (!resumeRequested) resumeRetryAfter = 0;
   resumeRequested = true;
   flushMeetingResume();
 }
@@ -389,14 +512,25 @@ function flushMeetingResume(): void {
   if (!resumeRequested || !appForeground || resumeURL.length == 0 || !state.connected || resumeNavigating) return;
   const pages = getCurrentPages();
   if (pages.length == 0) return;
-  if (pages[pages.length - 1].route == "subpackages/pages/im-meeting/im-meeting-room") {
+  if (pages[pages.length - 1].route == MEETING_ROOM_ROUTE) {
     resumeRequested = false;
     return;
   }
+  // complete 可能先于原生 Activity 切换结束；避免 250ms 轮询反复叠加导航。
+  if (Date.now() < resumeRetryAfter) return;
+  resumeRetryAfter = Date.now() + 1000;
   const generation = connectGeneration;
   resumeNavigating = true;
+  // 点击回会只能向前打开会议。后台/任务重建后的页面列表可能残留旧会议页，
+  // 不能按它计算 navigateBack(delta)：原生栈不一致时会退掉当前宿主甚至退到桌面。
+  // meetingMediaConnect 已按 activeRoom 复用原生 Room，不会重复签票或新增参会席位。
+  console.error(`[MeetingResume] navigate depth=${pages.length}`);
   uni.navigateTo({ url: resumeURL,
-    success: (_res) => { if (generation == connectGeneration) resumeRequested = false; },
+    // navigateTo 成功不代表会议页已经显示。保留请求，直到顶部路由确认是会议。
+    fail: (_res) => {
+      if (generation != connectGeneration || pages.length < 10) return;
+      uni.redirectTo({ url: resumeURL });
+    },
     complete: (_res) => { if (generation == connectGeneration) resumeNavigating = false; },
   });
 }
@@ -427,6 +561,7 @@ export async function meetingMediaConnect(options: MeetingMediaOptions): Promise
     return false;
   }
   state.connecting = true;
+  nativeResumeAllowed = false;
   backgroundSessionReady = false;
   activeRoom = options.room;
   connectGeneration += 1;
@@ -817,6 +952,7 @@ export async function meetingMediaStopScreenShare(room: string): Promise<void> {
 
 /** 页面最小化后仍在应用级校准；真正后台采集/接管/停止由原生负责。 */
 export function meetingMediaReconcile(expectedRoom: string = ""): void {
+  restoreNativeResumeState();
   // 仅恢复本次仍持有的会话。主动离会已清空 room/token，绝不能把迟到状态当成重新入会。
   if (activeRoom.length == 0 || activeMeetingToken.length == 0) return;
   if (expectedRoom.length > 0 && activeRoom != expectedRoom) return;
@@ -846,14 +982,8 @@ export function meetingMediaReconcile(expectedRoom: string = ""): void {
   } catch (_e) {}
   // #endif
   if (sessionPollTimer == -1) sessionPollTimer = setInterval(() => { meetingMediaReconcile(); }, 2000);
-  // #ifdef APP-ANDROID || APP-IOS
-  if (appForeground && nativePresentationReady) {
-    try {
-      if (livekitConsumeMeetingRestoreRequest()) resumeRequested = true;
-    } catch (_e) {}
-  }
-  // #endif
-  flushMeetingResume();
+  startMeetingResumePoll();
+  pollMeetingResume();
   if (restored) changed();
 }
 

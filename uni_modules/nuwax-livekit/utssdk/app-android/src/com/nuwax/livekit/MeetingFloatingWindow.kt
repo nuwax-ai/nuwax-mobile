@@ -1,158 +1,186 @@
 package com.nuwax.livekit
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.Application
 import android.app.KeyguardManager
 import android.app.PictureInPictureParams
 import android.content.Context
-import android.content.pm.PackageManager
+import android.content.Intent
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.util.Rational
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewConfiguration
-import android.widget.FrameLayout
-import android.widget.TextView
-import io.livekit.android.renderer.SurfaceViewRenderer
+import android.view.WindowManager
 
-/** 随会议生命周期挂到业务 Activity：App 内小窗 + 退后台系统 PiP。无额外悬浮权限。 */
+/** App 内与桌面使用同一个边沿入口；桌面窗口不依赖被最近任务移除的 Activity。 */
 class MeetingFloatingWindow(private val bridge: MeetingRoomBridge) {
+  private var application: Application? = null
   private var activity: Activity? = null
-  private var root: FrameLayout? = null
-  private var renderer: SurfaceViewRenderer? = null
-  private var pipContent: FrameLayout? = null
-  private var edgeHandle: View? = null
+  private var root: View? = null
+  private var overlay: View? = null
+  private var overlayParams: WindowManager.LayoutParams? = null
+  private var permissionDialog: AlertDialog? = null
   private var edgePosition = 0.68f
-  private var leaveListenerAttached = false
-  private var pipRequestPending = false
-  private var pipStatus = "idle"
   private var pageVisible = true
   private var foreground = true
-  private var wasInPip = false
+  private var overlayStatus = "idle"
   private val visibleActivities = mutableSetOf<Activity>()
   @Volatile private var restoreRequested = false
   private val handler = Handler(Looper.getMainLooper())
-  private val leaveListener = Runnable { requestPip("user_leave") }
   private val lifecycle = object : Application.ActivityLifecycleCallbacks {
-    // 权限弹窗、锁屏和 App 内 Activity 切换也会 pause，不能据此启动系统 PiP。
     override fun onActivityPaused(host: Activity) {}
     override fun onActivityResumed(host: Activity) {
-      if (host !== activity) return
       foreground = true
-      pipRequestPending = false
-      if (wasInPip && (Build.VERSION.SDK_INT < 26 || !host.isInPictureInPictureMode)) restoreRequested = true
-      layout()
+      hideOverlay()
+      // uni-app x 页面可能属于不同宿主 Activity。跟随当前业务宿主迁移入口，
+      // 不挂到通知跳板或录屏权限 Activity 上。
+      if (isBusinessActivity(host)) {
+        if (activity !== host) {
+          detachActivity()
+          activity = host
+          attach(host)
+        }
+        refreshAutoEnter()
+        layout()
+      }
     }
-    override fun onActivityDestroyed(host: Activity) { if (host === activity) stop() }
+    override fun onActivityDestroyed(host: Activity) {
+      visibleActivities.remove(host)
+      if (host === activity) {
+        detachActivity()
+        activity = null
+      }
+      scheduleBackground()
+    }
     override fun onActivityCreated(host: Activity, state: Bundle?) {}
-    override fun onActivityStarted(host: Activity) { visibleActivities.add(host) }
+    override fun onActivityStarted(host: Activity) {
+      visibleActivities.add(host)
+      foreground = true
+      hideOverlay()
+    }
     override fun onActivityStopped(host: Activity) {
       visibleActivities.remove(host)
-      if (host === activity) requestBackgroundPip()
+      scheduleBackground()
     }
     override fun onActivitySaveInstanceState(host: Activity, state: Bundle) {}
   }
   private val parentLayoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> layout() }
   private val refresh = object : Runnable {
     override fun run() {
-      val host = activity ?: return
-      if (!bridge.isConnected() || host.isDestroyed) { stop(); return }
-      val inPip = Build.VERSION.SDK_INT >= 26 && host.isInPictureInPictureMode
-      if (inPip != wasInPip) {
-        if (wasInPip && !inPip && foreground) restoreRequested = true
-        wasInPip = inPip
-        if (inPip) { pipStatus = "active"; pipRequestPending = false }
-        layout()
+      if (!bridge.isConnected()) { stop(); return }
+      syncOverlay()
+      // 新页面原生视图可能晚于 onResume 加入 decor；保持入口位于业务内容上方。
+      if (foreground) layout()
+      if (foreground && pageVisible) activity?.let { host ->
+        if (!host.isFinishing && !host.isDestroyed) explainOverlayPermission(host)
       }
-      if (inPip) {
-        // PiP 进入和拖动调整尺寸均可晚于生命周期回调，按宿主当前尺寸补布局。
-        val parent = root?.parent as? ViewGroup
-        if (parent != null && (root?.width != parent.width || root?.height != parent.height)) layout()
-      }
-      if (inPip) renderer?.let { bridge.updatePipRenderer(it) }
-      handler.postDelayed(this, 300)
+      handler.postDelayed(this, 500)
     }
   }
 
   fun setPresentation(currentActivity: Activity?, pageVisible: Boolean, foreground: Boolean) {
-    val host = currentActivity ?: activity ?: return
-    if (activity !== host) {
-      stop()
-      activity = host
-      visibleActivities.add(host)
+    // 页面切换时 UTS 的 currentActivity 可能仍是旧页面；优先使用已恢复且有焦点的宿主。
+    val resumed = activity?.takeIf { foreground && !it.isDestroyed && !it.isFinishing && it.hasWindowFocus() }
+    val host = resumed ?: currentActivity?.takeUnless { it.isDestroyed || it.isFinishing || !isBusinessActivity(it) }
+    if (application == null && host != null) {
+      application = host.application
       host.application.registerActivityLifecycleCallbacks(lifecycle)
-      // 部分 HX 宿主基于 ComponentActivity；反射让旧宿主无需升级 AndroidX 仍可运行。
-      leaveListenerAttached = try {
-        host.javaClass.getMethod("addOnUserLeaveHintListener", Runnable::class.java).invoke(host, leaveListener)
-        true
-      } catch (_: ReflectiveOperationException) { false }
+      visibleActivities.add(host)
+      MeetingForegroundService.floatingWindow = this
+      handler.post(refresh)
+    }
+    if (host != null && activity !== host) {
+      detachActivity()
+      activity = host
+      attach(host)
     }
     this.pageVisible = pageVisible
-    this.foreground = foreground
-    if (root == null) attach(host)
+    // onHide 也可能是权限页/页面跳转，后台以所有 Activity 的可见性为准。
+    if (foreground) this.foreground = true
     layout()
     refreshAutoEnter()
-    if (!foreground) requestBackgroundPip()
+    if (!foreground) scheduleBackground() else hideOverlay()
+    if (foreground && pageVisible && host != null) explainOverlayPermission(host)
   }
 
-  private fun requestBackgroundPip() {
+  private fun isBusinessActivity(host: Activity): Boolean {
+    var type: Class<*>? = host.javaClass
+    while (type != null) {
+      // 首页与普通页面不是父子关系：详情页/会议页继承 UniPageActivity。
+      if (type.name == "io.dcloud.uniapp.UniAppActivity" ||
+          type.name == "io.dcloud.uniapp.appframe.activity.UniPageActivity") return true
+      type = type.superclass
+    }
+    return false
+  }
+
+  private fun scheduleBackground() {
     handler.postDelayed({
-      val host = activity
-      // user-leave / Android 12+ auto-enter 为主；旧宿主仅在真正退后台时兜底。
-      if (host != null && visibleActivities.isEmpty() && !host.hasWindowFocus()) requestPip("background")
+      foreground = visibleActivities.isNotEmpty()
+      layout()
+      syncOverlay()
     }, 250)
   }
 
+  /** 仍有前台服务/原生 Room 时，移除任务不能销毁桌面入口。 */
+  fun onTaskRemoved() {
+    visibleActivities.clear()
+    foreground = false
+    layout()
+    syncOverlay()
+  }
+
+  /** 保留桥接调用入口，但会议不再自动进入黑色系统画中画。 */
   fun refreshAutoEnter() {
-    val host = activity ?: return
-    if (Build.VERSION.SDK_INT >= 31 && host.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
-      try {
-        host.setPictureInPictureParams(PictureInPictureParams.Builder()
-          .setAspectRatio(Rational(16, 10)).setAutoEnterEnabled(!bridge.isScreenSharePending()).build())
-      } catch (error: Exception) { recordPipFailure(error.javaClass.simpleName) }
+    if (Build.VERSION.SDK_INT >= 31) {
+      try { activity?.setPictureInPictureParams(PictureInPictureParams.Builder().setAutoEnterEnabled(false).build()) }
+      catch (_: Exception) {}
     }
   }
 
-  private fun requestPip(reason: String) {
-    val host = activity ?: return
-    if (!bridge.isConnected() || host.isFinishing || host.isDestroyed || host.isChangingConfigurations ||
-        bridge.isScreenSharePending() || pipRequestPending) return
-    if (Build.VERSION.SDK_INT < 26 || !host.packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) {
-      recordPipFailure("unsupported"); return
-    }
-    if (host.isInPictureInPictureMode) return
-    val keyguard = host.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-    if (keyguard?.isKeyguardLocked == true) return
+  private fun overlayAllowed(context: Context): Boolean = Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(context)
+
+  private fun explainOverlayPermission(host: Activity) {
+    if (overlayAllowed(host) || bridge.isScreenSharePending() || !host.hasWindowFocus()) return
+    val prefs = host.getSharedPreferences("meeting_window", Context.MODE_PRIVATE)
+    if (prefs.getBoolean("overlay_explained", false) || permissionDialog != null) return
+    // 仅首次说明；拒绝后不反复打断入会，仍可从系统通知返回会议。
+    val dialog = AlertDialog.Builder(host)
+      .setTitle("开启会议悬浮窗")
+      .setMessage("允许“显示在其他应用上层”后，切到桌面或其他应用时也能看到会议图标，点击即可返回会议。不开启也可通过通知返回会议。")
+      .setNegativeButton("暂不开启", null)
+      .setPositiveButton("去设置") { _, _ ->
+        try { host.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + host.packageName))) }
+        catch (_: Exception) { Log.w("MeetingWindow", "overlay settings unavailable") }
+      }.create()
+    dialog.setOnDismissListener { permissionDialog = null }
     try {
-      val entered = host.enterPictureInPictureMode(PictureInPictureParams.Builder().setAspectRatio(Rational(16, 10)).build())
-      pipRequestPending = entered
-      pipStatus = if (entered) "requested" else "denied"
-      Log.i("MeetingPiP", "$reason result=$pipStatus host=${host.javaClass.name}")
-      if (entered) layout()
-    } catch (error: Exception) { recordPipFailure(error.javaClass.simpleName) }
+      dialog.show()
+      permissionDialog = dialog
+      prefs.edit().putBoolean("overlay_explained", true).apply()
+    } catch (_: Exception) { Log.w("MeetingWindow", "permission explanation unavailable") }
   }
 
-  private fun recordPipFailure(reason: String) {
-    if (pipStatus != reason) Log.w("MeetingPiP", "unavailable=$reason host=${activity?.javaClass?.name}")
-    pipStatus = reason
-  }
-
-  fun diag(): String = "pip[state=$pipStatus,page=$pageVisible,foreground=$foreground,inPip=${if (Build.VERSION.SDK_INT >= 26) activity?.isInPictureInPictureMode else false},leaveHook=${if (leaveListenerAttached) 1 else 0}]"
+  fun diag(): String = "window[state=$overlayStatus,page=$pageVisible,foreground=$foreground,overlay=${overlay != null}]"
 
   private class EdgeHandle(context: Context) : View(context) {
     private val pen = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-      color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 1.8f
+      color = Color.rgb(128, 128, 128); style = Paint.Style.STROKE; strokeWidth = 1.8f
       strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
     }
     override fun onDraw(canvas: Canvas) {
@@ -174,81 +202,137 @@ class MeetingFloatingWindow(private val bridge: MeetingRoomBridge) {
     }
   }
 
-  private fun attach(host: Activity) {
-    val parent = host.window.decorView as? ViewGroup ?: return
-    val box = FrameLayout(host)
-    box.visibility = View.GONE
-    box.elevation = 32f
-    val content = FrameLayout(host).apply { setBackgroundColor(Color.BLACK); visibility = View.GONE }
-    content.addView(TextView(host).apply {
-      text = "会议进行中"; setTextColor(Color.WHITE); textSize = 13f; gravity = Gravity.CENTER
-    }, FrameLayout.LayoutParams(-1, -1))
-    renderer = bridge.createPipRenderer(host)
-    renderer?.let { content.addView(it, FrameLayout.LayoutParams(-1, -1)) }
-    box.addView(content, FrameLayout.LayoutParams(-1, -1))
-    pipContent = content
-    val handle = EdgeHandle(host).apply {
+  private fun makeHandle(context: Context, restore: () -> Unit): View {
+    val handle = EdgeHandle(context).apply {
       val radius = 16f * resources.displayMetrics.density
       background = GradientDrawable().apply {
-        setColor(Color.rgb(29, 30, 33))
+        setColor(Color.WHITE)
+        setStroke((resources.displayMetrics.density).toInt().coerceAtLeast(1), Color.rgb(232, 232, 232))
         cornerRadii = floatArrayOf(radius, radius, 0f, 0f, 0f, 0f, radius, radius)
       }
       contentDescription = "返回会议，可上下拖动"
       isFocusable = true
       isClickable = true
-      setOnClickListener { restoreRequested = true }
+      elevation = 8f * resources.displayMetrics.density
+      setOnClickListener { restore() }
     }
-    edgeHandle = handle
-    box.addView(handle, FrameLayout.LayoutParams(-1, -1))
     var downX = 0f
     var downY = 0f
-    var initialY = 0f
+    var initialPosition = 0f
     var dragged = false
-    val touchSlop = ViewConfiguration.get(host).scaledTouchSlop
+    val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     handle.setOnTouchListener { view, event ->
       when (event.actionMasked) {
         MotionEvent.ACTION_DOWN -> {
-          downX = event.rawX; downY = event.rawY; initialY = box.y; dragged = false
+          downX = event.rawX; downY = event.rawY; initialPosition = edgePosition; dragged = false
         }
         MotionEvent.ACTION_MOVE -> {
           if (kotlin.math.abs(event.rawX - downX) > touchSlop || kotlin.math.abs(event.rawY - downY) > touchSlop) dragged = true
           if (dragged) {
-            val margin = 28f * host.resources.displayMetrics.density
-            val available = (parent.height - box.height - 2 * margin).coerceAtLeast(1f)
-            edgePosition = ((initialY + event.rawY - downY - margin) / available).coerceIn(0f, 1f)
+            val density = context.resources.displayMetrics.density
+            val height = (view.parent as? ViewGroup)?.height ?: context.resources.displayMetrics.heightPixels
+            val available = (height - 120 * density).coerceAtLeast(1f)
+            edgePosition = (initialPosition + (event.rawY - downY) / available).coerceIn(0f, 1f)
             layout()
+            updateOverlayPosition()
           }
         }
-        MotionEvent.ACTION_UP -> {
-          if (!dragged) view.performClick()
-        }
+        MotionEvent.ACTION_UP -> if (!dragged) view.performClick()
       }
       true
     }
-    parent.addView(box, ViewGroup.LayoutParams(1, 1))
-    root = box
+    return handle
+  }
+
+  private fun attach(host: Activity) {
+    val parent = host.window.decorView as? ViewGroup ?: return
+    MeetingReturnRequest.rememberTask(host.taskId)
+    Log.i("MeetingWindow", "attach host=${host.javaClass.simpleName} task=${host.taskId}")
+    val handle = makeHandle(host) {
+      restoreRequested = true
+      Log.i("MeetingWindow", "restore source=in_app host=${host.javaClass.simpleName}")
+    }
+    handle.visibility = View.GONE
+    parent.addView(handle, ViewGroup.LayoutParams(1, 1))
+    root = handle
     parent.addOnLayoutChangeListener(parentLayoutListener)
-    handler.post(refresh)
   }
 
   private fun layout() {
-    val host = activity ?: return
     val box = root ?: return
     val parent = box.parent as? ViewGroup ?: return
-    val inPip = Build.VERSION.SDK_INT >= 26 && host.isInPictureInPictureMode
-    val show = inPip || (foreground && !pageVisible)
-    box.visibility = if (show) View.VISIBLE else View.GONE
-    pipContent?.visibility = if (inPip) View.VISIBLE else View.GONE
-    edgeHandle?.visibility = if (inPip) View.GONE else View.VISIBLE
-    val density = host.resources.displayMetrics.density
-    val width = if (inPip) parent.width else (36 * density).toInt()
-    val height = if (inPip) parent.height else (64 * density).toInt()
+    box.visibility = if (foreground && !pageVisible) View.VISIBLE else View.GONE
+    val density = box.resources.displayMetrics.density
+    val width = (36 * density).toInt()
+    val height = (64 * density).toInt()
     if (box.layoutParams.width != width || box.layoutParams.height != height) {
       box.layoutParams = box.layoutParams.apply { this.width = width; this.height = height }
     }
-    box.x = if (inPip) 0f else (parent.width - width).coerceAtLeast(0).toFloat()
-    box.y = if (inPip) 0f else 28 * density + (parent.height - height - 56 * density).coerceAtLeast(0f) * edgePosition
-    if (show) box.bringToFront()
+    box.x = (parent.width - width).coerceAtLeast(0).toFloat()
+    box.y = 28 * density + (parent.height - height - 56 * density).coerceAtLeast(0f) * edgePosition
+    if (box.visibility == View.VISIBLE) box.bringToFront()
+  }
+
+  private fun syncOverlay() {
+    val app = application ?: return
+    val locked = (app.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true
+    if (foreground || !bridge.isConnected() || locked || bridge.isScreenSharePending() || !overlayAllowed(app)) {
+      hideOverlay()
+      overlayStatus = if (!overlayAllowed(app)) "permission_required" else "hidden"
+      return
+    }
+    if (overlay != null) { updateOverlayPosition(); return }
+    val session = MeetingReturnRequest.begin()
+    val handle = makeHandle(app) {
+      // 优先恢复原任务，不启动 Launcher 重排到消息首页；通知复用同一入口。
+      if (bridge.isConnected()) MeetingReturnRequest.open(app, session)
+    }
+    val density = app.resources.displayMetrics.density
+    @Suppress("DEPRECATION")
+    val type = if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
+    val params = WindowManager.LayoutParams((36 * density).toInt(), (64 * density).toInt(), type,
+      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+      PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.RIGHT }
+    try {
+      (app.getSystemService(Context.WINDOW_SERVICE) as WindowManager).addView(handle, params)
+      overlay = handle
+      overlayParams = params
+      overlayStatus = "visible"
+      updateOverlayPosition()
+    } catch (error: Exception) {
+      if (overlayStatus != "denied") Log.w("MeetingWindow", "overlay unavailable: " + error.javaClass.simpleName)
+      overlayStatus = "denied"
+    }
+  }
+
+  private fun updateOverlayPosition() {
+    val app = application ?: return
+    val view = overlay ?: return
+    val params = overlayParams ?: return
+    val metrics = app.resources.displayMetrics
+    val y = (28 * metrics.density + (metrics.heightPixels - 120 * metrics.density).coerceAtLeast(0f) * edgePosition).toInt()
+    if (params.y == y) return
+    params.y = y
+    try { (app.getSystemService(Context.WINDOW_SERVICE) as WindowManager).updateViewLayout(view, params) }
+    catch (_: Exception) { hideOverlay() }
+  }
+
+  private fun hideOverlay() {
+    val app = application
+    val view = overlay
+    if (app != null && view != null) {
+      try { (app.getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeViewImmediate(view) }
+      catch (_: Exception) {}
+    }
+    overlay = null
+    overlayParams = null
+  }
+
+  private fun detachActivity() {
+    permissionDialog?.dismiss()
+    permissionDialog = null
+    (root?.parent as? ViewGroup)?.let { it.removeOnLayoutChangeListener(parentLayoutListener); it.removeView(root) }
+    root = null
   }
 
   fun consumeRestoreRequest(): Boolean {
@@ -259,27 +343,15 @@ class MeetingFloatingWindow(private val bridge: MeetingRoomBridge) {
 
   fun stop() {
     handler.removeCallbacksAndMessages(null)
-    val host = activity
-    host?.application?.unregisterActivityLifecycleCallbacks(lifecycle)
-    if (host != null && leaveListenerAttached) {
-      try { host.javaClass.getMethod("removeOnUserLeaveHintListener", Runnable::class.java).invoke(host, leaveListener) }
-      catch (_: ReflectiveOperationException) {}
-    }
-    leaveListenerAttached = false
-    visibleActivities.clear()
-    pipRequestPending = false
-    if (Build.VERSION.SDK_INT >= 31) {
-      try { activity?.setPictureInPictureParams(PictureInPictureParams.Builder().setAutoEnterEnabled(false).build()) } catch (_: Exception) {}
-    }
-    renderer?.let { bridge.releasePipRenderer(it) }
-    (root?.parent as? ViewGroup)?.let { it.removeOnLayoutChangeListener(parentLayoutListener); it.removeView(root) }
-    pipContent = null
-    edgeHandle = null
-    root = null
-    renderer = null
+    refreshAutoEnter()
+    hideOverlay()
+    detachActivity()
+    application?.unregisterActivityLifecycleCallbacks(lifecycle)
+    application = null
     activity = null
+    visibleActivities.clear()
     restoreRequested = false
-    wasInPip = false
-    pipStatus = "idle"
+    overlayStatus = "idle"
+    if (MeetingForegroundService.floatingWindow === this) MeetingForegroundService.floatingWindow = null
   }
 }

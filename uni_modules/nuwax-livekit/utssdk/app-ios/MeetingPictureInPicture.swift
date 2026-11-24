@@ -29,7 +29,9 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
   func makeSourceView() -> UIView {
     stop()
     let source = MeetingEdgeHandle(frame: CGRect(x: 0, y: 0, width: 36, height: 64))
-    source.backgroundColor = UIColor(white: 0.11, alpha: 0.96)
+    source.backgroundColor = .white
+    source.layer.borderColor = UIColor(white: 232.0 / 255.0, alpha: 1).cgColor
+    source.layer.borderWidth = 1
     source.layer.cornerRadius = 16
     source.layer.maskedCorners = [.layerMinXMinYCorner, .layerMinXMaxYCorner]
     source.clipsToBounds = true
@@ -105,7 +107,8 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
       .first { $0.activationState == .foregroundActive || $0.activationState == .foregroundInactive }
     let hostWindow = scene?.windows.first(where: { $0.isKeyWindow })
       ?? UIApplication.shared.windows.first(where: { $0.isKeyWindow && !$0.isHidden })
-    if source.window == nil, let window = hostWindow {
+    if let window = hostWindow, source.window !== window {
+      source.removeFromSuperview()
       window.addSubview(source)
     }
     guard let window = source.window else { return }
@@ -249,7 +252,7 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
   }
 }
 
-/// 与 static/icons/meeting-white.svg 同形，保持两端的会议入口一致。
+/// 与 static/icons/meeting-gray.svg 同形，保持两端的会议入口一致。
 private final class MeetingEdgeHandle: UIView {
   override func draw(_ rect: CGRect) {
     guard let context = UIGraphicsGetCurrentContext() else { return }
@@ -257,7 +260,7 @@ private final class MeetingEdgeHandle: UIView {
     defer { context.restoreGState() }
     context.translateBy(x: bounds.midX - 11, y: bounds.midY - 11)
     context.scaleBy(x: 22 / 24, y: 22 / 24)
-    UIColor.white.setStroke()
+    UIColor(white: 128.0 / 255.0, alpha: 1).setStroke()
     let head = UIBezierPath(ovalIn: CGRect(x: 5, y: 3, width: 8, height: 8))
     head.lineWidth = 1.8
     head.stroke()

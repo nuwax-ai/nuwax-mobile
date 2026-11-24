@@ -12,6 +12,15 @@ import android.os.IBinder
 /** 只在用户入会且 App 在前台时启动。录屏另由 SDK 的 mediaProjection 服务承载。 */
 class MeetingForegroundService : Service() {
   override fun onBind(intent: Intent?): IBinder? = null
+  override fun onTaskRemoved(rootIntent: Intent?) {
+    super.onTaskRemoved(rootIntent)
+    floatingWindow?.onTaskRemoved()
+  }
+
+  override fun onDestroy() {
+    floatingWindow?.stop()
+    super.onDestroy()
+  }
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     if (Build.VERSION.SDK_INT >= 26) {
@@ -41,6 +50,8 @@ class MeetingForegroundService : Service() {
   }
 
   companion object {
+    // 仅持有当前原生会议入口；Activity 销毁不销毁桌面悬浮窗，服务结束必须移除。
+    internal var floatingWindow: MeetingFloatingWindow? = null
     private const val CHANNEL = "NuwaxMeetingOngoing"
     private const val NOTIFICATION_ID = 4712
     fun start(context: Context) {

@@ -74,6 +74,9 @@ class MeetingRoomBridge(context: Context) {
   private var pipTrack: VideoTrack? = null
   private var pipRenderer: SurfaceViewRenderer? = null
   private val floatingWindow = MeetingFloatingWindow(this)
+  @Volatile private var resumeRoom = ""
+  @Volatile private var resumeUrl = ""
+  @Volatile private var resumeToken = ""
   @Volatile private var screenShareError = ""
   /** 本地共享发布诊断：授权成功不等于 LiveKit 已经发布出可订阅视频轨。 */
   @Volatile private var screenShareDiag = "off"
@@ -348,9 +351,26 @@ class MeetingRoomBridge(context: Context) {
     return refreshScreenShareState(r)
   }
 
-  fun diag(): String = "probe=android-meeting-20261123-p8 share[${screenShareDiag}] ${floatingWindow.diag()}"
+  fun diag(): String = "probe=android-meeting-20261123-p11 share[${screenShareDiag}] ${floatingWindow.diag()}"
 
   fun configureBackgroundSession(endpoint: String, token: String) { shareLease.configure(endpoint, token) }
+
+  fun rememberResumeState(room: String, url: String, token: String) {
+    if (!connectedFlag) return
+    resumeRoom = room
+    resumeUrl = url
+    resumeToken = token
+  }
+
+  /** 仅恢复仍存活的本场原生 Room；进程死亡/断会后返回空，禁止持久化或打印。 */
+  fun restoreResumeState(): String {
+    val current = room ?: return ""
+    if (!connectedFlag || resumeRoom.isEmpty() || resumeToken.isEmpty()) return ""
+    return JSONObject().put("room", resumeRoom).put("url", resumeUrl).put("token", resumeToken)
+      .put("mic", current.localParticipant.getTrackPublication(Track.Source.MICROPHONE)?.let { !it.muted && it.track != null } ?: false)
+      .put("camera", current.localParticipant.getTrackPublication(Track.Source.CAMERA)?.let { !it.muted && it.track != null } ?: false)
+      .put("speaker", speakerWanted).toString()
+  }
 
   private fun updateSharePending(pending: Boolean) {
     sharePending = pending
@@ -366,9 +386,12 @@ class MeetingRoomBridge(context: Context) {
     }
   }
   fun consumeMeetingRestoreRequest(): Boolean {
-    val notification = MeetingReturnRequest.consume()
+    val notification = MeetingReturnRequest.peek()
     val window = floatingWindow.consumeRestoreRequest()
     return connectedFlag && (notification || window)
+  }
+  fun acknowledgeMeetingRestoreRequest() {
+    if (connectedFlag) MeetingReturnRequest.acknowledge()
   }
 
   fun createPipRenderer(context: Context): SurfaceViewRenderer? {
@@ -789,6 +812,9 @@ class MeetingRoomBridge(context: Context) {
 
 
   private fun disconnectInternal(notify: Boolean) {
+    resumeRoom = ""
+    resumeUrl = ""
+    resumeToken = ""
     android.os.Handler(android.os.Looper.getMainLooper()).post { floatingWindow.stop() }
     shareRequestID += 1
     updateSharePending(false)

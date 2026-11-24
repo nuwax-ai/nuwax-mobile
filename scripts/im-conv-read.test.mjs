@@ -42,6 +42,11 @@ for (const page of ['message/message-content', 'union-record/union-record-conten
     assert.equal(rows.value[0].unreadCount, 0);
     assert.notEqual(rows.value[0], original, 'Android 行组件需要新的对象身份');
     assert.equal(refreshes, 1);
+    const staleRows = [{ convId: 'conv-1', unreadCount: 2, lastMsgSeq: 50 }];
+    rows.value = staleRows; // 隐藏期消费了通知，返回前旧快照又覆盖该行。
+    context.applyPendingConvReadMark(); // onShow 同步纠正，不等刷新请求。
+    assert.equal(rows.value[0].unreadCount, 0);
+    assert.notEqual(rows.value, staleRows, '列表属性也需新引用以触发原生子组件更新');
   });
 }
 
@@ -88,4 +93,62 @@ test('进入会话后立即清行角标，返回不等待已读接口，旧列�
   assert.equal(h.api.confirmedConvReadSeq({ data: { rateLimited: true } }, 50), 0);
   h.session('b');
   assert.equal(h.api.unreadAfterLocalView('conv-1', 2, 50), 2);
+});
+
+for (const page of ['message/message-content', 'union-record/union-record-content']) {
+  test(page + ': 已看会议邀请返回后，旧未读通知不能恢复角标，新消息仍有角标', () => {
+    const h = harness();
+    const rows = { value: [{ convId: 'conv-1', unreadCount: 0, lastMsgSeq: 50 }] };
+    const context = vm.createContext({
+      ...h.api, conversations: rows, messagePageVisible: true, convRevision: 0,
+      convLoaded: { value: true }, isAppInBackground: () => false, scheduleConvRefresh() {},
+      findConvRowById: id => rows.value.find(row => row.convId === id) ?? null,
+      cloneConvRow: row => ({ ...row }), readString: (obj, key) => String(obj[key] ?? ''),
+      readNumber: (obj, key, fallback) => Number(obj[key] ?? fallback),
+    });
+    const raw = readFileSync(new URL('../pages/' + page + '.uvue', import.meta.url), 'utf8');
+    const start = raw.indexOf('  function handleImConvUnread(');
+    const end = raw.indexOf('  /** 已读回包', start);
+    vm.runInContext(stripTypeScriptTypes(raw.slice(start, end)), context);
+    h.api.noteConvViewedLocally('conv-1', 50);
+    context.handleImConvUnread({ convId: 'conv-1', unreadCount: 1, readSeq: 49, lastMsgSeq: 50 });
+    assert.equal(rows.value[0].unreadCount, 0);
+    context.handleImConvUnread({ convId: 'conv-1', unreadCount: 1, readSeq: 50, lastMsgSeq: 51 });
+    assert.equal(rows.value[0].unreadCount, 1);
+    assert.equal(rows.value[0].lastMsgSeq, 51);
+    context.handleImConvUnread({ convId: 'conv-1', unreadCount: 0, readSeq: 50, lastMsgSeq: 50 });
+    assert.equal(rows.value[0].unreadCount, 1, '旧的清零帧也不能清除后来消息');
+  });
+}
+
+test('退页后服务端已读确认保留水位，队列已消费也不能被旧列表回包复活', () => {
+  const h = harness();
+  h.report(); h.api.consumeConvReadMark('message'); h.api.consumeConvReadMark('union');
+  assert.equal(h.api.unreadAfterLocalView('conv-1', 2, 50), 0);
+  assert.equal(h.api.unreadAfterLocalView('conv-1', 1, 51), 1);
+});
+
+
+test('只有会议邀请卡片的会话也立即报读；隐藏预加载不能清未读', () => {
+  const h = harness();
+  const raw = readFileSync(new URL('../pages/message/components/chat-view.uvue', import.meta.url), 'utf8');
+  function source(start, end) { return raw.slice(raw.indexOf(start), raw.indexOf(end, raw.indexOf(start))); }
+  let active = true;
+  const context = vm.createContext({
+    ...h.api, messages: { value: [{ msgType: 'meeting_invite', seq: 50 }] },
+    convId: { value: 'conv-1' }, isChatActive: () => active,
+    reportedReadSeq: 0, wantedReadSeq: 0, readReportRunning: false, readReportTimer: 0,
+    pullEntryDialog: false, pageVisible: true, setTimeout: () => 1,
+  });
+  const code = source('  function maxSeq():', '  /** 本地未确认行') +
+    source('  function reportReadIfNeeded(', '  // ===== 未读定位') +
+    source('  function reportReadAuto()', '  /** 距底余量阈值');
+  vm.runInContext(stripTypeScriptTypes(code), context);
+  active = false;
+  context.reportReadAuto();
+  assert.equal(h.api.consumeConvReadMark(), null);
+  active = true;
+  context.reportReadAuto();
+  assert.equal(h.api.consumeConvReadMark().readSeq, 50);
+  assert.equal(context.wantedReadSeq, 50);
 });

@@ -70,6 +70,11 @@ let closedDurationOverride = 0;
 /** 切段过程中点了暂停。新文件打开后再暂停同一个采集器。 */
 let pauseAfterRotate = false;
 // #endif
+/**
+ * 回前台时这一段已经超时长。先别切段，让停止、继续先用当前文件。
+ * 继续录音返回后再允许切段。
+ */
+let deferRotate = false;
 /** "" 用户没要求停 / rotate 到点切段 / user 用户停止 / discard 重录放弃 / busy 正在停 */
 /** 已经点了完成。暂停或切段的回调不能再把这次录音改回未结束。 */
 let sessionEnding = false;
@@ -461,7 +466,7 @@ function onTick(): void {
   }
   // #endif
   const segmentElapsed = openSegmentMs(record, Date.now());
-  if (segmentElapsed >= segmentMs && stopIntent.length == 0) {
+  if (!deferRotate && segmentElapsed >= segmentMs && stopIntent.length == 0) {
     // 鸿蒙切段要先停掉 AVRecorder 再 start。后台不允许重新 start，文件继续写，回前台再切。
     // #ifdef APP-HARMONY
     if (isAppInBackground()) {
@@ -561,10 +566,19 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
   segment.uploadStatus = "pending";
   segment.uploadAttempts = 0;
   record.segments.push(segment);
-  record.openSegmentIndex = index + 1;
-  record.segmentStartedAt = 0;
-  record.openElapsedMs = 0;
-  record.openSegmentPath = "";
+  const keepWriting = record.openSegmentPath.length > 0 && record.openSegmentPath != filePath && record.openSegmentPath != tempPath;
+  if (!keepWriting) {
+    record.openSegmentIndex = index + 1;
+    record.segmentStartedAt = 0;
+    record.openElapsedMs = 0;
+    record.openSegmentPath = "";
+  } else if (record.openSegmentIndex <= index) {
+    record.openSegmentIndex = index + 1;
+    record.openElapsedMs = 0;
+    if (record.phase != "recording") {
+      record.segmentStartedAt = 0;
+    }
+  }
   record.accumulatedMs = record.accumulatedMs + duration;
   touch(record);
   await splitLongHarmonySegment(record);
@@ -776,6 +790,27 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     return;
   }
   const pausing = usedIntent == "user";
+  // #ifdef APP
+  if (!pausing && usedIntent != "finish" && usedIntent != "exit" && usedIntent != "discard" && pauseAfterRotate) {
+    pauseAfterRotate = false;
+    if (pendingRotatedPath.length > 0) {
+      const opened = pendingRotatedPath;
+      pendingRotatedPath = "";
+      currentSegmentPath = opened;
+      record.openSegmentPath = opened;
+      markCaptureRunning(record.localId);
+    } else {
+      pendingRotatedPath = "";
+    }
+    await pauseActiveRecorder(record);
+    if (tempPath.length > 0 && tempPath != record.openSegmentPath) {
+      void closeSegment(record, tempPath);
+      void pumpQueue(record.localId, false);
+    }
+    stopIntent = "";
+    return;
+  }
+  // #endif
   let closedIndex = -1;
   if (tempPath.length > 0) {
     closedIndex = await closeSegment(record, tempPath);
@@ -1664,12 +1699,20 @@ async function resumePausedNote(record: VoiceNoteRecord): Promise<void> {
   await startRecorder();
 }
 
+function releaseRotateIfRecording(): void {
+  const record = activeRecord();
+  if (record != null && record.phase == "recording") {
+    deferRotate = false;
+  }
+}
+
 /** 开始一轮录音。已暂停的会话会接着录。调用前页面需已拿到麦克风权限。
  *  先让原生录音器写文件。创建笔记、上传、转写、补传都在开录成功之后，失败也不停录音。 */
 export async function startVoiceNote(): Promise<void> {
   if (captureStarting) return;
   const existing = activeRecord();
   if (existing != null && captureAlive) return;
+  deferRotate = true;
   captureStarting = true;
   try {
     if (existing != null) {
@@ -1704,6 +1747,7 @@ export async function startVoiceNote(): Promise<void> {
     }
   } finally {
     captureStarting = false;
+    releaseRotateIfRecording();
   }
 }
 
@@ -1854,6 +1898,7 @@ export async function playableLocalVoiceFile(): Promise<string> {
 export function stopVoiceNote(): void {
   pausedByInterruption = false;
   stopInterruptWatch();
+  deferRotate = true;
   const record = activeRecord();
   if (record == null) return;
   void pauseActiveRecorder(record);
@@ -2013,7 +2058,7 @@ export function voiceNoteOnAppShow(): void {
     ensureTicker();
     const now = Date.now();
     if (openSegmentMs(record, now) >= segmentMs && stopIntent.length == 0) {
-      stopActiveRecorder("rotate");
+      deferRotate = true;
     }
   }
 }

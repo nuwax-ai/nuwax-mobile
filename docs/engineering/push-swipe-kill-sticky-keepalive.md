@@ -170,6 +170,68 @@ W/ActivityManager: Scheduling restart of crashed service ...UniPushIntentService
 
 钉钉同时有 13 个服务、0 个前台服务，也没有用常驻通知 —— 说明「前台服务」不是这个问题的必需项。
 
+### 2.6 ★更上游的闸门：三星 autorun（自动运行）权限
+
+这一条是 2026-11-24 真机实测才发现的，比 `START_STICKY` 更关键。
+
+**现象**：同一个 App、同一个划掉动作，reason 会出现两种完全不同的结果。
+
+| 时间 | uid | reason | 结果 |
+|---|---|---|---|
+| 14:29 / 14:57 | `u0a16`（旧安装） | `remove task` | 普通 kill，STICKY 能救 |
+| 16:32 / 16:35 | `u0a509`（重装后） | `stop com.nuwax.app due to MARs #2` | **force-stop，STICKY 无效** |
+| 16:38（在系统设置里重新授权自动运行后） | `u0a509` | `remove task` | 恢复正常，STICKY 生效 |
+
+**`MARs #2` 的真实身份**：三星 `MARsPolicyManager` 的 **autorun 策略**。
+
+```
+V/MARsPolicyManager: Recent_Kill: add mRestrictedPackages com.nuwax.app policy --autorun(2)
+```
+
+反编译 `services.jar`（`classes.dex`）确认调用链：
+
+```
+MARsPolicyManager.forceRunPolicyForRecentKill(int policy, String pkg)
+  └─ forceKillPackage(pkg, Policy(autorun), uid, userId)
+       └─ ActivityManagerService.forceStopPackage(pkg, userId)     ← 强制停止
+```
+
+`forceStopPackage` 会**清空所有服务的重启队列**，因此：
+
+- 日志里**一条 `Scheduling restart` 都不会有**；
+- 进程被杀后**不会**因 `START_STICKY` 恢复；
+- App 进入 stopped 状态，**连开机广播都收不到**，直到用户手动打开。
+
+**触发条件**：三星的"自动运行"授权是跟着 **uid + 包名** 记的。
+重装 App（换签名/换安装来源）会导致 uid 变化 → 之前的授权失效 → 被当作"未授权应用" → 划掉直接强停。
+
+> ★这与 Android 标准的 `battery_optimization`（`dumpsys deviceidle whitelist`）是**两套独立机制**。
+> 只把 App 加进 Doze 白名单并设为「不限制」**不能**解除此限制（实测验证过）。
+
+**部署要求（必须写进安装引导）**：非厂商通道设备必须在三星设置里显式授权自动运行，两个入口任选：
+
+```
+设置 → 电池和设备维护 → 电池 → 后台使用限制
+  → 把「女娲Nuwax」放进「从不休眠的应用」
+
+或
+
+设置 → 应用程序 → 女娲Nuwax → 电池 → 选「不受限制」/ 打开「允许后台活动」
+```
+
+授权后实测恢复为 `remove task`，STICKY 在 **1.04 秒**后拉活进程：
+
+```
+16:38:14.940 Killing <pid>:com.nuwax.app (adj 100): remove task
+16:38:14.965 Scheduling restart of crashed service ...PushKeepAliveService in 1000ms for start-requested
+16:38:15.979 Start proc <newpid>:com.nuwax.app:pushservice for service {...PushKeepAliveService}
+16:38:16.618 NuwaxPushKeepAlive: onCreate: start Getui PushService ok
+16:38:16.682 Start proc <pid>:com.nuwax.app for content provider {com.getui.gtc.base.GtcProvider}
+```
+
+> 注意：拉活后 AMS 同时给 `UniPushService` 也发了一条 `for start-requested` 调度
+> （`in 10999ms` 错峰），说明同进程被拉活后 AMS 会把它一并纳管 —— 这是额外收益。
+
 ---
 
 ## 3. 产品闸门（重要）
@@ -380,10 +442,14 @@ function ensurePushKeepAliveIfNoVendorChannel(): void {
 
 1. **AMS 重启是退避的**。首次约 1s（钉钉实测 1000ms），反复被划掉后延迟会递增（钉钉同期其他服务
    出现 11000ms / 20047ms / 30036ms / 39972ms 的错峰值），上限约 60s。不是每次都能 1 秒回来。
+   ★本 App 实测：因 `UniPushService` 也拿到调度，出现 1000ms（锚点）与 10999ms（个推）错峰。
 2. **拉活到重连之间有断线窗口**（通常 1–5 秒）。这段时间到达的消息能否补收，**取决于个推控制台的
    「离线消息保存时长」配置**——端上改不了。上线前需要去个推控制台确认该值并记录。
 3. **用户「强行停止」（设置里）之后，STICKY 也不会重启**。这是 Android 系统行为，无解。
-4. **三星若把 App 判为"异常耗电"可能追加限制**。目前调研中未观察到，但无法排除。
+4. **★★三星 autorun 未授权时，本方案完全失效**。此时划掉走 `forceStopPackage`（`MARs #2`），
+   STICKY 不生效、App 进入 stopped 状态（连开机广播都收不到）。必须在系统设置里授权自动运行，
+   且**重装 App 会导致授权失效**（uid 变化）—— 安装引导/客服话术里必须包含这一步。
+   详见 §2.6。
 5. **不能 100% 等价于厂商通道**。这是「显著改善」，不是「彻底解决」。厂商通道由系统级服务投递，
    进程死不死都能收；自建通道永远受进程存活约束。
 

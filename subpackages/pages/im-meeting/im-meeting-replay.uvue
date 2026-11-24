@@ -2,27 +2,32 @@
   <view class="replay-page">
     <custom-nav-bar :title="t('Mobile.Meeting.detailReplay')" hasSafetyZone showBack />
     <view class="replay-stage">
-      <video v-if="ready && src.length > 0 && errorText.length == 0" :key="attemptId"
-        :id="'meetingReplayVideo-' + attemptId" class="replay-video" :src="src" :controls="true"
-        :autoplay="true" :initial-time="initialTime" object-fit="contain"
-        @play="handlePlay" @pause="handlePause"
-        @ended="handlePause" @waiting="handleWaiting" @timeupdate="handleTimeUpdate"
-        @error="handleVideoError" />
+      <template v-if="ready && src.length > 0 && errorText.length == 0">
+        <video v-for="videoAttempt in playerAttempts" :key="videoAttempt"
+          :id="'meetingReplayVideo-' + videoAttempt" class="replay-video" :src="src"
+          :controls="!preparingPreview" :show-center-play-btn="!preparingPreview"
+          :enable-progress-gesture="!preparingPreview"
+          :autoplay="true" :muted="preparingPreview" :initial-time="initialTime" object-fit="contain"
+          @play="handlePlay(videoAttempt)" @pause="handlePause(videoAttempt)"
+          @ended="handleEnded(videoAttempt)" @waiting="handleWaiting(videoAttempt)"
+          @timeupdate="handleTimeUpdate(videoAttempt, $event)" @error="handleVideoError(videoAttempt)" />
+      </template>
       <view v-if="errorText.length > 0" class="replay-error">
         <text class="replay-error__text">{{ errorText }}</text>
         <view class="replay-retry" hover-class="replay-retry--active" @click="retry">
           <text class="replay-retry__text">{{ t('Mobile.Common.retry') }}</text>
         </view>
       </view>
-    </view>
-    <view v-if="loading" class="replay-status">
-      <text class="replay-status__text">{{ caching ? t('Mobile.Meeting.replayCaching') : t('Mobile.Common.loading') }}{{ caching && progress > 0 ? ' ' + progress + '%' : '' }}</text>
+      <!-- 加载提示只覆盖视频，不随显隐改变原生播放器尺寸。 -->
+      <view v-if="loading" class="replay-status">
+        <text class="replay-status__text">{{ t('Mobile.Common.loading') }}</text>
+      </view>
     </view>
   </view>
 </template>
 
 <script setup lang="uts">
-  import { ref } from "vue";
+  import { ref, nextTick } from "vue";
   import { onLoad, onReady, onShow, onHide, onUnload } from "@dcloudio/uni-app";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { apiImMeetingRecordFileUrl } from "@/servers/imMeeting";
@@ -31,41 +36,40 @@
   import { meetingReplaySignedUrl } from "@/utils/meeting/meetingReplay";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+  // 预览停在起点附近时点击播放直接续播；偏差超过该秒数才认为预览没落在起点。
+  const PREVIEW_START_TOLERANCE = 2;
   const src = ref("");
   const ready = ref(false);
   const loading = ref(false);
-  const caching = ref(false);
-  const progress = ref(0);
   const errorText = ref("");
   const initialTime = ref(0);
   const attemptId = ref(0);
+  const preparingPreview = ref(true);
+  // 始终只有一个播放器；事件闭包捕获本轮编号，不依赖原生事件回传 DOM dataset。
+  const playerAttempts = ref<number[]>([]);
   let meetingId = "";
   let fileId = "";
   let alive = true;
   let visible = true;
   let generation = 0;
-  let bufferTimer = -1;
   let requestTimer = -1;
-  let downloadTask: DownloadTask | null = null;
-  let currentTime = 0;
-  let localPlayback = false;
-  let needsBuffering = false;
+  let previewTimer = -1;
   let reloadOnShow = false;
+  let currentTime = 0;
+  let playing = false;
+  let startedAttempt = 0;
+  // 预览已完成、还没被用户播放接管。
+  let previewHeld = false;
 
-  function clearBufferTimer(): void {
-    if (bufferTimer != -1) clearTimeout(bufferTimer);
-    bufferTimer = -1;
+  function isCurrentVideoAttempt(attempt: number): boolean {
+    if (!alive || !visible || src.value.length == 0 || errorText.value.length > 0) return false;
+    // 换源会卸载旧播放器；旧播放器延迟上报的 pause/error 不能污染新一轮加载。
+    return attempt == attemptId.value && attempt == generation;
   }
 
   function clearRequestTimer(): void {
     if (requestTimer != -1) clearTimeout(requestTimer);
     requestTimer = -1;
-  }
-
-  function abortDownload(): void {
-    const task = downloadTask;
-    downloadTask = null;
-    if (task != null) task.abort();
   }
 
   function pauseVideo(): void {
@@ -79,76 +83,93 @@
     // #endif
   }
 
-  function showFailure(message: string): void {
-    clearBufferTimer();
-    clearRequestTimer();
-    loading.value = false;
-    caching.value = false;
-    src.value = "";
-    needsBuffering = false;
-    errorText.value = message.length > 0 ? message : t("Mobile.Message.videoPlayFailed");
-  }
-
-  function downloadForPlayback(url: string, attempt: number): Promise<string> {
-    return new Promise<string>((resolve, reject) => {
-      // 现签对象存储地址原样使用，不加业务 Authorization，不改 query 编码。
-      const task = uni.downloadFile({
-        url,
-        timeout: 300000,
-        success: (result) => {
-          if (result.statusCode == 200 && result.tempFilePath.length > 0) {
-            resolve(result.tempFilePath);
-          } else {
-            console.error("[MeetingReplay] cache http=" + result.statusCode);
-            reject(new Error(t("Mobile.Terminal.downloadFailed")));
-          }
-        },
-        fail: (_error) => { reject(new Error(t("Mobile.Terminal.downloadFailed"))); },
-        complete: (_res) => { if (attempt == generation) downloadTask = null; },
-      });
-      downloadTask = task;
-      task.onProgressUpdate((event) => {
-        if (alive && attempt == generation) progress.value = event.progress;
-      });
+  function startMountedVideo(): void {
+    if (!ready.value || (!preparingPreview.value && !playing)) return;
+    const attempt = attemptId.value;
+    // 等 src 对应的原生节点挂载后主动启动，不只依赖初始化时的 autoplay。
+    nextTick(() => {
+      if (!isCurrentVideoAttempt(attempt) || startedAttempt == attempt) return;
+      if (!preparingPreview.value && !playing) return;
+      // #ifdef APP || WEB
+      const video = uni.getElementById("meetingReplayVideo-" + attempt) as UniVideoElement | null;
+      if (video == null) return;
+      try { video.play(); } catch (_error) {}
+      // #endif
+      // #ifdef MP-WEIXIN
+      uni.createVideoContext("meetingReplayVideo-" + attempt).play();
+      // #endif
     });
   }
 
-  function armBufferTimer(): void {
-    if (!alive || !visible || !ready.value || src.value.length == 0 || bufferTimer != -1) return;
+  function seekVideo(position: number): void {
+    // #ifdef APP || WEB
+    const video = uni.getElementById("meetingReplayVideo-" + attemptId.value) as UniVideoElement | null;
+    if (video != null) { try { video.seek(position); } catch (_error) {} }
+    // #endif
+    // #ifdef MP-WEIXIN
+    uni.createVideoContext("meetingReplayVideo-" + attemptId.value).seek(position);
+    // #endif
+  }
+
+  function clearPreviewTimer(): void {
+    if (previewTimer != -1) clearTimeout(previewTimer);
+    previewTimer = -1;
+  }
+
+  function finishPreview(): void {
+    // 保留最早已解码的画面：只 pause，不在暂停状态 seek、换源或重建播放器。
+    // 暂停位置就是用户点击播放后的续播位置，点击时不再 seek，避免画面回跳。
+    clearPreviewTimer();
+    pauseVideo();
+    playing = false;
+    previewHeld = true;
+    preparingPreview.value = false;
+    loading.value = false;
+  }
+
+  function showFailure(message: string): void {
+    clearRequestTimer();
+    clearPreviewTimer();
+    loading.value = false;
+    src.value = "";
+    playerAttempts.value = [];
+    playing = false;
+    previewHeld = false;
+    errorText.value = message.length > 0 ? message : t("Mobile.Message.videoPlayFailed");
+  }
+
+  function armPreviewTimer(): void {
+    clearPreviewTimer();
     const attempt = generation;
-    bufferTimer = setTimeout(() => {
-      bufferTimer = -1;
-      if (!alive || !visible || attempt != generation) return;
-      if (localPlayback) {
-        showFailure(t("Mobile.Meeting.replayLoadTimeout"));
-      } else {
-        console.error("[MeetingReplay] stream timeout; retry with local file");
-        void loadVideo(true);
-      }
+    previewTimer = setTimeout(() => {
+      previewTimer = -1;
+      if (!alive || attempt != generation || !preparingPreview.value) return;
+      // 首帧一直没出来（流播卡住且没报错）：给错误和重试，避免停在无控制条的加载态。
+      generation += 1;
+      showFailure(t("Mobile.Meeting.replayLoadTimeout"));
     }, 20000);
   }
 
-  async function loadVideo(useCache: boolean): Promise<void> {
-    if (!alive || !visible || meetingId.length == 0 || fileId.length == 0) return;
+  async function loadVideo(): Promise<void> {
+    if (!alive || meetingId.length == 0 || fileId.length == 0) return;
     const attempt = ++generation;
-    abortDownload();
-    clearBufferTimer();
     clearRequestTimer();
+    clearPreviewTimer();
     pauseVideo();
     src.value = "";
+    playerAttempts.value = [];
     errorText.value = "";
     loading.value = true;
-    caching.value = useCache;
-    progress.value = 0;
-    localPlayback = useCache;
-    needsBuffering = true;
+    preparingPreview.value = true;
+    playing = false;
+    previewHeld = false;
     requestTimer = setTimeout(() => {
       if (!alive || attempt != generation) return;
       generation += 1;
       showFailure(t("Mobile.Meeting.replayLoadTimeout"));
     }, 20000);
     try {
-      // 播放页/重试时现签，避免路由携带签名地址或过期地址。
+      // 播放页/重试时现签，避免路由携带签名地址或过期地址；URL 原样使用。
       const response = await apiImMeetingRecordFileUrl(meetingId, fileId, false);
       if (!alive || attempt != generation) return;
       clearRequestTimer();
@@ -165,67 +186,94 @@
         showFailure(reason != null ? reason as string : t("Mobile.Meeting.fileProcessing"));
         return;
       }
-      const playable = useCache ? await downloadForPlayback(url, attempt) : url;
-      if (!alive || !visible || attempt != generation) return;
-      caching.value = false;
       initialTime.value = currentTime;
       attemptId.value = attempt;
-      src.value = playable;
-      armBufferTimer();
+      playerAttempts.value = [attempt];
+      src.value = url;
+      armPreviewTimer();
+      startMountedVideo();
     } catch (_error) {
       if (!alive || attempt != generation) return;
       // 不打印签名 URL/原生异常全文，避免泄漏临时凭据。
-      console.error("[MeetingReplay] load failed cache=" + useCache);
+      console.error("[MeetingReplay] load failed");
       showFailure(t("Mobile.Message.videoPlayFailed"));
     }
   }
 
-  function isCurrentVideoEvent(event: UniEvent): boolean {
-    if (!alive || !visible || src.value.length == 0 || errorText.value.length > 0) return false;
-    const target = event.currentTarget;
-    // 换源会卸载旧播放器；旧播放器延迟上报的 pause/error 不能污染新一轮加载。
-    return target != null && target.id == "meetingReplayVideo-" + attemptId.value;
-  }
-
-  function handlePlay(event: UniEvent): void {
-    if (!isCurrentVideoEvent(event)) return;
-    loading.value = true;
-    needsBuffering = true;
-    armBufferTimer();
-  }
-
-  function handlePause(event: UniEvent): void {
-    if (!isCurrentVideoEvent(event)) return;
-    clearBufferTimer();
+  function handlePlay(attempt: number): void {
+    if (!isCurrentVideoAttempt(attempt)) return;
+    startedAttempt = attempt;
+    // 预览阶段的自动播放不算用户播放。
+    if (preparingPreview.value) return;
+    playing = true;
+    if (previewHeld) {
+      previewHeld = false;
+      // 预览已停在起点（或转写定位秒数）附近：直接续播，不 seek、不换源，点击播放画面不跳。
+      // 只有预览没落在起点（如平台未按 initial-time 起播）才在播放后向前定位一次。
+      if (currentTime + PREVIEW_START_TOLERANCE < initialTime.value) {
+        currentTime = initialTime.value;
+        seekVideo(initialTime.value);
+      }
+    }
+    // 原生已开始播放就结束加载提示，不等待下一次 timeupdate。
     loading.value = false;
-    needsBuffering = false;
   }
 
-  function handleWaiting(event: UniEvent): void {
-    if (!isCurrentVideoEvent(event)) return;
+  function handlePause(attempt: number): void {
+    if (!isCurrentVideoAttempt(attempt)) return;
+    if (preparingPreview.value) return;
+    playing = false;
+    loading.value = false;
+  }
+
+  function handleEnded(attempt: number): void {
+    if (!isCurrentVideoAttempt(attempt)) return;
+    // 播放结束（含极短视频在预览阶段就播完）：回到起点后暂停，下一次点击从头播放。
+    // 先 pause 再 seek：结束态下部分原生播放器 playWhenReady 仍为 true，先 seek 会瞬间续播。
+    clearPreviewTimer();
+    pauseVideo();
+    seekVideo(0);
+    currentTime = 0;
+    playing = false;
+    previewHeld = false;
+    preparingPreview.value = false;
+    loading.value = false;
+  }
+
+  function handleWaiting(attempt: number): void {
+    if (!isCurrentVideoAttempt(attempt)) return;
+    // 预览结束等待点击、用户暂停时也可能收到 waiting，不应显示加载。
+    if (!preparingPreview.value && !playing) return;
     loading.value = true;
-    needsBuffering = true;
-    armBufferTimer();
+    // 初次 nextTick 时原生内部播放器可能尚未初始化；收到原生 waiting 后补启动。
+    if (preparingPreview.value) startMountedVideo();
   }
 
-  function handleTimeUpdate(event: UniVideoTimeUpdateEvent): void {
-    if (!isCurrentVideoEvent(event)) return;
-    if (event.detail.currentTime != currentTime) {
-      currentTime = event.detail.currentTime;
+  // ★形参必须是 any：模板里 `@timeupdate="fn(attempt, $event)"` 的 $event 推断为 Any，
+  //   直接写 UniVideoTimeUpdateEvent 会报参数类型不匹配（同 im-meeting-room 的 $event 写法）。
+  function handleTimeUpdate(attempt: number, event: any): void {
+    if (!isCurrentVideoAttempt(attempt)) return;
+    const e = event as UniVideoTimeUpdateEvent;
+    if (preparingPreview.value) {
+      if (e.detail.currentTime > 0 && e.detail.currentTime != initialTime.value) {
+        currentTime = e.detail.currentTime;
+        finishPreview();
+      }
+      return;
+    }
+    if (e.detail.currentTime != currentTime) {
+      currentTime = e.detail.currentTime;
       loading.value = false;
-      needsBuffering = false;
-      clearBufferTimer();
     }
   }
 
-  function handleVideoError(event: UniVideoErrorEvent): void {
-    if (!isCurrentVideoEvent(event)) return;
-    console.error("[MeetingReplay] player error cache=" + localPlayback);
-    if (!localPlayback) { void loadVideo(true); return; }
+  function handleVideoError(attempt: number): void {
+    if (!isCurrentVideoAttempt(attempt)) return;
+    console.error("[MeetingReplay] player error");
     showFailure(t("Mobile.Message.videoPlayFailed"));
   }
 
-  function retry(): void { void loadVideo(false); }
+  function retry(): void { void loadVideo(); }
 
   onLoad((options) => {
     meetingId = options != null && options["id"] != null ? options["id"] as string : "";
@@ -233,41 +281,43 @@
     const seek = options != null && options["seek"] != null ? parseFloat(options["seek"] as string) : 0;
     currentTime = seek == seek ? Math.max(0, seek) : 0;
     if (meetingId.length == 0 || fileId.length == 0) { showFailure(t("Mobile.Meeting.detailMissing")); return; }
-    void loadVideo(false);
+    void loadVideo();
   });
-  onReady(() => { ready.value = true; if (needsBuffering) armBufferTimer(); });
+  onReady(() => {
+    ready.value = true;
+    startMountedVideo();
+  });
   onShow(() => {
     visible = true;
-    if (reloadOnShow) { reloadOnShow = false; void loadVideo(localPlayback); }
-    else if (needsBuffering) armBufferTimer();
+    if (reloadOnShow) { reloadOnShow = false; void loadVideo(); }
   });
   onHide(() => {
     visible = false;
-    reloadOnShow = reloadOnShow || (loading.value && src.value.length == 0);
-    if (reloadOnShow) { generation += 1; abortDownload(); }
+    // 首帧预览还没完成就离页：作废这轮加载，返回时重新取地址 + 重新预播。
+    reloadOnShow = reloadOnShow || (loading.value && (src.value.length == 0 || preparingPreview.value));
+    if (reloadOnShow) generation += 1;
     clearRequestTimer();
-    clearBufferTimer();
+    clearPreviewTimer();
     pauseVideo();
+    playing = false;
     loading.value = false;
-    needsBuffering = false;
   });
   onUnload(() => {
     alive = false;
     generation += 1;
     clearRequestTimer();
-    clearBufferTimer();
-    abortDownload();
+    clearPreviewTimer();
   });
 </script>
 
 <style scoped>
-  .replay-page { height: 100%; display: flex; flex-direction: column; background-color: #000000; }
-  .replay-stage { flex: 1; min-height: 0; width: 100%; justify-content: center; }
+  .replay-page { height: 100%; display: flex; flex-direction: column; }
+  .replay-stage { flex: 1; min-height: 0; width: 100%; justify-content: center; position: relative; }
   .replay-video { width: 100%; height: 100%; }
-  .replay-status { padding: 16px 24px 32px; align-items: center; }
-  .replay-status__text { color: #cccccc; font-size: 14px; }
+  .replay-status { position: absolute; left: 0; right: 0; bottom: 0; padding: 16px 24px 32px; align-items: center; pointer-events: none; }
+  .replay-status__text { color: #909399; font-size: 14px; }
   .replay-error { padding: 24px; align-items: center; }
-  .replay-error__text { color: #cccccc; font-size: 14px; text-align: center; }
+  .replay-error__text { color: #909399; font-size: 14px; text-align: center; }
   .replay-retry { margin-top: 20px; padding: 12px 28px; border-radius: 24px; background-color: #17171a; border: 1px solid #555555; }
   .replay-retry--active { opacity: 0.75; }
   .replay-retry__text { color: #ffffff; font-size: 14px; }

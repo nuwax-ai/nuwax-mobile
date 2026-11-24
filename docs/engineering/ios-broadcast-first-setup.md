@@ -50,6 +50,8 @@ open MeetingBroadcast.xcworkspace
 
 解压导出的 IPA，取得 `Payload/<宿主>.app/PlugIns/MeetingBroadcast.appex`。必须是编译签名后的完整目录，不能只复制 `SampleHandler.swift`。App 版本变化后需重新生成/导出匹配版本扩展。
 
+在 Mac 上对扩展可执行文件执行 `otool -L '/实际导出目录/MeetingBroadcast.appex/MeetingBroadcast'`。生成工程会把 LiveKitClient 和 LiveKitFFI 静态链接进扩展。第三方动态依赖应只有由主 App 的 `Frameworks/` 提供的 `LiveKitWebRTC.framework` 和 `RustLiveKitFFI.framework`。
+
 ## 3. 接入 HBuilderX 云打包
 
 回到仓库根目录执行，使用真实绝对路径：

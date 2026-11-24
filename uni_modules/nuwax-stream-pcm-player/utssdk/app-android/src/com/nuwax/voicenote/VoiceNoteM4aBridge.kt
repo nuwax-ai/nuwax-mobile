@@ -14,6 +14,7 @@ import android.media.MediaRecorder
 import android.os.Build
 import android.os.SystemClock
 import java.io.File
+import java.nio.ByteBuffer
 
 /**
  * 伙伴页录音。一次会话只用一个 AudioRecord，分段只换 AAC 编码器和 m4a。
@@ -577,8 +578,178 @@ class VoiceNoteM4aBridge {
         return raw.replace("/", "_").replace("\\", "_").replace("..", "_").trim()
     }
 
+    /**
+     * 进程被杀掉时 MediaMuxer.stop() 没跑到，m4a 只有 ftyp 和 mdat。
+     * 64kbps、16kHz、单声道 AAC-LC 每帧 512 字节。补上 moov 后再替换原文件。
+     * 已经有 moov 的文件原样返回成功。
+     */
+    fun sealFile(path: String): String {
+        val source = File(path)
+        if (!source.isFile || source.length() < 16) {
+            return "0:unreadable"
+        }
+        val bytes = try {
+            source.readBytes()
+        } catch (_e: Exception) {
+            return "0:unreadable"
+        }
+        if (mp4HasMoov(bytes)) {
+            return "1"
+        }
+        val payload = mp4MdatPayload(bytes) ?: return "0:nomdat"
+        val frames = payload.size / AAC_FRAME_BYTES
+        if (frames <= 0) {
+            return "0:short"
+        }
+        val tmp = File("$path.sealed")
+        if (tmp.exists()) {
+            tmp.delete()
+        }
+        val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, SAMPLE_RATE, 1)
+        format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+        format.setInteger(MediaFormat.KEY_BIT_RATE, 64000)
+        format.setInteger(MediaFormat.KEY_SAMPLE_RATE, SAMPLE_RATE)
+        format.setInteger(MediaFormat.KEY_CHANNEL_COUNT, 1)
+        format.setByteBuffer("csd-0", ByteBuffer.wrap(byteArrayOf(0x14, 0x08)))
+        val muxer = try {
+            MediaMuxer(tmp.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        } catch (_e: Exception) {
+            return "0:create"
+        }
+        try {
+            val track = muxer.addTrack(format)
+            muxer.start()
+            val info = MediaCodec.BufferInfo()
+            var index = 0
+            while (index < frames) {
+                val packet = ByteBuffer.wrap(payload, index * AAC_FRAME_BYTES, AAC_FRAME_BYTES)
+                info.set(0, AAC_FRAME_BYTES, index * 1024L * 1000000L / SAMPLE_RATE, 0)
+                muxer.writeSampleData(track, packet, info)
+                index += 1
+            }
+            muxer.stop()
+        } catch (_e: Exception) {
+            try {
+                muxer.release()
+            } catch (_release: Exception) {
+            }
+            tmp.delete()
+            return "0:write"
+        }
+        try {
+            muxer.release()
+        } catch (_e: Exception) {
+        }
+        val sealed = try {
+            tmp.readBytes()
+        } catch (_e: Exception) {
+            tmp.delete()
+            return "0:verify"
+        }
+        if (!mp4HasMoov(sealed)) {
+            tmp.delete()
+            return "0:verify"
+        }
+        val backup = File("$path.unsealed")
+        if (backup.exists()) {
+            backup.delete()
+        }
+        if (!source.renameTo(backup)) {
+            tmp.delete()
+            return "0:replace"
+        }
+        if (!tmp.renameTo(source)) {
+            backup.renameTo(source)
+            tmp.delete()
+            return "0:replace"
+        }
+        backup.delete()
+        return "1"
+    }
+
+    private fun mp4HasMoov(bytes: ByteArray): Boolean {
+        var pos = 0
+        var steps = 0
+        while (pos + 8 <= bytes.size && steps < 64) {
+            steps += 1
+            if (bytes[pos + 4] == 0x6d.toByte() && bytes[pos + 5] == 0x6f.toByte() &&
+                bytes[pos + 6] == 0x6f.toByte() && bytes[pos + 7] == 0x76.toByte()
+            ) {
+                return true
+            }
+            val boxSize = mp4BoxSize(bytes, pos) ?: return false
+            if (boxSize < 8 || pos + boxSize > bytes.size) {
+                return false
+            }
+            pos += boxSize
+        }
+        return false
+    }
+
+    private fun mp4MdatPayload(bytes: ByteArray): ByteArray? {
+        var pos = 0
+        var steps = 0
+        while (pos + 8 <= bytes.size && steps < 64) {
+            steps += 1
+            val size32 = mp4Be32(bytes, pos)
+            var header = 8
+            var boxSize = size32
+            if (size32 == 1) {
+                if (pos + 16 > bytes.size) {
+                    return null
+                }
+                if (mp4Be32(bytes, pos + 8) != 0) {
+                    return null
+                }
+                boxSize = mp4Be32(bytes, pos + 12)
+                header = 16
+            } else if (size32 == 0) {
+                boxSize = bytes.size - pos
+            }
+            if (boxSize < header) {
+                return null
+            }
+            val end = if (pos + boxSize > bytes.size) bytes.size else pos + boxSize
+            val typeM = bytes[pos + 4] == 0x6d.toByte() && bytes[pos + 5] == 0x64.toByte() &&
+                bytes[pos + 6] == 0x61.toByte() && bytes[pos + 7] == 0x74.toByte()
+            if (typeM) {
+                if (end <= pos + header) {
+                    return null
+                }
+                return bytes.copyOfRange(pos + header, end)
+            }
+            if (pos + boxSize > bytes.size) {
+                return null
+            }
+            pos += boxSize
+        }
+        return null
+    }
+
+    private fun mp4BoxSize(bytes: ByteArray, pos: Int): Int? {
+        val size32 = mp4Be32(bytes, pos)
+        if (size32 == 1) {
+            if (pos + 16 > bytes.size || mp4Be32(bytes, pos + 8) != 0) {
+                return null
+            }
+            return mp4Be32(bytes, pos + 12)
+        }
+        if (size32 == 0) {
+            return bytes.size - pos
+        }
+        return size32
+    }
+
+    private fun mp4Be32(bytes: ByteArray, pos: Int): Int {
+        return ((bytes[pos].toInt() and 0xff) shl 24) or
+            ((bytes[pos + 1].toInt() and 0xff) shl 16) or
+            ((bytes[pos + 2].toInt() and 0xff) shl 8) or
+            (bytes[pos + 3].toInt() and 0xff)
+    }
+
     companion object {
         private const val SAMPLE_RATE = 16000
+        private const val AAC_FRAME_BYTES = 512
 
         @Volatile
         private var active: VoiceNoteM4aBridge? = null

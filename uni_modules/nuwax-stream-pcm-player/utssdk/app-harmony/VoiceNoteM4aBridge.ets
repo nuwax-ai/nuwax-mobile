@@ -570,6 +570,11 @@ export class VoiceNoteM4aBridge {
   private sanitize(raw: string): string {
     return raw.split('/').join('_').split('..').join('_').trim()
   }
+
+  /** 没有 moov 的 m4a 补封口。已经封口返回 "1"。 */
+  sealFile(path: string): string {
+    return sealUnsealedM4a(path)
+  }
 }
 
 class SplitPiece {
@@ -809,6 +814,347 @@ function writeFileBytes(path: string, raw: ArrayBuffer): boolean {
       }
     }
   }
+}
+
+/**
+ * 64kbps、16kHz、单声道 AAC-LC，每帧 512 字节、1024 个采样。
+ * 进程被杀掉时 AVRecorder.stop() 没写 moov，这里按固定帧长补上。
+ */
+function sealUnsealedM4a(path: string): string {
+  const source = readFileBytes(path)
+  if (source == null) {
+    return '0:unreadable'
+  }
+  const view = payloadView(source)
+  if (findTopBox(view, source.length, BOX_MOOV) != null) {
+    return '1'
+  }
+  const payload = mdatPayload(view, source.length)
+  if (payload == null) {
+    return '0:nomdat'
+  }
+  const frames = Math.floor(payload.length / 512)
+  if (frames <= 0) {
+    return '0:short'
+  }
+  const used = frames * 512
+  const ftypBox = topBoxBytes(view, source.length, BOX_FTYP)
+  const ftyp = ftypBox != null ? ftypBox : defaultFtyp()
+  const moov = buildConstantAacMoov(frames, ftyp.length + 8)
+  const total = ftyp.length + 8 + used + moov.length
+  const raw = new ArrayBuffer(total)
+  const out = new Uint8Array(raw)
+  for (let i = 0; i < ftyp.length; i++) {
+    out[i] = ftyp[i]
+  }
+  const head = payloadView(out)
+  head.setUint32(ftyp.length, 8 + used)
+  head.setUint32(ftyp.length + 4, BOX_MDAT)
+  let cursor = ftyp.length + 8
+  for (let i = 0; i < used; i++) {
+    out[cursor + i] = payload[i]
+  }
+  cursor = cursor + used
+  for (let i = 0; i < moov.length; i++) {
+    out[cursor + i] = moov[i]
+  }
+  const temp = path + '.sealed'
+  if (!writeFileBytes(temp, raw)) {
+    removeFile(temp)
+    return '0:write'
+  }
+  const check = readFileBytes(temp)
+  if (check == null || findTopBox(payloadView(check), check.length, BOX_MOOV) == null) {
+    removeFile(temp)
+    return '0:verify'
+  }
+  removeFile(path)
+  if (!writeFileBytes(path, raw)) {
+    return '0:replace'
+  }
+  removeFile(temp)
+  return '1'
+}
+
+function mdatPayload(view: DataView, fileLength: number): Uint8Array | null {
+  let offset = 0
+  let steps = 0
+  while (offset + 8 <= fileLength && steps < 64) {
+    steps = steps + 1
+    const size32 = view.getUint32(offset)
+    const type = view.getUint32(offset + 4)
+    let header = 8
+    let size = size32
+    if (size32 == 1) {
+      if (offset + 16 > fileLength) {
+        return null
+      }
+      if (view.getUint32(offset + 8) != 0) {
+        return null
+      }
+      size = view.getUint32(offset + 12)
+      header = 16
+    } else if (size32 == 0) {
+      size = fileLength - offset
+    }
+    if (size < header) {
+      return null
+    }
+    let end = offset + size
+    if (end > fileLength) {
+      end = fileLength
+    }
+    if (type == BOX_MDAT) {
+      if (end <= offset + header) {
+        return null
+      }
+      return copySpan(view, offset + header, end - offset - header)
+    }
+    if (offset + size > fileLength) {
+      return null
+    }
+    offset = offset + size
+  }
+  return null
+}
+
+function topBoxBytes(view: DataView, fileLength: number, type: number): Uint8Array | null {
+  let offset = 0
+  let steps = 0
+  while (offset + 8 <= fileLength && steps < 64) {
+    steps = steps + 1
+    const size32 = view.getUint32(offset)
+    const boxType = view.getUint32(offset + 4)
+    let size = size32
+    if (size32 == 1) {
+      if (offset + 16 > fileLength || view.getUint32(offset + 8) != 0) {
+        return null
+      }
+      size = view.getUint32(offset + 12)
+    } else if (size32 == 0) {
+      size = fileLength - offset
+    }
+    if (size < 8 || offset + size > fileLength) {
+      return null
+    }
+    if (boxType == type) {
+      return copySpan(view, offset, size)
+    }
+    offset = offset + size
+  }
+  return null
+}
+
+class MoovWriter {
+  private bytes: number[] = []
+
+  u8(value: number): void {
+    let v = Math.floor(value)
+    if (v < 0) {
+      v = 0
+    }
+    this.bytes.push(v % 256)
+  }
+
+  u16(value: number): void {
+    this.u8(Math.floor(value / 256))
+    this.u8(value)
+  }
+
+  u32(value: number): void {
+    this.u8(Math.floor(value / 16777216))
+    this.u8(Math.floor(value / 65536))
+    this.u8(Math.floor(value / 256))
+    this.u8(value)
+  }
+
+  text(value: string): void {
+    for (let i = 0; i < value.length; i++) {
+      this.u8(value.charCodeAt(i))
+    }
+  }
+
+  beginBox(type: number): number {
+    const at = this.bytes.length
+    this.u32(0)
+    this.u32(type)
+    return at
+  }
+
+  endBox(at: number): void {
+    const size = this.bytes.length - at
+    this.bytes[at] = Math.floor(size / 16777216) % 256
+    this.bytes[at + 1] = Math.floor(size / 65536) % 256
+    this.bytes[at + 2] = Math.floor(size / 256) % 256
+    this.bytes[at + 3] = size % 256
+  }
+
+  matrix(): void {
+    this.u32(0x00010000)
+    this.u32(0)
+    this.u32(0)
+    this.u32(0)
+    this.u32(0x00010000)
+    this.u32(0)
+    this.u32(0)
+    this.u32(0)
+    this.u32(0x40000000)
+  }
+
+  toBytes(): Uint8Array {
+    const out = new Uint8Array(this.bytes.length)
+    for (let i = 0; i < this.bytes.length; i++) {
+      out[i] = this.bytes[i]
+    }
+    return out
+  }
+}
+
+function buildConstantAacMoov(sampleCount: number, chunkOffset: number): Uint8Array {
+  const duration = sampleCount * 1024
+  const w = new MoovWriter()
+  const moovAt = w.beginBox(BOX_MOOV)
+  const mvhdAt = w.beginBox(0x6d766864)
+  w.u32(0)
+  w.u32(0)
+  w.u32(0)
+  w.u32(16000)
+  w.u32(duration)
+  w.u32(0x00010000)
+  w.u16(0x0100)
+  w.u16(0)
+  w.u32(0)
+  w.u32(0)
+  w.matrix()
+  w.u32(0)
+  w.u32(0)
+  w.u32(0)
+  w.u32(0)
+  w.u32(0)
+  w.u32(0)
+  w.u32(2)
+  w.endBox(mvhdAt)
+  const trakAt = w.beginBox(0x7472616b)
+  const tkhdAt = w.beginBox(0x746b6864)
+  w.u32(7)
+  w.u32(0)
+  w.u32(0)
+  w.u32(1)
+  w.u32(0)
+  w.u32(duration)
+  w.u32(0)
+  w.u32(0)
+  w.u16(0)
+  w.u16(0)
+  w.u16(0x0100)
+  w.u16(0)
+  w.matrix()
+  w.u32(0)
+  w.u32(0)
+  w.endBox(tkhdAt)
+  const mdiaAt = w.beginBox(0x6d646961)
+  const mdhdAt = w.beginBox(0x6d646864)
+  w.u32(0)
+  w.u32(0)
+  w.u32(0)
+  w.u32(16000)
+  w.u32(duration)
+  w.u16(0x55c4)
+  w.u16(0)
+  w.endBox(mdhdAt)
+  const hdlrAt = w.beginBox(0x68646c72)
+  w.u32(0)
+  w.u32(0)
+  w.u32(0x736f756e)
+  w.u32(0)
+  w.u32(0)
+  w.u32(0)
+  w.text('SoundHandler')
+  w.u8(0)
+  w.endBox(hdlrAt)
+  const minfAt = w.beginBox(0x6d696e66)
+  const smhdAt = w.beginBox(0x736d6864)
+  w.u32(0)
+  w.u16(0)
+  w.u16(0)
+  w.endBox(smhdAt)
+  const dinfAt = w.beginBox(0x64696e66)
+  const drefAt = w.beginBox(0x64726566)
+  w.u32(0)
+  w.u32(1)
+  const urlAt = w.beginBox(0x75726c20)
+  w.u32(1)
+  w.endBox(urlAt)
+  w.endBox(drefAt)
+  w.endBox(dinfAt)
+  const stblAt = w.beginBox(0x7374626c)
+  const stsdAt = w.beginBox(0x73747364)
+  w.u32(0)
+  w.u32(1)
+  const mp4aAt = w.beginBox(0x6d703461)
+  w.u32(0)
+  w.u16(0)
+  w.u16(1)
+  w.u32(0)
+  w.u32(0)
+  w.u16(1)
+  w.u16(16)
+  w.u16(0)
+  w.u16(0)
+  w.u32(16000 * 65536)
+  const esdsAt = w.beginBox(0x65736473)
+  w.u32(0)
+  w.u8(0x03)
+  w.u8(25)
+  w.u16(0)
+  w.u8(0)
+  w.u8(0x04)
+  w.u8(17)
+  w.u8(0x40)
+  w.u8(0x15)
+  w.u8(0)
+  w.u16(0)
+  w.u32(64000)
+  w.u32(64000)
+  w.u8(0x05)
+  w.u8(2)
+  w.u8(0x14)
+  w.u8(0x08)
+  w.u8(0x06)
+  w.u8(1)
+  w.u8(0x02)
+  w.endBox(esdsAt)
+  w.endBox(mp4aAt)
+  w.endBox(stsdAt)
+  const sttsAt = w.beginBox(0x73747473)
+  w.u32(0)
+  w.u32(1)
+  w.u32(sampleCount)
+  w.u32(1024)
+  w.endBox(sttsAt)
+  const stscAt = w.beginBox(0x73747363)
+  w.u32(0)
+  w.u32(1)
+  w.u32(1)
+  w.u32(sampleCount)
+  w.u32(1)
+  w.endBox(stscAt)
+  const stszAt = w.beginBox(0x7374737a)
+  w.u32(0)
+  w.u32(512)
+  w.u32(sampleCount)
+  w.endBox(stszAt)
+  const stcoAt = w.beginBox(0x7374636f)
+  w.u32(0)
+  w.u32(1)
+  w.u32(chunkOffset)
+  w.endBox(stcoAt)
+  w.endBox(stblAt)
+  w.endBox(minfAt)
+  w.endBox(mdiaAt)
+  w.endBox(trakAt)
+  w.endBox(moovAt)
+  return w.toBytes()
 }
 
 function removeFile(path: string): void {

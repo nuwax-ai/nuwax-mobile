@@ -606,7 +606,7 @@ async function splitLongHarmonySegment(record: VoiceNoteRecord): Promise<void> {
   // #endif
 }
 
-// #ifdef APP-IOS
+// #ifdef APP
 /** 杀掉进程后补写 moov。成功才允许这段进入上传。 */
 async function sealUnfinishedM4a(filePath: string): Promise<boolean> {
   if (filePath.length == 0) return false;
@@ -1288,19 +1288,12 @@ function m4aHasMoov(filePath: string, size: number): boolean {
 async function segmentUploadReady(filePath: string): Promise<string> {
   const size = await segmentFileSize(filePath);
   if (size <= 0) return "missing";
-  // Android 划掉任务会先 stop()，鸿蒙 stop() 也会写 moov。这两端按文件大小收口。
-  // 只有 iOS 被杀掉时来不及 stop()，文件里可能只有 ftyp 和 mdat。
-  // #ifdef APP-IOS
   if (!isM4aPath(filePath)) return "ready";
   if (m4aHasMoov(filePath, size)) return "ready";
   await waitMs(300);
   const sizeAgain = await segmentFileSize(filePath);
   if (sizeAgain > 0 && m4aHasMoov(filePath, sizeAgain)) return "ready";
   return "unsealed";
-  // #endif
-  // #ifndef APP-IOS
-  return "ready";
-  // #endif
 }
 // #endif
 
@@ -1500,6 +1493,7 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
   const panelAtStart = panelVoiceNote();
   const protectedLocalId = panelAtStart != null ? panelAtStart.localId : "";
   try {
+    await stageOpenFileForUpload(localId);
     const skipped: number[] = [];
     let guard = 0;
     while (guard < 10000) {
@@ -1552,14 +1546,12 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
       let gate = "missing";
       // #ifdef APP
       gate = await segmentUploadReady(missingPath);
-      // #ifdef APP-IOS
       if (gate == "unsealed") {
         const sealedNow = await sealUnfinishedM4a(missingPath);
         if (sealedNow) {
           gate = "ready";
         }
       }
-      // #endif
       // #endif
       // #ifndef APP
       if (await segmentFileExists(missingPath)) {
@@ -1669,11 +1661,62 @@ function noteHasPendingUpload(record: VoiceNoteRecord): boolean {
   return false;
 }
 
+/** 没收成一段的文件还在 openSegmentPath。补传先纳入队列，发现没封口再补 moov。 */
+function hasUnstagedOpenFile(record: VoiceNoteRecord): boolean {
+  // #ifdef APP
+  if (record.phase == "recording" || record.phase == "paused") return false;
+  return record.openSegmentPath.length > 0;
+  // #endif
+  // #ifndef APP
+  return false;
+  // #endif
+}
+
 function historyNoteNeedsUpload(record: VoiceNoteRecord): boolean {
+  if (hasUnstagedOpenFile(record)) return true;
   for (let i = 0; i < record.segments.length; i++) {
     if (historySegmentNeedsUpload(record.segments[i])) return true;
   }
   return false;
+}
+
+/**
+ * 补传前把还没收成一段的文件放进队列。这段可能没有 moov，上传循环里会先封口。
+ * 正在录或已暂停的文件还在写，不能在这里封。
+ */
+async function stageOpenFileForUpload(localId: string): Promise<void> {
+  // #ifdef APP
+  const record = findVoiceNoteByLocalId(localId);
+  if (record == null) return;
+  if (record.phase == "recording" || record.phase == "paused") return;
+  const path = record.openSegmentPath;
+  if (path.length == 0) return;
+  let listed = false;
+  for (let i = 0; i < record.segments.length; i++) {
+    if (record.segments[i].filePath == path) listed = true;
+  }
+  if (!listed) {
+    const kept = new VoiceNoteSegmentRecord();
+    kept.segmentIndex = record.openSegmentIndex;
+    kept.filePath = path;
+    let durationMs = record.openElapsedMs;
+    if (durationMs <= 0) {
+      const size = await segmentFileSize(path);
+      if (size > 8) durationMs = size / 8;
+    }
+    kept.durationMs = durationMs;
+    kept.uploadStatus = "pending";
+    record.segments.push(kept);
+    record.openSegmentIndex = record.openSegmentIndex + 1;
+  }
+  record.openSegmentPath = "";
+  record.awaitComplete = true;
+  if (record.phase == "failed" || record.phase == "stopped") {
+    record.phase = "uploading";
+  }
+  record.error = "";
+  touch(record);
+  // #endif
 }
 
 function historyNoteStillUploading(record: VoiceNoteRecord): boolean {
@@ -1802,11 +1845,16 @@ function backfillPassLocalIds(): string[] {
       ids.push(row.localId);
       continue;
     }
+    let picked = false;
     for (let s = 0; s < row.segments.length; s++) {
       if (segmentCanUpload(row.segments[s])) {
         ids.push(row.localId);
+        picked = true;
         break;
       }
+    }
+    if (!picked && hasUnstagedOpenFile(row)) {
+      ids.push(row.localId);
     }
   }
   return ids;
@@ -1820,7 +1868,7 @@ async function runBackfillPass(ids: string[]): Promise<void> {
       const open = findVoiceNoteByLocalId(localId);
       if (open == null) continue;
       if (backfillSkips(open)) continue;
-      let needsUpload = false;
+      let needsUpload = hasUnstagedOpenFile(open);
       for (let s = 0; s < open.segments.length; s++) {
         if (segmentCanUpload(open.segments[s])) {
           needsUpload = true;

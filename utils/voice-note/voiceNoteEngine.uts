@@ -77,6 +77,10 @@ let endingLocalId = "";
 let stopIntent = "";
 /** 本进程里录音器是否还在写当前段。进程重启后为 false，用来把没停完的段收成最后一段。 */
 let captureAlive = false;
+/** 正在录音的本地会话。接口回写缓存时只能改这一条的笔记编号，不能改阶段和文件。 */
+let captureLocalId = "";
+/** 一次开始还没返回。连点开始不会并行打开两个录音器。 */
+let captureStarting = false;
 let tickTimer = 0;
 let lastPersistAt = 0;
 /** 本次录音自己的上传是否在进行。不占用补传。 */
@@ -102,7 +106,34 @@ function activeRecord(): VoiceNoteRecord | null {
   return null;
 }
 
+function markCaptureRunning(localId: string): void {
+  captureAlive = true;
+  captureLocalId = localId;
+}
+
+function markCaptureStopped(): void {
+  captureAlive = false;
+  captureLocalId = "";
+}
+
+/**
+ * 录音器还在写时，接口成功或失败都不能把这条改成失败、上传中或已结束，也不能清掉正在写的文件。
+ * 暂停仍允许写成暂停。用户点停止后会先 markCaptureStopped，再按完成落盘。
+ */
+function keepLiveRecording(record: VoiceNoteRecord): void {
+  if (!captureAlive || captureLocalId.length == 0 || record.localId != captureLocalId) return;
+  if (record.phase != "paused") {
+    record.phase = "recording";
+  }
+  record.awaitComplete = false;
+  record.error = "";
+  if (record.openSegmentPath.length == 0 && currentSegmentPath.length > 0) {
+    record.openSegmentPath = currentSegmentPath;
+  }
+}
+
 function touch(record: VoiceNoteRecord): void {
+  keepLiveRecording(record);
   upsertVoiceNote(record);
 }
 
@@ -184,12 +215,40 @@ function segmentStampName(index: number): string {
   return `${stamp}${index}`;
 }
 
+/**
+ * 原生文件已经打开之后才做。
+ * 创建笔记、申请后台录音失败只记日志，不能停掉正在写的录音。
+ */
+function armCaptureSideEffects(localId: string): void {
+  try {
+    bindNoteAfterCapture(localId);
+  } catch (e) {
+    console.warn("[voice-note] bind note failed " + e);
+  }
+  try {
+    beginBackground();
+  } catch (e) {
+    console.warn("[voice-note] background failed " + e);
+  }
+}
+
+function saveRecordQuiet(record: VoiceNoteRecord): void {
+  try {
+    touch(record);
+  } catch (e) {
+    console.warn("[voice-note] save record failed " + e);
+  }
+}
+
+/** 只负责让原生开始写文件。没有路径才算没录上。笔记和补传不在这里。 */
 async function startRecorder(): Promise<void> {
   const record = activeRecord();
   if (record == null) {
-    captureAlive = false;
+    markCaptureStopped();
     return;
   }
+  const localId = record.localId;
+  const indexName = segmentStampName(record.openSegmentIndex);
   // #ifdef APP
   if (m4aRecorder == null) {
     m4aRecorder = new VoiceNoteM4aRecorder();
@@ -197,7 +256,7 @@ async function startRecorder(): Promise<void> {
   let path = "";
   let startError = "";
   try {
-    path = await m4aRecorder!.start(record.localId, segmentStampName(record.openSegmentIndex));
+    path = await m4aRecorder!.start(localId, indexName);
   } catch (e) {
     console.warn("[voice-note] m4a start failed " + e);
     startError = `${e}`;
@@ -213,30 +272,32 @@ async function startRecorder(): Promise<void> {
     return;
   }
   currentSegmentPath = path;
-  captureAlive = true;
+  markCaptureRunning(localId);
   const latest = activeRecord();
-  if (latest != null) {
-    latest.openSegmentPath = path;
-    touch(latest);
-    bindNoteAfterCapture(latest.localId);
-    // 文件已经打开再申请后台录音。开录失败时不要先申请再马上结束。
-    beginBackground();
-  }
+  const saved = latest != null ? latest : record;
+  saved.openSegmentPath = path;
+  saveRecordQuiet(saved);
+  armCaptureSideEffects(localId);
   // #endif
   // #ifndef APP
-  captureAlive = true;
-  const recorder = uni.getRecorderManager();
-  recorder.start({
-    duration: 600000,
-    sampleRate: 16000,
-    numberOfChannels: 1,
-    format: "aac",
-  });
+  try {
+    const recorder = uni.getRecorderManager();
+    recorder.start({
+      duration: 600000,
+      sampleRate: 16000,
+      numberOfChannels: 1,
+      format: "aac",
+    });
+    markCaptureRunning(localId);
+  } catch (e) {
+    console.warn("[voice-note] recorder start failed " + e);
+    abandonUnstartedRecording(`${e}`);
+  }
   // #endif
 }
 
 function stopActiveRecorder(intent: string): void {
-  captureAlive = false;
+  markCaptureStopped();
   // #ifdef APP
   if (recorderBusy) {
     queuedIntent = intent;
@@ -489,7 +550,7 @@ function readErrorMessage(err: any | null): string {
 
 async function forgetUnstartedNote(noteId: string): Promise<void> {
   try {
-    await apiVoiceNoteDelete(noteId);
+    await apiVoiceNoteDelete(noteId, true);
   } catch (_e) {
     // 本地会话已经丢掉。服务端未收尾的笔记会在 7 天后回收。
   }
@@ -500,7 +561,7 @@ async function forgetUnstartedNote(noteId: string): Promise<void> {
  * 不能留成失败记录，否则下次点击开始会再次把它当成当前录音并继续报错。
  */
 function abandonUnstartedRecording(reason: string): void {
-  captureAlive = false;
+  markCaptureStopped();
   stopIntent = "";
   const record = activeRecord();
   endBackground();
@@ -536,7 +597,7 @@ function abandonUnstartedRecording(reason: string): void {
 }
 
 function onNativeError(err: any | null): void {
-  captureAlive = false;
+  markCaptureStopped();
   stopIntent = "";
   // #ifdef APP-HARMONY
   if (m4aRecorder != null) {
@@ -648,7 +709,7 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     releaseRecorderCallbacks();
     if (noteId.length > 0) {
       try {
-        await apiVoiceNoteDelete(noteId);
+        await apiVoiceNoteDelete(noteId, true);
       } catch (_e) {
         // 本地已放弃。服务端会话会在 7 天未收尾后回收。
       }
@@ -739,7 +800,7 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     pendingRotatedPath = "";
     currentSegmentPath = opened;
     record.openSegmentPath = opened;
-    captureAlive = true;
+    markCaptureRunning(record.localId);
     touch(record);
     pushVoiceNoteDebug("录音", "切段，采集器不重建");
     if (pauseAfterRotate) {
@@ -758,7 +819,7 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     record.segmentStartedAt = 0;
     record.awaitComplete = false;
     touch(record);
-    captureAlive = false;
+    markCaptureStopped();
     pushVoiceNoteDebug("录音", "下一段没有打开，已暂停");
     endBackground();
     stopTicker();
@@ -1046,7 +1107,7 @@ async function ensureNoteId(localId: string): Promise<VoiceNoteRecord | null> {
   if (noteCreateBusy(localId)) return null;
   rememberNoteCreate(localId);
   try {
-    const noteId = await apiVoiceNoteCreate(current.title);
+    const noteId = await apiVoiceNoteCreate(current.title, true);
     if (noteId.length == 0) {
       throw new Error("创建笔记未返回 noteId");
     }
@@ -1167,7 +1228,7 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
             if (latest.error.length == 0) latest.error = "有录音分段上传失败";
             touch(latest);
           }
-        } else if (open.awaitComplete && open.phase != "recording") {
+        } else if (open.awaitComplete && open.phase != "recording" && open.phase != "paused") {
           if (allSegmentsUploaded(open)) {
             await completeRecord(open);
           } else {
@@ -1185,7 +1246,7 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
       const fileExists = await segmentFileExists(missingPath);
       if (!fileExists) {
         const left = removeMissingSegment(sessionId, pending.segmentIndex);
-        if (left != null && left.segments.length == 0 && left.awaitComplete && left.phase != "recording") {
+        if (left != null && left.segments.length == 0 && left.awaitComplete && left.phase != "recording" && left.phase != "paused") {
           left.phase = "failed";
           left.awaitComplete = false;
           left.error = "录音文件已删除";
@@ -1343,6 +1404,9 @@ export function backfillVoiceNoteByNoteId(noteId: string): void {
 }
 
 async function completeRecord(record: VoiceNoteRecord): Promise<void> {
+  if (record.phase == "recording" || record.phase == "paused") {
+    return;
+  }
   if (record.noteId.length == 0) {
     return;
   }
@@ -1361,7 +1425,7 @@ async function completeRecord(record: VoiceNoteRecord): Promise<void> {
   record.phase = "uploading";
   touch(record);
   try {
-    const status = await apiVoiceNoteComplete(record.noteId, total);
+    const status = await apiVoiceNoteComplete(record.noteId, total, true);
     record.phase = "processing";
     record.serverStatus = status;
     record.awaitComplete = false;
@@ -1537,17 +1601,22 @@ async function resumePausedNote(record: VoiceNoteRecord): Promise<void> {
   record.segmentStartedAt = Date.now();
   record.awaitComplete = false;
   record.error = "";
-  touch(record);
-  captureAlive = true;
+  saveRecordQuiet(record);
   stopIntent = "";
   ensureTicker();
   // #ifdef APP
   if (m4aRecorder != null && record.openSegmentPath.length > 0) {
-    const resumed = await m4aRecorder!.resume();
+    let resumed = "0";
+    try {
+      resumed = await m4aRecorder!.resume();
+    } catch (e) {
+      console.warn("[voice-note] m4a resume failed " + e);
+      resumed = "0";
+    }
     if (resumed == "1") {
+      markCaptureRunning(record.localId);
       pushVoiceNoteDebug("录音", "继续写入当前文件");
-      bindNoteAfterCapture(record.localId);
-      beginBackground();
+      armCaptureSideEffects(record.localId);
       return;
     }
   }
@@ -1557,30 +1626,48 @@ async function resumePausedNote(record: VoiceNoteRecord): Promise<void> {
 }
 
 /** 开始一轮录音。已暂停的会话会接着录。调用前页面需已拿到麦克风权限。
- *  有权限后立刻进入录音并开始计时。笔记在原生真正开录之后才创建，不参与这一步。 */
+ *  先让原生录音器写文件。创建笔记、上传、转写、补传都在开录成功之后，失败也不停录音。 */
 export async function startVoiceNote(): Promise<void> {
+  if (captureStarting) return;
   const existing = activeRecord();
-  if (existing != null) return;
-  const paused = findPausedVoiceNote();
-  if (paused != null) {
-    await resumePausedNote(paused);
-    return;
+  if (existing != null && captureAlive) return;
+  captureStarting = true;
+  try {
+    if (existing != null) {
+      await resumePausedNote(existing);
+    } else {
+      const paused = findPausedVoiceNote();
+      if (paused != null) {
+        await resumePausedNote(paused);
+      } else {
+        bindRecorder();
+        const now = Date.now();
+        const record = new VoiceNoteRecord();
+        record.localId = `${now}`;
+        record.phase = "recording";
+        record.startedAt = now;
+        record.segmentStartedAt = now;
+        record.openSegmentIndex = 0;
+        record.title = "";
+        saveRecordQuiet(record);
+        stopIntent = "";
+        ensureTicker();
+        await startRecorder();
+      }
+    }
+    try {
+      startBackfill();
+    } catch (e) {
+      console.warn("[voice-note] backfill skipped " + e);
+    }
+  } catch (e) {
+    console.warn("[voice-note] start recording failed " + e);
+    if (!captureAlive) {
+      abandonUnstartedRecording("");
+    }
+  } finally {
+    captureStarting = false;
   }
-  bindRecorder();
-  const now = Date.now();
-  const record = new VoiceNoteRecord();
-  record.localId = `${now}`;
-  record.phase = "recording";
-  record.startedAt = now;
-  record.segmentStartedAt = now;
-  record.openSegmentIndex = 0;
-  record.title = "";
-  touch(record);
-  captureAlive = true;
-  stopIntent = "";
-  ensureTicker();
-  await startRecorder();
-  void startBackfill();
 }
 
 /**
@@ -1756,7 +1843,7 @@ export function discardVoiceNote(): void {
 
 async function deleteNoteQuiet(noteId: string): Promise<void> {
   try {
-    await apiVoiceNoteDelete(noteId);
+    await apiVoiceNoteDelete(noteId, true);
   } catch (_e) {
     // 本地已放弃。未收尾的服务端会话会在 7 天后回收。
   }

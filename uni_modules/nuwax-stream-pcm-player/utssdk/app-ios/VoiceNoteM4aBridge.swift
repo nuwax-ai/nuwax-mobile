@@ -8,7 +8,6 @@ import AVFoundation
 import Foundation
 
 public class VoiceNoteM4aBridge {
-    private let queue = DispatchQueue(label: "voice-note-m4a")
     private var recorder: AVAudioRecorder?
     private var lastClosedDurationMs: Int = 0
     private var currentPath = ""
@@ -36,107 +35,117 @@ public class VoiceNoteM4aBridge {
     }
 
     public func startSegment(_ segmentKey: String) -> String {
-        lastError = ""
-        guard let path = preparePath(segmentKey) else {
-            lastError = "录音路径无效"
-            return ""
+        return onMain {
+            self.startSegmentOnMain(segmentKey)
         }
-        guard activateSession() else {
-            return ""
-        }
-        var opened = ""
-        queue.sync {
-            self.ignoreBeganUntil = Date().addingTimeInterval(1.5)
-            self.interruptHold = false
-            if self.openRecorder(path) {
-                opened = path
-            }
-        }
-        return opened
     }
 
     /// 封上当前 m4a，立刻打开下一段。
     public func rotateSegment(_ segmentKey: String) -> String {
-        guard let path = preparePath(segmentKey) else {
-            lastError = "录音路径无效"
-            return ""
-        }
-        var opened = ""
-        queue.sync {
+        return onMain {
+            guard let path = self.preparePath(segmentKey) else {
+                self.lastError = "录音路径无效"
+                return ""
+            }
             self.closeRecorder()
             if self.openRecorder(path) {
-                opened = path
+                return path
             }
+            return ""
+        }
+    }
+
+    /// AVAudioRecorder 只能在主线程创建和开始。从后台线程调用时 record() 会直接返回失败。
+    private func onMain(_ work: () -> String) -> String {
+        if Thread.isMainThread {
+            return work()
+        }
+        var opened = ""
+        DispatchQueue.main.sync {
+            opened = work()
         }
         return opened
     }
 
+    private func startSegmentOnMain(_ segmentKey: String) -> String {
+        lastError = ""
+        let session = AVAudioSession.sharedInstance()
+        if session.recordPermission == .denied {
+            lastError = "没有麦克风权限"
+            return ""
+        }
+        guard let path = preparePath(segmentKey) else {
+            lastError = "录音路径无效"
+            return ""
+        }
+        ignoreBeganUntil = Date().addingTimeInterval(1.5)
+        interruptHold = false
+        guard activateSession() else {
+            return ""
+        }
+        if openRecorder(path) {
+            return path
+        }
+        // 第一次 record() 失败后，重新激活会话，再用去掉码率的参数试一次。
+        guard activateSession() else {
+            return ""
+        }
+        if openRecorder(path) {
+            return path
+        }
+        return ""
+    }
+
     public func pauseSegment() -> String {
-        var ok = "0"
-        queue.sync {
+        return onMain {
             guard let recorder = self.recorder else {
                 self.lastError = "录音器不存在"
-                return
+                return "0"
             }
             if recorder.isRecording {
                 recorder.pause()
             }
-            ok = "1"
+            return "1"
         }
-        return ok
     }
 
     public func resumeSegment() -> String {
-        var ok = "0"
-        queue.sync {
+        return onMain {
             guard let recorder = self.recorder else {
                 self.lastError = "录音器不存在"
-                return
+                return "0"
             }
             self.interruptHold = false
             if recorder.record() {
-                ok = "1"
-            } else {
-                self.lastError = "继续录音失败"
+                return "1"
             }
+            self.lastError = "继续录音失败"
+            return "0"
         }
-        return ok
     }
 
     public func stopSegment() -> String {
-        var sealed = "1"
-        queue.sync {
+        return onMain {
             self.interruptHold = false
             self.pendingEvent = ""
-            sealed = self.closeRecorder()
+            return self.closeRecorder()
         }
-        return sealed
     }
 
     public func takeClosedDurationMs() -> String {
-        var duration = "0"
-        queue.sync {
-            duration = String(self.lastClosedDurationMs)
-            self.lastClosedDurationMs = 0
-        }
+        let duration = String(lastClosedDurationMs)
+        lastClosedDurationMs = 0
         return duration
     }
 
     public func takeLastError() -> String {
-        var text = ""
-        queue.sync {
-            text = self.lastError
-        }
-        return text
+        return lastError
     }
 
     /// 来电、微信语音、飞书语音等抢走音频会话。返回一次 "began" 或 "ended"，读完即清。
     public func takeInterruption() -> String {
-        var event = ""
-        queue.sync {
-            event = self.pendingEvent
-            self.pendingEvent = ""
-        }
+        let event = pendingEvent
+        pendingEvent = ""
         return event
     }
 
@@ -167,8 +176,8 @@ public class VoiceNoteM4aBridge {
             if Date() < ignoreBeganUntil {
                 return
             }
-            queue.sync {
-                guard let recorder = self.recorder, recorder.isRecording else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, let recorder = self.recorder, recorder.isRecording else {
                     return
                 }
                 recorder.pause()
@@ -177,8 +186,8 @@ public class VoiceNoteM4aBridge {
             }
             return
         }
-        queue.sync {
-            if !self.interruptHold {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.interruptHold else {
                 return
             }
             self.pendingEvent = "ended"
@@ -191,7 +200,7 @@ public class VoiceNoteM4aBridge {
             try session.setCategory(
                 .playAndRecord,
                 mode: .default,
-                options: [.defaultToSpeaker, .mixWithOthers]
+                options: [.defaultToSpeaker]
             )
             try session.setActive(true)
             return true
@@ -204,21 +213,35 @@ public class VoiceNoteM4aBridge {
 
     private func openRecorder(_ path: String) -> Bool {
         closeRecorder()
-        let url = URL(fileURLWithPath: path)
-        let settings: [String: Any] = [
+        if writeRecorder(path, bitRate: 64000) {
+            return true
+        }
+        try? FileManager.default.removeItem(atPath: path)
+        return writeRecorder(path, bitRate: 0)
+    }
+
+    /// bitRate 为 0 时不写码率，避开部分系统因码率拒绝 prepareToRecord。
+    private func writeRecorder(_ path: String, bitRate: Int) -> Bool {
+        var settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
             AVSampleRateKey: 16000,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderBitRateKey: 64000
+            AVNumberOfChannelsKey: 1
         ]
+        if bitRate > 0 {
+            settings[AVEncoderBitRateKey] = bitRate
+        }
         do {
-            let next = try AVAudioRecorder(url: url, settings: settings)
-            next.isMeteringEnabled = true
-            if !next.prepareToRecord() || !next.record() {
+            let next = try AVAudioRecorder(url: URL(fileURLWithPath: path), settings: settings)
+            let prepared = next.prepareToRecord()
+            if !prepared || !next.record() {
+                let session = AVAudioSession.sharedInstance()
                 lastError = "录音器未能开始"
-                NSLog("[voice-note] m4a record() failed \(path)")
+                NSLog("[voice-note] m4a record() failed prepared=\(prepared) category=\(session.category.rawValue) permission=\(session.recordPermission.rawValue) input=\(session.isInputAvailable) bitRate=\(bitRate) path=\(path)")
+                next.stop()
                 return false
             }
+            lastError = ""
+            next.isMeteringEnabled = true
             recorder = next
             currentPath = path
             return true

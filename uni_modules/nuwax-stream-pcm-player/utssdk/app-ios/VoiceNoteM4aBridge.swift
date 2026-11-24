@@ -14,7 +14,8 @@ public class VoiceNoteM4aBridge {
     private var lastError = ""
     private var interruptObserver: NSObjectProtocol?
     private var interruptHold = false
-    private var pendingEvent = ""
+    private var interruptBeganAt = Date()
+    private var pendingEvents: [String] = []
     private var ignoreBeganUntil = Date()
 
     public init() {
@@ -115,8 +116,9 @@ public class VoiceNoteM4aBridge {
                 self.lastError = "录音器不存在"
                 return "0"
             }
-            self.interruptHold = false
             if recorder.record() {
+                self.interruptHold = false
+                self.pendingEvents.removeAll()
                 return "1"
             }
             self.lastError = "继续录音失败"
@@ -127,7 +129,7 @@ public class VoiceNoteM4aBridge {
     public func stopSegment() -> String {
         return onMain {
             self.interruptHold = false
-            self.pendingEvent = ""
+            self.pendingEvents.removeAll()
             return self.closeRecorder()
         }
     }
@@ -148,10 +150,17 @@ public class VoiceNoteM4aBridge {
     }
 
     /// 来电、微信语音、飞书语音等抢走音频会话。返回一次 "began" 或 "ended"，读完即清。
+    /// 结束后系统经常不发 interruption ended，会话空出来后补一次结束。
     public func takeInterruption() -> String {
-        let event = pendingEvent
-        pendingEvent = ""
-        return event
+        return onMain {
+            if self.interruptHold && self.interruptGraceDone() && !self.otherAudioBusy() {
+                self.pushEvent("ended")
+            }
+            if self.pendingEvents.isEmpty {
+                return ""
+            }
+            return self.pendingEvents.removeFirst()
+        }
     }
 
     /// 最近一小段输入的音量，0 到 100。面板用来画左侧音波。
@@ -186,16 +195,45 @@ public class VoiceNoteM4aBridge {
                     return
                 }
                 recorder.pause()
+                if !self.interruptHold {
+                    self.interruptBeganAt = Date()
+                }
                 self.interruptHold = true
-                self.pendingEvent = "began"
+                self.pushEvent("began")
             }
             return
         }
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, self.interruptHold else {
+            guard let self = self, self.interruptHold, self.interruptGraceDone(), !self.otherAudioBusy() else {
                 return
             }
-            self.pendingEvent = "ended"
+            self.pushEvent("ended")
+        }
+    }
+
+    private func interruptGraceDone() -> Bool {
+        return Date().timeIntervalSince(interruptBeganAt) >= 0.8
+    }
+
+    /// 电话或第三方语音还占着会话时不要恢复。
+    private func otherAudioBusy() -> Bool {
+        let session = AVAudioSession.sharedInstance()
+        if session.isOtherAudioPlaying {
+            return true
+        }
+        if session.secondaryAudioShouldBeSilencedHint {
+            return true
+        }
+        return false
+    }
+
+    private func pushEvent(_ event: String) {
+        if pendingEvents.last == event {
+            return
+        }
+        pendingEvents.append(event)
+        if pendingEvents.count > 4 {
+            pendingEvents.removeFirst()
         }
     }
 

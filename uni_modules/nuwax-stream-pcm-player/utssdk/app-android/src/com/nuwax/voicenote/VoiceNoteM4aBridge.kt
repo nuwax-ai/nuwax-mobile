@@ -12,6 +12,7 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.SystemClock
 import java.io.File
 
 /**
@@ -39,18 +40,26 @@ class VoiceNoteM4aBridge {
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
     private var interruptHold: Boolean = false
-    @Volatile private var pendingEvent: String = ""
+    private var interruptBeganAt: Long = 0
+    private val pendingEvents = mutableListOf<String>()
     @Volatile private var inputLevel: Int = 0
 
     private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
-        if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+        if (
+            change == AudioManager.AUDIOFOCUS_LOSS ||
+            change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
+            change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
+        ) {
             synchronized(lock) {
                 if (!running || paused) {
                     return@synchronized
                 }
                 paused = true
+                if (!interruptHold) {
+                    interruptBeganAt = SystemClock.elapsedRealtime()
+                }
                 interruptHold = true
-                pendingEvent = "began"
+                pushEventLocked("began")
                 try {
                     if (audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
                         audioRecord?.stop()
@@ -62,10 +71,10 @@ class VoiceNoteM4aBridge {
         }
         if (change == AudioManager.AUDIOFOCUS_GAIN) {
             synchronized(lock) {
-                if (!interruptHold) {
+                if (!interruptHold || otherCallActive() || !interruptGraceDone()) {
                     return@synchronized
                 }
-                pendingEvent = "ended"
+                pushEventLocked("ended")
             }
         }
     }
@@ -125,8 +134,14 @@ class VoiceNoteM4aBridge {
                 return "0"
             }
             paused = false
+            val ok = ensureRecording()
+            if (!ok) {
+                paused = true
+                return "0"
+            }
             interruptHold = false
-            return if (ensureRecording()) "1" else "0"
+            pendingEvents.clear()
+            return "1"
         }
     }
 
@@ -136,7 +151,7 @@ class VoiceNoteM4aBridge {
             running = false
             paused = false
             interruptHold = false
-            pendingEvent = ""
+            pendingEvents.clear()
             closeEncoder()
             val current = audioRecord
             audioRecord = null
@@ -190,10 +205,63 @@ class VoiceNoteM4aBridge {
     }
 
     fun takeInterruption(): String {
+        val probe = synchronized(lock) {
+            interruptHold && interruptGraceDone()
+        }
+        if (probe && focusAvailable()) {
+            synchronized(lock) {
+                if (interruptHold && interruptGraceDone() && !otherCallActive()) {
+                    pushEventLocked("ended")
+                }
+            }
+        }
         synchronized(lock) {
-            val event = pendingEvent
-            pendingEvent = ""
-            return event
+            if (pendingEvents.isEmpty()) {
+                return ""
+            }
+            return pendingEvents.removeAt(0)
+        }
+    }
+
+    /** 电话、微信语音、飞书语音结束后系统经常不回调 AUDIOFOCUS_GAIN。麦克风空出来就补一次结束。 */
+    private fun interruptGraceDone(): Boolean {
+        return SystemClock.elapsedRealtime() - interruptBeganAt >= 800
+    }
+
+    private fun otherCallActive(): Boolean {
+        val manager = audioManager ?: return false
+        val mode = manager.mode
+        return mode == AudioManager.MODE_IN_CALL ||
+            mode == AudioManager.MODE_IN_COMMUNICATION ||
+            mode == AudioManager.MODE_RINGTONE
+    }
+
+    private fun focusAvailable(): Boolean {
+        val manager = audioManager ?: return false
+        if (otherCallActive()) {
+            return false
+        }
+        if (Build.VERSION.SDK_INT >= 26) {
+            val request = focusRequest ?: return false
+            return manager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        }
+        @Suppress("DEPRECATION")
+        val result = manager.requestAudioFocus(
+            focusListener,
+            AudioManager.STREAM_MUSIC,
+            AudioManager.AUDIOFOCUS_GAIN
+        )
+        return result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+    }
+
+    private fun pushEventLocked(event: String) {
+        val size = pendingEvents.size
+        if (size > 0 && pendingEvents[size - 1] == event) {
+            return
+        }
+        pendingEvents.add(event)
+        if (pendingEvents.size > 4) {
+            pendingEvents.removeAt(0)
         }
     }
 

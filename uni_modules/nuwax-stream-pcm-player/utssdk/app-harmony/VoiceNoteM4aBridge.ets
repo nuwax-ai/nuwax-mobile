@@ -4,6 +4,7 @@
  * 不走聊天页的 StreamPcmRecorder。
  */
 import { media } from '@kit.MediaKit'
+import { audio } from '@kit.AudioKit'
 import { fileIo as fs } from '@kit.CoreFileKit'
 
 /**
@@ -50,7 +51,8 @@ export class VoiceNoteM4aBridge {
   private lastClosedDurationMs: number = 0
   private selfActionUntil: number = 0
   private interruptHold: boolean = false
-  private pendingEvent: string = ''
+  private interruptBeganAt: number = 0
+  private pendingEvents: string[] = []
   private inputLevel: number = 0
   private levelBusy: boolean = false
   private levelStartedAt: number = 0
@@ -64,12 +66,13 @@ export class VoiceNoteM4aBridge {
       return
     }
     if ((state == 'paused' || state == 'error') && !this.interruptHold) {
+      this.interruptBeganAt = Date.now()
       this.interruptHold = true
-      this.pendingEvent = 'began'
+      this.pushEvent('began')
       return
     }
-    if (state == 'started' && this.interruptHold) {
-      this.pendingEvent = 'ended'
+    if (state == 'started' && this.interruptHold && this.interruptGraceDone() && !this.otherCallActive()) {
+      this.pushEvent('ended')
     }
   }
 
@@ -134,20 +137,17 @@ export class VoiceNoteM4aBridge {
 
   async resumeSegment(): Promise<string> {
     this.markSelfAction()
-    this.interruptHold = false
     const av = this.recorder
     if (av == null || !this.fileOpen) {
       return '0'
     }
     try {
       await av.resume()
-      if (this.pauseBeganAt > 0) {
-        this.pausedAccumMs = this.pausedAccumMs + (Date.now() - this.pauseBeganAt)
-        this.pauseBeganAt = 0
-      }
+      this.finishInterruptionResume()
       return '1'
     } catch (eResume) {
       if (av.state == 'started') {
+        this.finishInterruptionResume()
         return '1'
       }
       console.warn('[voice-note] m4a resume failed', eResume)
@@ -158,7 +158,7 @@ export class VoiceNoteM4aBridge {
   async stopSegment(): Promise<string> {
     this.markSelfAction()
     this.interruptHold = false
-    this.pendingEvent = ''
+    this.pendingEvents = []
     await this.finishFile()
     const av = this.recorder
     this.recorder = null
@@ -177,11 +177,67 @@ export class VoiceNoteM4aBridge {
     return `${duration}`
   }
 
-  /** 其他应用抢走音频时返回一次 began 或 ended，读完即清。 */
+  /** 其他应用抢走音频时返回一次 began 或 ended，读完即清。通话结束后系统经常不把录音器拉回 started。 */
   takeInterruption(): string {
-    const event = this.pendingEvent
-    this.pendingEvent = ''
+    if (this.interruptHold && this.interruptGraceDone() && !this.otherCallActive()) {
+      this.pushEvent('ended')
+    }
+    if (this.pendingEvents.length == 0) {
+      return ''
+    }
+    const event = this.pendingEvents[0]
+    const next: string[] = []
+    for (let i = 1; i < this.pendingEvents.length; i++) {
+      next.push(this.pendingEvents[i])
+    }
+    this.pendingEvents = next
     return event
+  }
+
+  private interruptGraceDone(): boolean {
+    return Date.now() - this.interruptBeganAt >= 800
+  }
+
+  /** 响铃、电话、语音通话还在时不要恢复。 */
+  private otherCallActive(): boolean {
+    try {
+      const scene = audio.getAudioManager().getAudioSceneSync()
+      if (scene == audio.AudioScene.AUDIO_SCENE_RINGING) {
+        return true
+      }
+      if (scene == audio.AudioScene.AUDIO_SCENE_PHONE_CALL) {
+        return true
+      }
+      if (scene == audio.AudioScene.AUDIO_SCENE_VOICE_CHAT) {
+        return true
+      }
+    } catch (_eScene) {
+    }
+    return false
+  }
+
+  private pushEvent(event: string): void {
+    const size = this.pendingEvents.length
+    if (size > 0 && this.pendingEvents[size - 1] == event) {
+      return
+    }
+    this.pendingEvents.push(event)
+    if (this.pendingEvents.length > 4) {
+      const kept: string[] = []
+      for (let i = this.pendingEvents.length - 4; i < this.pendingEvents.length; i++) {
+        kept.push(this.pendingEvents[i])
+      }
+      this.pendingEvents = kept
+    }
+  }
+
+  private finishInterruptionResume(): void {
+    if (this.pauseBeganAt > 0) {
+      this.pausedAccumMs = this.pausedAccumMs + (Date.now() - this.pauseBeganAt)
+      this.pauseBeganAt = 0
+    }
+    this.interruptHold = false
+    this.pendingEvents = []
   }
 
   /**

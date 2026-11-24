@@ -116,6 +116,16 @@ public class VoiceNoteM4aBridge {
                 self.lastError = "录音器不存在"
                 return "0"
             }
+            // 电话挂断后会话是停用的，要先激活再继续写同一个文件。
+            if !recorder.isRecording {
+                _ = self.activateSession()
+            }
+            if recorder.record() {
+                self.interruptHold = false
+                self.pendingEvents.removeAll()
+                return "1"
+            }
+            _ = self.activateSession()
             if recorder.record() {
                 self.interruptHold = false
                 self.pendingEvents.removeAll()
@@ -159,7 +169,12 @@ public class VoiceNoteM4aBridge {
             if self.pendingEvents.isEmpty {
                 return ""
             }
-            return self.pendingEvents.removeFirst()
+            let event = self.pendingEvents.removeFirst()
+            if event == "began" {
+                let ms = Int(self.interruptBeganAt.timeIntervalSince1970 * 1000)
+                return "began|\(ms)"
+            }
+            return event
         }
     }
 
@@ -187,14 +202,18 @@ public class VoiceNoteM4aBridge {
             return
         }
         if type == .began {
-            if Date() < ignoreBeganUntil {
-                return
-            }
             DispatchQueue.main.async { [weak self] in
-                guard let self = self, let recorder = self.recorder, recorder.isRecording else {
+                guard let self = self, self.recorder != nil, !self.currentPath.isEmpty else {
                     return
                 }
-                recorder.pause()
+                // 开录时会话激活会自己发一次中断。真有电话或语音占用时不能忽略。
+                if Date() < self.ignoreBeganUntil && !self.otherAudioBusy() {
+                    return
+                }
+                // 系统经常先停掉录音器再发通知。这时 isRecording 已经是 false，仍然要通知页面暂停。
+                if let recorder = self.recorder, recorder.isRecording {
+                    recorder.pause()
+                }
                 if !self.interruptHold {
                     self.interruptBeganAt = Date()
                 }

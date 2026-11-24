@@ -17,20 +17,30 @@ public enum VoiceNoteM4aSeal {
     private static let preferredPacketBytes = [512, 1024, 256, 384, 640, 768, 320, 192]
     private static let cookie: [UInt8] = [0x14, 0x08]
     private static let queue = DispatchQueue(label: "voice-note.m4a-seal")
+    /// 最近一次没封上的原因。成功时为空。页面日志会带上它。
+    private static var lastDetail = ""
 
     public static func sealFile(_ path: String) -> String {
         if path.isEmpty {
-            return "0"
+            return "0:path"
         }
-        var result = "0"
+        var result = "0:unknown"
         queue.sync {
+            lastDetail = ""
             result = sealFileNow(path)
         }
-        return result
+        if result == "1" {
+            return "1"
+        }
+        if lastDetail.isEmpty {
+            return "0"
+        }
+        return "0:" + lastDetail
     }
 
     private static func sealFileNow(_ path: String) -> String {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), data.count >= 16 else {
+            lastDetail = "unreadable"
             NSLog("[voice-note] m4a seal unreadable \(path)")
             return "0"
         }
@@ -38,11 +48,13 @@ public enum VoiceNoteM4aSeal {
             return "1"
         }
         guard let payload = mdatPayload(data), payload.count >= minFrameBytes else {
+            lastDetail = "nomdat"
             NSLog("[voice-note] m4a seal no mdat \(path)")
             return "0"
         }
         guard let ranges = frameRanges(payload) else {
-            NSLog("[voice-note] m4a seal frames failed bytes=\(payload.count)")
+            lastDetail = lastDetail.isEmpty ? "frames" : lastDetail
+            NSLog("[voice-note] m4a seal frames failed bytes=\(payload.count) \(lastDetail)")
             return "0"
         }
         let tmp = path + ".sealed"
@@ -50,11 +62,15 @@ public enum VoiceNoteM4aSeal {
         try? FileManager.default.removeItem(at: tmpURL)
         guard writeM4a(payload: payload, ranges: ranges, to: tmpURL) else {
             try? FileManager.default.removeItem(at: tmpURL)
+            if lastDetail.isEmpty {
+                lastDetail = "write"
+            }
             NSLog("[voice-note] m4a seal write failed \(path)")
             return "0"
         }
         guard let sealed = try? Data(contentsOf: tmpURL), topLevelHasMoov(sealed), packetCount(tmpURL) == ranges.count else {
             try? FileManager.default.removeItem(at: tmpURL)
+            lastDetail = "verify"
             NSLog("[voice-note] m4a seal verify failed \(path)")
             return "0"
         }
@@ -70,6 +86,7 @@ public enum VoiceNoteM4aSeal {
                 try? FileManager.default.moveItem(atPath: backup, toPath: path)
             }
             try? FileManager.default.removeItem(at: tmpURL)
+            lastDetail = "replace"
             NSLog("[voice-note] m4a seal replace failed \(error.localizedDescription)")
             return "0"
         }
@@ -78,38 +95,76 @@ public enum VoiceNoteM4aSeal {
     }
 
     private static func frameRanges(_ payload: Data) -> [Range<Int>]? {
+        let decoder = AacDecoder()
+        if decoder == nil {
+            lastDetail = AacDecoder.lastError
+            // 解码器建不起来时，仍按开录码率的固定帧长封口。64000bps、16kHz、1024 采样正好 512 字节。
+            if let ranges = uniformRanges(payload, packetBytes: 512) {
+                NSLog("[voice-note] m4a seal fallback 512 frames=\(ranges.count)")
+                return ranges
+            }
+            return nil
+        }
         for size in preferredPacketBytes {
-            if let ranges = fixedRanges(payload, packetBytes: size) {
+            if let ranges = fixedRanges(payload, packetBytes: size, decoder: decoder!) {
                 return ranges
             }
         }
-        return searchedRanges(payload)
+        if payload.count <= 128 * 1024, let ranges = searchedRanges(payload) {
+            return ranges
+        }
+        if let ranges = uniformRanges(payload, packetBytes: 512) {
+            NSLog("[voice-note] m4a seal fallback 512 frames=\(ranges.count)")
+            lastDetail = ""
+            return ranges
+        }
+        return nil
     }
 
-    /// 整段都能按固定长度解码时，直接采用这个长度。杀进程留下的半帧丢掉。
-    private static func fixedRanges(_ payload: Data, packetBytes: Int) -> [Range<Int>]? {
+    /// 按固定长度切帧。杀进程留下的半帧丢掉。
+    private static func uniformRanges(_ payload: Data, packetBytes: Int) -> [Range<Int>]? {
         if packetBytes < minFrameBytes || payload.count < packetBytes {
             return nil
         }
         let count = payload.count / packetBytes
-        let tail = payload.count - count * packetBytes
-        if count < 1 || tail >= packetBytes {
+        if count < 1 {
+            lastDetail = "short"
             return nil
-        }
-        guard let decoder = AacDecoder() else {
-            return nil
-        }
-        for index in 0..<count {
-            let start = index * packetBytes
-            if !decoder.decode(payload, start: start, length: packetBytes, reset: false) {
-                return nil
-            }
         }
         var ranges: [Range<Int>] = []
         ranges.reserveCapacity(count)
         for index in 0..<count {
             let start = index * packetBytes
             ranges.append(start..<(start + packetBytes))
+        }
+        return ranges
+    }
+
+    /// 抽查开头、中间、结尾。有一帧能解开就采用这个长度；第一帧可能只是编码器延迟。
+    private static func fixedRanges(_ payload: Data, packetBytes: Int, decoder: AacDecoder) -> [Range<Int>]? {
+        guard let ranges = uniformRanges(payload, packetBytes: packetBytes) else {
+            return nil
+        }
+        let count = ranges.count
+        var indexes = [0]
+        if count > 2 {
+            indexes.append(count / 2)
+        }
+        if count > 1 {
+            indexes.append(count - 1)
+        }
+        var decoded = 0
+        var errors = 0
+        for index in indexes {
+            let samples = decoder.decode(payload, start: ranges[index].lowerBound, length: packetBytes, reset: true)
+            if samples < 0 {
+                errors += 1
+            } else if samples >= 1024 {
+                decoded += 1
+            }
+        }
+        if decoded == 0 && errors > 0 {
+            return nil
         }
         return ranges
     }
@@ -125,7 +180,7 @@ public enum VoiceNoteM4aSeal {
             guard let length = frameLength(payload, offset: offset, decoder: decoder) else {
                 break
             }
-            if !decoder.decode(payload, start: offset, length: length, reset: false) {
+            if decoder.decode(payload, start: offset, length: length, reset: false) < 1024 {
                 return nil
             }
             ranges.append(offset..<(offset + length))
@@ -151,7 +206,7 @@ public enum VoiceNoteM4aSeal {
         var found = 0
         while low <= high {
             let mid = (low + high) / 2
-            if decoder.decode(payload, start: offset, length: mid, reset: true) {
+            if decoder.decode(payload, start: offset, length: mid, reset: true) >= 1024 {
                 found = mid
                 high = mid - 1
             } else {
@@ -169,6 +224,7 @@ public enum VoiceNoteM4aSeal {
         var file: AudioFileID?
         let created = AudioFileCreateWithURL(url as CFURL, kAudioFileM4AType, &input, .eraseFile, &file)
         guard created == noErr, let file = file else {
+            lastDetail = "create=\(created)"
             NSLog("[voice-note] m4a seal create status=\(created)")
             return false
         }
@@ -183,6 +239,7 @@ public enum VoiceNoteM4aSeal {
             &cookie
         )
         if cookieStatus != noErr {
+            lastDetail = "cookie=\(cookieStatus)"
             NSLog("[voice-note] m4a seal cookie status=\(cookieStatus)")
             return false
         }
@@ -202,6 +259,7 @@ public enum VoiceNoteM4aSeal {
                 return AudioFileWritePackets(file, false, UInt32(slice.count), &desc, index, &packets, base)
             }
             if status != noErr || packets != 1 {
+                lastDetail = "packet=\(status)"
                 NSLog("[voice-note] m4a seal packet status=\(status)")
                 return false
             }
@@ -325,6 +383,7 @@ public enum VoiceNoteM4aSeal {
 }
 
 private final class AacDecoder {
+    static var lastError = ""
     private var converter: AudioConverterRef?
     private let feed = SealFeed()
     private let output = UnsafeMutablePointer<Int16>.allocate(capacity: 4096)
@@ -335,6 +394,7 @@ private final class AacDecoder {
         var created: AudioConverterRef?
         let status = AudioConverterNew(&source, &dest, &created)
         guard status == noErr, let created = created else {
+            AacDecoder.lastError = "decoder=\(status)"
             output.deallocate()
             return nil
         }
@@ -346,9 +406,11 @@ private final class AacDecoder {
             &cookie
         )
         if cookieStatus != noErr {
-            AudioConverterDispose(created)
-            output.deallocate()
-            return nil
+            // 没有 cookie 也继续试。封口不能因为这一项直接放弃整段录音。
+            AacDecoder.lastError = "cookie=\(cookieStatus)"
+            NSLog("[voice-note] m4a seal cookie status=\(cookieStatus)")
+        } else {
+            AacDecoder.lastError = ""
         }
         converter = created
     }
@@ -360,42 +422,53 @@ private final class AacDecoder {
         output.deallocate()
     }
 
-    func decode(_ payload: Data, start: Int, length: Int, reset: Bool) -> Bool {
+    /// 喂一帧并把它吐完。返回 PCM 采样数；输入本身无效返回 -1。0 表示解码器接受了这一帧但还没吐出采样。
+    func decode(_ payload: Data, start: Int, length: Int, reset: Bool) -> Int {
         guard let converter = converter else {
-            return false
+            return -1
         }
         if reset {
             AudioConverterReset(converter)
         }
         let end = start + length
         if start < 0 || length < 2 || end > payload.count {
-            return false
+            return -1
         }
         return payload.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else {
-                return false
+                return -1
             }
             feed.bytes = base.advanced(by: start)
             feed.size = UInt32(length)
             feed.fed = false
-            var list = AudioBufferList(
-                mNumberBuffers: 1,
-                mBuffers: AudioBuffer(
-                    mNumberChannels: 1,
-                    mDataByteSize: UInt32(4096 * MemoryLayout<Int16>.size),
-                    mData: output
+            var total = 0
+            for _ in 0..<4 {
+                var list = AudioBufferList(
+                    mNumberBuffers: 1,
+                    mBuffers: AudioBuffer(
+                        mNumberChannels: 1,
+                        mDataByteSize: UInt32(4096 * MemoryLayout<Int16>.size),
+                        mData: output
+                    )
                 )
-            )
-            var packets: UInt32 = 4096
-            let status = AudioConverterFillComplexBuffer(
-                converter,
-                sealInputProc,
-                Unmanaged.passUnretained(feed).toOpaque(),
-                &packets,
-                &list,
-                nil
-            )
-            return status == noErr && packets >= 1024
+                var packets: UInt32 = 4096
+                let status = AudioConverterFillComplexBuffer(
+                    converter,
+                    sealInputProc,
+                    Unmanaged.passUnretained(feed).toOpaque(),
+                    &packets,
+                    &list,
+                    nil
+                )
+                if status != noErr {
+                    return total >= 1024 ? total : -1
+                }
+                total += Int(packets)
+                if total >= 1024 || packets == 0 {
+                    break
+                }
+            }
+            return total
         }
     }
 }

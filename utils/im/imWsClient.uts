@@ -20,6 +20,7 @@
  */
 import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { getApiBaseUrl } from "@/constants/config";
+import { getImSessionStamp } from "./imSessionScope";
 import { applyBearerAuthorization } from "@/utils/authSession";
 import { isAppWebViewEmbedded } from "@/utils/appWebViewDetect";
 import { getImDeviceId, apiImSync, apiImDeviceRegister, apiImDeviceUnregister, imDevicePlatform, revokeManagedImPushBinding } from "@/servers/im";
@@ -800,6 +801,8 @@ export function stopImWsClient(): void {
 /** 设备注销去重位：一次注销尝试后置位，直到下次 CONNECT_ACK 注册（registerDevice）
  *  才复位。防止同一会话尾部的重复注销（见 unregisterImDeviceSafe 注释第 2 条）。 */
 let imDeviceUnregisterDone = false;
+let retiringImSession = "";
+let accountDeviceRetirement: Promise<void> | null = null;
 
 /** Domain changes wait for the current push binding to be released. */
 export async function confirmImPushReleaseForDomainChange(): Promise<boolean> {
@@ -819,14 +822,31 @@ export async function confirmImPushReleaseForDomainChange(): Promise<boolean> {
  * 2) 一次注销去重：登出流程已显式注销（凭证齐全）后，IM_SESSION_CLEARED 事件的
  *    二次注销此刻 token/cookie 已清，必为裸调——置位跳过，registerDevice 复位。
  */
-export async function unregisterImDeviceSafe(): Promise<void> {
-  if (imDeviceUnregisterDone) return;
+export async function unregisterImDeviceSafe(retireAccountDevice: boolean = false): Promise<void> {
+  const stamp = getImSessionStamp();
+  if (retireAccountDevice && retiringImSession == stamp) {
+    const pending = accountDeviceRetirement;
+    if (pending != null) await pending;
+    return;
+  }
+  if (imDeviceUnregisterDone && !retireAccountDevice) return;
   if (readAccessToken().length == 0 && !canUseBrowserCookieAuth()) return;
   imDeviceUnregisterDone = true;
+  const task = unregisterCurrentImDevice(stamp, retireAccountDevice);
+  if (retireAccountDevice) {
+    retiringImSession = stamp;
+    accountDeviceRetirement = task;
+  }
+  await task;
+}
+
+async function unregisterCurrentImDevice(stamp: string, retireAccountDevice: boolean): Promise<void> {
   try {
     // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
-    const managed = await revokeManagedImPushBinding(getApiBaseUrl(), readAccessToken().length > 0);
-    if (managed != null) return;
+    const origin = getApiBaseUrl();
+    const managed = await revokeManagedImPushBinding(origin, readAccessToken().length > 0, false, retireAccountDevice);
+    // 显式退出时也注销该账号的 IM 设备，清理由旧版本留下的来电路由。
+    if ((managed != null && !retireAccountDevice) || stamp != getImSessionStamp() || origin != getApiBaseUrl()) return;
     // #endif
     await apiImDeviceUnregister(getImDeviceId());
   } catch (_e) {

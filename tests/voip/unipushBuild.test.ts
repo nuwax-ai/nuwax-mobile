@@ -5,15 +5,16 @@ import { describe, expect, it } from 'vitest';
 describe('UniPush native call adapter packaging', () => {
   it('rebuilds the same single receiver and restores SDK behavior when disabled', () => {
     const result = execFileSync('python3', ['-c', `
-import json, os, sys, tempfile
+import json, os, runpy, shutil, sys, tempfile
 from pathlib import Path
 import xml.etree.ElementTree as ET
 sys.path.insert(0, sys.argv[1])
 from configure_unipush import configure, ANDROID, TOOLS, CALL_RECEIVER, STOCK_RECEIVER, CALL_RECEIVER_FILE
+from configure_unipush import VIVO_STOCK_RECEIVER, VIVO_PUSH_RECEIVER, VIVO_CALL_RECEIVER, VIVO_RECEIVER_FILE
 with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     root = Path(directory)
     (root / 'app/src/main').mkdir(parents=True)
-    (root / 'uts-nuwax-voip').mkdir()
+    (root / 'uts-nuwax-voip/src/main').mkdir(parents=True)
     (root / 'app/build.gradle').write_text('android { defaultConfig { } }\\ndependencies { }\\n')
     (root / 'settings.gradle').write_text('repositories { }\\n')
     manifest = root / 'app/src/main/AndroidManifest.xml'
@@ -45,8 +46,30 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     assert metadata['com.hihonor.push.app_id'] == '987654321'
     assert metadata['com.vivo.push.app_id'] == '\${VIVO_APP_ID}'
     assert metadata['com.vivo.push.api_key'] == '\${VIVO_APP_KEY}'
+    os.environ.pop('NUWAX_ANDROID_QA_PROJECT', None)
+    os.environ.update(ANDROID_ESP_PROJECT=str(root), NUWAX_ANDROID_UNIPUSH_CONFIG=str(config),
+        NUWAX_ANDROID_VOIP_RELEASE_ORIGIN='https://testagent.xspaceagi.com', NUWAX_VOIP_DEVICE_TEST='0')
+    entry = str(Path(sys.argv[1]) / 'configure-android.py')
+    runpy.run_path(entry, run_name='__main__')
+    runpy.run_path(entry, run_name='__main__')
+    app = ET.parse(manifest).getroot().find('application')
+    names = [r.get(ANDROID+'name') for r in app.findall('receiver')]
+    assert names == [VIVO_STOCK_RECEIVER, VIVO_PUSH_RECEIVER, VIVO_CALL_RECEIVER]
+    stock, push, call = app.findall('receiver')
+    assert stock.get(TOOLS+'node') == 'remove'
+    assert push.get(ANDROID+'process') == ':pushservice'
+    assert push.find('intent-filter/action').get(ANDROID+'name') == 'com.vivo.pushclient.action.RECEIVE'
+    assert call.get(ANDROID+'exported') == 'false' and call.get(ANDROID+'process') is None
+    assert (root / VIVO_RECEIVER_FILE).is_file()
+    assert (root / 'app/build.gradle').read_text().count('com.assist-v3:vivo:3.3.0') == 1
+    os.environ.pop('NUWAX_ANDROID_VOIP_RELEASE_ORIGIN')
+    runpy.run_path(entry, run_name='__main__')
+    app = ET.parse(manifest).getroot().find('application')
+    assert not app.findall('receiver') and not (root / VIVO_RECEIVER_FILE).exists()
+    assert (root / 'app/build.gradle').read_text().count('com.assist-v3:vivo:3.1.2') == 1
     configure(root, None)
     app = ET.parse(manifest).getroot().find('application')
+    assert not app.findall('receiver') and not (root / VIVO_RECEIVER_FILE).exists()
     assert [s.get(ANDROID+'name') for s in app.findall('service')] == ['example.OrdinaryService']
     assert not (root / CALL_RECEIVER_FILE).exists()
     assert 'com.getui:gtsdk' not in (root / 'app/build.gradle').read_text()
@@ -54,9 +77,11 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     assert 'com.assist-v3:vivo' not in (root / 'app/build.gradle').read_text()
     assert 'VIVO_APP_' not in (root / 'app/build.gradle').read_text()
     assert not any(n.get(ANDROID+'name') in ['com.huawei.hms.client.appid','com.hihonor.push.app_id','com.vivo.push.app_id','com.vivo.push.api_key'] for n in app.findall('meta-data'))
-    (root / 'uts-nuwax-voip').rmdir()
-    configure(root, config)
+    shutil.rmtree(root / 'uts-nuwax-voip')
+    configure(root, config, enable_vivo_voip=True)
     app = ET.parse(manifest).getroot().find('application')
+    assert not app.findall('receiver') and not (root / VIVO_RECEIVER_FILE).exists()
+    assert (root / 'app/build.gradle').read_text().count('com.assist-v3:vivo:3.1.2') == 1
     assert [s.get(ANDROID+'name') for s in app.findall('service')] == ['example.OrdinaryService']
     assert not (root / CALL_RECEIVER_FILE).exists()
 print('adapter packaging and SDK fallback verified')

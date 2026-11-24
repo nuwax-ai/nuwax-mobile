@@ -1,0 +1,274 @@
+<template>
+  <view class="replay-page">
+    <custom-nav-bar :title="t('Mobile.Meeting.detailReplay')" hasSafetyZone showBack />
+    <view class="replay-stage">
+      <video v-if="ready && src.length > 0 && errorText.length == 0" :key="attemptId"
+        :id="'meetingReplayVideo-' + attemptId" class="replay-video" :src="src" :controls="true"
+        :autoplay="true" :initial-time="initialTime" object-fit="contain"
+        @play="handlePlay" @pause="handlePause"
+        @ended="handlePause" @waiting="handleWaiting" @timeupdate="handleTimeUpdate"
+        @error="handleVideoError" />
+      <view v-if="errorText.length > 0" class="replay-error">
+        <text class="replay-error__text">{{ errorText }}</text>
+        <view class="replay-retry" hover-class="replay-retry--active" @click="retry">
+          <text class="replay-retry__text">{{ t('Mobile.Common.retry') }}</text>
+        </view>
+      </view>
+    </view>
+    <view v-if="loading" class="replay-status">
+      <text class="replay-status__text">{{ caching ? t('Mobile.Meeting.replayCaching') : t('Mobile.Common.loading') }}{{ caching && progress > 0 ? ' ' + progress + '%' : '' }}</text>
+    </view>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { ref } from "vue";
+  import { onLoad, onReady, onShow, onHide, onUnload } from "@dcloudio/uni-app";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiImMeetingRecordFileUrl } from "@/servers/imMeeting";
+  import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
+  import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { meetingReplaySignedUrl } from "@/utils/meeting/meetingReplay";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+  const src = ref("");
+  const ready = ref(false);
+  const loading = ref(false);
+  const caching = ref(false);
+  const progress = ref(0);
+  const errorText = ref("");
+  const initialTime = ref(0);
+  const attemptId = ref(0);
+  let meetingId = "";
+  let fileId = "";
+  let alive = true;
+  let visible = true;
+  let generation = 0;
+  let bufferTimer = -1;
+  let requestTimer = -1;
+  let downloadTask: DownloadTask | null = null;
+  let currentTime = 0;
+  let localPlayback = false;
+  let needsBuffering = false;
+  let reloadOnShow = false;
+
+  function clearBufferTimer(): void {
+    if (bufferTimer != -1) clearTimeout(bufferTimer);
+    bufferTimer = -1;
+  }
+
+  function clearRequestTimer(): void {
+    if (requestTimer != -1) clearTimeout(requestTimer);
+    requestTimer = -1;
+  }
+
+  function abortDownload(): void {
+    const task = downloadTask;
+    downloadTask = null;
+    if (task != null) task.abort();
+  }
+
+  function pauseVideo(): void {
+    if (!ready.value || src.value.length == 0) return;
+    // #ifdef APP || WEB
+    const video = uni.getElementById("meetingReplayVideo-" + attemptId.value) as UniVideoElement | null;
+    if (video != null) { try { video.pause(); } catch (_error) {} }
+    // #endif
+    // #ifdef MP-WEIXIN
+    uni.createVideoContext("meetingReplayVideo-" + attemptId.value).pause();
+    // #endif
+  }
+
+  function showFailure(message: string): void {
+    clearBufferTimer();
+    clearRequestTimer();
+    loading.value = false;
+    caching.value = false;
+    src.value = "";
+    needsBuffering = false;
+    errorText.value = message.length > 0 ? message : t("Mobile.Message.videoPlayFailed");
+  }
+
+  function downloadForPlayback(url: string, attempt: number): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      // 现签对象存储地址原样使用，不加业务 Authorization，不改 query 编码。
+      const task = uni.downloadFile({
+        url,
+        timeout: 300000,
+        success: (result) => {
+          if (result.statusCode == 200 && result.tempFilePath.length > 0) {
+            resolve(result.tempFilePath);
+          } else {
+            console.error("[MeetingReplay] cache http=" + result.statusCode);
+            reject(new Error(t("Mobile.Terminal.downloadFailed")));
+          }
+        },
+        fail: (_error) => { reject(new Error(t("Mobile.Terminal.downloadFailed"))); },
+        complete: (_res) => { if (attempt == generation) downloadTask = null; },
+      });
+      downloadTask = task;
+      task.onProgressUpdate((event) => {
+        if (alive && attempt == generation) progress.value = event.progress;
+      });
+    });
+  }
+
+  function armBufferTimer(): void {
+    if (!alive || !visible || !ready.value || src.value.length == 0 || bufferTimer != -1) return;
+    const attempt = generation;
+    bufferTimer = setTimeout(() => {
+      bufferTimer = -1;
+      if (!alive || !visible || attempt != generation) return;
+      if (localPlayback) {
+        showFailure(t("Mobile.Meeting.replayLoadTimeout"));
+      } else {
+        console.error("[MeetingReplay] stream timeout; retry with local file");
+        void loadVideo(true);
+      }
+    }, 20000);
+  }
+
+  async function loadVideo(useCache: boolean): Promise<void> {
+    if (!alive || !visible || meetingId.length == 0 || fileId.length == 0) return;
+    const attempt = ++generation;
+    abortDownload();
+    clearBufferTimer();
+    clearRequestTimer();
+    pauseVideo();
+    src.value = "";
+    errorText.value = "";
+    loading.value = true;
+    caching.value = useCache;
+    progress.value = 0;
+    localPlayback = useCache;
+    needsBuffering = true;
+    requestTimer = setTimeout(() => {
+      if (!alive || attempt != generation) return;
+      generation += 1;
+      showFailure(t("Mobile.Meeting.replayLoadTimeout"));
+    }, 20000);
+    try {
+      // 播放页/重试时现签，避免路由携带签名地址或过期地址。
+      const response = await apiImMeetingRecordFileUrl(meetingId, fileId, false);
+      if (!alive || attempt != generation) return;
+      clearRequestTimer();
+      if (apiResCode(response) != SUCCESS_CODE) {
+        showFailure(apiResMessage(response));
+        return;
+      }
+      const raw = apiResData<any>(response);
+      const data = raw != null ? raw as UTSJSONObject : null;
+      if (data == null) { showFailure(""); return; }
+      const url = meetingReplaySignedUrl(data, false);
+      if (url.length == 0) {
+        const reason = data["reason"];
+        showFailure(reason != null ? reason as string : t("Mobile.Meeting.fileProcessing"));
+        return;
+      }
+      const playable = useCache ? await downloadForPlayback(url, attempt) : url;
+      if (!alive || !visible || attempt != generation) return;
+      caching.value = false;
+      initialTime.value = currentTime;
+      attemptId.value = attempt;
+      src.value = playable;
+      armBufferTimer();
+    } catch (_error) {
+      if (!alive || attempt != generation) return;
+      // 不打印签名 URL/原生异常全文，避免泄漏临时凭据。
+      console.error("[MeetingReplay] load failed cache=" + useCache);
+      showFailure(t("Mobile.Message.videoPlayFailed"));
+    }
+  }
+
+  function isCurrentVideoEvent(event: UniEvent): boolean {
+    if (!alive || !visible || src.value.length == 0 || errorText.value.length > 0) return false;
+    const target = event.currentTarget;
+    // 换源会卸载旧播放器；旧播放器延迟上报的 pause/error 不能污染新一轮加载。
+    return target != null && target.id == "meetingReplayVideo-" + attemptId.value;
+  }
+
+  function handlePlay(event: UniEvent): void {
+    if (!isCurrentVideoEvent(event)) return;
+    loading.value = true;
+    needsBuffering = true;
+    armBufferTimer();
+  }
+
+  function handlePause(event: UniEvent): void {
+    if (!isCurrentVideoEvent(event)) return;
+    clearBufferTimer();
+    loading.value = false;
+    needsBuffering = false;
+  }
+
+  function handleWaiting(event: UniEvent): void {
+    if (!isCurrentVideoEvent(event)) return;
+    loading.value = true;
+    needsBuffering = true;
+    armBufferTimer();
+  }
+
+  function handleTimeUpdate(event: UniVideoTimeUpdateEvent): void {
+    if (!isCurrentVideoEvent(event)) return;
+    if (event.detail.currentTime != currentTime) {
+      currentTime = event.detail.currentTime;
+      loading.value = false;
+      needsBuffering = false;
+      clearBufferTimer();
+    }
+  }
+
+  function handleVideoError(event: UniVideoErrorEvent): void {
+    if (!isCurrentVideoEvent(event)) return;
+    console.error("[MeetingReplay] player error cache=" + localPlayback);
+    if (!localPlayback) { void loadVideo(true); return; }
+    showFailure(t("Mobile.Message.videoPlayFailed"));
+  }
+
+  function retry(): void { void loadVideo(false); }
+
+  onLoad((options) => {
+    meetingId = options != null && options["id"] != null ? options["id"] as string : "";
+    fileId = options != null && options["fileId"] != null ? options["fileId"] as string : "";
+    const seek = options != null && options["seek"] != null ? parseFloat(options["seek"] as string) : 0;
+    currentTime = seek == seek ? Math.max(0, seek) : 0;
+    if (meetingId.length == 0 || fileId.length == 0) { showFailure(t("Mobile.Meeting.detailMissing")); return; }
+    void loadVideo(false);
+  });
+  onReady(() => { ready.value = true; if (needsBuffering) armBufferTimer(); });
+  onShow(() => {
+    visible = true;
+    if (reloadOnShow) { reloadOnShow = false; void loadVideo(localPlayback); }
+    else if (needsBuffering) armBufferTimer();
+  });
+  onHide(() => {
+    visible = false;
+    reloadOnShow = reloadOnShow || (loading.value && src.value.length == 0);
+    if (reloadOnShow) { generation += 1; abortDownload(); }
+    clearRequestTimer();
+    clearBufferTimer();
+    pauseVideo();
+    loading.value = false;
+    needsBuffering = false;
+  });
+  onUnload(() => {
+    alive = false;
+    generation += 1;
+    clearRequestTimer();
+    clearBufferTimer();
+    abortDownload();
+  });
+</script>
+
+<style scoped>
+  .replay-page { height: 100%; display: flex; flex-direction: column; background-color: #000000; }
+  .replay-stage { flex: 1; min-height: 0; width: 100%; justify-content: center; }
+  .replay-video { width: 100%; height: 100%; }
+  .replay-status { padding: 16px 24px 32px; align-items: center; }
+  .replay-status__text { color: #cccccc; font-size: 14px; }
+  .replay-error { padding: 24px; align-items: center; }
+  .replay-error__text { color: #cccccc; font-size: 14px; text-align: center; }
+  .replay-retry { margin-top: 20px; padding: 12px 28px; border-radius: 24px; background-color: #17171a; border: 1px solid #555555; }
+  .replay-retry--active { opacity: 0.75; }
+  .replay-retry__text { color: #ffffff; font-size: 14px; }
+</style>

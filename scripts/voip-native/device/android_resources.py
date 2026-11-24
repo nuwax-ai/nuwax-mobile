@@ -8,6 +8,7 @@ from pathlib import Path
 RESOURCE_PATH = Path("uni_modules/nuwax-voip/utssdk/app-android/res")
 LOCALES = {"values": "en-us", "values-zh-rCN": "zh-cn", "values-zh-rTW": "zh-tw", "values-zh-rHK": "zh-hk"}
 LABELS = {"nuwax_voip_incoming_channel": "Mobile.Voip.notificationIncoming",
+          "nuwax_voip_presented_incoming_channel": "Mobile.Voip.notificationPresentedIncoming",
           "nuwax_voip_ongoing_channel": "Mobile.Voip.notificationOngoing"}
 
 

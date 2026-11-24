@@ -37,6 +37,8 @@ nuwax-mobile-offline-sdk/              # 本机统一入口
 
 ## 3. 环境变量
 
+本地打包脚本使用 PATH 中的 `python3`，兼容 Python 3.9.6，仅使用标准库。可运行 `python3 --version` 确认当前解释器。
+
 统一入口：`source scripts/local-base-env.sh`。
 
 | 变量 | 默认 | 含义 |
@@ -86,7 +88,7 @@ make base-all              # 三份一起打（不装设备、不上 S3）
 |------|------|
 | `android_debug.apk` | Android 真机 / 模拟器（同一包；默认含 HX `debug-server`，见 `ENABLE_HX_DEBUG`） |
 | `android_release.apk` | `make android-tester` 生成的完整可安装测试 APK，使用团队 Android 签名 |
-| `iOS_debug.ipa` | **iOS 真机** HX 自定义基座 |
+| `iOS_debug.ipa` | **iOS 真机** HX 自定义基座，含 VoIP 和其他原生插件。见 [iOS 本地调试与测试包](voip-ios-qa-package.md) |
 | `Pandora_simulator_debug.app` | **iOS 模拟器**（官方命名；**Release + 默认 x86_64/Rosetta**，对齐 ExtAPI 仅有的 x86_64-sim；与真机包勿混用） |
 
 一键出包（不含资源/S3）：`./scripts/package-custom-bases.sh`（`TARGETS=android,ios-device,ios-simulator`）。

@@ -4,11 +4,13 @@ const fake = vi.hoisted(() => ({
   commands: [] as any[],
   events: [] as any[],
   sequence: 0,
+  nativeFails: false,
   capabilities: vi.fn(),
   permissions: vi.fn(),
   create: vi.fn(),
   claimAudio: vi.fn(),
   settings: vi.fn(),
+  background: false,
   token: 'fixture',
 }));
 
@@ -30,9 +32,15 @@ vi.mock('../../utils/apiResponse.uts', () => ({ apiResData: vi.fn() }));
 vi.mock('../../utils/common.uts', () => ({ generateUUID: () => `fixture-${++fake.sequence}` }));
 vi.mock('../../utils/im/imSessionScope.uts', () => ({ getImSessionStamp: () => 'fixture-session' }));
 vi.mock('../../utils/appPrivacyConsent.uts', () => ({ hasAppPrivacyConsent: () => true }));
-vi.mock('../../utils/appLifecycle.uts', () => ({ isAppInBackground: () => false }));
+vi.mock('../../utils/appLifecycle.uts', () => ({ isAppInBackground: () => fake.background }));
+vi.mock('../../utils/meeting/meetingInviteNavigation.uts', () => ({
+  openMeetingInvite: vi.fn(), clearMeetingInviteNavigation: vi.fn(), flushMeetingInviteNavigation: vi.fn(),
+}));
 vi.mock('../../uni_modules/nuwax-voip/utssdk/web/index.uts', () => ({
-  executeVoip: (raw: string) => fake.commands.push(JSON.parse(raw)),
+  executeVoip: (raw: string) => {
+    if (fake.nativeFails) throw new Error("uts plugin unavailable");
+    fake.commands.push(JSON.parse(raw));
+  },
   drainVoipEvents: () => JSON.stringify(fake.events.splice(0)),
   ensureVoipPermissions: fake.permissions,
   openVoipAppSettings: fake.settings,
@@ -41,7 +49,7 @@ vi.mock('../../features/voip/audioFocus.uts', () => ({ claimVoipAudio: fake.clai
 vi.mock('../../utils/voice/stopAllSpeechPlayback.uts', () => ({ stopAllSpeechPlayback: vi.fn() }));
 vi.mock('../../utils/i18n.uts', () => ({ t: (key: string) => key }));
 
-import { bootstrapVoip, clearVoipSession, getVoipSnapshot, startVoipCall, answerVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioInterrupted, voipPermissionPending, voipPushRegistration } from '../../features/voip/callManager.uts';
+import { bootstrapVoip, clearVoipSession, getVoipSnapshot, startVoipCall, answerVoipCall, endVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioInterrupted, voipPermissionPending, voipPushRegistration, setVoipBackground } from '../../features/voip/callManager.uts';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -59,7 +67,8 @@ beforeEach(() => {
     navigateTo: (options: any) => options.complete(),
   });
   clearVoipSession();
-  fake.commands = []; fake.events = []; fake.token = 'fixture';
+  fake.nativeFails = false;
+  fake.commands = []; fake.events = []; fake.token = 'fixture'; fake.background = false;
   fake.capabilities.mockReset().mockResolvedValue({ enabled: true, audio: true, video: true });
   fake.permissions.mockReset().mockResolvedValue(true);
   fake.create.mockReset().mockRejectedValue(new Error('UNEXPECTED_CREATE'));
@@ -69,9 +78,9 @@ beforeEach(() => {
 
 afterEach(() => { clearVoipSession(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
-async function deliverIncoming() {
+async function deliverIncoming(presentation: { nativeIncomingUI: boolean; foregroundIncomingPage: boolean } | null = null) {
   const initialized = fake.commands.find(command => command.op === 'initialize');
-  fake.events.push({ type: 'snapshot', scope: initialized.scope, snapshot: {
+  fake.events.push({ type: 'snapshot', scope: initialized.scope, ...presentation, snapshot: {
     callId: 'incoming', convId: 'chat', version: 1, state: 'ringing',
     callerId: 'bob', calleeId: 'alice', callerDeviceId: 'b1', mediaType: 'audio',
     expiresAt: Date.now() + 45_000,
@@ -191,6 +200,66 @@ describe('incoming actions and event isolation', () => {
   async function incoming() { await bootstrapVoip(); await deliverIncoming(); }
   function event(value: any) { fake.events.push({ scope: fake.commands.find(c => c.op === 'initialize').scope, ...value }); }
 
+  it('opens the foreground call page once for a reported iOS call', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    await deliverIncoming({ nativeIncomingUI: true, foregroundIncomingPage: true });
+    event({ type: 'snapshot', nativeIncomingUI: true, foregroundIncomingPage: true,
+      snapshot: { ...getVoipSnapshot(), version: 2 } });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+  });
+
+  it('opens a still-ringing iOS call after the App returns to the foreground', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    fake.background = true;
+    await deliverIncoming({ nativeIncomingUI: true, foregroundIncomingPage: true });
+    expect(navigate).not.toHaveBeenCalled();
+    fake.background = false;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+    endVoipCall();
+    expect(fake.commands.at(-1)).toMatchObject({ op: 'action', action: 'reject', callId: 'incoming' });
+    await vi.advanceTimersByTimeAsync(300);
+    expect(navigate).toHaveBeenCalledOnce();
+  });
+
+  it('waits for the root page after the system answered a cold-start iOS call', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    vi.stubGlobal('getCurrentPages', () => []);
+    event({ type: 'snapshot', foregroundIncomingPage: true, snapshot: {
+      callId: 'accepted', convId: 'chat', version: 2, state: 'connecting',
+      callerId: 'bob', calleeId: 'alice', callerDeviceId: 'b1', acceptedDeviceId: 'a1', mediaType: 'audio',
+    } });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).not.toHaveBeenCalled();
+    vi.stubGlobal('getCurrentPages', () => [{ route: 'pages/tab-shell/tab-shell' }]);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+    endVoipCall();
+    expect(fake.commands.at(-1)).toMatchObject({ op: 'action', action: 'end', callId: 'accepted' });
+  });
+
+  it('leaves background calls and native-only incoming activities to the system', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    fake.background = true;
+    await deliverIncoming({ nativeIncomingUI: true, foregroundIncomingPage: true });
+    event({ type: 'localEnded', callId: 'incoming', reason: 'remoteCancelled' });
+    await vi.advanceTimersByTimeAsync(100);
+    fake.background = false;
+    event({ type: 'snapshot', nativeIncomingUI: true, snapshot: {
+      callId: 'native', convId: 'chat', version: 1, state: 'ringing',
+      callerId: 'bob', calleeId: 'alice', callerDeviceId: 'b1', mediaType: 'audio',
+      expiresAt: Date.now() + 45_000,
+    } });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(getVoipSnapshot()?.callId).toBe('native');
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
   it('recovers the reserved incoming call after native rejects a conflicting outgoing watch', async () => {
     fake.create.mockResolvedValue({ callId: 'outgoing', convId: 'chat', version: 1, state: 'ringing', callerId: 'alice', calleeId: 'bob', callerDeviceId: 'a1', mediaType: 'audio', expiresAt: Date.now() + 45_000 });
     await startVoipCall('chat', 'audio');
@@ -274,5 +343,22 @@ describe('incoming actions and event isolation', () => {
     event({ type: 'localEnded', callId: 'incoming', reason: 'permissionRequired' });
     await vi.advanceTimersByTimeAsync(100);
     expect(voipAudioRoutes.value).toEqual([]); expect(voipPermissionPending.value).toBe(false); expect(voipAudioInterrupted.value).toBe(false);
+  });
+});
+
+
+describe('native plugin unavailable', () => {
+  it('does not interrupt App background/foreground lifecycle', () => {
+    fake.nativeFails = true;
+    expect(() => setVoipBackground(true)).not.toThrow();
+    expect(() => setVoipBackground(false)).not.toThrow();
+    expect(voipError.value).toBe('CALL_SYSTEM_UNAVAILABLE');
+  });
+  it('retries initialization after a failed native call for the same session', async () => {
+    fake.nativeFails = true;
+    await expect(bootstrapVoip()).rejects.toThrow('uts plugin unavailable');
+    fake.nativeFails = false;
+    await bootstrapVoip();
+    expect(fake.commands.filter(command => command.op === 'initialize')).toHaveLength(1);
   });
 });

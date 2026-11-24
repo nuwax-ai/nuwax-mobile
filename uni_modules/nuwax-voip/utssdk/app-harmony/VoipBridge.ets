@@ -14,11 +14,12 @@ export interface CallData {
   callId: string; convId: string; version: number; state: string; callerId: string; calleeId: string;
   callerDeviceId: string; acceptedDeviceId: string; mediaType: string; displayName: string;
   callerDisplayName?: string; calleeDisplayName?: string;
+  callerAvatar?: string; calleeAvatar?: string;
   connectExpiresAt?: number; prepareExpiresAt?: number; expiresAt: number; connectedAt: number; reason: string;
   serverUrl?: string; participantToken?: string;
   protocol?: string; roomName?: string; msgId?: string; wsUrl?: string; token?: string;
-  convType?: number; peerUserId?: string; peerName?: string;
-  msgType?: string; senderType?: number; senderId?: string; msgStatus?: number; sendTime?: number;
+  convType?: number; peerUserId?: string; peerName?: string; peerAvatar?: string;
+  msgType?: string; senderType?: number; senderId?: string; senderAvatar?: string; msgStatus?: number; sendTime?: number;
   body?: InvitationBody; eventType?: string; payload?: SignalBody;
   heartbeatInterval?: number; seq?: number;
 }
@@ -308,7 +309,8 @@ export class VoipBridge {
     const detail = await VoipBridge.request(`/api/instant-message/conversations/${encodeURIComponent(convId)}`, '', true)
     if (VoipBridge.generation !== run || detail.convType !== 1 || `${detail.peerUserId ?? ''}` !== senderId ||
       sent + 60000 <= Date.now() || VoipBridge.terminal.has(id)) return null
-    return { protocol: 'im-voip-v1', callId: id, roomName: body.roomName, msgId, convId, version: 1, state: 'ringing', callerId: senderId, calleeId: config.userId, callerDeviceId: '', acceptedDeviceId: '', mediaType: body.mediaType, displayName: detail.peerName ?? '', callerDisplayName: detail.peerName, expiresAt: sent + 60000, connectedAt: 0, reason: '' }
+    const callerAvatar = detail.peerAvatar?.trim() || message.senderAvatar?.trim() || ''
+    return { protocol: 'im-voip-v1', callId: id, roomName: body.roomName, msgId, convId, version: 1, state: 'ringing', callerId: senderId, calleeId: config.userId, callerDeviceId: '', acceptedDeviceId: '', mediaType: body.mediaType, displayName: detail.peerName ?? '', callerDisplayName: detail.peerName, callerAvatar, expiresAt: sent + 60000, connectedAt: 0, reason: '' }
   }
   static async receiveInvitation(message: CallData): Promise<void> {
     const id = message.body?.callId

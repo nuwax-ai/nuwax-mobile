@@ -14,6 +14,7 @@ import android.os.Looper
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 
 /** A real notification destination, available before the UTS page resumes.
  * Intents contain only a business call ID. State, identity and actions stay in the singleton.
@@ -32,6 +33,7 @@ class VoipIncomingActivity : Activity() {
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(true); setTurnScreenOn(true) }
         else window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         window.statusBarColor = VoipNativeCallView.BACKDROP_TOP
         window.navigationBarColor = VoipNativeCallView.BACKDROP_BOTTOM
         callId = intent.getStringExtra("callId") ?: ""
@@ -44,14 +46,17 @@ class VoipIncomingActivity : Activity() {
 
     override fun onNewIntent(value: Intent) {
         super.onNewIntent(value)
-        VoipBridge.nativeVisible(callId, false)
-        intent = value; callId = value.getStringExtra("callId") ?: ""
-        pendingAnswer = null; actionPending = false
-        VoipBridge.nativeVisible(callId, true)
-        render(); consumeAnswerIntent()
+        intent = value
+        val nextCallId = value.getStringExtra("callId") ?: ""
+        if (nextCallId != callId) {
+            callId = nextCallId
+            pendingAnswer = null; actionPending = false
+        }
+        render()
     }
     override fun onResume() {
         super.onResume()
+        if (isFinishing) return
         VoipBridge.nativeVisible(callId, true)
         handler.removeCallbacks(refresh); handler.post(refresh)
         consumeAnswerIntent()
@@ -63,19 +68,37 @@ class VoipIncomingActivity : Activity() {
     }
     override fun onDestroy() {
         handler.removeCallbacks(refresh)
-        callView.releaseVideo()
+        callView.release()
         super.onDestroy()
     }
     private fun consumeAnswerIntent() {
-        if (intent.getBooleanExtra("answer", false)) { intent.removeExtra("answer"); answer("audio") }
+        if (!intent.getBooleanExtra("answer", false)) return
+        intent.removeExtra("answer")
+        answer()
     }
-    private fun answer(type: String) {
+    private fun answer(requestedType: String? = null) {
         val value = VoipBridge.uiSnapshot(callId) ?: return
         if (!value.optBoolean("incoming") || value.optString("state") != "ringing" || actionPending) return
+        val type = VoipCallPolicy.answerMediaType(value.optString("mediaType"), requestedType)
         // 会议接听只负责打开会议页，麦克风/摄像头由会议页按需申请，不在锁屏强行弹权限。
         if (value.optString("scene") == "meeting") {
+            val keyguard = getSystemService(KeyguardManager::class.java)
             actionPending = true
-            VoipBridge.uiCommand(callId, "action", mediaType = type)
+            if (keyguard.isKeyguardLocked) {
+                keyguard.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
+                    override fun onDismissSucceeded() { actionPending = false; answer(type) }
+                    override fun onDismissCancelled() { actionPending = false; render() }
+                    override fun onDismissError() { actionPending = false; render() }
+                })
+            } else {
+                // 显式拉起主 App，业务层等前台恢复后消费入会路由。
+                packageManager.getLaunchIntentForPackage(packageName)?.let { launch ->
+                    launch.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    startActivity(launch)
+                }
+                VoipBridge.uiCommand(callId, "action", mediaType = type)
+                finish()
+            }
             return
         }
         // Video and runtime permission prompts require the user to unlock. Audio with an
@@ -85,8 +108,11 @@ class VoipIncomingActivity : Activity() {
         if (type == "video" && ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) missing.add(Manifest.permission.CAMERA)
         val keyguard = getSystemService(KeyguardManager::class.java)
         if ((type == "video" || missing.isNotEmpty()) && keyguard.isKeyguardLocked) {
+            val pendingCallId = callId
             keyguard.requestDismissKeyguard(this, object : KeyguardManager.KeyguardDismissCallback() {
-                override fun onDismissSucceeded() { answer(type) }
+                override fun onDismissSucceeded() {
+                    if (!isFinishing && callId == pendingCallId) answer(type)
+                }
             })
             return
         }

@@ -6,9 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SOURCE_DIR="${NUWAX_BASE_SOURCE:-$ROOT_DIR/unpackage/debug}"
 VERSION="${NUWAX_BASE_VERSION:-}"
-CHANNEL="${NUWAX_BASE_CHANNEL:-debug}"
+CHANNEL="${NUWAX_BASE_CHANNEL:-}"
 TARGETS="${NUWAX_BASE_TARGETS:-}"
-NO_PROMOTE="${NUWAX_BASE_NO_PROMOTE:-0}"
+NO_PROMOTE="${NUWAX_BASE_NO_PROMOTE:-}"
 DRY_RUN="${NUWAX_BASE_DRY_RUN:-0}"
 PROMOTE_ONLY=0
 NOTE=""
@@ -17,7 +17,7 @@ usage() {
   cat <<'HELP'
 Usage: bash scripts/publish-custom-base-s3.sh [options]
 
-  --version ID    基座版本（新发布必填 X.Y.Z；每次新出包使用新版本）
+  --version ID    基座版本（默认取当前分支的显式映射；使用未发布的 X.Y.Z）
   --channel NAME  更新指定通道（默认 debug）
   --source DIR    基座产物所在目录（默认 unpackage/debug）
   --targets LIST  android,ios-device,ios-simulator,harmony（默认上传找到的产物）
@@ -59,6 +59,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$PROMOTE_ONLY" != 1 && -f "$ROOT_DIR/custom-base.lock.json" && -f "$SCRIPT_DIR/resolve-package-profile.mjs" ]]; then
+  if [[ -z "$VERSION" ]]; then
+    VERSION="$(node "$SCRIPT_DIR/resolve-package-profile.mjs" publish-base)" || fail "无法读取分支基座配置"
+  fi
+  if [[ -z "$CHANNEL" ]]; then NO_PROMOTE="${NO_PROMOTE:-1}"; fi
+fi
+CHANNEL="${CHANNEL:-debug}"
+NO_PROMOTE="${NO_PROMOTE:-0}"
 [[ "$CHANNEL" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "无效通道：$CHANNEL"
 if [[ "$PROMOTE_ONLY" == 1 ]]; then
   [[ -n "$VERSION" && "$NO_PROMOTE" != 1 ]] || fail "切换通道需指定已发布版本，且不能使用 --no-promote"

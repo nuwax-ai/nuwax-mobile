@@ -1,41 +1,65 @@
-# 两台 iPhone 的真实 App 测试包
-
-本轮为完整女娲 App（`com.nuwax.app`）的内部测试环境 IPA，使用现有开发描述文件签名。不是原 Alice/Bob 专用测试宿主，也不需要连接 HBuilderX 获取页面资源。版本沿用当前 manifest；不自动合并、上传、修改生产配置或部署服务。
+# iOS 本地调试与测试包
 
 ## 构建与校验
 
-在 `mobile-voip` 工作树、HBuilderX 5.34 与隔离的对应离线 SDK 下执行：
+从移动端 `feat-2026.11` 开始。准备好 Xcode（真机联调用过 27.2）、HBuilderX 5.34、XcodeGen、CocoaPods、Node.js 和 `pnpm install --frozen-lockfile` 安装的项目依赖。启动 HBuilderX 并导入移动端 checkout。首次打包会下载 DCloud 的 iOS 5.34 离线 SDK 到 `out/voip-native-work/ios-sdk/`。已有相同版本时，可以用 `UNIAPPX_SDK_ROOT` 指定 `UniAppX-iOS@5.34` 目录。
+
+签名用团队的 `nuwax-signing/local-secrets.env`，也可以设置 `NUWAX_SIGNING_ENV` 指向本机受控配置。先将 Apple Development 证书和私钥导入钥匙串，并在 Xcode 安装描述文件。参考 [签名配置示例](../../scripts/local-secrets.env.example)，填写 `DCLOUD_APPKEY`、`IOS_DEVELOPMENT_TEAM`、`IOS_PROVISIONING_PROFILE_UUID` 和 `IOS_PROVISIONING_PROFILE_PATH`。Getui 客户端配置由 `NUWAX_IOS_UNIPUSH_CLIENT_IPA` 指定的同应用基座提供，请保存在 `unpackage/debug` 之外。脚本验签时核对包名与 Getui 客户端配置。证书、描述文件、密钥、SDK 和签名包通过团队渠道管理。
+
+**周一（11 月 23 日）签名待办**
+
+- [ ] 与签名负责人确认新申请的 Apple Development 证书及对应私钥的配置方式。确认 `com.nuwax.app` 的开发描述文件包含该证书、同事的真机 UDID，并带 `aps-environment=development`。补齐同应用的 DCloud AppKey 和测试 UniPush 客户端配置后，由同事在自己的 Mac 构建并覆盖安装一次。
+
+### 日常调试基座
 
 ```bash
-bash scripts/voip-native/package-business-qa-ios.sh
+make app-resource
+make base-ios-device
+pnpm hx:ios:device -- --playground custom --customType device \
+  --deviceId "$IPHONE_ID" --ipaPath "$PWD/unpackage/debug/iOS_debug.ipa"
 ```
 
-默认从 `${NUWAX_SIGNING_HOME:-$HOME/workspace/nuwax-signing}/local-secrets.env` 加载统一签名配置，也可通过 `NUWAX_SIGNING_ENV` 指定受控配置。脚本先准备离线资源，再将当前源码快照复制到忽略目录 `out/voip-business-qa-project`；仅该副本固定测试域名 `https://testagent.xspaceagi.com`、开启 Android/iOS 测试域名的业务通话入口，并跳过会替换当前包的版本更新检查。主工作树的生产默认地址、升级策略与平台验收开关不变。QA 原生宿主还核对签名宿主固定的 API origin，防止恢复旧安装遗留的生产电话身份。
+基座输出到 `unpackage/debug/iOS_debug.ipa`。运行前，将 `IPHONE_ID` 设为 `pnpm hx:ios:devices` 列出的设备序列号，也可在 HBuilderX 中选择“使用自定义基座运行”。只改业务页面时可以复用已生成的基座。修改 Swift 或其他原生插件后，重新生成资源并打基座。需要调试 HX 生成的 Swift 时，见 [HBuilderX 5.34 的 iOS 原生复用](voip-business-integration.md#hbuilderx-534-的-ios-原生复用)。
+
+### 可直接安装的测试 IPA
+
+```bash
+make ios-tester
+```
+
+脚本先准备离线资源，再将当前源码快照复制到 `out/voip-business-qa-project`。该副本固定测试域名 `https://testagent.xspaceagi.com`，开启业务通话入口，并跳过会替换当前包的版本更新检查。QA 原生宿主还核对固定的 API origin，防止恢复旧安装遗留的生产电话身份。
 
 HBuilderX 生成本地 iOS 发行资源，随后离线 SDK 构建 Debug 原生宿主、签名、验证 APNs 元数据并生成独立 IPA。SDK `ipatype=2`，不链接 HX DebugServe；调试基座仍沿用原流程及路径。全 App 编译可临时提高 HX 堆内存，构建结束恢复既有配置。资源、证书派生文件及产物都不进入版本库。
 
 产物位置：
 
-- `out/voip-business-packages/Nuwax-VoIP-Test-<时间>.ipa`：发给同事安装的完整包。
+- `out/voip-business-packages/Nuwax-iOS-Test-<时间>.ipa`：发给同事安装的完整包。
 - 同名 `.sha256`：文件完整性校验；同名 `.json`：构建变体元数据。
-- `Nuwax-VoIP-Test-latest.ipa`：最新包的本地软链，转发时选择实际 IPA 文件。
-- `out/voip-ios-audit-20261117/ipa-verification.json`：环境、内置资源与当前原生模块摘要核对结果。
+- `Nuwax-iOS-Test-latest.ipa`：最新包的本地软链，转发时选择实际 IPA 文件。
+- `out/voip-business-packages/ios-qa-verification.json`：环境、内置资源与当前原生模块摘要核对结果。
 
 `verify-business-qa-ios.py` 校验包名、真实产品名称、测试环境、发行宿主模式、后台模式、无 DebugServe、导出资源和内置资源逐文件一致、当前原生 Swift 实现一致及有效签名。签名与构建通过仍不代表实机启动或通话矩阵已验收。
 
 ## 安装和账号
 
-1. 沿用团队已有的开发包安装方式（例如 Apple Configurator/Xcode）；也可把手机接到这台 Mac 后安装。开发签名的手机需允许开发者模式，系统信任按实际提示完成。2026-11-17 已回读本次 IPA 的内嵌描述文件，确认包含 LLD16 和 zhengqiang（ZQ）；签名材料统一维护在 `nuwax-signing`，未在 worktree 新增持久签名副本。
+1. iPhone 开启开发者模式，解锁并用 USB 连接。可以用 Apple Configurator 安装 IPA，也可以用 CoreDevice 安装本机生成且已签名的 `.app`。
 2. 这是同一 `com.nuwax.app` 的测试包，安装会覆盖现有同包名 App。测试环境原账号可继续使用；若现有安装曾登录生产环境，须退出后重新登录测试账号，不能把旧生产凭据当作测试凭据。
 3. 两台手机分别登录不同测试账号，在真实联系人单聊中点「＋ → 语音通话/视频通话」。不用填写 LAN 地址、Alice/Bob 或 RTC JWT。
 4. 本机记录从同一加号面板的「通话记录」进入；只显示该账号在这台手机上观察到的呼叫。回拨重新创建呼叫和检查能力，不复用旧 callId。
+
+```bash
+# 将 COREDEVICE_ID 设为下列命令返回的目标设备 ID。
+xcrun devicectl list devices
+xcrun devicectl device install app --device "$COREDEVICE_ID" \
+  out/voip-business-qa-ios-derived/Build/Products/Debug-iphoneos/UniAppX.app
+```
 
 ## 分层测试
 
 先测前台两账号双向拨号、拒接、取消、无人接听、接通/静音/挂断；每通核对两端界面、系统通话和动态岛计时是否清除。再测最小化返回通话、权限首次申请/拒绝与设置、视频后台停采、音频路由、系统音频打断、30 秒重连上限及挂断后资源释放。
 
-后台、锁屏、有进程、系统挂起、系统回收无进程、用户强退、重启首次解锁前后分别记录。**前台与在线通话通过不能作为未启动唤醒通过。** 专用 APNs sender、独立电话设备路由、原生凭据续期、权威终态/原子接听需后端先就绪；这些依赖与验收条件单列在[后端待配合清单](voip-backend-required.md)。本轮没有替团队修改任何生产证书或服务配置。
+验证冷启动时，先登录测试账号并确认原生日志出现 `PushKit registration state=registered senderReady=true`。关闭专注模式、锁屏，通过调试工具结束 App 进程，再从另一个测试账号正常拨号。核对系统来电、接听和主叫端同一条邀请的通话时长。流程中的 `registrationId` 由手机登记，由 IM 按目标 CID 交给测试云函数。后台、用户上滑退出、重启首次解锁前后分别记录。
 
-2026-11-17 已对照 PC Web 重新确认：会议建房、RTC token 和在线邀请/接听/取消采用现有接口，**这个 IPA 已在复用，可直接先测两台 iPhone 在线互拨**，无需等待新会议 API，也无需因本次文档澄清重打包。RTC token 续签已有接口；未定的原生续期指平台登录凭据。后端新路径和产品增强不作为本次在线接打的统一阻断条件。
+11 月 21 日，iPhone 16（iOS 27.3）在锁屏、App 进程已退出状态下，通过测试 Web 的正常拨号收到 VoIP 推送并接听，Web 记录通话 9 秒。会议建房、RTC token 和在线邀请、接听、取消仍使用现有接口。
 
 当前最低安装范围 iOS 15；iOS 15–17.3 使用 PushKit/CallKit，17.4+ 使用 PushKit/LiveCommunicationKit。两条路径都不因代码接入而视为验收通过，仍需分别验证前台、后台、锁屏和未启动时系统接听。

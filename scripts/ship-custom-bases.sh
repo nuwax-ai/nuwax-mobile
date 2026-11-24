@@ -33,6 +33,11 @@ SKIP_APP_RESOURCE="${SKIP_APP_RESOURCE:-0}"
 SKIP_PUBLISH="${SKIP_PUBLISH:-0}"
 TARGETS="${TARGETS:-all}"
 
+if [[ "$SKIP_PUBLISH" != 1 && -z "${NUWAX_BASE_VERSION:-}" && -f "$ROOT_DIR/custom-base.lock.json" && -f "$SCRIPT_DIR/resolve-package-profile.mjs" ]]; then
+  NUWAX_BASE_VERSION="$(node "$SCRIPT_DIR/resolve-package-profile.mjs" publish-base)" || exit 1
+  export NUWAX_BASE_VERSION
+fi
+
 if [[ "$SKIP_PUBLISH" != 1 && ! "${NUWAX_BASE_VERSION:-}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
   echo "发布前须显式设置 NUWAX_BASE_VERSION 为 X.Y.Z 格式的新基座版本" >&2
   exit 1

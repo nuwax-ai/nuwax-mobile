@@ -34,6 +34,9 @@ enum NuwaxVoipCallPolicy {
         guard !terminal else { return false }
         return state == "connecting" || state == "active" || (state == "ringing" && outgoing)
     }
+    static func answerMediaType(invited: String?, requested: String?) -> String {
+        (invited == "video" && (requested == nil || requested == "video")) ? "video" : "audio"
+    }
     static func isDuplicateIncomingReport(_ error: Error) -> Bool {
         let value = error as NSError
         return value.domain == "com.apple.CallKit.error.incomingcall" && value.code == 2

@@ -13,14 +13,13 @@ const ordinaryFixtures = JSON.parse(readFileSync(resolve(import.meta.dirname, 'f
 const now = 1_793_000_000_000;
 const locator = { type: 'voip', convId: '245475557381246976', msgId: '9223372036854775807' };
 const notificationOnlyTransports = [
-  ['android-honor', 'android'],
-  ['android-xiaomi', 'android'],
-  ['android-vivo', 'android'],
-  ['android-oppo', 'android'],
-  ['android-oppo-global', 'android'],
-  ['android-meizu', 'android'],
-  ['android-smartisan', 'android'],
-  ['android-fcm', 'android'],
+  ['android-honor', 'ho'],
+  ['android-xiaomi', 'xm'],
+  ['android-oppo', 'op'],
+  ['android-oppo-global', 'opg'],
+  ['android-meizu', 'mz'],
+  ['android-smartisan', 'st'],
+  ['android-fcm', 'fcm'],
 ] as const;
 
 function load(entry = latestEntry, env: Record<string, string> = {}) {
@@ -28,11 +27,12 @@ function load(entry = latestEntry, env: Record<string, string> = {}) {
   const request = vi.fn().mockResolvedValue({ errCode: 0, data: { accepted: true } });
   const manager = { sendMessage: send, request };
   const database = vi.fn(() => { throw new Error('push delivery should not query a database'); });
+  const log = vi.fn();
   const module = { exports: {} as any };
   runInNewContext(readFileSync(entry, 'utf8'), { filename: entry, exports: module.exports, require: createRequire(entry), Buffer,
     process: { env: { PUSH_SIGN_KEY: 'fixture-only-sign', ...env } },
-    uniCloud: { database, getPushManager: () => manager }, console: { log() {}, error() {} } });
-  return { send, request, manager, database,
+    uniCloud: { database, getPushManager: () => manager }, console: { log, error() {} } });
+  return { send, request, manager, database, log,
     call: (body: any, sign = 'fixture-only-sign') => module.exports.main({ headers: { 'x-push-sign': sign }, body: JSON.stringify(body) }) };
 }
 
@@ -149,10 +149,25 @@ describe('native call delivery', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it.each(notificationOnlyTransports)('keeps %s unavailable for native calls on %s', async (transport, platform) => {
-    const { call, send, request } = load(latestEntry, { NUWAX_VOIP_ANDROID_TRANSPORTS: transport });
-    const result = await call({ ...makeBody(), callRoute: { cid, platform, transport } });
-    expect(result).toEqual({ errCode: 400, errMsg: 'native call transport unavailable' });
+  it.each(notificationOnlyTransports)('delivers an explicit %s route by notification', async (transport) => {
+    const { call, send, request } = load();
+    const body = makeBody();
+    const callRoute = { cid, platform: 'android', transport };
+    expect((await call({ ...body, push_clientid: [cid], callRoute })).errCode).toBe(0);
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0]).toMatchObject({ push_clientid: [cid], payload: body.payload });
+    expect(send.mock.calls[0][0].payload).not.toHaveProperty('delivery');
+    expect(send.mock.calls[0][0].settings).not.toHaveProperty('strategy');
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('rejects a notification-only route for a different target and skips expired invitations', async () => {
+    const { call, send, request } = load();
+    const callRoute = { cid, platform: 'android', transport: 'android-honor' };
+    expect(await call({ ...makeBody(), push_clientid: [cid, 'other-cid'], callRoute }))
+      .toEqual({ errCode: 400, errMsg: 'one matching call device is required' });
+    expect(await call({ ...makeBody(Date.now() - 1), callRoute }))
+      .toEqual({ errCode: 0, data: { skipped: true } });
     expect(send).not.toHaveBeenCalled();
     expect(request).not.toHaveBeenCalled();
   });
@@ -533,6 +548,58 @@ describe('automatic vendor route resolution', () => {
     return loadable;
   };
 
+  it.each(notificationOnlyTransports)('resolves %s from the registry and delivers one notification', async (transport, brand) => {
+    const cid = 'vendor-registry-cid';
+    const { call, send, request, log } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand: brand.toUpperCase(), phone_type: 1 },
+    });
+    const result = await call(makeCall(cid));
+    const [, routeLog] = log.mock.calls.find(([event]) => event === '[push-send] call route auto')!;
+    expect(JSON.parse(routeLog)).toMatchObject({ brand, transport });
+    expect(result.data.results).toEqual([{ delivery: 'notification', errCode: 0, cids: [cid] }]);
+    expect(send).toHaveBeenCalledOnce();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it.each(['call', 'meeting'])('uses the UniPush vivo call options for a ringing %s', async scene => {
+    const cid = 'vivo-cid';
+    const { call, send, request } = withRegistry(load(), { [cid]: { brand: 'VV', device_token: 'vendor-registration' } });
+    const base = makeCall(cid);
+    const payload = scene === 'call' ? base.payload : { ...base.payload, scene, convType: 2,
+      inviteId: 'qa-meeting', roomName: 'qa-room', title: '测试会议', silent: false, groupCall: true };
+    const body = { ...base, type: 'voip', push_clientid: [cid], payload };
+    const auto = await call(body);
+    expect(auto.data.results).toMatchObject([{ cid, transport: 'android-vivo', delivery: 'native', errCode: 0 }]);
+    const args = send.mock.calls[0][0];
+    expect(args.push_clientid).toEqual([cid]);
+    expect(args.settings).toEqual({ ttl: 5000, strategy: { vv: 2 } });
+    expect(args.options.android.VV).toEqual({ '/header/message-type': 3, '/message/extraData': JSON.stringify(args.payload),
+      '/options/ttl': 5, '/options/appMessageId': args.request_id });
+    expect(args.payload).toMatchObject({ scene, type: 'voip', delivery: 'android-native', pushEnvironment: 'test' });
+    expect(args).not.toHaveProperty('category');
+    expect(JSON.stringify(args)).not.toContain('vendor-registration');
+    await call({ ...body, callRoute: { cid, transport: 'android-vivo', platform: 'android' } });
+    expect(send.mock.calls[1][0].request_id).toBe(args.request_id);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('propagates a vivo submission failure without sending an IM duplicate', async () => {
+    const cid = 'vivo-cid';
+    const { call, send } = withRegistry(load(), { [cid]: { brand: 'vv', device_token: 'token' } });
+    send.mockResolvedValueOnce({ errCode: 10097 });
+    expect((await call(makeCall(cid))).errCode).toBe(10097);
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it('skips a vivo call with less than one second left on either routing path', async () => {
+    const cid = 'vivo-cid';
+    const { call, send } = withRegistry(load(), { [cid]: { brand: 'vv', device_token: 'token' } });
+    const body = { ...makeCall(cid), settings: { ttl: 500 } };
+    expect((await call(body)).data.results).toMatchObject([{ cid, skipped: true }]);
+    expect((await call({ ...body, callRoute: { cid, transport: 'android-vivo', platform: 'android' } })).data.skipped).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it('routes one Huawei-registered cid through the native transmission channel', async () => {
     const cid = 'huawei-registry-cid';
     const { call, send, request, manager } = withRegistry(load(), {
@@ -583,7 +650,9 @@ describe('automatic vendor route resolution', () => {
 
   it.each([
     ['no vendor token', { device_token: '', brand: 'hw', phone_type: 1 }],
-    ['non-Huawei brand', { device_token: 'vendor-token', brand: 'vv', phone_type: 1 }],
+    ['no vivo vendor token', { device_token: ' ', brand: 'vv', phone_type: 1 }],
+    ['unknown brand', { device_token: 'vendor-token', brand: 'unknown', phone_type: 1 }],
+    ['HarmonyOS reported as Huawei', { device_token: 'vendor-token', brand: 'hw', phone_type: 7 }],
     ['missing registry entry', undefined],
   ])('keeps the ordinary notification when the registry says %s', async (_name, entry) => {
     const cid = 'registry-cid';

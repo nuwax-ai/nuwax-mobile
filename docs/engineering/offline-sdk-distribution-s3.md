@@ -1,5 +1,7 @@
 # 离线 SDK · S3 分发
 
+当前分支的 SDK 选择、独立的本地目录及维护者预演命令见 [分支打包手册](./branch-packaging.md)。以下历史默认路径及 latest 行为适用于独立下载入口和未配置分支 SDK 的 checkout。
+
 > 把 `nuwax-mobile-offline-sdk`（DCloud uni-app x 5.15 SDK + 乐鑫配网依赖的官方源材料）放到 Nuwax S3（MinIO），团队成员一条命令拉取，避免"每人各自找 SDK / 路径写死本机"。
 >
 > 与自定义基座分发同构：[custom-base-distribution-s3.md](./custom-base-distribution-s3.md)。维护规范：[local-custom-base-maintenance.md](./local-custom-base-maintenance.md)。

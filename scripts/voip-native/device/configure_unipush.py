@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Restore uni-push dependencies and client configuration for an opted-in local build."""
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -12,6 +14,10 @@ TOOLS = "{http://schemas.android.com/tools}"
 STOCK_RECEIVER = "uts.sdk.modules.DCloudUniPush.UniPushIntentService"
 CALL_RECEIVER = "com.nuwax.voip.VoipUniPushIntentService"
 CALL_RECEIVER_FILE = "app/src/main/java/com/nuwax/voip/VoipUniPushIntentService.kt"
+VIVO_STOCK_RECEIVER = "com.igexin.sdk.VivoPushMessageReceiver"
+VIVO_PUSH_RECEIVER = "com.nuwax.voip.VivoVoipPushMessageReceiver"
+VIVO_CALL_RECEIVER = "com.nuwax.voip.VivoVoipCallReceiver"
+VIVO_RECEIVER_FILE = "app/src/main/java/com/nuwax/voip/VivoVoipPushMessageReceiver.kt"
 ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
 ET.register_namespace("tools", "http://schemas.android.com/tools")
 
@@ -41,11 +47,17 @@ def clear_previous_configuration(project: Path) -> None:
                 node.get(ANDROID + "name") == STOCK_RECEIVER and node.get(TOOLS + "node") == "remove"
             ):
                 application.remove(node)
+        for node in list(application.findall("receiver")):
+            if node.get(ANDROID + "name") in (VIVO_PUSH_RECEIVER, VIVO_CALL_RECEIVER) or (
+                node.get(ANDROID + "name") == VIVO_STOCK_RECEIVER and node.get(TOOLS + "node") == "remove"
+            ):
+                application.remove(node)
         (project / CALL_RECEIVER_FILE).unlink(missing_ok=True)
+        (project / VIVO_RECEIVER_FILE).unlink(missing_ok=True)
         tree.write(manifest, encoding="utf-8", xml_declaration=True)
 
 
-def configure(project: Path, config_file: Path | None) -> None:
+def configure(project: Path, config_file: Path | None, *, enable_vivo_voip: bool = False) -> None:
     if config_file is None:
         clear_previous_configuration(project)
         return
@@ -92,6 +104,8 @@ def configure(project: Path, config_file: Path | None) -> None:
         metadata.update({"OPPOPUSH_APPKEY": "${OPPO_APP_KEY}", "OPPOPUSH_APPSECRET": "${OPPO_APP_SECRET}"})
 
     vivo = config.get("vivo")
+    voip_module = (project / "uts-nuwax-voip").is_dir()
+    vivo_voip = enable_vivo_voip and vivo is not None and voip_module
     if vivo is not None:
         app_id_vivo = vivo.get("appId") if isinstance(vivo, dict) else None
         app_key_vivo = vivo.get("appKey") if isinstance(vivo, dict) else None
@@ -99,7 +113,8 @@ def configure(project: Path, config_file: Path | None) -> None:
             raise SystemExit("A valid vivo client AppID is required")
         if not isinstance(app_key_vivo, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", app_key_vivo):
             raise SystemExit("A valid vivo client AppKey is required")
-        dependencies.append("implementation 'com.assist-v3:vivo:3.1.2'")
+        vivo_version = "3.3.0" if vivo_voip else "3.1.2"
+        dependencies.append(f"implementation 'com.assist-v3:vivo:{vivo_version}'")
         # The vivo SDK reads these before the adapter's app_id and api_key aliases.
         metadata.update({"com.vivo.push.app_id": "${VIVO_APP_ID}", "com.vivo.push.api_key": "${VIVO_APP_KEY}"})
 
@@ -163,13 +178,23 @@ def configure(project: Path, config_file: Path | None) -> None:
         node.set(TOOLS + "replace", "android:value")
     # Getui 3.x discovers the one GTIntentService declared in the merged manifest.
     # Its subclass keeps UniPush behavior and can receive before UTS/JS is resumed.
-    if (project / "uts-nuwax-voip").is_dir():
-        source = Path(__file__).resolve().parents[3] / "uni_modules/nuwax-voip/native/android-unipush/VoipUniPushIntentService.kt"
+    if voip_module:
+        source = Path(__file__).resolve().parents[3] / "uni_modules/nuwax-voip/native/android-unipush"
         target = project / CALL_RECEIVER_FILE
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
+        shutil.copyfile(source / target.name, target)
         ET.SubElement(application, "service", {ANDROID + "name": STOCK_RECEIVER, TOOLS + "node": "remove"})
         ET.SubElement(application, "service", {ANDROID + "name": CALL_RECEIVER, ANDROID + "exported": "false"})
+        if vivo_voip:
+            target = project / VIVO_RECEIVER_FILE
+            shutil.copyfile(source / target.name, target)
+            ET.SubElement(application, "receiver", {ANDROID + "name": VIVO_STOCK_RECEIVER, TOOLS + "node": "remove"})
+            receiver = ET.SubElement(application, "receiver", {
+                ANDROID + "name": VIVO_PUSH_RECEIVER, ANDROID + "exported": "false", ANDROID + "process": ":pushservice"
+            })
+            intent_filter = ET.SubElement(receiver, "intent-filter")
+            ET.SubElement(intent_filter, "action", {ANDROID + "name": "com.vivo.pushclient.action.RECEIVE"})
+            ET.SubElement(application, "receiver", {ANDROID + "name": VIVO_CALL_RECEIVER, ANDROID + "exported": "false"})
     tree.write(manifest, encoding="utf-8", xml_declaration=True)
     print("✓ uni-push client configured; vendor adapters: " + ", ".join(vendor for vendor in ["huawei", "honor", "xiaomi", "vivo", "oppo"] if config.get(vendor)))
 

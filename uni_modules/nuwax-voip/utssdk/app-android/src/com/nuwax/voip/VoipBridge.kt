@@ -5,6 +5,9 @@ import android.app.*
 import android.content.*
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.net.Uri
 import android.media.AudioManager
 import android.os.Build
@@ -19,6 +22,8 @@ import androidx.core.app.Person
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.telecom.*
+import com.caverock.androidsvg.SVG
+import com.caverock.androidsvg.SVGParseException
 import io.livekit.android.LiveKit
 import io.livekit.android.LiveKitOverrides
 import io.livekit.android.AudioOptions
@@ -34,6 +39,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import okhttp3.*
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
@@ -89,6 +95,8 @@ object VoipBridge {
     private var camera = false
     private var hidden = false
     private var nativeUiId = ""
+    private var appCallUiId = ""
+    private var incomingUiWait: Job? = null
     private var speaker = false
     private val terminal = LinkedHashSet<String>()
     private val incomingNotifications = VoipIncomingNotificationGate()
@@ -108,12 +116,15 @@ object VoipBridge {
     @JvmStatic fun presentationStatus(ctx: Context): String {
         val manager = ctx.getSystemService(NotificationManager::class.java)
         val channel = VoipNotificationChannels.incoming(manager)
+        val presented = manager.getNotificationChannel(VoipNotificationChannels.PRESENTED_INCOMING)
         val audio = ctx.getSystemService(AudioManager::class.java)
+        val interruptionFilter = manager.currentInterruptionFilter
         return JSONObject().put("supported", true)
             .put("bundleId", ctx.packageName)
             .put("developmentListener", VoipDevControlService.running)
             .put("uniPushConfigured", ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA).metaData?.getBoolean("nuwax.voip.uniPush", false) == true)
             .put("notificationsAllowed", NotificationManagerCompat.from(ctx).areNotificationsEnabled())
+            .put("overlayAllowed", Settings.canDrawOverlays(ctx))
             .put("fullScreenAllowed", Build.VERSION.SDK_INT < 34 || manager.canUseFullScreenIntent())
             .put("fullScreenPermissionChecked", Build.VERSION.SDK_INT >= 34)
             .put("sdk", Build.VERSION.SDK_INT).put("manufacturer", Build.MANUFACTURER)
@@ -121,19 +132,104 @@ object VoipBridge {
             .put("channelId", channel?.id ?: VoipNotificationChannels.INCOMING)
             .put("channelImportance", channel?.importance ?: -1)
             .put("channelSoundEnabled", channel?.sound != null)
+            .put("presentedChannelExists", presented != null && channel != null && channel.importance > NotificationManager.IMPORTANCE_DEFAULT)
+            .put("presentedChannelAudible", presented != null && presented.importance >= NotificationManager.IMPORTANCE_DEFAULT && presented.sound != null)
             .put("ringerMode", audio.ringerMode).put("ringVolume", audio.getStreamVolume(AudioManager.STREAM_RING))
-            .put("interruptionFilter", manager.currentInterruptionFilter)
+            .put("interruptionFilter", interruptionFilter)
+            .put("doNotDisturbActive", interruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL &&
+                interruptionFilter != NotificationManager.INTERRUPTION_FILTER_UNKNOWN)
+            .put("ringerAudible", audio.ringerMode == AudioManager.RINGER_MODE_NORMAL && audio.getStreamVolume(AudioManager.STREAM_RING) > 0)
             .put("keyguardLocked", ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked).toString()
     }
     @JvmStatic fun openPresentationSettings(ctx: Context) {
-        val intent = if (Build.VERSION.SDK_INT >= 34) Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, Uri.parse("package:" + ctx.packageName))
-            else Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
-        ctx.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        openAlertSettings(ctx, if (Build.VERSION.SDK_INT >= 34) "fullScreen" else "notifications")
+    }
+    @JvmStatic fun openAlertSettings(ctx: Context, setting: String): Boolean {
+        val packageUri = Uri.fromParts("package", ctx.packageName, null)
+        val notifications = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+        val intent = when (setting) {
+            "notifications" -> notifications
+            "channel", "presentedChannel" -> {
+                val manager = ctx.getSystemService(NotificationManager::class.java)
+                val channel = if (setting == "channel") {
+                    runCatching { ensureNotificationChannels(ctx) }
+                    VoipNotificationChannels.incoming(manager)
+                } else manager.getNotificationChannel(VoipNotificationChannels.PRESENTED_INCOMING)
+                if (channel != null) Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+                    .putExtra(Settings.EXTRA_CHANNEL_ID, channel.id)
+                else notifications
+            }
+            "overlay" -> Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, packageUri)
+            "fullScreen" -> Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, packageUri)
+            else -> return false
+        }
+        if (startSettings(ctx, intent)) return true
+        if ((setting == "channel" || setting == "presentedChannel") && intent !== notifications && startSettings(ctx, notifications)) return true
+        return startSettings(ctx, Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri))
     }
     @JvmStatic fun openAppSettings(ctx: Context) {
-        ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + ctx.packageName)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        startSettings(ctx, Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", ctx.packageName, null)))
     }
-    internal fun label(key: String): String = config.optJSONObject("labels")?.optString(key, key) ?: key
+    private fun startSettings(ctx: Context, intent: Intent): Boolean {
+        return runCatching { ctx.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }.isSuccess
+    }
+    internal fun label(key: String): String {
+        val fallback = when (key) {
+            "meetingInvitation" -> "会议邀请"
+            "meetingNumber" -> "会议号"
+            "meetingInvitedBy" -> "{name} 邀请你加入会议"
+            "meetingJoin" -> "入会"
+            "meetingIgnore" -> "忽略"
+            "meetingJoining" -> "正在加入会议…"
+            "meetingMinimize" -> "收起"
+            else -> key
+        }
+        return config.optJSONObject("labels")?.optString(key, fallback) ?: fallback
+    }
+    internal suspend fun loadPeerAvatar(raw: String, sizePx: Int): Bitmap? {
+        val base = config.optString("apiBaseUrl").toHttpUrlOrNull() ?: return null
+        val url = base.resolve(raw) ?: return null
+        val sameOrigin = url.scheme == base.scheme && url.host == base.host && url.port == base.port
+        if (url.scheme != "https" && !(sameOrigin && config.optBoolean("development"))) return null
+        if (url.username.isNotEmpty() || url.password.isNotEmpty()) return null
+        val request = Request.Builder().url(url)
+        if (sameOrigin && url.encodedPath.startsWith("/api/f/", ignoreCase = true)) {
+            request.header("Authorization", "Bearer " + config.optString("accessToken"))
+        }
+        return withContext(Dispatchers.IO) {
+            try {
+                http.newCall(request.build()).execute().use { response ->
+                    if (!response.isSuccessful) return@use null
+                    val source = response.body?.source() ?: return@use null
+                    if (source.request(4 * 1024 * 1024L + 1)) return@use null
+                    val bytes = source.readByteArray()
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@use decodeSvgAvatar(bytes, sizePx)
+                    val largestSide = maxOf(bounds.outWidth, bounds.outHeight)
+                    val options = BitmapFactory.Options()
+                    options.inSampleSize = 1
+                    while (largestSide / options.inSampleSize > sizePx * 2) options.inSampleSize *= 2
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+                }
+            } catch (_: java.io.IOException) { null }
+        }
+    }
+    private fun decodeSvgAvatar(bytes: ByteArray, sizePx: Int): Bitmap? {
+        val content = bytes.toString(Charsets.UTF_8)
+        // The profile uploader accepts SVG. Profile images need no XML entities.
+        if (!content.contains("<svg") || content.contains("<!ENTITY")) return null
+        return try {
+            val svg = SVG.getFromString(content)
+            Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888).also {
+                svg.renderToCanvas(Canvas(it))
+            }
+        } catch (_: SVGParseException) { null }
+        catch (_: RuntimeException) { null }
+        catch (_: StackOverflowError) { null }
+    }
     internal fun developmentListenerAllowed(ctx: Context): Boolean = isTestPackage(ctx) && config.optBoolean("development") && config.optString("accessToken").isNotEmpty()
     internal fun uiSnapshot(id: String): JSONObject? {
         val value = current ?: return null
@@ -144,8 +240,10 @@ object VoipBridge {
     }
     internal fun nativeVisible(id: String, visible: Boolean) {
         trace(if (visible) "native call activity visible" else "native call activity hidden")
-        if (visible && current?.optString("callId") == id) nativeUiId = id
-        else if (!visible && nativeUiId == id) nativeUiId = ""
+        if (visible && current?.optString("callId") == id) {
+            nativeUiId = id
+            updatePresentedIncoming(id)
+        } else if (!visible && nativeUiId == id) nativeUiId = ""
         scope.launch {
             try {
                 if (room != null) VoipCallService.enableCapture(camera && cameraVisible())
@@ -187,11 +285,20 @@ object VoipBridge {
                     "switchCamera" -> (room?.localParticipant?.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack)?.switchCamera()
                     "background" -> {
                         hidden = command.optBoolean("hidden")
+                        if (!hidden && appCallUiId.isNotEmpty()) updatePresentedIncoming(appCallUiId)
                         room?.localParticipant?.setCameraEnabled(camera && cameraVisible())
                         if (room != null) VoipCallService.enableCapture(camera && cameraVisible())
                         if (!hidden && activity.get()?.intent?.getBooleanExtra("nuwaxVoip", false) == true) {
                             activity.get()?.intent?.removeExtra("nuwaxVoip"); emit("openPage")
                         }
+                    }
+                    "callPageVisibility" -> {
+                        val id = command.optString("callId")
+                        val visible = command.optBoolean("visible")
+                        if (visible && id == current?.optString("callId")) {
+                            appCallUiId = id
+                            updatePresentedIncoming(id)
+                        } else if (!visible && appCallUiId == id) appCallUiId = ""
                     }
                     "audioRoute" -> setAudioRoute(command.optString("route"))
                 }
@@ -211,6 +318,14 @@ object VoipBridge {
         val same = config.optString("userId") == value.optString("userId") && config.optString("apiBaseUrl") == value.optString("apiBaseUrl") && config.optString("deviceId") == value.optString("deviceId")
         if (!same) reset()
         config = value
+        if (same) {
+            // 锁屏入会唤醒 UTS 后会更换 scope；同一账号的已确认入会意图不能因此丢失。
+            queue.forEach { event ->
+                if (event.optString("type") == "meetingInvite" && event.optString("action") == "accept") {
+                    event.put("scope", config.optString("scope"))
+                }
+            }
+        }
         trace(if (business()) "business session accepted" else "development session accepted")
         hidden = activity.get() == null || value.optBoolean("background")
         saveConfig()
@@ -365,9 +480,12 @@ object VoipBridge {
         if (conversation.optInt("convType") != 1 || conversation.optString("peerUserId") != sender) return
         val deadline = if (push == null) sent + 60000 else push.optLong("expiresAt")
         if (deadline <= System.currentTimeMillis() || terminal.contains(id) || current?.optString("callId") == id) return
+        val peerAvatar = (conversation.opt("peerAvatar") as? String)?.trim().orEmpty()
+            .ifEmpty { (message.opt("senderAvatar") as? String)?.trim().orEmpty() }
         val next = JSONObject().put("protocol", "im-voip-v1").put("callId", id).put("roomName", body.getString("roomName")).put("msgId", message.getString("msgId")).put("convId", conv)
             .put("version", 1).put("state", "ringing").put("callerId", sender).put("calleeId", config.getString("userId")).put("callerDeviceId", "").put("acceptedDeviceId", "")
-            .put("mediaType", media).put("callerDisplayName", conversation.optString("peerName", sender)).put("calleeDisplayName", config.getString("userId")).put("expiresAt", deadline)
+            .put("mediaType", media).put("callerDisplayName", conversation.optString("peerName", sender)).put("calleeDisplayName", config.getString("userId"))
+            .put("callerAvatar", peerAvatar).put("expiresAt", deadline)
         if (current != null && current?.optString("callId") != id) { notifyBusinessEnd(next, "busy"); terminal.add(id); return }
         trace("invitation accepted"); adopt(next)
     }
@@ -399,10 +517,12 @@ object VoipBridge {
         val sender = message.optString("senderId")
         val next = JSONObject().put("protocol", "im-voip-v1").put("scene", "meeting")
             .put("callId", inviteId).put("inviteId", inviteId).put("roomName", room).put("title", title)
+            .put("passcode", body.optString("passcode"))
             .put("msgId", msg).put("convId", conv).put("version", 1).put("state", "ringing")
             .put("callerId", sender).put("calleeId", config.optString("userId")).put("acceptedDeviceId", "")
             .put("mediaType", media)
             .put("callerDisplayName", message.optString("senderName", title))
+            .put("callerAvatar", message.opt("senderAvatar") as? String ?: "")
             .put("calleeDisplayName", config.optString("userId"))
             .put("expiresAt", deadline)
         current = next
@@ -416,12 +536,8 @@ object VoipBridge {
                 closeMeeting()
             }
         }
+        if (!hidden) requestIncomingCallUi(inviteId)
         publishCall()
-        val ctx = context
-        if (!hidden && ctx != null) {
-            try { ctx.startActivity(VoipIncomingActivity.intent(ctx, inviteId)) }
-            catch (_: Exception) { /* 通知的全屏 Intent 仍是兜底入口 */ }
-        }
     }
 
     private fun emitMeeting(action: String, meeting: JSONObject) {
@@ -429,6 +545,7 @@ object VoipBridge {
             .put("action", action).put("callId", meeting.optString("callId"))
             .put("inviteId", meeting.optString("inviteId")).put("roomName", meeting.optString("roomName"))
             .put("title", meeting.optString("title")).put("mediaType", meeting.optString("mediaType"))
+            .put("passcode", meeting.optString("passcode"))
             .put("convId", meeting.optString("convId")).put("msgId", meeting.optString("msgId"))
         queue.add(event)
         while (queue.size > 256) queue.poll()
@@ -440,6 +557,7 @@ object VoipBridge {
         if (id.isNotEmpty()) { terminal.add(id); if (terminal.size > 128) terminal.remove(terminal.first()) }
         current = null
         expiryJob?.cancel(); expiryJob = null
+        clearIncomingUiWait()
         incomingNotifications.reset()
         try { VoipCallService.removeNotification() } catch (_: Exception) { }
         try { if (ctx != null) NotificationManagerCompat.from(ctx).cancel(9090) } catch (_: Exception) { }
@@ -571,12 +689,9 @@ object VoipBridge {
         val callee = snapshot.optString("calleeId") == uid
         if (callee && accepted.isNotEmpty() && accepted != config.optString("deviceId")) { finish("answeredElsewhere"); return }
         if (!caller && !callee) return
+        if (first && callee && phase == "ringing" && !hidden) requestIncomingCallUi(id, fallbackToAppPage = true)
         if (telecomJob == null) addTelecom(snapshot, !caller)
         if (control != null) publishCall()
-        if (first && callee && phase == "ringing" && !hidden) {
-            try { context?.startActivity(VoipIncomingActivity.intent(context!!, id)) }
-            catch (_: Exception) { emit("openPage") }
-        }
         if ((snapshot.optString("state") != "ringing" || (business() && caller)) && (caller || accepted == config.optString("deviceId"))) connectMedia(snapshot)
     }
 
@@ -607,9 +722,8 @@ object VoipBridge {
                     control = owner
                     trace("telecom call registered")
                     // Telecom must own the call before asking for background phone-call execution.
-                    // Posting CallStyle here also satisfies Core-Telecom's five-second deadline.
+                    if (incoming && ownsCall()) requestBackgroundCallUi(id)
                     publishCall()
-                    if (incoming && ownsCall()) requestLockedCallUi(id)
                     launch { isMuted.collect { muted -> if (control === owner) setMicrophone(!muted) } }
                     launch { currentCallEndpoint.collect { endpoint -> if (control === owner) { speaker = endpoint.type == CallEndpointCompat.TYPE_SPEAKER; emit("speaker", "enabled", speaker) } } }
                 }
@@ -649,34 +763,74 @@ object VoipBridge {
             emit("error", "code", "CALL_ACTION_FAILED")
         }
     }
-    // A no-process cold start cannot rely on the notification full-screen intent alone:
-    // OEM SystemUI may downgrade the effective importance below HIGH and refuse the launch
-    // (observed on EMUI even with a user-locked HIGH channel). Once Core-Telecom owns the
-    // ringing connection the background-activity-start exemption holds, so open the
-    // incoming page directly; the notification remains the fallback entry.
-    private fun requestLockedCallUi(id: String) {
+    // After Telecom registers the call, use the user-granted overlay permission to try
+    // the native incoming Activity. Some devices show a banner for the full-screen
+    // notification intent, so keep it as the fallback when the Activity cannot open.
+    private fun requestBackgroundCallUi(id: String) {
         val ctx = context ?: return
         val call = current ?: return
-        if (!business() || call.optString("callId") != id || call.optString("state") != "ringing" ||
-            call.optString("calleeId") != config.optString("userId") || call.optString("mediaType") != "audio" ||
-            call.optLong("expiresAt") <= System.currentTimeMillis() || nativeUiId == id) return
-        if (!ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked || !Settings.canDrawOverlays(ctx)) return
+        if (!business() || call.optString("callId") != id || !isRingingIncoming(call) ||
+            call.optLong("expiresAt") <= System.currentTimeMillis() || callUiVisible(id) || incomingUiWait != null) return
+        val locked = ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked
+        if (!VoipCallPolicy.shouldOpenBackgroundCallUi(locked, call.optString("mediaType")) || !Settings.canDrawOverlays(ctx)) return
         val manager = ctx.getSystemService(NotificationManager::class.java)
+        if (runCatching { ensureNotificationChannels(ctx) }.isFailure) return
         val channel = VoipNotificationChannels.incoming(manager) ?: return
         if (!manager.areNotificationsEnabled() || channel.importance < NotificationManager.IMPORTANCE_HIGH ||
             manager.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) return
-        trace("locked call activity requested")
+        trace(if (locked) "locked call activity requested" else "unlocked incoming call activity requested")
+        requestIncomingCallUi(id)
+    }
+
+    private fun callUiVisible(id: String) = nativeUiId == id || (!hidden && appCallUiId == id)
+
+    private fun isRingingIncoming(call: JSONObject) =
+        call.optString("state") == "ringing" && call.optString("calleeId") == config.optString("userId")
+
+    private fun updatePresentedIncoming(id: String) {
+        val call = current ?: return
+        if (call.optString("callId") == id && callUiVisible(id) && isRingingIncoming(call) && hasSystemCall()) publishCall()
+    }
+
+    private fun requestIncomingCallUi(id: String, fallbackToAppPage: Boolean = false) {
+        val ctx = context ?: return
+        if (callUiVisible(id) || incomingUiWait != null) return
         try {
             ctx.startActivity(VoipIncomingActivity.intent(ctx, id))
         } catch (ex: RuntimeException) {
-            trace("locked call activity declined: " + ex.javaClass.simpleName)
+            trace("incoming call activity declined: " + ex.javaClass.simpleName)
+            if (!fallbackToAppPage) return
+        }
+        // startActivity can return without showing anything. Leave enough time for the
+        // Activity to resume while still posting CallStyle within Telecom's five seconds.
+        incomingUiWait = scope.launch {
+            delay(750)
+            val ringing = current
+            if (fallbackToAppPage && !hidden && ringing?.optString("callId") == id &&
+                isRingingIncoming(ringing) && !callUiVisible(id)) {
+                emit("openPage")
+                delay(500)
+            }
+            incomingUiWait = null
+            val call = current
+            if (call?.optString("callId") == id && isRingingIncoming(call) && hasSystemCall()) publishCall()
         }
     }
+
+    private fun clearIncomingUiWait() {
+        incomingUiWait?.cancel()
+        incomingUiWait = null
+    }
+
     private fun publishCall() {
         val ctx = context ?: return
         val call = current ?: return
-        val incoming = call.optString("state") == "ringing" && call.optString("calleeId") == config.optString("userId")
-        if (!incomingNotifications.publish(call.optString("callId"), incoming)) return
+        val id = call.optString("callId")
+        val incoming = isRingingIncoming(call)
+        val visible = incoming && callUiVisible(id)
+        if (incoming && incomingUiWait != null && !visible) return
+        clearIncomingUiWait()
+        if (!incomingNotifications.publish(id, incoming, visible)) return
         if (incoming && Build.VERSION.SDK_INT >= 31) {
             // Ringing is a call invitation, not an ongoing foreground-service notification.
             // Telecom already grants foreground execution while owning this call. Start our
@@ -686,7 +840,7 @@ object VoipBridge {
             catch (_: Exception) { incomingNotifications.reset(); trace("incoming call notification failed") }
             return
         }
-        try { VoipCallService.show(ctx, call.optString("callId")) }
+        try { VoipCallService.show(ctx, id) }
         catch (_: IllegalStateException) {
             // Core-Telecom on Android 14+ can keep a notified call alive via its own
             // foreground delegation. Do not lose the invitation if an OEM denies our FGS.
@@ -857,6 +1011,7 @@ object VoipBridge {
         val id = current?.optString("callId") ?: ""
         if (id.isNotEmpty()) { terminal.add(id); if (terminal.size > 128) terminal.remove(terminal.first()) }
         expiryJob?.cancel(); expiryJob = null
+        clearIncomingUiWait()
         releaseMedia(); mediaJob?.cancel(); mediaJob = null; mediaId = ""
         val c = control; control = null
         val job = telecomJob; telecomJob = null
@@ -876,7 +1031,7 @@ object VoipBridge {
         context?.stopService(Intent(context, VoipCallService::class.java))
         context?.getSystemService(NotificationManager::class.java)?.cancel(9090)
         if (reason.isNotEmpty()) emit("localEnded", "reason", reason)
-        current = null; nativeUiId = ""
+        current = null; nativeUiId = ""; appCallUiId = ""
     }
     private fun expireSession() {
         val event = JSONObject().put("type", "localEnded").put("scope", config.optString("scope")).put("callId", current?.optString("callId")).put("reason", "sessionExpired")
@@ -903,7 +1058,9 @@ object VoipBridge {
     }
 
     /** Called by the native UniPush service before the SDK converts force_notification into an IM notice. */
-    @JvmStatic fun receiveUniPush(ctx: Context, payload: String, source: String): Boolean {
+    @JvmStatic @JvmOverloads fun receiveUniPush(
+        ctx: Context, payload: String, source: String, onVerification: ((Job) -> Unit)? = null
+    ): Boolean {
         context = ctx.applicationContext
         val invitation = runCatching { JSONObject(payload) }.getOrNull() ?: return false
         val native = VoipPushPayload.isNative(invitation)
@@ -921,14 +1078,15 @@ object VoipBridge {
         if (!debug && !saved.optBoolean("qaAccepted") && !native) return false
         if (native && !VoipPushPayload.eligible(invitation, saved.optString("userId"), System.currentTimeMillis())) return true
         trace(if (native) "native push routed to call source=$source callId=${invitation.optString("callId")}" else "native push routed to call")
-        incoming(ctx, invitation, saved.optString("scope"))
+        val verification = incoming(ctx, invitation, saved.optString("scope"))
+        onVerification?.invoke(verification)
         return true
     }
 
     /** Restore the authenticated native context and verify the invitation before ringing. */
-    private fun incoming(ctx: Context, invitation: JSONObject, sessionScope: String) {
+    private fun incoming(ctx: Context, invitation: JSONObject, sessionScope: String): Job {
         context = ctx.applicationContext
-        scope.launch {
+        return scope.launch {
             try {
                 if (config.optString("accessToken").isEmpty()) {
                     loadConfig()?.takeIf { it.optString("scope") == sessionScope }?.let { initialize(it) }
@@ -985,34 +1143,59 @@ object VoipBridge {
         return VoipCallPolicy.originAllowed(fixedOrigin, value.optString("apiBaseUrl"))
     }
 
-    internal fun notification(ctx: Context): Notification {
+    private fun ensureNotificationChannels(ctx: Context) {
         VoipNotificationChannels.ensure(ctx,
             config.optString("ongoingNotificationLabel").ifEmpty { VoipNotificationChannels.resourceLabel(ctx, "nuwax_voip_ongoing_channel") },
             config.optString("incomingNotificationLabel").ifEmpty { VoipNotificationChannels.resourceLabel(ctx, "nuwax_voip_incoming_channel") })
+    }
+
+    internal fun notification(ctx: Context): Notification {
+        ensureNotificationChannels(ctx)
         val s = current ?: JSONObject()
-        val incoming = s.optString("state") == "ringing" && s.optString("calleeId") == config.optString("userId")
+        val incoming = isRingingIncoming(s)
+        val presented = incoming && incomingNotifications.wasPresented(s.optString("callId"))
+        val alert = incoming && !presented
         fun intent(action: String): PendingIntent = PendingIntent.getBroadcast(ctx, action.hashCode(), Intent(ctx, VoipActionReceiver::class.java)
             .setData(Uri.parse("nuwax-voip://call/" + Uri.encode(s.optString("callId"))))
             .putExtra("action", action).putExtra("callId", s.optString("callId")), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val open = VoipIncomingActivity.intent(ctx, s.optString("callId"))
         val content = PendingIntent.getActivity(ctx, 9091, open, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val answer = PendingIntent.getActivity(ctx, 9092, VoipIncomingActivity.intent(ctx, s.optString("callId")).putExtra("answer", true), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val person = Person.Builder().setName(s.optString(if (s.optString("callerId") == config.optString("userId")) "calleeDisplayName" else "callerDisplayName", "Nuwax")).setImportant(true).build()
+        val meeting = s.optString("scene") == "meeting"
+        val personName = if (meeting) "${label("meetingInvitation")} · ${s.optString("title")}" else
+            s.optString(if (s.optString("callerId") == config.optString("userId")) "calleeDisplayName" else "callerDisplayName", "Nuwax")
+        val person = Person.Builder().setName(personName).setImportant(true).build()
         val style = if (incoming) NotificationCompat.CallStyle.forIncomingCall(person, intent("reject"), answer)
+            .setIsVideo(!meeting && s.optString("mediaType") == "video")
             else NotificationCompat.CallStyle.forOngoingCall(person, intent(if (s.optString("state") == "ringing") "cancel" else "end"))
-        val builder = NotificationCompat.Builder(ctx, if (incoming) VoipNotificationChannels.INCOMING else VoipNotificationChannels.ONGOING)
+        val channel = when {
+            alert -> VoipNotificationChannels.INCOMING
+            presented -> VoipNotificationChannels.presentedIncoming(ctx)
+            else -> VoipNotificationChannels.ONGOING
+        }
+        val priority = when {
+            alert -> NotificationCompat.PRIORITY_MAX
+            presented -> NotificationCompat.PRIORITY_DEFAULT
+            else -> NotificationCompat.PRIORITY_LOW
+        }
+        val builder = NotificationCompat.Builder(ctx, channel)
             .setSmallIcon(android.R.drawable.sym_call_incoming).setContentIntent(content)
-            .setContentTitle(person.name).setContentText(if (s.optString("state") == "active") config.optString("callLabel", "Nuwax")
+            .setContentTitle(person.name).setContentText(if (meeting) "${label("meetingNumber")} ${s.optString("roomName")}" else if (s.optString("state") == "active") config.optString("callLabel", "Nuwax")
                 else label(if (incoming) "incoming" else if (s.optString("state") == "ringing") "dialing" else "connecting"))
             .setCategory(NotificationCompat.CATEGORY_CALL).setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_ALL)
-            .setPriority(NotificationCompat.PRIORITY_MAX).setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .setOngoing(true).setOnlyAlertOnce(!incoming).setStyle(style)
-        if (incoming) builder.setFullScreenIntent(content, true)
-        else builder.setSilent(true)
+            .setPriority(priority).setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .setOngoing(true).setOnlyAlertOnce(!incoming)
+        if (meeting && incoming) {
+            // CallStyle 的接听文案由系统生成；会议用明确的「入会」动作。
+            builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, label("meetingIgnore"), intent("reject"))
+                .addAction(android.R.drawable.ic_menu_call, label("meetingJoin"), answer)
+        } else builder.setStyle(style)
+        if (alert) builder.setFullScreenIntent(content, true)
+        if (!incoming) builder.setSilent(true)
         return builder.build().also {
             if (incoming) it.flags = it.flags or Notification.FLAG_INSISTENT
-            trace("call notification fullscreenIntent=" + (it.fullScreenIntent != null) + ", groupAlertBehavior=" + it.groupAlertBehavior + ", flags=" + it.flags)
+            trace("call notification channel=$channel, fullscreenIntent=" + (it.fullScreenIntent != null) + ", groupAlertBehavior=" + it.groupAlertBehavior + ", flags=" + it.flags)
             trace("call notification incoming=" + incoming + ", presentation=" + presentationStatus(ctx))
         }
     }

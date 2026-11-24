@@ -7,11 +7,14 @@ object VoipCallPolicyTest {
         standaloneQaCannotRestoreProductionIdentity()
         releaseOriginRequiresAnExplicitMatchingHttpsPin()
         incomingSoundHonorsSilenceAndExplicitChoices()
+        unlockedBackgroundUiOpensForAudioAndVideo()
+        notificationAnswerPreservesTheInvitationMedia()
         duplicatedInvitationsCannotRestartOrStopTheRingingNotification()
+        showingTheCallUiReplacesTheAlertWithoutRearmingIt()
         endingOrAnsweringReleasesTheIncomingNotificationSlot()
         ringTimeStartsAfterInvitationAcknowledgement(); activeHangupDoesNotSendLegacyCancel()
         reconnectMustNotLookLikeRemoteHangup(); authFailuresAreSeparateFromNotificationFailures()
-        println("13 Kotlin call policy cases passed")
+        println("16 Kotlin call policy cases passed")
     }
     private fun ringTimeStartsAfterInvitationAcknowledgement() {
         check(VoipCallPolicy.ringDeadline(120000, 120500) == 180000L)
@@ -61,6 +64,34 @@ object VoipCallPolicyTest {
         repeat(5) { check(!gate.publish("call-a", true)) }
         check(gate.publish("call-b", true))
         check(!gate.publish("call-b", true))
+    }
+    private fun unlockedBackgroundUiOpensForAudioAndVideo() {
+        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = "audio"))
+        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = "video"))
+        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = ""))
+        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, mediaType = "audio"))
+        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, mediaType = "video"))
+    }
+    private fun notificationAnswerPreservesTheInvitationMedia() {
+        check(VoipCallPolicy.answerMediaType(invited = "video", requested = null) == "video")
+        check(VoipCallPolicy.answerMediaType(invited = "audio", requested = null) == "audio")
+        check(VoipCallPolicy.answerMediaType(invited = "video", requested = "video") == "video")
+        check(VoipCallPolicy.answerMediaType(invited = "video", requested = "audio") == "audio")
+        check(VoipCallPolicy.answerMediaType(invited = "audio", requested = "video") == "audio")
+    }
+    private fun showingTheCallUiReplacesTheAlertWithoutRearmingIt() {
+        val gate = VoipIncomingNotificationGate()
+        check(gate.publish("direct", incoming = true, uiVisible = true))
+        check(gate.wasPresented("direct"))
+        check(!gate.publish("direct", incoming = true, uiVisible = false))
+        check(gate.publish("fallback", incoming = true))
+        check(!gate.wasPresented("fallback"))
+        check(gate.publish("fallback", incoming = true, uiVisible = true))
+        check(gate.wasPresented("fallback"))
+        check(!gate.publish("fallback", incoming = true, uiVisible = true))
+        check(!gate.publish("fallback", incoming = true, uiVisible = false))
+        gate.reset()
+        check(!gate.wasPresented("fallback"))
     }
     private fun endingOrAnsweringReleasesTheIncomingNotificationSlot() {
         val gate = VoipIncomingNotificationGate()

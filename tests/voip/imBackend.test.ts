@@ -21,6 +21,12 @@ describe('actual IM backend adapter', () => {
     expect(call.expiresAt).toBeGreaterThan(Date.now() + 59000);
     expect(f.request).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/api/instant-message/meetings/rtc/rooms', data: { name: 'call-c1', maxParticipants: 2, emptyTimeoutSeconds: 120, platform: 'android', deviceId: 'physical-device' } }));
   });
+  it('uses the configured peer avatar for outbound voice and video calls', async () => {
+    f.contacts.mockResolvedValue({ code: '0000', data: { items: [{ userId: peer, subjectType: 1, avatar: '/api/f/contact.png' }] } });
+    f.detail.mockResolvedValueOnce({ code: '0000', data: { convType: 1, peerUserId: peer, peerAvatar: '/api/f/profile.png' } });
+    expect((await createImVoipCall(conv, 'video', 'c1')).calleeAvatar).toBe('/api/f/profile.png');
+    expect((await createImVoipCall(conv, 'audio', 'c2')).calleeAvatar).toBe('/api/f/contact.png');
+  });
   it.each([2, 4])('does not enable group/space conversations (%s)', async convType => {
     f.detail.mockResolvedValue({ code: '0000', data: { convType, peerUserId: peer } });
     expect((await imVoipCapabilities(conv)).enabled).toBe(false);

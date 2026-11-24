@@ -170,23 +170,26 @@ exports.prepareVoipScene = (body, now = Date.now()) => {
   return { meeting }
 }
 
-// Mobile vendor keys from the provider's REST v2 settings.strategy table.
-const strategies = {
-  'ios-voip': 'ios',
-  'android-huawei': 'hw',
-  'android-honor': 'ho',
-  'android-xiaomi': 'xm',
-  'android-vivo': 'vv',
+// Getui brand codes and the UniPush strategies exercised in this test space.
+const callTransports = new Map([
+  ['ios-voip', { platform: 'ios', strategy: 'ios' }],
+  ['android-huawei', { platform: 'android', brand: 'hw', strategy: 'hw' }],
+  ['android-honor', { platform: 'android', brand: 'ho' }],
+  ['android-xiaomi', { platform: 'android', brand: 'xm' }],
+  ['android-vivo', { platform: 'android', brand: 'vv', strategy: 'vv' }],
   // Includes OnePlus and realme devices registered with domestic OPPO PUSH.
-  'android-oppo': 'op',
-  'android-oppo-global': 'opg',
-  'android-meizu': 'mz',
-  'android-smartisan': 'st',
-  'harmony-huawei': 'hoshw',
+  ['android-oppo', { platform: 'android', brand: 'op' }],
+  ['android-oppo-global', { platform: 'android', brand: 'opg' }],
+  ['android-meizu', { platform: 'android', brand: 'mz' }],
+  ['android-smartisan', { platform: 'android', brand: 'st' }],
   // Samsung devices with Google Play services can register for FCM, a separate transport.
-  'android-fcm': null,
-}
-const nativePlatforms = { ios: 'ios', hw: 'android', hoshw: 'harmonyos' }
+  ['android-fcm', { platform: 'android', brand: 'fcm' }],
+  ['harmony-huawei', { platform: 'harmonyos', strategy: 'hoshw' }],
+])
+const androidTransportByBrand = new Map(
+  [...callTransports].filter(([, config]) => config.platform === 'android')
+    .map(([transport, config]) => [config.brand, transport])
+)
 const registrationId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 
 function validIosRegistration(registration) {
@@ -203,20 +206,27 @@ exports.iosCallRouteForCid = (cid, registrations, environment) => {
   return validIosRegistration(route) ? route : null
 }
 
+exports.androidCallRouteForCid = (cid, brand, phoneType) => {
+  // Some older registry entries omit phone_type. A reported platform takes precedence over brand.
+  if (phoneType != null && phoneType !== 1 && phoneType !== '1') return null
+  const transport = androidTransportByBrand.get(brand)
+  return transport ? { cid, platform: 'android', transport } : null
+}
+
 // One authenticated IM route per request. No caller-controlled vendor options or broadcast target.
 exports.prepareNativeVoip = (body, now = Date.now()) => {
   if (!Object.prototype.hasOwnProperty.call(body, 'callRoute')) return null
   const route = body.callRoute
-  if (!route || typeof route.transport !== 'string' || !Object.prototype.hasOwnProperty.call(strategies, route.transport)) return { error: 'unsupported call route' }
-  const strategy = strategies[route.transport]
-  const platform = nativePlatforms[strategy]
-  if (!platform) return { error: 'native call transport unavailable' }
-  const ios = strategy === 'ios'
-  const harmony = strategy === 'hoshw'
-  const target = harmony && Array.isArray(body.push_clientid) && body.push_clientid.length === 1
+  const transport = callTransports.get(route?.transport)
+  if (!transport) return { error: 'unsupported call route' }
+  const { platform, strategy } = transport
+  const ios = platform === 'ios'
+  const harmony = platform === 'harmonyos'
+  const target = !ios && Array.isArray(body.push_clientid) && body.push_clientid.length === 1
     ? body.push_clientid[0] : body.push_clientid
-  if (route.platform !== platform ||
-      !isCallCid(route.cid) || target !== route.cid) return { error: 'one matching call device is required' }
+  if (route.platform !== platform || !isCallCid(route.cid) || target !== route.cid) {
+    return { error: 'one matching call device is required' }
+  }
   if (ios && !validIosRegistration(route)) {
     return { error: 'signed environment and current iOS route registration are required' }
   }
@@ -227,6 +237,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
     ? prepareMeetingRingInvitation(body, now)
     : prepareCallInvitation(body, now)
   if (invitation.error || invitation.expired) return invitation
+  if (!strategy) return { notificationOnly: true }
   const payload = { ...invitation.payload }
   if (ios) payload.routeRegistrationId = route.registrationId
   if (platform === 'android') payload.delivery = 'android-native'
@@ -235,9 +246,21 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   const requestId = createHash('sha256')
     .update(JSON.stringify([route.transport, route.cid, ios ? route.registrationId : '', payload.callId]))
     .digest('hex').slice(0, 32)
-  return {
-    payload, requestId,
-    settings: { ttl: harmony ? invitation.settings.ttl : Math.min(5_000, invitation.settings.ttl), strategy: { [strategy]: 2 } },
-    ...(ios ? { options: { ios: { type: 'voip', payload: JSON.stringify(payload) } } } : {})
+  const ttl = harmony ? invitation.settings.ttl : Math.min(5_000, invitation.settings.ttl)
+  const settings = { ttl, strategy: { [strategy]: 2 } }
+  if (strategy === 'vv') {
+    // Test-space probe via UniPush. Vendor receipt and SDK callback are verified separately.
+    const seconds = Math.floor(ttl / 1000)
+    if (seconds < 1) return { expired: true }
+    const callPayload = { ...payload, scene: payload.scene ?? 'call', pushEnvironment: 'test' }
+    const options = { android: { VV: {
+      '/header/message-type': 3,
+      '/message/extraData': JSON.stringify(callPayload),
+      '/options/ttl': seconds,
+      '/options/appMessageId': requestId,
+    } } }
+    return { payload: callPayload, requestId, settings, options }
   }
+  return { payload, requestId, settings,
+    ...(ios ? { options: { ios: { type: 'voip', payload: JSON.stringify(payload) } } } : {}) }
 }

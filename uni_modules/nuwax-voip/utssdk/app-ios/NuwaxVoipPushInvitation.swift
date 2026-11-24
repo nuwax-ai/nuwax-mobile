@@ -62,10 +62,15 @@ struct NuwaxVoipPushInvitation {
         displayName = name.isEmpty ? "Nuwax" : String(name.prefix(80))
     }
 
-    var report: [AnyHashable: Any] {
-        // The system UI shows the meeting title for meeting invites, the caller for calls.
-        let label = scene == "meeting" ? (title ?? displayName) : displayName
-        return ["callId": callId, "displayName": label, "mediaType": mediaType, "scene": scene]
+    func report(labels: [String: Any]) -> [AnyHashable: Any] {
+        // 系统接听布局不可定制；显示会议语义和会议号，不把业务 inviteId 当电话号码。
+        let meetingLabel = labels["meetingInvitation"] as? String ?? "会议邀请"
+        let numberLabel = labels["meetingNumber"] as? String ?? "会议号"
+        let meeting = scene == "meeting"
+        return ["callId": callId,
+                "displayName": meeting ? "\(meetingLabel) · \(title ?? displayName)" : displayName,
+                "handle": meeting ? "\(numberLabel) \(roomName ?? "")" : callId,
+                "mediaType": mediaType, "scene": scene]
     }
 
     func matches(_ message: [String: Any], now: Double) -> Bool {

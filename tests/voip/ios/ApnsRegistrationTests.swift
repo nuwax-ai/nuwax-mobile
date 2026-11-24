@@ -50,13 +50,20 @@ import XCTest
         XCTAssertEqual(NuwaxVoipApnsDevice(stored: old.stored), old)
         for action in ["register", "revoke"] {
             let body = old.body(action)
-            XCTAssertEqual(body["provider"] as? String, "unipush")
-            XCTAssertEqual(body["cid"] as? String, "cid-one")
+            XCTAssertEqual(body["pushToken"] as? String, "cid-one")
+            XCTAssertEqual(body["platform"] as? String, "ios")
             XCTAssertNil(body["token"])
+            XCTAssertNil(body["environment"])
+            let registration = try XCTUnwrap(body["iosVoip"] as? [String: String])
+            XCTAssertEqual(registration["registrationId"], old.registrationId)
+            XCTAssertEqual(registration["action"], action)
         }
-        var response = ack(old.body("register"), ready: true)
+        var response: [String: Any] = [
+            "deviceId": "phone", "platform": "ios",
+            "iosVoip": ["registrationId": old.registrationId, "registered": true, "nativePush": true]
+        ]
         XCTAssertTrue(old.acknowledges(response))
-        response["cid"] = "wrong"
+        response["deviceId"] = "wrong"
         XCTAssertFalse(old.acknowledges(response))
         XCTAssertFalse(old.acknowledges(ack(device().body("register"), ready: true)))
     }
@@ -88,9 +95,10 @@ import XCTest
         let record = device(); registration.register(record)
         await until { pending != nil }
         let revoke = registration.stop(revoke: true)
-        await revoke?.value
+        let acknowledged = await revoke?.value
         pending?.resume()
         await Task.yield()
+        XCTAssertEqual(acknowledged, true)
         XCTAssertEqual(states.last, "stopped")
         XCTAssertFalse(states.contains("registered"))
         XCTAssertEqual(requests.last?["registrationId"] as? String, record.registrationId)
@@ -100,9 +108,21 @@ import XCTest
     func testRestoredTokenCanBeRevokedBeforeFirstRegistryUpdate() async {
         let record = device(); var sent: [String: Any] = [:]
         let registration = NuwaxVoipApnsRegistration(restored: record, transport: { sent = $0; return self.ack($0, registered: false) }, changed: { _, _ in })
-        await registration.stop(revoke: true)?.value
+        let acknowledged = await registration.stop(revoke: true)?.value
+        XCTAssertEqual(acknowledged, true)
         XCTAssertEqual(sent["registrationId"] as? String, record.registrationId)
         XCTAssertNil(registration.current)
+    }
+    func testLogoutWithoutMatchingReceiptRemainsUnconfirmed() async {
+        let record = device()
+        var requests = 0
+        let registration = NuwaxVoipApnsRegistration(restored: record, transport: { _ in
+            requests += 1
+            return self.ack(self.device(2).body("revoke"), registered: false)
+        }, sleep: { _ in }, changed: { _, _ in })
+        let acknowledged = await registration.stop(revoke: true)?.value
+        XCTAssertEqual(acknowledged, false)
+        XCTAssertEqual(requests, 3)
     }
     func testTokenRotationIgnoresPriorResponseAndKeepsNewRegistration() async {
         let old = device(), new = device(2)

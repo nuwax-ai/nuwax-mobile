@@ -31,6 +31,20 @@ APP=OUT/'App'
 shutil.copytree(SDK/'UniAppXDemo/UniAppXDemo',APP,dirs_exist_ok=True)
 shutil.rmtree(APP/'uni-app-x',ignore_errors=True)
 shutil.copytree(RES/'__UNI__8BF05E4',APP/'uni-app-x/apps/__UNI__8BF05E4')
+# iOS 系统启动屏：SDK Demo 自带的 LaunchScreen 是官方示例样式（无品牌 Logo，冷启动
+# 只见一片白）。用仓库里的自定义 storyboard 覆盖，并补齐 @2x/@3x 图标；manifest.json
+# 的同名 zip 给云打包用，两条打包路径共用 nativeResources/ios/launchscreen 这一份源。
+LAUNCH_DIR=ROOT/'nativeResources/ios/launchscreen'
+if (LAUNCH_DIR/'LaunchScreen.storyboard').is_file():
+ for old in list(APP.rglob('LaunchScreen.storyboard'))+list(APP.rglob('LaunchScreen.storyboardc')):
+  if old.is_dir(): shutil.rmtree(old,ignore_errors=True)
+  else: old.unlink(missing_ok=True)
+ icons=sorted(LAUNCH_DIR.glob('dc_launchscreen_icon@*.png'))
+ assert icons, f'Missing iOS LaunchScreen icon assets under {LAUNCH_DIR}'
+ # 与 SDK Demo 保持一致放进 Base.lproj；没有该目录时退回 App 根。
+ storyboard_dir=APP/'Base.lproj' if (APP/'Base.lproj').is_dir() else APP
+ shutil.copy2(LAUNCH_DIR/'LaunchScreen.storyboard',storyboard_dir/'LaunchScreen.storyboard')
+ for icon in icons: shutil.copy2(icon,APP/icon.name)
 if HX_DEV:
  shutil.rmtree(APP/'uni-app-x/apps/__UNI__8BF05E4/www')
  shutil.copytree(HX_DEV_ROOT,APP/'uni-app-x/apps/__UNI__8BF05E4/www')
@@ -79,10 +93,12 @@ info.update(CFBundleIdentifier='$(PRODUCT_BUNDLE_IDENTIFIER)',CFBundleExecutable
  NSMicrophoneUsageDescription='用于您主动拨打或接听测试通话；通话期间后台和锁屏继续采集，挂断后释放。',
  NSCameraUsageDescription='用于您主动拨打或接听视频通话后的前台画面采集。',
  NSLocalNetworkUsageDescription='连接您指定的局域网 VoIP 测试服务，验证两台手机之间的语音和视频通话。',
+ UILaunchStoryboardName='LaunchScreen',
  UIBackgroundModes=['audio','voip','remote-notification'])
 info['uniapp-x']={'appid':'__UNI__8BF05E4','uniRuntimeVersion':'5.34','ipatype':2,'dcloud_appkey':os.environ['DCLOUD_APPKEY']}
 info['NSAppTransportSecurity']={'NSAllowsLocalNetworking':True,'NSAllowsArbitraryLoads':True}
 info.pop('UIMainStoryboardFile',None)
+info.pop('UILaunchScreen',None)
 for scenes in info.get('UIApplicationSceneManifest',{}).get('UISceneConfigurations',{}).values():
  for item in scenes: item.pop('UISceneStoryboardFile',None)
 if BUSINESS:

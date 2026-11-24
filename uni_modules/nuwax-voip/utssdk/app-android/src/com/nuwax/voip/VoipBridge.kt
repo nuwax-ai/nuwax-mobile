@@ -831,11 +831,9 @@ object VoipBridge {
         if (incoming && incomingUiWait != null && !visible) return
         clearIncomingUiWait()
         if (!incomingNotifications.publish(id, incoming, visible)) return
-        if (incoming && Build.VERSION.SDK_INT >= 31) {
-            // Ringing is a call invitation, not an ongoing foreground-service notification.
-            // Telecom already grants foreground execution while owning this call. Start our
-            // microphone/camera foreground service only after the user answers. Keep
-            // the FGS association on older Android versions for CallStyle ranking.
+        // Once the call page is visible, its CallStyle drops the full-screen Intent.
+        // Post it through the phoneCall foreground service so the system accepts it.
+        if (incoming && Build.VERSION.SDK_INT >= 31 && !visible) {
             try { NotificationManagerCompat.from(ctx).notify(9090, notification(ctx)); trace("incoming call notification posted") }
             catch (_: Exception) { incomingNotifications.reset(); trace("incoming call notification failed") }
             return

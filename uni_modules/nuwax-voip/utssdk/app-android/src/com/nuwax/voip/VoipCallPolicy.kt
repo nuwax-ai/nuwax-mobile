@@ -48,19 +48,23 @@ internal object VoipCallPolicy {
 internal class VoipIncomingNotificationGate {
     private var incomingId: String? = null
     private var presented = false
+    private var presentedFirst = false
 
     fun publish(id: String, incoming: Boolean, uiVisible: Boolean = false): Boolean {
         if (!incoming) { reset(); return true }
         if (id == incomingId && (presented || !uiVisible)) return false
+        if (id != incomingId) presentedFirst = uiVisible
         incomingId = id
         presented = uiVisible
         return true
     }
 
     fun wasPresented(id: String) = incomingId == id && presented
+    fun wasPresentedFirst(id: String) = incomingId == id && presentedFirst
 
     fun reset() {
         incomingId = null
         presented = false
+        presentedFirst = false
     }
 }

@@ -8,10 +8,16 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
-import android.net.Uri
+import android.media.AudioAttributes
 import android.media.AudioManager
+import android.media.Ringtone
+import android.media.RingtoneManager
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.Settings
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
@@ -827,6 +833,7 @@ object VoipBridge {
         val call = current ?: return
         val id = call.optString("callId")
         val incoming = isRingingIncoming(call)
+        if (!incoming) VoipCallService.stopIncomingRingtone()
         val visible = incoming && callUiVisible(id)
         if (incoming && incomingUiWait != null && !visible) return
         clearIncomingUiWait()
@@ -1147,11 +1154,28 @@ object VoipBridge {
             config.optString("incomingNotificationLabel").ifEmpty { VoipNotificationChannels.resourceLabel(ctx, "nuwax_voip_incoming_channel") })
     }
 
+    internal fun presentedRingtoneChannel(ctx: Context): NotificationChannel? {
+        if (Build.VERSION.SDK_INT < 31) return null
+        val call = current ?: return null
+        if (!isRingingIncoming(call) || call.optString("scene") == "meeting" ||
+            !incomingNotifications.wasPresentedFirst(call.optString("callId"))) return null
+        val manager = ctx.getSystemService(NotificationManager::class.java)
+        val channel = manager.getNotificationChannel(VoipNotificationChannels.presentedIncoming(ctx)) ?: return null
+        if (!manager.areNotificationsEnabled() || channel.importance < NotificationManager.IMPORTANCE_DEFAULT ||
+            channel.sound == null || channel.sound == Uri.EMPTY) return null
+        val filter = manager.currentInterruptionFilter
+        if (filter != NotificationManager.INTERRUPTION_FILTER_ALL &&
+            (filter != NotificationManager.INTERRUPTION_FILTER_PRIORITY || !channel.canBypassDnd())) return null
+        val audio = ctx.getSystemService(AudioManager::class.java)
+        return channel.takeIf { audio.ringerMode == AudioManager.RINGER_MODE_NORMAL && audio.getStreamVolume(AudioManager.STREAM_RING) > 0 }
+    }
+
     internal fun notification(ctx: Context): Notification {
         ensureNotificationChannels(ctx)
         val s = current ?: JSONObject()
         val incoming = isRingingIncoming(s)
         val presented = incoming && incomingNotifications.wasPresented(s.optString("callId"))
+        val ringsInService = presented && presentedRingtoneChannel(ctx) != null
         val alert = incoming && !presented
         fun intent(action: String): PendingIntent = PendingIntent.getBroadcast(ctx, action.hashCode(), Intent(ctx, VoipActionReceiver::class.java)
             .setData(Uri.parse("nuwax-voip://call/" + Uri.encode(s.optString("callId"))))
@@ -1190,9 +1214,9 @@ object VoipBridge {
                 .addAction(android.R.drawable.ic_menu_call, label("meetingJoin"), answer)
         } else builder.setStyle(style)
         if (alert) builder.setFullScreenIntent(content, true)
-        if (!incoming) builder.setSilent(true)
+        if (!incoming || ringsInService) builder.setSilent(true)
         return builder.build().also {
-            if (incoming) it.flags = it.flags or Notification.FLAG_INSISTENT
+            if (incoming && !ringsInService) it.flags = it.flags or Notification.FLAG_INSISTENT
             trace("call notification channel=$channel, fullscreenIntent=" + (it.fullScreenIntent != null) + ", groupAlertBehavior=" + it.groupAlertBehavior + ", flags=" + it.flags)
             trace("call notification incoming=" + incoming + ", presentation=" + presentationStatus(ctx))
         }
@@ -1204,19 +1228,59 @@ class VoipActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) { VoipBridge.receiveAction(intent.getStringExtra("callId") ?: "", intent.getStringExtra("action") ?: "") }
 }
 class VoipCallService : Service() {
+    private var ringtone: Ringtone? = null
+    private var ringtoneVibrator: Vibrator? = null
+
     override fun onCreate() { super.onCreate(); instance = this }
-    override fun onDestroy() { stopForeground(STOP_FOREGROUND_REMOVE); if (instance === this) instance = null; super.onDestroy() }
+    override fun onDestroy() {
+        stopRinging()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        if (instance === this) instance = null
+        super.onDestroy()
+    }
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (!VoipBridge.hasSystemCall()) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return START_NOT_STICKY }
         if (VoipBridge.uiSnapshot(intent?.getStringExtra("callId") ?: "") == null) return START_NOT_STICKY
         if (Build.VERSION.SDK_INT >= 29) startForeground(9090, VoipBridge.notification(this), ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
         else startForeground(9090, VoipBridge.notification(this))
+        syncRinging()
         return START_NOT_STICKY
     }
+
+    private fun syncRinging() {
+        if (Build.VERSION.SDK_INT < 31) return
+        val channel = VoipBridge.presentedRingtoneChannel(this)
+        if (channel == null) { stopRinging(); return }
+        if (ringtone != null) return
+        try {
+            val player = RingtoneManager.getRingtone(this, channel.sound) ?: return
+            val attributes = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build()
+            player.audioAttributes = attributes
+            player.isLooping = true
+            ringtone = player
+            player.play()
+            if (channel.shouldVibrate()) {
+                val vibrator = getSystemService(VibratorManager::class.java).defaultVibrator
+                val pattern = channel.vibrationPattern?.takeIf { it.isNotEmpty() } ?: longArrayOf(0, 250, 1000)
+                ringtoneVibrator = vibrator
+                vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0), attributes)
+            }
+        } catch (error: Exception) {
+            Log.w("NuwaxVoip", "Unable to start incoming ringtone: ${error.javaClass.simpleName}")
+        }
+    }
+
+    private fun stopRinging() {
+        ringtone?.stop(); ringtone = null
+        ringtoneVibrator?.cancel(); ringtoneVibrator = null
+    }
+
     companion object {
         private var instance: VoipCallService? = null
-        fun removeNotification() { instance?.stopForeground(STOP_FOREGROUND_REMOVE) }
+        fun stopIncomingRingtone() { instance?.stopRinging() }
+        fun removeNotification() { stopIncomingRingtone(); instance?.stopForeground(STOP_FOREGROUND_REMOVE) }
         fun show(context: Context, id: String) { ContextCompat.startForegroundService(context, Intent(context, VoipCallService::class.java).putExtra("callId", id)) }
         fun enableCapture(video: Boolean): Boolean {
             val service = instance ?: return false

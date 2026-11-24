@@ -83,11 +83,13 @@ object VoipCallPolicyTest {
         val gate = VoipIncomingNotificationGate()
         check(gate.publish("direct", incoming = true, uiVisible = true))
         check(gate.wasPresented("direct"))
+        check(gate.wasPresentedFirst("direct"))
         check(!gate.publish("direct", incoming = true, uiVisible = false))
         check(gate.publish("fallback", incoming = true))
         check(!gate.wasPresented("fallback"))
         check(gate.publish("fallback", incoming = true, uiVisible = true))
         check(gate.wasPresented("fallback"))
+        check(!gate.wasPresentedFirst("fallback"))
         check(!gate.publish("fallback", incoming = true, uiVisible = true))
         check(!gate.publish("fallback", incoming = true, uiVisible = false))
         gate.reset()
@@ -95,8 +97,10 @@ object VoipCallPolicyTest {
     }
     private fun endingOrAnsweringReleasesTheIncomingNotificationSlot() {
         val gate = VoipIncomingNotificationGate()
-        check(gate.publish("call-a", true))
+        check(gate.publish("call-a", true, uiVisible = true))
+        check(gate.wasPresentedFirst("call-a"))
         check(gate.publish("call-a", false)) // silent connecting notification must replace the alert
+        check(!gate.wasPresentedFirst("call-a"))
         check(gate.publish("call-a", false))
         check(gate.publish("call-b", true))
         gate.reset() // hangup/logout/media failure must not leave a notification owner

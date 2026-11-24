@@ -172,7 +172,8 @@ function keepLiveRecording(record: VoiceNoteRecord): void {
   }
   record.awaitComplete = false;
   record.error = "";
-  if (record.openSegmentPath.length == 0 && currentSegmentPath.length > 0) {
+  // 已经暂停的记录不要把刚封口的路径再填回去，否则通话结束后会去恢复一个已经关掉的文件。
+  if (record.phase != "paused" && record.openSegmentPath.length == 0 && currentSegmentPath.length > 0) {
     record.openSegmentPath = currentSegmentPath;
   }
 }
@@ -435,6 +436,8 @@ function freezeOpenSegment(record: VoiceNoteRecord): void {
 let pausedByInterruption = false;
 let interruptTimer: number = 0;
 let interruptBusy = false;
+let interruptRetryAt = 0;
+let interruptRetryNoted = false;
 let onInterruptTick: (() => void) | null = null;
 
 function stopInterruptWatch(): void {
@@ -1965,6 +1968,7 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
       return;
     }
     if (paused == "2") {
+      currentSegmentPath = "";
       closedDurationOverride = m4aRecorder!.takeClosedDurationMs();
       const sealedPath = record.openSegmentPath;
       if (sealedPath.length > 0) {
@@ -2007,10 +2011,60 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
   pushVoiceNoteDebug("录音", "暂停未停住采集，当前段不落盘");
 }
 
+/** 鸿蒙通话中 pause 会失败，当前段已经封口。这里新开下一段；麦克风还被占用时安静失败，不弹错、不丢掉这次录音。 */
+async function openSealedInterruptSegment(record: VoiceNoteRecord): Promise<boolean> {
+  // #ifdef APP
+  bindRecorder();
+  if (m4aRecorder == null) {
+    m4aRecorder = new VoiceNoteM4aRecorder();
+  }
+  let path = "";
+  try {
+    path = await m4aRecorder!.restart(record.localId, segmentStampName(record.openSegmentIndex));
+  } catch (e) {
+    console.warn("[voice-note] m4a restart after interruption failed " + e);
+    path = "";
+  }
+  if (path.length == 0) {
+    if (!interruptRetryNoted) {
+      interruptRetryNoted = true;
+      pushVoiceNoteDebug("录音", "下一段还没打开，等麦克风空出来再试");
+    }
+    return false;
+  }
+  interruptRetryNoted = false;
+  currentSegmentPath = path;
+  record.phase = "recording";
+  record.openSegmentPath = path;
+  record.segmentStartedAt = Date.now();
+  record.awaitComplete = false;
+  record.error = "";
+  markCaptureRunning(record.localId);
+  saveRecordQuiet(record);
+  stopIntent = "";
+  ensureTicker();
+  pushVoiceNoteDebug("录音", "继续录音");
+  armCaptureSideEffects(record.localId);
+  return true;
+  // #endif
+  // #ifndef APP
+  return false;
+  // #endif
+}
+
+function interruptRetryDue(): boolean {
+  const now = Date.now();
+  if (interruptRetryAt > 0 && now - interruptRetryAt < 1500) {
+    return false;
+  }
+  interruptRetryAt = now;
+  return true;
+}
+
 /** 其他应用占用麦克风或播放语音时暂停，结束后再接着录。用户自己点的暂停不会自动恢复。 */
 async function resumeInterruptedNote(record: VoiceNoteRecord): Promise<boolean> {
   // #ifdef APP
-  if (m4aRecorder != null && record.openSegmentPath.length > 0) {
+  if (record.openSegmentPath.length > 0 && m4aRecorder != null) {
     let resumed = "0";
     try {
       resumed = await m4aRecorder!.resume();
@@ -2018,13 +2072,26 @@ async function resumeInterruptedNote(record: VoiceNoteRecord): Promise<boolean> 
       console.warn("[voice-note] m4a resume after interruption failed " + e);
       resumed = "0";
     }
-    if (resumed != "1") {
-      return false;
+    if (resumed == "1") {
+      await resumePausedNote(record);
+      return captureAlive;
     }
   }
+  // 鸿蒙封口之后文件已经关掉，resume 会失败。改成新开一段。
+  return await openSealedInterruptSegment(record);
   // #endif
+  // #ifndef APP
   await resumePausedNote(record);
   return captureAlive;
+  // #endif
+}
+
+/** 录音面板还在时把中断监听拉起来。退到通话界面后定时器可能停住，回到面板要继续试。 */
+export function keepVoiceNoteInterruptionWatch(): void {
+  if (!pausedByInterruption) {
+    return;
+  }
+  ensureInterruptWatch();
 }
 
 async function pollVoiceInterruption(): Promise<void> {
@@ -2051,7 +2118,7 @@ async function pollVoiceInterruption(): Promise<void> {
       await pauseActiveRecorder(record);
       return;
     }
-    if (event != "ended" || !pausedByInterruption) {
+    if (!pausedByInterruption) {
       return;
     }
     let paused = findPausedVoiceNote();
@@ -2059,6 +2126,11 @@ async function pollVoiceInterruption(): Promise<void> {
       paused = activeRecord();
     }
     if (paused == null) {
+      return;
+    }
+    // 鸿蒙把当前段封口后，通话结束不一定还有 ended。回到前台就试着新开一段，麦克风仍被占用则继续等。
+    const retrySealed = event != "ended" && paused.openSegmentPath.length == 0 && interruptRetryDue();
+    if (event != "ended" && !retrySealed) {
       return;
     }
     const resumed = await resumeInterruptedNote(paused);
@@ -2312,6 +2384,10 @@ export function voiceNoteOnAppShow(): void {
     return;
   }
   void sealLeftoverOpenFiles();
+  if (pausedByInterruption) {
+    ensureInterruptWatch();
+    void pollVoiceInterruption();
+  }
   if (record != null) {
     beginBackground();
     ensureTicker();

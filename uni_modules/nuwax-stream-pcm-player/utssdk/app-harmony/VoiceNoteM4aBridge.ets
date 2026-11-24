@@ -76,6 +76,21 @@ export class VoiceNoteM4aBridge {
     }
   }
 
+  /** 通话把当前段封口后，旧的 AVRecorder 往往还停在暂停或错误态，prepare 会直接失败。先丢掉它再开下一段。 */
+  async restartSegment(filesDir: string, localId: string, indexName: string): Promise<string> {
+    const av = this.recorder
+    this.recorder = null
+    this.fileOpen = false
+    this.closeFd()
+    if (av != null) {
+      try {
+        await av.release()
+      } catch (_eRelease) {
+      }
+    }
+    return await this.startSegment(filesDir, localId, indexName)
+  }
+
   async startSegment(filesDir: string, localId: string, indexName: string): Promise<string> {
     const path = this.preparePath(filesDir, localId, indexName)
     if (path.length == 0) {
@@ -356,12 +371,18 @@ export class VoiceNoteM4aBridge {
       this.segmentStartedAt = Date.now()
       this.pausedAccumMs = 0
       this.pauseBeganAt = 0
+      this.interruptHold = false
+      this.pendingEvents = []
       return true
     } catch (eStart) {
       console.warn('[voice-note] m4a start failed', eStart)
       try {
         fs.closeSync(opened)
       } catch (_eClose) {
+      }
+      try {
+        await av.reset()
+      } catch (_eReset) {
       }
       return false
     }

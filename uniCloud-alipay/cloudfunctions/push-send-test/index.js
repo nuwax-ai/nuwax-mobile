@@ -298,7 +298,7 @@ function attachBadgeToPayload(payload, badge) {
 //   cid → 厂商 token / 品牌的档案存在个推服务端，是设备上次在线注册时写入并持久化的，
 //   云函数按 cid 查档案即可，不依赖接收端 App 存活 —— 与普通厂商通知用同一份数据。
 // device_token 非空时按 brand 选路。缺少专用发送能力或查档失败时走普通通知。
-async function resolveAutoCallRoute(cid, invocationId) {
+async function resolveAutoCallRoute(cid, invocationId, singleChatCall) {
   if (typeof uniPush.getClientDetailByCid !== 'function') return null
   let detail = null
   try {
@@ -318,7 +318,12 @@ async function resolveAutoCallRoute(cid, invocationId) {
     ? Object.fromEntries(Object.entries(detail).map(([k, v]) =>
         [k, typeof v === 'string' ? (/token/i.test(k) ? `len:${v.length}` : v.slice(0, 24)) : v]))
     : null
-  const route = token ? androidCallRouteForCid(cid, brand, detail.phone_type) : null
+  const phoneType = detail?.phone_type
+  const harmony = singleChatCall && (brand === 'hoshw' || brand === 'hw') &&
+    (phoneType === 7 || phoneType === '7')
+  const route = token && harmony
+    ? { cid, platform: 'harmonyos', transport: 'harmony-huawei' }
+    : token ? androidCallRouteForCid(cid, brand, phoneType) : null
   console.log('[push-send] call route auto', JSON.stringify({
     invocationId, hasVendorToken: token.length > 0, brand,
     detailShape: shape,
@@ -555,7 +560,7 @@ async function handle(event, invocationId) {
       const cid = ids[i]
       const iosRoute = iosCallRouteForCid(cid, iosRegistrations,
         process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT || 'development')
-      const route = iosRoute ?? await resolveAutoCallRoute(cid, invocationId)
+      const route = iosRoute ?? await resolveAutoCallRoute(cid, invocationId, scene?.call != null)
       if (route != null) {
         const native = prepareNativeVoip({
           ...body, push_clientid: cid, payload: invitation.payload, callRoute: route,

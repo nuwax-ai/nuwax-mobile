@@ -81,13 +81,24 @@ File.write(File.join(output, 'Podfile'), <<~POD)
   source 'https://cdn.cocoapods.org/'
   source 'https://github.com/livekit/podspecs.git'
   platform :ios, '15.0'
-  use_frameworks!
+  use_frameworks! :linkage => :static
   project 'MeetingBroadcast.xcodeproj'
   target 'MeetingBroadcastHost' do
     pod 'LiveKitClient', '2.19.0'
   end
   target 'MeetingBroadcast' do
     pod 'LiveKitClient', '2.19.0'
+  end
+  post_install do |installer|
+    minimum_ios = Gem::Version.new('15.0')
+    installer.pods_project.targets.each do |target|
+      target.build_configurations.each do |config|
+        deployment_target = config.build_settings['IPHONEOS_DEPLOYMENT_TARGET']
+        if deployment_target && Gem::Version.new(deployment_target) < minimum_ios
+          config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = minimum_ios.to_s
+        end
+      end
+    end
   end
 POD
 puts "Generated #{output}. Install pods and archive/export with Xcode; no build was run."

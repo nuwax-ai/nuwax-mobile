@@ -72,6 +72,8 @@ object VoipPushPayload {
 
     fun isNative(invitation: JSONObject): Boolean = invitation.opt("delivery") == NATIVE
 
+    internal fun isSilentMeeting(body: JSONObject): Boolean = body.optBoolean("silent")
+
     fun eligible(invitation: JSONObject, user: String, now: Long): Boolean =
         isNative(invitation) && user.isNotEmpty() && invitation.opt("calleeId") == user &&
             invitation.optLong("expiresAt") in (now + 1)..(now + 65_000)
@@ -83,7 +85,7 @@ object VoipPushPayload {
         val sameLocator = id(message.opt("convId")) == invitation.opt("convId") &&
             id(message.opt("msgId")) == invitation.opt("msgId")
         if (invitation.optString("scene") == "meeting") {
-            return message.opt("msgType") == "meeting_invite" &&
+            return message.opt("msgType") == "meeting_invite" && !isSilentMeeting(body) &&
                 message.optInt("senderType", 1) == 1 && message.optInt("msgStatus", 1) == 1 && sameLocator &&
                 body.opt("inviteId") == invitation.opt("inviteId") &&
                 body.opt("roomName") == invitation.opt("roomName") &&

@@ -20,6 +20,8 @@ import notificationManager from "@ohos.notificationManager";
 // #endif
 // #ifdef APP-ANDROID
 import Build from "android.os.Build";
+import { classifyOemPushVendor } from "@/utils/push/pushBackgroundPolicy";
+import { ensurePushKeepAlive } from "@/uni_modules/nuwax-push-keepalive";
 // #endif
 
 /**
@@ -361,6 +363,49 @@ function showLocalNoticeForAndroid(data: UTSJSONObject | null): void {
   }
 }
 
+// #ifdef APP-ANDROID
+/** 保活锚点是否已尝试过（模块级一次性闸门，避免重复 startService）。 */
+let pushKeepAliveEnsured = false;
+
+/**
+ * 只有「没有厂商推送通道」的设备才启动自己的 START_STICKY 锚点服务。
+ *
+ * 为什么需要：三星等非厂商通道设备上，用户从最近任务划掉 App 时，ROM 会按包名把
+ *   `:pushservice` 连同主进程一起 kill（reason = "remove task"）；而 uni-push 的
+ *   UniPushService 继承的 com.igexin.sdk.PushService.onStartCommand 硬编码
+ *   return START_NOT_STICKY，系统不会重启它 —— 长连接断了就再也回不来，离线推送全丢。
+ *   锚点服务返回 START_STICKY，被杀后由 AMS 约 1s 重新拉起进程，并在进程里把
+ *   UniPushService 重新 start，让个推自己重连。
+ *   详见 docs/engineering/push-swipe-kill-sticky-keepalive.md
+ *
+ * 为什么在这里判定而不是直接调 getPushBackgroundStatus()：
+ *   pushBackgroundStatus.uts 反向 import 了本文件（getImNotifyPermissionState），
+ *   直接引用会形成循环依赖。classifyOemPushVendor 是纯策略层（无任何项目内依赖），
+ *   且与 readVendor() 口径一致 —— pushBackgroundStatus 里 fcmConfigured 恒为 false，
+ *   未命中 OEM 时 resolvePushSystemVendor 必然返回 "none"。
+ *   ★若将来接入 FCM 并把 fcmConfigured 改成 true，这里必须同步改成走 readVendor 口径。
+ *
+ * ★闸门用 vendor 而不是「是否弹过设置引导」：manualSettingsRequired 是状态（用户按引导
+ *   设置好后就变 false、不再弹窗），但设备始终是非厂商通道设备，划掉照样被杀。
+ */
+function ensurePushKeepAliveIfNoVendorChannel(): void {
+  if (pushKeepAliveEnsured) return;
+  pushKeepAliveEnsured = true;
+  try {
+    const oem = classifyOemPushVendor(`${Build.MANUFACTURER}`, `${Build.BRAND}`);
+    if (oem != "none") {
+      console.log(`[ImPush] 保活锚点跳过，厂商通道=${oem}`);
+      return;
+    }
+    ensurePushKeepAlive();
+    console.log("[ImPush] 保活锚点已启动（无厂商通道设备）");
+  } catch (e) {
+    // 保活属于增强能力，失败绝不能影响推送主链路
+    console.warn(`[ImPush] 保活锚点启动失败: ${e}`);
+  }
+}
+// #endif
+
 /**
  * 绑定推送消息监听（登录后由 scheduleImPushAfterLogin 调；已登录冷启动还会经
  * bindImPushClientIfLoggedIn 在 onLaunch 提前绑一次，保证点通知进来的 click 不丢。幂等。）
@@ -369,6 +414,11 @@ function showLocalNoticeForAndroid(data: UTSJSONObject | null): void {
  * 见 showLocalNoticeForReceive。
  */
 export function bindImPushClient(): void {
+  // #ifdef APP-ANDROID
+  // ★放在 pushBound 守卫之前：已登录冷启动时本函数可能被调用多次，锚点启动要保证每次
+  //   都能走到（内部 pushKeepAliveEnsured 自带一次性闸门，重复调用无副作用）。
+  ensurePushKeepAliveIfNoVendorChannel();
+  // #endif
   if (pushBound) {
     return;
   }

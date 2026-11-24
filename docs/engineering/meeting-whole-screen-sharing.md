@@ -3,7 +3,7 @@
 ## 当前实现
 
 - Android：MediaProjection 默认显示器采集，Android 14+ 显式使用 `createConfigForDefaultDisplay()`，最终授权范围仍以系统界面为准。每次共享重新授权。SDK 的 mediaProjection 前台服务承载录屏；独立会议前台服务承载会议音频。
-- iOS：ReplayKit Broadcast Upload Extension → LiveKit IPC → 主 App 原有 Room 发布屏幕轨。扩展不建第二个参会席位，也不接触 JWT。扩展在 IPC 前将整帧等比缩到最长边 1280、最短边不超过 720，上限 30fps；主 App 保留单层 H.264 优先、3Mbps 上限及实际编码诊断。这些是配置上限，不是已实测帧率。
+- iOS：ReplayKit Broadcast Upload Extension 通过 LiveKit 的 `LKSampleHandler` 将采集帧送到主 App，由已有 Room 发布屏幕轨。主 App 在编码前等比缩放，最长边上限 1280、最短边上限 720，发布配置为 30 fps、3 Mbps 上限并优先单层 H.264。实际帧率和发送尺寸以真机日志为准。
 - 用户点击系统开始广播、原生发布完成后才显示共享开启。取消、系统停止、断会或共享被接管均由原生收尾，不依赖页面轮询。后台释放占位复用现有 `POST /api/instant-message/meetings/public/rooms/{room}/share-holder/release`，服务端校验入会 JWT，仅允许释放本人席位。
 - 不提供“小窗”按钮或“最小化”选择。返回其他页面自动保留会议并显示贴右边沿的白底灰色会议图标（36×64、仅左侧圆角），可以上下拖动，点击回到会议。会议页不显示该入口，会议列表不再重复显示顶部返回横条；旧基座使用相同外形的业务组件备用入口。
 - Android 退后台使用 `TYPE_APPLICATION_OVERLAY`，与 App 内相同的白底灰色会议图标（36×64、左侧圆角、可上下拖动），不再自动进入系统 PiP。首次在会中前台展示悬浮窗权限说明，用户点击“去设置”后开启“显示在其他应用上层”；拒绝后不重复弹窗，可从系统通知返回会议，之后也可在系统应用设置中手动授权。回前台隐藏桌面入口，会议页面隐藏 App 内入口；录屏授权期间和锁屏时隐藏桌面入口。

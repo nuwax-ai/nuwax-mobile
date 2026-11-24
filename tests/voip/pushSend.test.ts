@@ -648,11 +648,30 @@ describe('automatic vendor route resolution', () => {
     expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({ delivery: 'android-native' });
   });
 
+  it.each([[7, 'hoshw'], ['7', 'HW']])('routes only single-chat calls to Harmony (%s, %s)', async (phoneType, brand) => {
+    const cid = 'harmony-registry-cid';
+    const { call, send, request } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand, phone_type: phoneType },
+    });
+    const body = makeCall(cid);
+    const result = await call({ ...body, push_clientid: [cid] });
+    expect(result.data.results).toMatchObject([{ cid, transport: 'harmony-huawei', delivery: 'native', errCode: 0 }]);
+    expect(request.mock.calls[0][0].requestData.push_channel).toMatchObject({
+      harmony: { custom: { HW: { type: 'voip_call' } } },
+    });
+    expect(send).not.toHaveBeenCalled();
+
+    await call({ ...body, payload: { ...body.payload, scene: 'meeting', convType: 2,
+      inviteId: 'qa-meeting', roomName: 'qa-room', title: '测试会议', silent: false, groupCall: true } });
+    expect(request).toHaveBeenCalledOnce();
+    expect(send).toHaveBeenCalledOnce();
+  });
+
   it.each([
     ['no vendor token', { device_token: '', brand: 'hw', phone_type: 1 }],
     ['no vivo vendor token', { device_token: ' ', brand: 'vv', phone_type: 1 }],
     ['unknown brand', { device_token: 'vendor-token', brand: 'unknown', phone_type: 1 }],
-    ['HarmonyOS reported as Huawei', { device_token: 'vendor-token', brand: 'hw', phone_type: 7 }],
+    ['HarmonyOS without a vendor token', { device_token: '', brand: 'hw', phone_type: 7 }],
     ['missing registry entry', undefined],
   ])('keeps the ordinary notification when the registry says %s', async (_name, entry) => {
     const cid = 'registry-cid';

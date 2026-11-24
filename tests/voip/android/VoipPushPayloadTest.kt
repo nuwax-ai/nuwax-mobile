@@ -63,6 +63,23 @@ class VoipPushPayloadTest {
         assertFalse(VoipPushPayload.matches(parsed, message, "bob", now))
     }
 
+    @Test fun nativeMeetingPushOnlyRingsWhenTheAuthoritativeInviteIsAudible() {
+        val now = 1_793_000_000_000L
+        val push = JSONObject(locator).put("delivery", "android-native").put("callId", "mi-12")
+            .put("scene", "meeting").put("inviteId", "mi-12").put("roomName", "123456789")
+            .put("calleeId", "bob").put("expiresAt", now + 30_000).put("mediaType", "video")
+        val parsed = JSONObject(VoipPushPayload.invitation(push.toString())!!)
+        val body = JSONObject().put("inviteId", "mi-12").put("roomName", "123456789")
+        val message = JSONObject().put("msgType", "meeting_invite").put("convId", parsed.getString("convId"))
+            .put("msgId", parsed.getString("msgId")).put("sendTime", now - 1000).put("body", body)
+
+        assertTrue(VoipPushPayload.matches(parsed, message, "bob", now))
+        body.put("silent", false)
+        assertTrue(VoipPushPayload.matches(parsed, message, "bob", now))
+        body.put("silent", true)
+        assertFalse(VoipPushPayload.matches(parsed, message, "bob", now))
+    }
+
     @Test fun incompleteNativeInvitesDoNotBecomeLegacyLocators() {
         val marked = JSONObject(locator).put("delivery", "android-native")
         assertNull(VoipPushPayload.invitation(marked.toString()))

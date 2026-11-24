@@ -16,11 +16,12 @@ function sourceFiles(directory: string): string[] {
 }
 
 describe('VoIP feature integration boundary', () => {
-  it('keeps host imports on the lifecycle, audio and chat-component entries', () => {
+  it('keeps host imports on the public lifecycle, audio and UI entries', () => {
     const allowed = new Set([
       '@/features/voip/integration',
       '@/features/voip/audioFocus',
       '@/features/voip/components/chat-actions.uvue',
+      '@/features/voip/components/return-to-call.uvue',
     ]);
     const hosts = ['App.uvue', ...['pages', 'components', 'utils', 'hooks'].flatMap(sourceFiles)];
     for (const path of hosts) {

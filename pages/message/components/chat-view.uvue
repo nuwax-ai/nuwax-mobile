@@ -2152,6 +2152,7 @@
   import { getCachedContactRemarks, setCachedContactRemarks } from "@/utils/im/contactRemarkCache";
   import {
     buildAuthProtectedFileHeaders,
+    downloadAuthProtectedFileToTemp,
     extractFileNameFromUrl,
     fetchAuthProtectedFileAkUrl,
     fetchAuthProtectedFileDisplayUrl,
@@ -10772,6 +10773,12 @@
     if (path.length == 0) {
       return false;
     }
+    // ★远程地址恒不是本地文件：iOS 的 accessSync 失败只打 log 不抛异常（见下方分支），
+    //  https:// 地址会一路被判「可读」→ 直接喂给 uni.uploadFile → 「request system error」。
+    //  （2026-11-24 已发送语音「转文字」iOS 必失败即此因）
+    if (path.indexOf("http://") == 0 || path.indexOf("https://") == 0) {
+      return false;
+    }
     // #ifdef H5
     return path.indexOf("blob:") != 0;
     // #endif
@@ -11005,12 +11012,56 @@
     }
   }
 
-  /** STT 按文件扩展名识别格式：下载临时名无扩展名时补拷一份 .wav（失败回落原路径试传）。 */
+  /**
+   * STT 取本地音频文件（仅服务端地址走这里）：
+   * · 受保护 /api/f/** → downloadAuthProtectedFileToTemp（鸿蒙 ak 直链 + 三级兜底）。
+   *   ★不能复用 fetchChatVideoProtectedUrl：那是裸 downloadFile + Bearer，鸿蒙跟随
+   *   302 到对象存储时会把 Bearer 原样转发，S3 判非法签名回 400（2026-11-02 实证，
+   *   本次「鸿蒙转文字报 400」即此路径）；视频侧早就 ak 优先，语音这条一直没接上。
+   * · 非受保护（第三方 CDN 直链等）→ 裸头整段下载。
+   */
+  function downloadAudioForStt(url: string): Promise<string> {
+    // #ifdef APP
+    if (isAuthProtectedFileUrl(url)) {
+      return downloadAuthProtectedFileToTemp(url);
+    }
+    return new Promise<string>((resolve, reject) => {
+      uni.downloadFile({
+        url: resolveAuthProtectedFileFetchUrl(url),
+        header: {} as UTSJSONObject,
+        success: (res) => {
+          const tempPath = res.tempFilePath;
+          if (res.statusCode == 200 && tempPath != null && tempPath.length > 0) {
+            resolve(tempPath);
+            return;
+          }
+          reject(new Error(translateFn("Mobile.Error.downloadStatus", objectI18nParams({ status: res.statusCode }), "")));
+        },
+        fail: (err) => {
+          reject(new Error(err.errMsg != null ? err.errMsg : "download fail"));
+        },
+      });
+    });
+    // #endif
+    // #ifndef APP
+    return Promise.resolve(url);
+    // #endif
+  }
+
+  /** STT 按文件扩展名识别格式（平台靠后缀认格式）：已是已知音频后缀则原样用，
+   *  无后缀/未知后缀才补拷一份 .wav（失败回落原路径试传）。 */
   function ensureWavSuffixForStt(path: string, msgId: string): string {
     // #ifdef APP
-    const lower = path.toLowerCase();
-    if (path.length == 0 || (lower.length >= 4 && lower.substring(lower.length - 4) == ".wav")) {
+    if (path.length == 0) {
       return path;
+    }
+    const lower = path.toLowerCase();
+    const knownAudioExts = [".wav", ".mp3", ".m4a", ".aac", ".ogg", ".webm", ".amr", ".flac"];
+    for (let i = 0; i < knownAudioExts.length; i++) {
+      const ext = knownAudioExts[i];
+      if (lower.length > ext.length && lower.substring(lower.length - ext.length) == ext) {
+        return path;
+      }
     }
     const target = `${uni.env.USER_DATA_PATH}/asr-${msgId}.wav`;
     try {
@@ -11029,7 +11080,7 @@
 
   /**
    * 长按「转文字」（仅 App，动作项在 buildActionsFor 收敛）：本地占位行直传 wav /
-   * 远端行整段下载（受保护 /api/f/ 自动带鉴权头，复用视频兜底下载封装）→ 上传
+   * 远端行整段下载（受保护 /api/f/ 走 downloadAudioForStt：鸿蒙 ak 直链，其余端 Bearer）→ 上传
    * /api/audio/stt → 文本落在语音条下方。转写中行内小白块三点 loading（audioAsrState=1
    * 同时抑制菜单项，防重入）；结果仅存 chatAsrTextCache，IM 消息体无文本字段不落库。
    * 已收起（state=4）再点=直接展开缓存文本，不重新转写。
@@ -11052,12 +11103,21 @@
     setRowAsrState(msgId, 1, "");
     let uploadPath = "";
     try {
-      if (localFileReadable(msg.audioUrl)) {
+      const audioUrl = msg.audioUrl;
+      // ★先按地址形态分流，不能只问 localFileReadable：iOS 上它对 https 地址恒判
+      // 「可读」（accessSync 失败不抛异常），会把远程地址当 filePath 交给 uploadFile。
+      const isRemote = audioUrl.indexOf("http://") == 0 ||
+        audioUrl.indexOf("https://") == 0 ||
+        isAuthProtectedFileUrl(audioUrl);
+      if (isRemote) {
+        // 服务端地址：整段下载到临时文件（受保护地址按端选链路，见 downloadAudioForStt）
+        uploadPath = await downloadAudioForStt(audioUrl);
+      } else if (localFileReadable(audioUrl)) {
         // 本地占位行（刚录的 wav 直传）或已落盘缓存：文件就在，免下载
-        uploadPath = msg.audioUrl;
+        uploadPath = audioUrl;
       } else {
-        // 远端地址：整段下载到临时文件（同视频整段兜底路径，含受保护鉴权头）
-        uploadPath = await fetchChatVideoProtectedUrl(msg.audioUrl, null);
+        // 既不是服务端地址、本地文件也已失效（重启后临时目录被清）
+        throw new Error(t("Mobile.Message.sendFileExpired"));
       }
       uploadPath = ensureWavSuffixForStt(uploadPath, msgId);
       const audio = new AudioFile(uploadPath, msg.audioDuration, 0, "wav");
@@ -11070,18 +11130,11 @@
       chatAsrHidden.set(msgId, false);
       setRowAsrState(msgId, 2, text);
     } catch (error: any) {
+      // 原始原因（下载/网络/平台错误码）只进日志：后端 message 与系统异常文案对用户
+      // 没有可操作性，界面统一一句「转写失败，请稍后重试」。
       console.error("[ChatAudio] voice to text failed msgId=" + msgId, error);
       setRowAsrState(msgId, 3, "");
-      let tip = "";
-      try {
-        const err = error as Error;
-        if (err != null && err.message != null) {
-          tip = err.message;
-        }
-      } catch (_e) {
-        // ignore
-      }
-      uni.showToast({ title: tip.length > 0 ? tip : t("Mobile.Message.voiceTranscribeFailed"), icon: "none" });
+      uni.showToast({ title: t("Mobile.Message.voiceTranscribeFailed"), icon: "none" });
     }
     // #endif
   }

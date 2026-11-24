@@ -99,7 +99,12 @@
                 <text class="file-row__name" :lines="1">{{ file.name }}</text>
                 <text class="file-row__meta">{{ file.meta }}</text>
               </view>
-              <text :class="file.status == 2 ? 'file-row__state file-row__state--ready' : 'file-row__state'">{{ file.stateText }}</text>
+              <view v-if="file.status == 2 && host" class="file-download"
+                :class="{ 'file-download--busy': downloadBusy }" hover-class="file-download--active"
+                @click.stop="handleDownload(file)">
+                <text class="file-download__text">{{ downloadBusy && downloadingFileId == file.id ? t("Mobile.Terminal.downloading") : t("Mobile.Terminal.download") }}</text>
+              </view>
+              <text v-else-if="file.status != 2" class="file-row__state">{{ file.stateText }}</text>
             </view>
           </view>
 
@@ -110,16 +115,9 @@
               </view>
               <text class="player__time">{{ currentTimeText }} / {{ totalTimeText }}</text>
               <text v-if="audioLoading" class="player__loading">{{ t("Mobile.Common.loading") }}</text>
-              <view
-                class="player__download"
-                :class="{ 'player__download--busy': downloadBusy }"
-                hover-class="player__download--active"
-                @click="handleDownload"
-              >
-                <text class="player__download-text">{{ downloadBusy ? t("Mobile.Terminal.downloading") : t("Mobile.Terminal.download") }}</text>
-              </view>
             </view>
             <slider
+              v-if="!selectedVideo"
               class="player__slider"
               :value="sliderValue"
               :min="0"
@@ -176,6 +174,8 @@
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
   import { formatMeetingId, meetingDisplayTitle } from "@/utils/meeting/meetingLink";
   import { setCurrentPageNavigationBarTitle } from "@/utils/system";
+  import { MeetingReplayFile as DetailFile, meetingReplayKind, visibleMeetingReplayFiles, meetingReplayVideoRoute, meetingReplaySignedUrl } from "@/utils/meeting/meetingReplay";
+  import { saveVideoToAlbumInApp } from "@/utils/appWebViewImagePreview";
 
   const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
 
@@ -183,17 +183,6 @@
     key: string = "";
     name: string = "";
     host: boolean = false;
-  }
-
-  class DetailFile {
-    id: string = "";
-    name: string = "";
-    status: number = 1;
-    stateText: string = "";
-    durationSec: number = 0;
-    sizeBytes: number = 0;
-    meta: string = "";
-    isVideo: boolean = false;
   }
 
   class TranscriptLine {
@@ -237,6 +226,8 @@
   const playing = ref<boolean>(false);
   const audioLoading = ref<boolean>(false);
   const downloadBusy = ref<boolean>(false);
+  const downloadingFileId = ref<string>("");
+  let pageAlive = true;
   const currentSec = ref<number>(0);
   const audioDurationSec = ref<number>(0);
   let audioCtx: InnerAudioContext | null = null;
@@ -331,12 +322,6 @@
     return "—";
   }
 
-  function isVideoFilename(filename: string): boolean {
-    const lower = filename.toLowerCase();
-    return lower.endsWith(".mp4") || lower.endsWith(".mov")
-      || lower.endsWith(".m4v") || lower.endsWith(".webm");
-  }
-
   function transcriptStateText(status: number, fallback: string): string {
     if (status >= 1 && status <= 4) return t("Mobile.Meeting.transcriptProcessing");
     if (status == 5) return t("Mobile.Meeting.transcriptDone");
@@ -369,7 +354,9 @@
       file.name = filename.length > 0 ? filename : `${t("Mobile.Meeting.recording")} ${i + 1}`;
       const contentType = readStr(item, "contentType").toLowerCase();
       const kind = readStr(item, "kind").toLowerCase();
-      file.isVideo = isVideoFilename(file.name) || contentType.startsWith("video/") || kind == "video";
+      file.contentType = contentType;
+      const mediaKind = meetingReplayKind(file.name, contentType);
+      file.isVideo = mediaKind == "video" || (mediaKind.length == 0 && kind == "video");
       file.status = Math.floor(readNum(item, "status", 1));
       file.stateText = fileStateText(file.status, readStr(item, "statusText"));
       file.durationSec = readNum(item, "durationSec", 0);
@@ -558,8 +545,7 @@
     const raw = apiResData<any>(res);
     const data = raw != null ? (raw as UTSJSONObject) : null;
     if (data == null) return "";
-    let url = download ? readStr(data, "downloadUrl") : readStr(data, "playUrl");
-    if (url.length == 0) url = readStr(data, "url");
+    const url = meetingReplaySignedUrl(data, download);
     if (url.length == 0) {
       const reason = readStr(data, "reason");
       uni.showToast({ title: reason.length > 0 ? reason : t("Mobile.Meeting.fileProcessing"), icon: "none" });
@@ -567,11 +553,10 @@
     return url;
   }
 
-  async function openVideoFile(file: DetailFile): Promise<void> {
-    if (!file.isVideo || file.status != 2 || file.id.length == 0) return;
-    const url = await resolveFileUrl(file, false);
-    if (url.length == 0) return;
-    uni.navigateTo({ url: `/subpackages/pages/im-video-preview/im-video-preview?src=${encodeURIComponent(url)}` });
+  function openVideoFile(file: DetailFile, seekSec: number = 0): void {
+    if (!file.isVideo || file.status != 2 || file.id.length == 0 || replayLocked.value) return;
+    stopAudio();
+    uni.navigateTo({ url: meetingReplayVideoRoute(meetingId.value, file.id, seekSec) });
   }
 
   function openDownloadedFile(tempFilePath: string): Promise<void> {
@@ -592,14 +577,29 @@
     });
   }
 
-  async function handleDownload(): Promise<void> {
-    if (downloadBusy.value) return;
-    const file = findFile(selectedFileId.value);
-    if (file == null || file.status != 2 || file.id.length == 0) return;
+  async function handleDownload(file: DetailFile): Promise<void> {
+    if (downloadBusy.value || !host.value || replayLocked.value || file.status != 2 || file.id.length == 0) return;
     downloadBusy.value = true;
+    downloadingFileId.value = file.id;
     try {
       const url = await resolveFileUrl(file, true);
-      if (url.length == 0) return;
+      if (url.length == 0 || !pageAlive) return;
+      // 视频下载必须保存到相册，不能用只支持文档类型的 openDocument 打开 MP4。
+      // #ifdef APP || MP-WEIXIN
+      if (file.isVideo) {
+        // 共用保存方法已处理权限引导和错误提示，避免外层再次覆盖具体提示。
+        try { await saveVideoToAlbumInApp(url); } catch (_saveError) {}
+        return;
+      }
+      // #endif
+      // #ifdef H5 || WEB
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = file.name;
+      anchor.rel = "noopener";
+      anchor.click();
+      return;
+      // #endif
       await new Promise<void>((resolve, _reject) => {
         uni.downloadFile({
           url,
@@ -622,6 +622,7 @@
       uni.showToast({ title: t("Mobile.Terminal.downloadFailed"), icon: "none" });
     } finally {
       downloadBusy.value = false;
+      downloadingFileId.value = "";
     }
   }
 
@@ -650,13 +651,14 @@
     const membersRaw = data["members"];
     members.value = membersRaw != null ? parseMembers(membersRaw as UTSJSONObject[]) : ([] as DetailMember[]);
     const filesRaw = data["files"];
-    const nextFiles = filesRaw != null ? parseFiles(filesRaw as UTSJSONObject[]) : ([] as DetailFile[]);
+    const allFiles = filesRaw != null ? parseFiles(filesRaw as UTSJSONObject[]) : ([] as DetailFile[]);
+    const nextFiles = visibleMeetingReplayFiles(allFiles);
     files.value = nextFiles;
     const transcriptsRaw = data["transcripts"];
     const nextBlocks = transcriptsRaw != null
       ? parseTranscripts(transcriptsRaw as UTSJSONObject[])
       : ([] as TranscriptBlock[]);
-    if (nextFiles.length == 1) {
+    if (allFiles.length == 1) {
       for (let i = 0; i < nextBlocks.length; i++) {
         if (nextBlocks[i].fileId.length == 0) nextBlocks[i].fileId = nextFiles[0].id;
       }
@@ -756,6 +758,12 @@
   }
 
   function handleTranscriptClick(line: TranscriptLine): void {
+    const file = findFile(line.fileId);
+    if (file == null) return;
+    if (file.isVideo) {
+      openVideoFile(file, Math.max(0, line.beginMs / 1000));
+      return;
+    }
     loadAudio(line.fileId, Math.max(0, line.beginMs / 1000), true);
   }
 
@@ -777,6 +785,11 @@
   const replayLockedHint = computed((): string => replayShared.value
     ? t("Mobile.Meeting.replayNotSharedToMe")
     : t("Mobile.Meeting.replayNotShared"));
+
+  const selectedVideo = computed((): boolean => {
+    const file = findFile(selectedFileId.value);
+    return file != null && file.isVideo;
+  });
 
   const selectedReady = computed((): boolean => {
     const file = findFile(selectedFileId.value);
@@ -875,6 +888,7 @@
   });
 
   onUnload((): void => {
+    pageAlive = false;
     stopPolling();
     destroyAudio();
   });
@@ -976,10 +990,10 @@
   .play-button__text { position: relative; left: 3rpx; font-size: 36rpx; line-height: 40rpx; color: #ffffff; }
   .player__time { margin-left: 20rpx; font-size: 25rpx; color: #5c5863; }
   .player__loading { margin-left: auto; font-size: 23rpx; color: #9994a1; }
-  .player__download { margin-left: auto; min-width: 96rpx; height: 56rpx; padding: 0 18rpx; border-radius: 28rpx; background: #17171a; display: flex; align-items: center; justify-content: center; }
-  .player__download--busy { opacity: 0.55; }
-  .player__download--active { opacity: 0.75; }
-  .player__download-text { font-size: 23rpx; color: #ffffff; }
+  .file-download { margin-left: 16rpx; flex-shrink: 0; min-width: 96rpx; height: 56rpx; padding: 0 18rpx; border-radius: 28rpx; background: #17171a; display: flex; align-items: center; justify-content: center; }
+  .file-download--busy { opacity: 0.55; }
+  .file-download--active { opacity: 0.75; }
+  .file-download__text { font-size: 23rpx; color: #ffffff; }
   .player__slider { margin: 18rpx 0 0; }
 
   .transcript-list { width: 100%; }

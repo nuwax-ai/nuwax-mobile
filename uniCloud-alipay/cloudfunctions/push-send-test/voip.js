@@ -184,7 +184,7 @@ const callTransports = new Map([
   ['android-smartisan', { platform: 'android', brand: 'st' }],
   // Samsung devices with Google Play services can register for FCM, a separate transport.
   ['android-fcm', { platform: 'android', brand: 'fcm' }],
-  ['harmony-huawei', { platform: 'harmonyos' }],
+  ['harmony-huawei', { platform: 'harmonyos', strategy: 'hoshw' }],
 ])
 const androidTransportByBrand = new Map(
   [...callTransports].filter(([, config]) => config.platform === 'android')
@@ -220,8 +220,8 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   const transport = callTransports.get(route?.transport)
   if (!transport) return { error: 'unsupported call route' }
   const { platform, strategy } = transport
-  if (platform === 'harmonyos') return { error: 'native call transport unavailable' }
   const ios = platform === 'ios'
+  const harmony = platform === 'harmonyos'
   const target = !ios && Array.isArray(body.push_clientid) && body.push_clientid.length === 1
     ? body.push_clientid[0] : body.push_clientid
   if (route.platform !== platform || !isCallCid(route.cid) || target !== route.cid) {
@@ -230,18 +230,23 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   if (ios && !validIosRegistration(route)) {
     return { error: 'signed environment and current iOS route registration are required' }
   }
+  if (harmony && (body.payload?.scene === 'meeting' || !locator(body.payload?.calleeId))) {
+    return { error: 'Harmony native push requires a single-chat call' }
+  }
   const invitation = body.payload?.scene === 'meeting'
     ? prepareMeetingRingInvitation(body, now)
     : prepareCallInvitation(body, now)
   if (invitation.error || invitation.expired) return invitation
   if (!strategy) return { notificationOnly: true }
-  const payload = ios
-    ? { ...invitation.payload, routeRegistrationId: route.registrationId }
-    : { ...invitation.payload, delivery: 'android-native' }
+  const payload = { ...invitation.payload }
+  if (ios) payload.routeRegistrationId = route.registrationId
+  if (platform === 'android') payload.delivery = 'android-native'
+  // Harmony retrieves the authorized room through IM after waking.
+  if (harmony) delete payload.roomName
   const requestId = createHash('sha256')
     .update(JSON.stringify([route.transport, route.cid, ios ? route.registrationId : '', payload.callId]))
     .digest('hex').slice(0, 32)
-  const ttl = Math.min(5_000, invitation.settings.ttl)
+  const ttl = harmony ? invitation.settings.ttl : Math.min(5_000, invitation.settings.ttl)
   const settings = { ttl, strategy: { [strategy]: 2 } }
   if (strategy === 'vv') {
     // Test-space probe via UniPush. Vendor receipt and SDK callback are verified separately.

@@ -502,6 +502,7 @@ object VoipBridge {
     private fun receiveMeetingInvitation(message: JSONObject, push: JSONObject?, sessionScope: String?) {
         if (message.optInt("senderType", 1) != 1 || message.optInt("msgStatus", 1) != 1) return
         val body = message.optJSONObject("body") ?: return
+        if (VoipPushPayload.isSilentMeeting(body)) return
         val inviteId = body.optString("inviteId")
         val room = body.optString("roomName")
         val title = body.optString("title")
@@ -566,6 +567,7 @@ object VoipBridge {
         clearIncomingUiWait()
         incomingNotifications.reset()
         try { VoipCallService.removeNotification() } catch (_: Exception) { }
+        ctx?.stopService(Intent(ctx, VoipCallService::class.java))
         try { if (ctx != null) NotificationManagerCompat.from(ctx).cancel(9090) } catch (_: Exception) { }
     }
 
@@ -1157,7 +1159,7 @@ object VoipBridge {
     internal fun presentedRingtoneChannel(ctx: Context): NotificationChannel? {
         if (Build.VERSION.SDK_INT < 31) return null
         val call = current ?: return null
-        if (!isRingingIncoming(call) || call.optString("scene") == "meeting" ||
+        if (!isRingingIncoming(call) ||
             !incomingNotifications.wasPresentedFirst(call.optString("callId"))) return null
         val manager = ctx.getSystemService(NotificationManager::class.java)
         val channel = manager.getNotificationChannel(VoipNotificationChannels.presentedIncoming(ctx)) ?: return null
@@ -1170,12 +1172,12 @@ object VoipBridge {
         return channel.takeIf { audio.ringerMode == AudioManager.RINGER_MODE_NORMAL && audio.getStreamVolume(AudioManager.STREAM_RING) > 0 }
     }
 
-    internal fun notification(ctx: Context): Notification {
+    internal fun notification(ctx: Context, useServiceRingtone: Boolean = false): Notification {
         ensureNotificationChannels(ctx)
         val s = current ?: JSONObject()
         val incoming = isRingingIncoming(s)
         val presented = incoming && incomingNotifications.wasPresented(s.optString("callId"))
-        val ringsInService = presented && presentedRingtoneChannel(ctx) != null
+        val ringsInService = useServiceRingtone && presented && presentedRingtoneChannel(ctx) != null
         val alert = incoming && !presented
         fun intent(action: String): PendingIntent = PendingIntent.getBroadcast(ctx, action.hashCode(), Intent(ctx, VoipActionReceiver::class.java)
             .setData(Uri.parse("nuwax-voip://call/" + Uri.encode(s.optString("callId"))))
@@ -1242,8 +1244,9 @@ class VoipCallService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (!VoipBridge.hasSystemCall()) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return START_NOT_STICKY }
         if (VoipBridge.uiSnapshot(intent?.getStringExtra("callId") ?: "") == null) return START_NOT_STICKY
-        if (Build.VERSION.SDK_INT >= 29) startForeground(9090, VoipBridge.notification(this), ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
-        else startForeground(9090, VoipBridge.notification(this))
+        val notification = VoipBridge.notification(this, useServiceRingtone = true)
+        if (Build.VERSION.SDK_INT >= 29) startForeground(9090, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
+        else startForeground(9090, notification)
         syncRinging()
         return START_NOT_STICKY
     }

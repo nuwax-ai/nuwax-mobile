@@ -50,22 +50,11 @@ class VoiceNoteM4aBridge {
             change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
             change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
         ) {
+            if (!callConnected()) {
+                return@OnAudioFocusChangeListener
+            }
             synchronized(lock) {
-                if (!running || paused) {
-                    return@synchronized
-                }
-                paused = true
-                if (!interruptHold) {
-                    interruptBeganAt = SystemClock.elapsedRealtime()
-                }
-                interruptHold = true
-                pushEventLocked("began")
-                try {
-                    if (audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                        audioRecord?.stop()
-                    }
-                } catch (_e: Exception) {
-                }
+                pauseForConnectedCallLocked()
             }
             return@OnAudioFocusChangeListener
         }
@@ -205,6 +194,11 @@ class VoiceNoteM4aBridge {
     }
 
     fun takeInterruption(): String {
+        if (callConnected()) {
+            synchronized(lock) {
+                pauseForConnectedCallLocked()
+            }
+        }
         val probe = synchronized(lock) {
             interruptHold && interruptGraceDone()
         }
@@ -220,6 +214,31 @@ class VoiceNoteM4aBridge {
                 return ""
             }
             return pendingEvents.removeAt(0)
+        }
+    }
+
+    /** 响铃不算接通。只有电话已接起，或微信等语音通话已建立，才暂停。 */
+    private fun callConnected(): Boolean {
+        val manager = audioManager ?: return false
+        val mode = manager.mode
+        return mode == AudioManager.MODE_IN_CALL || mode == AudioManager.MODE_IN_COMMUNICATION
+    }
+
+    private fun pauseForConnectedCallLocked() {
+        if (!running || paused || !callConnected()) {
+            return
+        }
+        paused = true
+        if (!interruptHold) {
+            interruptBeganAt = SystemClock.elapsedRealtime()
+        }
+        interruptHold = true
+        pushEventLocked("began")
+        try {
+            if (audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                audioRecord?.stop()
+            }
+        } catch (_e: Exception) {
         }
     }
 

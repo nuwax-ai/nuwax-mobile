@@ -44,6 +44,9 @@ import {
   VoiceNoteM4aRecorder,
   beginVoiceNoteBackground,
   endVoiceNoteBackground,
+  holdVoiceNoteCall,
+  markVoiceNoteBackgroundStale,
+  releaseVoiceNoteCall,
 } from "@/uni_modules/nuwax-stream-pcm-player";
 // #endif
 
@@ -196,6 +199,12 @@ function beginBackground(): void {
     console.warn("[voice-note] begin background failed " + e);
   }
   // #endif
+  // #ifdef APP-HARMONY
+  try {
+    releaseVoiceNoteCall();
+  } catch (_eRelease) {
+  }
+  // #endif
 }
 
 function endBackground(): void {
@@ -208,6 +217,37 @@ function endBackground(): void {
   } catch (e) {
     console.warn("[voice-note] end background failed " + e);
   }
+  // #endif
+  // #ifdef APP-HARMONY
+  if (!pausedByInterruption) {
+    try {
+      releaseVoiceNoteCall();
+    } catch (_eRelease) {
+    }
+  }
+  // #endif
+}
+
+/**
+ * 鸿蒙接通后录音器通常已经被系统按住。
+ * 不停止长时任务，只把它记成可能已失效。挂断后对同一个采集器 resume，成功后再重新申请。
+ * 短时保活要在退后台当时申请，这里再补一次；已经在保活中则不会重复申请。
+ */
+function finishHarmonyInterruptPause(): void {
+  // #ifdef APP-HARMONY
+  if (pausedByInterruption) {
+    try {
+      holdVoiceNoteCall();
+    } catch (_eHold) {
+    }
+    backgroundOn = false;
+    try {
+      markVoiceNoteBackgroundStale();
+    } catch (_eStale) {
+    }
+    return;
+  }
+  endBackground();
   // #endif
 }
 
@@ -1981,7 +2021,7 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
       touch(record);
       pushVoiceNoteDebug("录音", "暂停接口不可用，当前段已封口");
       // #ifdef APP-HARMONY
-      endBackground();
+      finishHarmonyInterruptPause();
       // #endif
       return;
     }
@@ -1993,9 +2033,9 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
       target.phase = "paused";
       target.awaitComplete = false;
       touch(target);
-      // 暂停后已不再采集。停掉长时任务，避免系统因“未在录音仍占后台”把进程冻住。
       // #ifdef APP-HARMONY
-      endBackground();
+      // 用户自己暂停才停长时任务。通话打断要留住进程，挂断后才能接着录。
+      finishHarmonyInterruptPause();
       // #endif
       return;
     }
@@ -2076,6 +2116,10 @@ async function resumeInterruptedNote(record: VoiceNoteRecord): Promise<boolean> 
       await resumePausedNote(record);
       return captureAlive;
     }
+    // 文件还在，只是麦克风被通话占着。不要丢掉采集器再新建，后台创建会被拒绝。
+    // #ifdef APP-HARMONY
+    return false;
+    // #endif
   }
   // 鸿蒙封口之后文件已经关掉，resume 会失败。改成新开一段。
   return await openSealedInterruptSegment(record);
@@ -2128,9 +2172,13 @@ async function pollVoiceInterruption(): Promise<void> {
     if (paused == null) {
       return;
     }
-    // 鸿蒙把当前段封口后，通话结束不一定还有 ended。回到前台就试着新开一段，麦克风仍被占用则继续等。
+    // 通话结束后系统经常仍报着电话场景，也不会再发 ended。文件还在就隔一会儿 resume 一次。
+    let retryOpen = false;
+    // #ifdef APP-HARMONY
+    retryOpen = event != "ended" && paused.openSegmentPath.length > 0 && interruptRetryDue();
+    // #endif
     const retrySealed = event != "ended" && paused.openSegmentPath.length == 0 && interruptRetryDue();
-    if (event != "ended" && !retrySealed) {
+    if (event != "ended" && !retrySealed && !retryOpen) {
       return;
     }
     const resumed = await resumeInterruptedNote(paused);
@@ -2357,6 +2405,19 @@ async function sealLeftoverOpenFiles(): Promise<void> {
   }
   // #endif
   return;
+}
+
+/** 刚退后台时申请短时保活。接通后再申请，已经过了系统允许的窗口。 */
+export function voiceNoteOnAppHide(): void {
+  // #ifdef APP-HARMONY
+  if (!captureAlive && !pausedByInterruption) {
+    return;
+  }
+  try {
+    holdVoiceNoteCall();
+  } catch (_eHold) {
+  }
+  // #endif
 }
 
 /** 回前台：本进程仍在录就继续计时和切段。从最近任务划掉或进程已被杀掉，则把这次按完成结束，不在这里上传。 */

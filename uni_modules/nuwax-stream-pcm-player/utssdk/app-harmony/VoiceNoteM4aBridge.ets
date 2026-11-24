@@ -14,6 +14,11 @@ interface AmplitudeRecorder {
   getAudioCapturerMaxAmplitude(): Promise<number>
 }
 
+/** API 20 起，来电打断时改为写入静音，不把采集器停掉。必须在 prepare 之前调用。 */
+interface MuteInterruptRecorder {
+  setWillMuteWhenInterrupted(muteWhenInterrupted: boolean): Promise<void>
+}
+
 function amplitudeToLevel(amp: number): number {
   if (!(amp > 0)) {
     return 0
@@ -57,6 +62,11 @@ export class VoiceNoteM4aBridge {
   private levelBusy: boolean = false
   private levelStartedAt: number = 0
 
+  private ringResumeBusy: boolean = false
+  /** 接通期间写入的静音区间，成对的起止毫秒。封口时从文件里剪掉。 */
+  private silenceMarks: number[] = []
+  private silenceOpen: boolean = false
+
   private markSelfAction(): void {
     this.selfActionUntil = Date.now() + 800
   }
@@ -66,6 +76,10 @@ export class VoiceNoteM4aBridge {
       return
     }
     if ((state == 'paused' || state == 'error') && !this.interruptHold) {
+      if (!this.callConnected()) {
+        this.keepRecordingThroughRing()
+        return
+      }
       this.interruptBeganAt = Date.now()
       this.interruptHold = true
       this.pushEvent('began')
@@ -74,6 +88,72 @@ export class VoiceNoteM4aBridge {
     if (state == 'started' && this.interruptHold && this.interruptGraceDone() && !this.otherCallActive()) {
       this.pushEvent('ended')
     }
+  }
+
+  /** 电话已接通或语音通话已建立。响铃不算。 */
+  private callConnected(): boolean {
+    try {
+      const scene = audio.getAudioManager().getAudioSceneSync()
+      if (scene == audio.AudioScene.AUDIO_SCENE_PHONE_CALL) {
+        return true
+      }
+      if (scene == audio.AudioScene.AUDIO_SCENE_VOICE_CHAT) {
+        return true
+      }
+    } catch (_eScene) {
+    }
+    return false
+  }
+
+  /**
+   * 接通后不暂停采集器。暂停后再 resume 要重新启动麦克风，后台会被系统拒绝。
+   * 这里只记下静音区间，当前文件封口时再剪掉。
+   */
+  private noteCallSilence(): void {
+    if (!this.fileOpen) {
+      return
+    }
+    if (this.callConnected()) {
+      if (!this.silenceOpen) {
+        this.silenceOpen = true
+        this.silenceMarks.push(this.mediaElapsedMs())
+      }
+      return
+    }
+    if (this.silenceOpen) {
+      this.silenceOpen = false
+      this.silenceMarks.push(this.mediaElapsedMs())
+    }
+  }
+
+  private mediaElapsedMs(): number {
+    if (this.segmentStartedAt <= 0) {
+      return 0
+    }
+    const endAt = this.pauseBeganAt > 0 ? this.pauseBeganAt : Date.now()
+    let elapsed = endAt - this.segmentStartedAt - this.pausedAccumMs
+    if (elapsed < 0) {
+      elapsed = 0
+    }
+    return elapsed
+  }
+
+  /** 只是来电响铃时，系统可能把录音器按住。拉回来继续写，不进入暂停。 */
+  private keepRecordingThroughRing(): void {
+    if (this.ringResumeBusy || !this.fileOpen || this.callConnected()) {
+      return
+    }
+    const av = this.recorder
+    if (av == null) {
+      return
+    }
+    this.ringResumeBusy = true
+    this.markSelfAction()
+    av.resume().then((): void => {
+      this.ringResumeBusy = false
+    }).catch((): void => {
+      this.ringResumeBusy = false
+    })
   }
 
   /** 通话把当前段封口后，旧的 AVRecorder 往往还停在暂停或错误态，prepare 会直接失败。先丢掉它再开下一段。 */
@@ -138,8 +218,13 @@ export class VoiceNoteM4aBridge {
       this.pauseBeganAt = Date.now()
       return '1'
     } catch (ePause) {
-      // 模拟器经常拒绝 pause。改为封口当前文件并 reset，同一个 AVRecorder 还在。
-      console.warn('[voice-note] m4a pause failed', ePause)
+      // 电话接通时系统已经把录音器按成 paused，再 pause 会被拒绝。
+      // 这时采集器还在，挂断后直接 resume。封口再新建采集器，后台会被系统拒绝。
+      console.warn('[voice-note] m4a pause failed', av.state, ePause)
+      if (av.state == 'paused') {
+        this.pauseBeganAt = Date.now()
+        return '1'
+      }
       try {
         await this.finishFile()
         return '2'
@@ -194,6 +279,13 @@ export class VoiceNoteM4aBridge {
 
   /** 其他应用抢走音频时返回一次 began 或 ended，读完即清。通话结束后系统经常不把录音器拉回 started。 */
   takeInterruption(): string {
+    this.noteCallSilence()
+    if (!this.interruptHold && this.fileOpen && !this.callConnected()) {
+      const av = this.recorder
+      if (av != null && (av.state == 'paused' || av.state == 'error')) {
+        this.keepRecordingThroughRing()
+      }
+    }
     if (this.interruptHold && this.interruptGraceDone() && !this.otherCallActive()) {
       this.pushEvent('ended')
     }
@@ -213,7 +305,7 @@ export class VoiceNoteM4aBridge {
     return Date.now() - this.interruptBeganAt >= 800
   }
 
-  /** 响铃、电话、语音通话还在时不要恢复。 */
+  /** 响铃或通话还在时不要恢复。暂停只认已接通的电话和语音通话。 */
   private otherCallActive(): boolean {
     try {
       const scene = audio.getAudioManager().getAudioSceneSync()
@@ -341,6 +433,20 @@ export class VoiceNoteM4aBridge {
     }
   }
 
+  /**
+   * 来电或语音通话优先级更高。不设置时系统会把录音器打成 error，后台不能再新建麦克风。
+   * 设置后采集器保持录音。接通期间的静音留在文件里，封口时再剪掉。
+   */
+  private async enableMuteWhenInterrupted(av: media.AVRecorder): Promise<void> {
+    try {
+      const muteable = av as MuteInterruptRecorder
+      await muteable.setWillMuteWhenInterrupted(true)
+      console.info('[voice-note] mute when interrupted on')
+    } catch (eMute) {
+      console.warn('[voice-note] mute when interrupted unavailable', eMute)
+    }
+  }
+
   private async openFile(av: media.AVRecorder, path: string): Promise<boolean> {
     this.markSelfAction()
     let opened: fs.File
@@ -363,6 +469,7 @@ export class VoiceNoteM4aBridge {
         profile: profile,
         url: `fd://${opened.fd}`,
       }
+      await this.enableMuteWhenInterrupted(av)
       await av.prepare(config)
       await av.start()
       this.file = opened
@@ -373,6 +480,8 @@ export class VoiceNoteM4aBridge {
       this.pauseBeganAt = 0
       this.interruptHold = false
       this.pendingEvents = []
+      this.silenceMarks = []
+      this.silenceOpen = false
       return true
     } catch (eStart) {
       console.warn('[voice-note] m4a start failed', eStart)
@@ -400,6 +509,16 @@ export class VoiceNoteM4aBridge {
       duration = 0
     }
     this.lastClosedDurationMs = duration
+    const sealedPath = this.currentPath
+    const marks: number[] = []
+    for (let i = 0; i < this.silenceMarks.length; i++) {
+      marks.push(this.silenceMarks[i])
+    }
+    if (this.silenceOpen) {
+      marks.push(duration)
+    }
+    this.silenceMarks = []
+    this.silenceOpen = false
     try {
       await this.recorder.stop()
     } catch (_eStop) {
@@ -414,6 +533,12 @@ export class VoiceNoteM4aBridge {
     this.pauseBeganAt = 0
     this.currentPath = ''
     this.closeFd()
+    if (sealedPath.length > 0 && marks.length >= 2) {
+      const trimmed = dropCallSilence(sealedPath, marks)
+      if (trimmed > 0) {
+        this.lastClosedDurationMs = trimmed
+      }
+    }
   }
 
   private closeFd(): void {
@@ -509,6 +634,89 @@ const BOX_CTTS: number = 0x63747473
 const BOX_EDTS: number = 0x65647473
 const HANDLER_SOUN: number = 0x736f756e
 const SPLIT_FILE_LIMIT: number = 96 * 1024 * 1024
+
+function dropCallSilence(path: string, marks: number[]): number {
+  if (path.length == 0 || marks.length < 2) {
+    return -1
+  }
+  const source = readFileBytes(path)
+  if (source == null) {
+    return -1
+  }
+  const layout = readLayout(source)
+  if (layout == null || layout.mediaScale <= 0 || layout.moov == null) {
+    return -1
+  }
+  const count = layout.sizes.length < layout.deltas.length ? layout.sizes.length : layout.deltas.length
+  const compact = new M4aLayout()
+  compact.moov = layout.moov
+  compact.ftyp = layout.ftyp
+  compact.mediaScale = layout.mediaScale
+  compact.movieScale = layout.movieScale
+  compact.trakIndex = layout.trakIndex
+  compact.descIndex = layout.descIndex
+  let tick = 0
+  let keptDuration = 0
+  let dropped = 0
+  for (let i = 0; i < count; i++) {
+    const startMs = Math.floor(tick * 1000 / layout.mediaScale)
+    tick = tick + layout.deltas[i]
+    const endMs = Math.floor(tick * 1000 / layout.mediaScale)
+    if (sampleInCall(startMs, endMs, marks)) {
+      dropped = dropped + 1
+      continue
+    }
+    compact.sizes.push(layout.sizes[i])
+    compact.deltas.push(layout.deltas[i])
+    compact.offsets.push(layout.offsets[i])
+    keptDuration = keptDuration + layout.deltas[i]
+  }
+  if (dropped <= 0 || compact.sizes.length <= 0) {
+    return -1
+  }
+  const range = new SampleRange()
+  range.start = 0
+  range.end = compact.sizes.length
+  range.mediaDuration = keptDuration
+  const temp = path + '.nosilence.m4a'
+  const piece = writePiece(source, compact, range, temp)
+  if (piece == null) {
+    removeFile(temp)
+    return -1
+  }
+  const trimmed = readFileBytes(temp)
+  removeFile(temp)
+  if (trimmed == null || !writeFileBytes(path, copyBuffer(trimmed))) {
+    return -1
+  }
+  console.info('[voice-note] call silence removed ' + dropped)
+  return piece.durationMs
+}
+
+function copyBuffer(view: Uint8Array): ArrayBuffer {
+  const raw = new ArrayBuffer(view.byteLength)
+  const out = new Uint8Array(raw)
+  for (let i = 0; i < view.byteLength; i++) {
+    out[i] = view[i]
+  }
+  return raw
+}
+
+function sampleInCall(startMs: number, endMs: number, marks: number[]): boolean {
+  let i = 0
+  while (i + 1 < marks.length) {
+    let from = marks[i] - 1200
+    if (from < 0) {
+      from = 0
+    }
+    const to = marks[i + 1] + 400
+    if (endMs > from && startMs < to) {
+      return true
+    }
+    i = i + 2
+  }
+  return false
+}
 
 async function splitSealedM4a(path: string, segmentMs: number): Promise<SplitPiece[]> {
   const empty: SplitPiece[] = []

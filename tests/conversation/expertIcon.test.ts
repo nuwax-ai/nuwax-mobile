@@ -10,6 +10,52 @@ const { code } = transformSync(source.slice(start, end), { loader: "ts" });
 const origin = "https://example.test";
 const defaultIcon = "/static/assets/agent_image.png";
 
+const stateStart = source.indexOf("  function iconOrFallback(");
+const stateEnd = source.indexOf("  const handlePendingImageLoad", stateStart);
+const { code: iconStateCode } = transformSync(source.slice(stateStart, stateEnd), { loader: "ts" });
+
+function createIconState(icon: string, showDefaultIcon: boolean) {
+  const resolveIconUrl = vi.fn(async (url: string) => url);
+  const watch = vi.fn();
+  const state = runInNewContext(
+    `${iconStateCode}\n({ currentIcon, handleImageError })`,
+    {
+      defaultAgentIcon: defaultIcon,
+      props: { icon, showDefaultIcon },
+      ref: (value: unknown) => ({ value }),
+      resolveIconUrl,
+      watch,
+    },
+  );
+  return { ...state, resolveIconUrl, setIcon: watch.mock.calls[0][1] };
+}
+
+describe("首页输入框智能体图标", () => {
+  it("空值不解析图标，切换到空值时丢弃尚在解析的旧图标", async () => {
+    const { currentIcon, resolveIconUrl, setIcon } = createIconState("  ", false);
+    expect(currentIcon.value).toBe("");
+    expect(resolveIconUrl).not.toHaveBeenCalled();
+
+    setIcon("/plugin.svg");
+    await Promise.resolve();
+    expect(currentIcon.value).toBe("/plugin.svg");
+    setIcon("/another.svg");
+    setIcon("");
+    await Promise.resolve();
+    expect(currentIcon.value).toBe("");
+  });
+
+  it("仅给启用默认图标的场景提供回退", async () => {
+    const home = createIconState("/plugin.svg", false);
+    const withFallback = createIconState("/plugin.svg", true);
+    await Promise.resolve();
+    home.handleImageError();
+    withFallback.handleImageError();
+    expect(home.currentIcon.value).toBe("");
+    expect(withFallback.currentIcon.value).toBe(defaultIcon);
+  });
+});
+
 function androidIconResolver() {
   const svg = vi.fn(async (url: string) => url);
   const display = vi.fn(async () => "/tmp/protected-image");

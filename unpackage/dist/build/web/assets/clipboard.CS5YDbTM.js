@@ -1,0 +1,1 @@
+import{e5 as a,e6 as t}from"./index-B4WA2o4_.js";function s(s,n,c){if(0==s.length)return c(),null;const e="".concat(s);a({data:e,showToast:!1,success:()=>{t(new UTSJSONObject({success:a=>{(null!=a.data?"".concat(a.data):"").length>0?n():c()},fail:()=>{n()}}))},fail:()=>{c()}})}export{s as w};

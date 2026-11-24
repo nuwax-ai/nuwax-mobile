@@ -8,6 +8,11 @@ import AVFoundation
 import CallKit
 import Foundation
 
+/// 只要被设成 delegate，CXCallObserver.calls 才会更新。
+private final class CallWatch: NSObject, CXCallObserverDelegate {
+    func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {}
+}
+
 public class VoiceNoteM4aBridge {
     private var recorder: AVAudioRecorder?
     private var lastClosedDurationMs: Int = 0
@@ -21,9 +26,12 @@ public class VoiceNoteM4aBridge {
     /// 用户自己点的暂停。这种停止不能当成电话打断，否则挂断后又会自动录。
     private var userPaused = false
     private var resumeNotBefore = Date()
+    /// 不设置 delegate 时 calls 一直是空的，系统电话会被当成已经挂断。
+    private let callWatch = CallWatch()
     private let callObserver = CXCallObserver()
 
     public init() {
+        callObserver.setDelegate(callWatch, queue: .main)
         let center = NotificationCenter.default
         interruptObserver = center.addObserver(
             forName: AVAudioSession.interruptionNotification,

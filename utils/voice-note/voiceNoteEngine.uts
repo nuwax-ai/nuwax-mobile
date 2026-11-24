@@ -607,17 +607,22 @@ async function splitLongHarmonySegment(record: VoiceNoteRecord): Promise<void> {
 }
 
 // #ifdef APP
-/** 杀掉进程后补写 moov。成功才允许这段进入上传。 */
-async function sealUnfinishedM4a(filePath: string): Promise<boolean> {
-  if (filePath.length == 0) return false;
+/**
+ * 杀掉进程后补写 moov。成功返回 "1"。
+ * 旧基座没有 seal 方法时返回 "0"，Android、鸿蒙按原文件上传。
+ * 新基座封口失败返回 "0:原因"，这次不上传。
+ */
+async function sealUnfinishedM4a(filePath: string): Promise<string> {
+  if (filePath.length == 0) return "0";
   try {
     const sealer = new VoiceNoteM4aRecorder();
     const result = await sealer.seal(filePath);
     pushVoiceNoteDebug("录音", "补封口 " + result);
-    return result == "1";
+    if (result.length == 0) return "0";
+    return result;
   } catch (e) {
     console.warn("[voice-note] m4a 封口失败 " + e);
-    return false;
+    return "0";
   }
 }
 // #endif
@@ -644,8 +649,8 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
   if (isM4aPath(filePath)) {
     let gate = await segmentUploadReady(filePath);
     if (gate == "unsealed") {
-      const sealedNow = await sealUnfinishedM4a(filePath);
-      if (sealedNow) {
+      const sealResult = await sealUnfinishedM4a(filePath);
+      if (sealResult == "1") {
         gate = await segmentUploadReady(filePath);
       }
     }
@@ -1547,10 +1552,16 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
       // #ifdef APP
       gate = await segmentUploadReady(missingPath);
       if (gate == "unsealed") {
-        const sealedNow = await sealUnfinishedM4a(missingPath);
-        if (sealedNow) {
+        const sealResult = await sealUnfinishedM4a(missingPath);
+        if (sealResult == "1") {
           gate = "ready";
         }
+        // #ifdef APP-ANDROID || APP-HARMONY
+        // 当前基座还没有补封口。划掉任务时 stop() 已经写过 moov，不要因此收成失败。
+        if (sealResult == "0") {
+          gate = "ready";
+        }
+        // #endif
       }
       // #endif
       // #ifndef APP
@@ -2577,8 +2588,8 @@ async function sealLeftoverOpenFiles(): Promise<void> {
     if (row.phase == "recording" || row.phase == "paused") continue;
     if (row.openSegmentPath.length == 0) continue;
     const path = row.openSegmentPath;
-    const sealedNow = await sealUnfinishedM4a(path);
-    if (!sealedNow) continue;
+    const sealResult = await sealUnfinishedM4a(path);
+    if (sealResult != "1") continue;
     const current = findVoiceNoteByLocalId(row.localId);
     if (current == null || current.openSegmentPath != path) continue;
     await closeSegment(current, path);
@@ -2616,7 +2627,8 @@ async function uploadMistakenFailedNotes(): Promise<void> {
   const rows = loadVoiceNotes();
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
-    if (row.phase != "failed" || row.error != "录音文件未封口") continue;
+    if (row.phase != "failed") continue;
+    if (row.error != "录音文件未封口" && row.error != "有录音分段上传失败") continue;
     const localId = row.localId;
     const path = row.openSegmentPath;
     if (path.length > 0) {

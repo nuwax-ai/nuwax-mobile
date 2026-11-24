@@ -2,7 +2,7 @@ import { readFile, writeFile, mkdir, copyFile, cp, realpath } from 'node:fs/prom
 import { resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSON5 from 'json5';
-import { stageVoiceQa, verifyVoiceQaTarget } from './voip-native/harmony-voice-qa/stage.mjs';
+import { pinVoiceQaBridge, stageVoiceQa, verifyVoiceQaTarget } from './voip-native/harmony-voice-qa/stage.mjs';
 
 function prepareEntryAbility(source) {
   const marker = '// nuwax-voip-entry-hook';
@@ -71,7 +71,9 @@ delete plugin.requestPermissions;
 plugin.module.requestPermissions = permissions;
 await writeFile(pluginModule, JSON.stringify(plugin, null, 2) + '\n');
 await cp(`${root}/uni_modules/nuwax-voip/utssdk/app-harmony/resources`, `${project}/uni_modules/nuwax-voip/src/main/resources`, { recursive: true });
-await copyFile(`${root}/uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge.ets`, `${project}/uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge.ets`);
+const bridgePath = 'uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge.ets';
+const bridgeSource = await readFile(`${root}/${bridgePath}`, 'utf8');
+await writeFile(`${project}/${bridgePath}`, voiceQaLibrary ? pinVoiceQaBridge(bridgeSource) : bridgeSource);
 config.module.requestPermissions ??= [];
 for (const permission of permissions) {
   const old = config.module.requestPermissions.find(value => value.name === permission.name);

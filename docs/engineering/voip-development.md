@@ -54,7 +54,7 @@ HBuilderX 生成 Harmony 原生工程后、hvigor 编译前执行：
 
 ```bash
 pnpm voip:prepare
-pnpm voip:harmony:assemble -- "$PWD/unpackage/dist/dev/app-harmony"
+pnpm voip:harmony:assemble "$PWD/unpackage/dist/dev/app-harmony"
 ```
 
 assemble 入口使用 DevEco 自带的 Node/JBR/hvigor，先执行 prepare 再编译 HAP。prepare 脚本只允许修改当前 worktree 忽略目录下的工程；合并权限、单个推送监听、媒体 Ability 和页面路由，并复制模板、i18n reason 和 ArkWeb 资源。重复执行不增加重复项；发现其他 Ability 已拥有 push listener 则拒绝构建，让维护者协调现有 uni-push 接收方，不能默默抢占。模板源在 `scripts/voip-native/harmony/`，不手改生成目录。每次 HBuilderX 重生成工程后都须重新运行该步骤；正式打包入口须把它设为 hvigor 前置步骤。
@@ -68,7 +68,7 @@ assemble 入口使用 DevEco 自带的 Node/JBR/hvigor，先执行 prepare 再�
 ```bash
 bash scripts/voip-native/harmony-voice-qa/build-library.sh
 NUWAX_HARMONY_VOICE_LIBRARY="$PWD/out/harmony-native-audio-rtc/libnuwax_harmony_rtc.so" \
-  pnpm voip:harmony:assemble -- "$PWD/out/voip-business-qa-project/unpackage/dist/dev/app-harmony"
+  pnpm voip:harmony:assemble "$PWD/out/voip-business-qa-project/unpackage/dist/dev/app-harmony"
 ```
 
 使用测试签名出包，记录 HAP 的 SHA-256。原生语音库只允许装入指向测试环境的业务测试工程，系统接听语音时才使用。视频继续由 ArkWeb 承载。

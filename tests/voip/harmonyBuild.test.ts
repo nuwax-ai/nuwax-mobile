@@ -79,6 +79,8 @@ export default class EntryAbility extends UniEntryAbility {
     expect(project.read(`${media}/call-icons/microphone-off-ink.png`).length).toBeGreaterThan(0);
     expect(abilities[0].backgroundModes).toBeUndefined();
     expect(source).not.toContain('HarmonyNativeVoice');
+    const bridge = project.read(`${plugin}/utssdk/app-harmony/VoipBridge.ets`);
+    expect(bridge).not.toContain('if (config.apiBaseUrl !== VoipBridge.nativeVoiceTestOrigin) return');
   });
 
   it('stages native voice once in an explicitly selected test variant', () => {
@@ -92,6 +94,9 @@ export default class EntryAbility extends UniEntryAbility {
     expect(prepared).toMatch(/VoipBridge\.bindPush\(this\)\s+VoipBridge\.nativeVoiceStart/);
     expect(JSON.parse(project.read(moduleFile)).module.abilities[0].backgroundModes).toEqual(['voip']);
     expect(project.read('unpackage/app-harmony/entry/libs/arm64-v8a/libnuwax_harmony_rtc.so')).toBe('fixture');
+    const bridge = project.read(`${plugin}/utssdk/app-harmony/VoipBridge.ets`);
+    expect(bridge).toContain('if (config.apiBaseUrl !== VoipBridge.nativeVoiceTestOrigin) return');
+    expect(bridge).toContain('if (config && config.apiBaseUrl === VoipBridge.nativeVoiceTestOrigin)');
     expect(project.run().stderr).toContain('Generated QA output contains native voice');
   });
 

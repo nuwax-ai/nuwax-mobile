@@ -44,11 +44,11 @@ struct NuwaxVoipMedia {
   private closeTimer = -1
   private visible = false
   private displayedCallId = ''
-  @State private lastPeer = ''
-  @State private lastVideo = false
-  @State private avatar = ''
-  @State private avatarFailed = false
-  @State private revision = 0
+  @State private lastPeer: string = ''
+  @State private lastVideo: boolean = false
+  @State private avatar: string = ''
+  @State private avatarFailed: boolean = false
+  @State private revision: number = 0
   private listener: () => void = () => { this.refreshCall() }
 
   aboutToAppear(): void {

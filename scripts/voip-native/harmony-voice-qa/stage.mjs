@@ -22,6 +22,17 @@ export async function verifyVoiceQaTarget(root, project) {
   }
 }
 
+export function pinVoiceQaBridge(source) {
+  const initialize = '  static initialize(config: Configuration, restoring: boolean = false): void {\n';
+  const restore = 'const config = VoipBridge.readSession(true) ?? VoipBridge.readSession(false)\n      if (config) {';
+  if (source.split(initialize).length !== 2 || source.split(restore).length !== 2) {
+    throw new Error('The Harmony VoIP session entry points changed; review test origin isolation');
+  }
+  return source
+    .replace(initialize, initialize + '    if (config.apiBaseUrl !== VoipBridge.nativeVoiceTestOrigin) return\n')
+    .replace(restore, restore.replace('if (config)', 'if (config && config.apiBaseUrl === VoipBridge.nativeVoiceTestOrigin)'));
+}
+
 export async function stageVoiceQa(project, library, entryAbility, abilitySource, abilityConfig) {
   const entry = `${project}/entry`;
   const nativeLibrary = `${entry}/libs/arm64-v8a/${libraryName}`;

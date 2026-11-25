@@ -1757,6 +1757,92 @@
     scheduleCurrentConvRowsIcons(conversations.value, convRevision);
   }
 
+  // ===== 联系人展示名索引（单聊会话行标题 / 进会话 name 入参的数据源）=====
+  // 消息页不挂通讯录，但会话行标题要「备注 > 昵称 > 账号」——索引只在智联录/资料页
+  // 的通讯录回包里建立，纯内存。冷启不补的话（杀进程重开）行标题与进会话的 name
+  // 都回落会话接口的 peerName（不含备注），改过的备注要等进智联录才恢复。做法对齐
+  // 列表本身：先用通讯录缓存水合（智联录/资料页/本页回写），再静默拉一次整表刷新。
+  let contactNamesHydrateSession = "";
+  let contactNamesRemoteSession = "";
+  let contactNamesRemoteSyncing = false;
+
+  /** 通讯录条目 → 展示名索引行（只取 rebuildContactNameIndex 需要的三字段）。 */
+  function readContactNameRow(obj: UTSJSONObject): ImContactRow {
+    const row = new ImContactRow();
+    row.userId = readString(obj, "userId");
+    row.displayName = readString(obj, "displayName");
+    row.remark = readString(obj, "remark");
+    return row;
+  }
+
+  /** 水合通讯录缓存建索引（本会话水合过则跳过）：索引变化且已有会话行时换行身份
+   *  重渲标题。 */
+  function hydrateContactNamesFromCache(): void {
+    if (workGateBlocked.value) return;
+    if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+    const stamp = getImSessionStamp();
+    if (contactNamesHydrateSession == stamp) return;
+    contactNamesHydrateSession = stamp;
+    const cached = readImContactsCache();
+    if (cached == null) return;
+    const list: ImContactRow[] = [];
+    for (let i = 0; i < cached.items.length; i++) {
+      if (readNumber(cached.items[i], "status", 1) != 1) continue;
+      const row = readContactNameRow(cached.items[i]);
+      if (row.userId.length > 0) list.push(row);
+    }
+    if (list.length == 0) return;
+    // 隐藏期不整表替换（同 onHide 口径）：索引版本号已 bump，回页 onShow 自会重建
+    if (rebuildContactNameIndex(list) && conversations.value.length > 0 && messagePageVisible && !isAppInBackground()) {
+      conversations.value = cloneConvRows(conversations.value);
+    }
+  }
+
+  /** 通讯录整表刷新（每会话成功一次；失败下次 onShow 重试）：重建展示名索引 +
+   *  回写通讯录缓存（智联录与冷启水合共用同一份）。force=WS 联系人更新事件驱动，
+   *  突破「每会话一次」（跨端改备注要即时生效）。 */
+  async function loadContactNames(force: boolean): Promise<void> {
+    if (contactNamesRemoteSyncing) return;
+    // 隐藏页不发包（口径同整表刷新调度）：回页 onShow 再试
+    if (!messagePageVisible || isAppInBackground()) return;
+    if (workGateBlocked.value || workGatePending.value) return;
+    if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+    if (!force && contactNamesRemoteSession == getImSessionStamp()) return;
+    if (!hasLoginSession()) {
+      // App / 小程序 token 缺失即纯匿名，不发包；H5 放行请求由 4010 兜底
+      //（口径同智联录 loadContacts）
+      // #ifndef H5 || WEB
+      return;
+      // #endif
+    }
+    contactNamesRemoteSyncing = true;
+    try {
+      const res = await apiImContacts();
+      contactNamesRemoteSyncing = false;
+      if (messagePageDisposed || messagePageSession != getImSessionStamp()) return;
+      if (apiResCode(res) != SUCCESS_CODE) return;
+      const dataRaw = apiResData<any>(res);
+      const dataObj = dataRaw != null ? (dataRaw as UTSJSONObject) : null;
+      const itemsRaw = dataObj == null ? null : dataObj["items"];
+      if (itemsRaw == null) return;
+      const items = itemsRaw as UTSJSONObject[];
+      const list: ImContactRow[] = [];
+      for (let i = 0; i < items.length; i++) {
+        if (readNumber(items[i], "status", 1) != 1) continue;
+        const row = readContactNameRow(items[i]);
+        if (row.userId.length > 0) list.push(row);
+      }
+      contactNamesRemoteSession = getImSessionStamp();
+      saveImContactsCache(res);
+      // 回包期间可能已切走/退后台：索引照更，行重建留给回页 onShow 的版本号比对
+      if (rebuildContactNameIndex(list) && conversations.value.length > 0 && messagePageVisible && !isAppInBackground()) {
+        conversations.value = cloneConvRows(conversations.value);
+      }
+    } catch (_error) {
+      contactNamesRemoteSyncing = false;
+    }
+  }
+
   /** 触发服务端默认智能体补建（DEV-325 挂在 whoami 尾部的异步旁路：加联系人+建会话
    *  置顶+发默认消息，ensure 语义幂等）。App 端 whoami 只挂在 chat 页 onLoad，新账号
    *  伙伴页空、无会话可进 ⇒ 那条触发链断裂——在此补一脚对齐 PC web「每次进 IM 必调」。
@@ -1905,10 +1991,14 @@
     refreshPullEntryAgent();
     // 先水合再首拉：缓存命中秒出列表（加载态直接进静默刷新语义），网络照常整表替换
     //（onShow 复查可能已抢先解锁并补拉过：loadXxx 自带 loading 去重，水合已有数据早退，重复调用无害）
+    // ★展示名索引先于会话行水合：行标题渲染时即按备注取名，不闪昵称
+    hydrateContactNamesFromCache();
     hydrateConversationsFromCache();
     loadConversations();
-    // ★不再拉通讯录/群组/团队：智联录已是独立 tab（pages/union-record），由
-    //   union-record-content 自己 hydrate + load，这里多发请求无人消费。
+    // 通讯录整表（仅展示名索引用，每会话一次）：消息页虽不挂通讯录，但单聊行标题与
+    // 进会话的 name 入参取自此索引——冷启不拉就只能显示会话接口的 peerName（无备注）。
+    // 群组/团队仍归智联录自己 hydrate + load。
+    loadContactNames(false);
     // 默认智能体补建触发（fire-and-forget，不消费响应）：异步补建赶不上首拉属预期，
     // 靠 WS 推送（ImConversationUpdated/ImContactUpdated 已订阅）或下次回页刷新出现
     pingWhoamiForAgentProvision();
@@ -3504,10 +3594,12 @@
   }
 
   function handleImContactUpdated(_payload: any): void {
-    // 通讯录已归智联录页维护；本页只关心它带来的会话标题/会话行变化，
-    // 重拉会话列表即可（服务端 peerName 已按备注/昵称算好）。
+    // 通讯录表本身归智联录维护；本页只关心它带来的会话行变化：重拉会话列表
+    //（对方昵称/头像等）+ 强制刷新展示名索引（对方在别的端改了我方备注，会话接口
+    //  peerName 不含备注，只靠会话回包拿不到新名）。
     if (!messagePageVisible || isAppInBackground()) return;
     loadConversations();
+    loadContactNames(true);
   }
 
   /**
@@ -3723,11 +3815,14 @@
       workGateBlocked.value = false;
       initImWsClient();
       refreshImUnreadBadge();
+      hydrateContactNamesFromCache();
       hydrateConversationsFromCache();
       loadConversations();
       // 解锁也是「进 IM」：blocked 期间从未触发过补建，随首拉一并补上
       pingWhoamiForAgentProvision();
     }
+    // 通讯录整表刷新只成功一次/会话；失败（或上次被闸门/未登录挡下）随每次回页重试
+    loadContactNames(false);
     // 页面隐藏期间收到 IM 事件时，scheduleConvRefresh/refreshConvImmediately 只会
     // 记下 convRefreshOwed（隐藏页不能改整表），onHide 又会撤掉已武装的 timer。
     // 回到消息 Tab 后必须主动消费这笔欠账，否则角标已更新但会话列表仍停在旧快照。

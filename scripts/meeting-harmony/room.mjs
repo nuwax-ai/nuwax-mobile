@@ -10,6 +10,7 @@ export function createMeetingMedia(post, render) {
   let current;
   let leaving = Promise.resolve(true);
   let closedThrough = -1;
+  let pendingDisplayConsent;
   const active = (session) => current === session;
 
   function holder(room) {
@@ -39,8 +40,9 @@ export function createMeetingMedia(post, render) {
     if (session.share?.owned && !ownsShare) stopShare(session, 'stopped');
     if (session.share?.started && connected && !canPublishScreen) stopShare(session, 'screen_capture_permission');
     if (room.state === ConnectionState.Disconnected) stopShare(session);
-    const captureAllowed = !!session.share && connected && ownsShare && canPublishScreen;
-    const awaitingCapture = captureAllowed && !session.share.started;
+    const canCapture = !!session.share && connected && ownsShare && canPublishScreen;
+    const awaitingCapture = canCapture && !pendingDisplayConsent && !session.share.started;
+    const captureAllowed = canCapture && pendingDisplayConsent === session.share && !session.share.track;
     const shared = remotes.find((participant) => participant.identity === shareHolder);
     const share = shared?.getTrackPublication(Track.Source.ScreenShare);
     const audioPublications = remotes.flatMap((participant) => [...participant.audioTrackPublications.values()]);
@@ -134,13 +136,15 @@ export function createMeetingMedia(post, render) {
   // This runs synchronously from the Web button so getDisplayMedia receives user activation.
   async function startCapture(request) {
     const session = current;
-    if (!session || !request || request !== session.share || request.started ||
+    if (!session || !request || request !== session.share || request.started || pendingDisplayConsent ||
         session.room.state !== ConnectionState.Connected ||
         holder(session.room) !== session.room.localParticipant.identity ||
         !canPublish(session.room.localParticipant, Track.Source.ScreenShare)) return;
     request.started = true;
-    update(session);
+    // ArkWeb grants by page origin, so only one request in this WebView can wait for consent.
+    pendingDisplayConsent = request;
     try {
+      update(session);
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
       const track = stream.getVideoTracks()[0];
       const local = session.room.localParticipant;
@@ -151,7 +155,6 @@ export function createMeetingMedia(post, render) {
         stream.getTracks().forEach((item) => item.stop());
         if (stillOwnsRequest()) {
           stopShare(session, track ? 'screen_capture_permission' : 'screen_capture_failed');
-          update(session);
         }
         return;
       }
@@ -165,7 +168,6 @@ export function createMeetingMedia(post, render) {
       if (!stillOwnsRequest() || !canPublish(local, Track.Source.ScreenShare)) {
         if (stillOwnsRequest()) {
           stopShare(session, 'screen_capture_permission');
-          update(session);
         } else {
           track.stop();
         }
@@ -173,12 +175,13 @@ export function createMeetingMedia(post, render) {
         return;
       }
       request.published = true;
-      update(session);
     } catch (error) {
       if (session.share === request) {
         stopShare(session, error?.name === 'NotAllowedError' ? 'cancelled' : 'screen_capture_failed');
-        update(session);
       }
+    } finally {
+      pendingDisplayConsent = undefined;
+      if (current) update(current);
     }
   }
 

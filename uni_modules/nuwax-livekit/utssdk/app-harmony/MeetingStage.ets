@@ -539,6 +539,7 @@ export class MeetingStageHost {
   }
 
   requestScreenCapture(handler: ScreenCaptureHandler): void {
+    // The bridge allows this only while the current share's getDisplayMedia request is pending.
     if (MeetingStageSession.host !== this || !MeetingStageSession.isConnected() ||
       !MeetingStageSession.captureArmed || !MeetingStageSession.captureAllowed ||
       !this.captureOriginAllowed(handler.getOrigin())) {

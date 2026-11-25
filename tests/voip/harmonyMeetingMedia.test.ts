@@ -191,8 +191,9 @@ describe('Harmony LiveKit room', () => {
     room.emit(RoomEvent.ParticipantPermissionsChanged);
     const request = render.mock.lastCall?.[3];
     expect(request.label).toBe('Share the entire screen');
-    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ captureAllowed: true, awaitingCapture: true }));
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ captureAllowed: false, awaitingCapture: true }));
     const capture = media.startCapture(request);
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ captureAllowed: true, awaitingCapture: false }));
     expect(getDisplayMedia).toHaveBeenCalledWith({ video: true, audio: false });
     await capture;
     expect(room.localParticipant.publishTrack).toHaveBeenCalledWith(track, expect.objectContaining({ source: Track.Source.ScreenShare }));
@@ -205,6 +206,39 @@ describe('Harmony LiveKit room', () => {
     expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: 'shareError', shareId: 2, error: 'stopped' }));
     expect(room.localParticipant.unpublishTrack).toHaveBeenCalledWith(track);
     expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ sharing: false }));
+  });
+
+  it('holds a new capture until the cancelled system consent request has settled', async () => {
+    const { media, room, render, post } = connection();
+    await waitForOperations();
+    const firstScreen = fakeScreen();
+    const secondScreen = fakeScreen();
+    let finishFirst!: (value: typeof firstScreen.stream) => void;
+    const getDisplayMedia = vi.fn(async () => secondScreen.stream)
+      .mockImplementationOnce(() => new Promise(resolve => { finishFirst = resolve; }));
+    vi.stubGlobal('navigator', { mediaDevices: { getDisplayMedia } });
+    room.metadata = JSON.stringify({ shareHolder: room.localParticipant.identity });
+    media.dispatch({ id: 1, type: 'prepareShare', shareId: 2, text: 'Share', name: 'Cancel' });
+    const first = media.startCapture(render.mock.lastCall?.[3]);
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ captureAllowed: true, shareId: 2 }));
+    media.dispatch({ id: 1, type: 'stopShare', shareId: 2 });
+    media.dispatch({ id: 1, type: 'prepareShare', shareId: 3, text: 'Share', name: 'Cancel' });
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({
+      captureAllowed: false, awaitingCapture: false, shareId: 3,
+    }));
+    expect(render.mock.lastCall?.[3]).toBeUndefined();
+    expect(getDisplayMedia).toHaveBeenCalledOnce();
+
+    finishFirst(firstScreen.stream);
+    await first;
+    expect(firstScreen.track.stop).toHaveBeenCalledOnce();
+    expect(room.localParticipant.publishTrack).not.toHaveBeenCalled();
+    const request = render.mock.lastCall?.[3];
+    expect(request.shareId).toBe(3);
+    await media.startCapture(request);
+    expect(getDisplayMedia).toHaveBeenCalledTimes(2);
+    expect(room.localParticipant.publishTrack).toHaveBeenCalledExactlyOnceWith(secondScreen.track,
+      expect.objectContaining({ source: Track.Source.ScreenShare }));
   });
 
   it('dismisses pending confirmation when another participant takes over the share', async () => {

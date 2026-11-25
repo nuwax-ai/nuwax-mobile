@@ -365,6 +365,9 @@ it('only grants the current authorized ArkWeb screen capture request once', asyn
   session.receive({ type: 'state', id: session.id, connection: 'connected', captureAllowed: true, shareId: 99 });
   session.host.requestScreenCapture(handler);
   expect(handler.grant).not.toHaveBeenCalled();
+  session.receive({ type: 'state', id: session.id, connection: 'connected', awaitingCapture: true, shareId: 1 });
+  session.host.requestScreenCapture(handler);
+  expect(handler.grant).not.toHaveBeenCalled();
   session.receive({ type: 'state', id: session.id, connection: 'connected', captureAllowed: true, shareId: 1 });
   handler.getOrigin.mockReturnValueOnce('https://elsewhere.test');
   session.host.requestScreenCapture(handler);
@@ -373,7 +376,7 @@ it('only grants the current authorized ArkWeb screen capture request once', asyn
   session.host.requestScreenCapture(handler);
   session.host.requestScreenCapture(handler);
   expect(handler.grant).toHaveBeenCalledExactlyOnceWith({ captureMode: 0 });
-  expect(handler.deny).toHaveBeenCalledTimes(4);
+  expect(handler.deny).toHaveBeenCalledTimes(5);
   session.stopShare();
   await settle();
   expect(session.captureAllowed).toBe(false);

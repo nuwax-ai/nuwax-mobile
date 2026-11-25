@@ -79,19 +79,39 @@ def has_abi_libs(libs: Path) -> bool:
     return False
 
 
+def dependency_line(entry) -> str:
+    """把 config.json 的 dependencies 条目转成 dependencies {} 里的一行。
+
+    支持两种官方写法：
+      "io.livekit:livekit-android:2.28.2"
+      {"id": "...", "source": "compileOnly('...') { exclude group: '...' }"}
+    第二种的 source 是完整 Gradle 表达式（含配置名与 exclude 等），原样保留。
+    """
+    if isinstance(entry, str):
+        return f"implementation {json.dumps(entry)}"
+    if isinstance(entry, dict):
+        source = entry.get("source")
+        if isinstance(source, str) and source.strip():
+            return " ".join(source.split())
+        dep_id = entry.get("id")
+        if isinstance(dep_id, str) and dep_id.strip():
+            return f"implementation {json.dumps(dep_id.strip())}"
+    raise ValueError(f"无法解析的原生依赖条目: {entry!r}")
+
+
 def read_native_dependencies(export_dir: Path) -> tuple[list[str], list[str]]:
     config = export_dir / "config.json"
     if not config.is_file():
         return [], []
     data = json.loads(config.read_text())
-    dependencies = data.get("dependencies", [])
+    dependencies = [dependency_line(entry) for entry in data.get("dependencies", [])]
     repositories = data.get("project", {}).get("repositories", [])
-    if not all(isinstance(value, str) for value in dependencies + repositories):
-        raise ValueError(f"无效原生依赖配置: {export_dir.name}")
+    if not all(isinstance(value, str) for value in repositories):
+        raise ValueError(f"无效原生依赖仓库配置: {export_dir.name}")
     return dependencies, repositories
 
 
-def write_module_gradle(mod: Path, namespace: str, min_sdk: int, jni_from_libs: bool, dependencies: list[str] | None = None) -> None:
+def write_module_gradle(mod: Path, namespace: str, min_sdk: int, jni_from_libs: bool, dependency_lines: list[str] | None = None) -> None:
     jni_block = ""
     if jni_from_libs:
         jni_block = """
@@ -101,7 +121,7 @@ def write_module_gradle(mod: Path, namespace: str, min_sdk: int, jni_from_libs: 
         }
     }
 """
-    dependency_lines = "\n".join(f"    implementation {json.dumps(value)}" for value in (dependencies or []))
+    dependency_lines = "\n".join(f"    {line}" for line in (dependency_lines or []))
     text = f"""plugins {{
     alias(libs.plugins.android.library)
     alias(libs.plugins.jetbrains.kotlin.android)

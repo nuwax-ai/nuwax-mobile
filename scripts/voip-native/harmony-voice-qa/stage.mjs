@@ -1,7 +1,7 @@
 import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, relative } from 'node:path';
 import JSON5 from 'json5';
-import { testOrigin } from '../prepare-business-qa.mjs';
+import { fingerprintBusinessQaSource, testOrigin } from '../prepare-business-qa.mjs';
 
 const libraryName = 'libnuwax_harmony_rtc.so';
 const source = new URL('./', import.meta.url);
@@ -12,7 +12,9 @@ const voiceHooks = [
 ].join('\n');
 
 export async function verifyVoiceQaTarget(root, project) {
-  const variant = root.endsWith('/out/voip-business-qa-project') ? root : `${root}/out/voip-business-qa-project`;
+  const nested = root.endsWith('/out/voip-business-qa-project');
+  const sourceRoot = nested ? dirname(dirname(root)) : root;
+  const variant = `${sourceRoot}/out/voip-business-qa-project`;
   if (!relative(variant, project).startsWith('unpackage/')) {
     throw new Error('Native Harmony voice must target the isolated VoIP business QA output');
   }
@@ -23,6 +25,22 @@ export async function verifyVoiceQaTarget(root, project) {
   const dependencies = JSON5.parse(await readFile(`${project}/oh-package.json5`, 'utf8')).dependencies;
   if (!dependencies?.['@uni_modules/nuwax-livekit']) {
     throw new Error('Regenerate the Harmony QA project from the current source to include nuwax-livekit');
+  }
+  if (metadata.sourceDigest !== await fingerprintBusinessQaSource(sourceRoot)) {
+    throw new Error('The Harmony QA source snapshot is stale. Run prepare-business-qa.mjs and regenerate the HBuilderX export.');
+  }
+  const { appid } = JSON5.parse(await readFile(`${variant}/manifest.json`, 'utf8'));
+  if (typeof appid !== 'string' || !/^[\w-]+$/.test(appid)) throw new Error('Invalid Harmony QA app ID');
+  // HBuilderX writes the build time in milliseconds next to the generated app resources.
+  const stamp = await readFile(`${project}/entry/src/main/resources/resfile/uni-app-x/apps/${appid}/www/buildstamp`, 'utf8')
+    .catch(error => {
+      if (error.code === 'ENOENT') return '';
+      throw error;
+    });
+  const builtAt = Number(stamp.trim());
+  const preparedAt = Date.parse(metadata.preparedAt);
+  if (!Number.isSafeInteger(builtAt) || !Number.isFinite(preparedAt) || builtAt < preparedAt) {
+    throw new Error('The HBuilderX export predates the Harmony QA source snapshot. Regenerate the Harmony export before assembly.');
   }
 }
 

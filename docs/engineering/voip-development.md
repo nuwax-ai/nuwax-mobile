@@ -73,6 +73,8 @@ NUWAX_HARMONY_VOICE_LIBRARY="$PWD/out/harmony-native-audio-rtc/libnuwax_harmony_
 
 使用测试签名出包，记录 HAP 的 SHA-256。原生语音库只允许装入指向测试环境的业务测试工程，系统接听语音时才使用。视频继续由 ArkWeb 承载。
 
+鸿蒙业务测试包组装前会核对当前工作树与 QA 源码快照，并检查 HBuilderX 导出时间。源码有更新时，重新生成 QA 工程并导出鸿蒙工程后再组装。这个检查也覆盖随测试包交付的会议媒体资源。
+
 真机上分别由本端和对端挂断，按同一 `callId` 检查日志，并在进程仍存活时采集系统音频和后台任务状态：
 
 - 原生语音核对 `nativeVoiceResourceReleased` 的 `capturer`、`renderer`、`backgroundTask` 三项和最终的 `nativeVoiceReleased`。资源调用报错时会记录 `nativeVoiceResourceReleaseFailed`。

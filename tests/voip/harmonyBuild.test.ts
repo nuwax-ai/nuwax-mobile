@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { fingerprintBusinessQaSource } from '../../scripts/voip-native/prepare-business-qa.mjs';
 
 const root = resolve(import.meta.dirname, '../..');
 const fixtures: string[] = [];
@@ -10,8 +11,9 @@ const plugin = 'unpackage/app-harmony/uni_modules/nuwax-voip';
 const abilityFile = `${entry}/ets/entryability/EntryAbility.ets`;
 const moduleFile = `${entry}/module.json5`;
 const listener = 'action.ohos.push.listener';
+const buildstamp = `${entry}/resources/resfile/uni-app-x/apps/__UNI__fixture/www/buildstamp`;
 
-function fixture(abilitySource: string, qa = false, meetingBuilt = true) {
+async function fixture(abilitySource: string, qa = false, meetingBuilt = true) {
   mkdirSync(join(root, 'out'), { recursive: true });
   const directory = mkdtempSync(join(root, 'out/voip-harmony-fixture-'));
   fixtures.push(directory);
@@ -29,7 +31,6 @@ function fixture(abilitySource: string, qa = false, meetingBuilt = true) {
   }
   const prefix = qa ? 'out/voip-business-qa-project/' : '';
   const writeProject = (path: string, content: string) => write(prefix + path, content);
-  if (qa) write(prefix + 'nuwax-local-qa.json', '{"flavor":"voip-business-qa","apiOrigin":"https://testagent.xspaceagi.com"}');
   writeProject(abilityFile, abilitySource);
   writeProject(moduleFile, JSON.stringify({ module: { abilities: [{
     name: 'EntryAbility', srcEntry: './ets/entryability/EntryAbility.ets',
@@ -44,12 +45,24 @@ function fixture(abilitySource: string, qa = false, meetingBuilt = true) {
   writeProject('unpackage/app-harmony/oh-package.json5', JSON.stringify({ dependencies }));
   write('static/app/voip/media.html', '<html><head></head><body></body></html>');
   write('native-voice-fixture.so', 'fixture');
+  if (qa) {
+    const init = spawnSync('git', ['init', '--quiet'], { cwd: directory, encoding: 'utf8' });
+    if (init.status !== 0) throw new Error(init.stderr);
+    write('.git/info/exclude', '/out/\n/unpackage/\n');
+    const preparedAt = '2026-11-25T07:00:00.000Z';
+    writeProject('manifest.json', '{"appid":"__UNI__fixture"}');
+    writeProject(buildstamp, String(Date.parse(preparedAt) + 1000));
+    writeProject('nuwax-local-qa.json', JSON.stringify({
+      flavor: 'voip-business-qa', apiOrigin: 'https://testagent.xspaceagi.com',
+      sourceDigest: await fingerprintBusinessQaSource(directory), preparedAt,
+    }));
+  }
   const run = (voice = false) => spawnSync(process.execPath, ['scripts/prepare-voip-harmony.mjs', prefix + 'unpackage/app-harmony'], {
     cwd: directory, encoding: 'utf8',
     env: { ...process.env, NUWAX_HARMONY_VOICE_LIBRARY: voice ? join(directory, 'native-voice-fixture.so') : '' },
   });
   const read = (path: string) => readFileSync(join(directory, prefix + path), 'utf8');
-  return { run, read };
+  return { run, read, write, writeProject };
 }
 
 afterEach(() => {
@@ -57,8 +70,8 @@ afterEach(() => {
 });
 
 describe('Harmony generated VoIP host', () => {
-  it('installs one synchronous hook and one listener and is safe to run again', () => {
-    const project = fixture(`import { UniEntryAbility } from '@dcloudio/uni-app-x-runtime'
+  it('installs one synchronous hook and one listener and is safe to run again', async () => {
+    const project = await fixture(`import { UniEntryAbility } from '@dcloudio/uni-app-x-runtime'
 export default class EntryAbility extends UniEntryAbility {
   constructor() { super('__UNI__fixture', {}) }
 }`);
@@ -87,8 +100,8 @@ export default class EntryAbility extends UniEntryAbility {
     expect(bridge).not.toContain('if (config.apiBaseUrl !== VoipBridge.nativeVoiceTestOrigin) return');
   });
 
-  it('stages native voice once in an explicitly selected test variant', () => {
-    const project = fixture('export default class EntryAbility extends UniEntryAbility {}', true);
+  it('stages native voice once in an explicitly selected test variant', async () => {
+    const project = await fixture('export default class EntryAbility extends UniEntryAbility {}', true);
     for (let i = 0; i < 2; i++) {
       const result = project.run(true);
       expect(result.status, result.stderr).toBe(0);
@@ -109,8 +122,8 @@ export default class EntryAbility extends UniEntryAbility {
     expect(project.run().stderr).toContain('Generated QA output contains native voice');
   });
 
-  it('keeps an existing onNewWant body and uses the declared Want parameter', () => {
-    const project = fixture(`export default class EntryAbility extends UniEntryAbility {
+  it('keeps an existing onNewWant body and uses the declared Want parameter', async () => {
+    const project = await fixture(`export default class EntryAbility extends UniEntryAbility {
       override onNewWant(incoming: Want, launch: AbilityConstant.LaunchParam): void { super.onNewWant(incoming, launch) }
     }`, true);
     const result = project.run(true);
@@ -121,8 +134,8 @@ export default class EntryAbility extends UniEntryAbility {
     expect(ability.match(/onNewWant\(incoming: Want/g)).toHaveLength(1);
   });
 
-  it('rejects staging the native voice library in the standard project', () => {
-    const project = fixture('export default class EntryAbility extends UniEntryAbility {}');
+  it('rejects staging the native voice library in the standard project', async () => {
+    const project = await fixture('export default class EntryAbility extends UniEntryAbility {}');
     const original = project.read(moduleFile);
     const result = project.run(true);
     expect(result.status).not.toBe(0);
@@ -130,8 +143,8 @@ export default class EntryAbility extends UniEntryAbility {
     expect(project.read(moduleFile)).toBe(original);
   });
 
-  it('rejects a stale QA project without the shared task module before patching it', () => {
-    const project = fixture('export default class EntryAbility extends UniEntryAbility {}', true, false);
+  it('rejects a stale QA project without the shared task module before patching it', async () => {
+    const project = await fixture('export default class EntryAbility extends UniEntryAbility {}', true, false);
     const original = project.read(abilityFile);
     const result = project.run(true);
     expect(result.status).not.toBe(0);
@@ -139,8 +152,28 @@ export default class EntryAbility extends UniEntryAbility {
     expect(project.read(abilityFile)).toBe(original);
   });
 
-  it('registers before existing initialization and ignores mentions of onCreate outside the lifecycle method', () => {
-    const project = fixture(`// See onCreate() for initialization.
+  it('rejects a QA export from a previous source snapshot even if the meeting plugin is present', async () => {
+    const project = await fixture('export default class EntryAbility extends UniEntryAbility {}', true);
+    const original = project.read(moduleFile);
+    project.write('scripts/meeting-harmony/room.mjs', 'console.log("new meeting behavior");');
+    const result = project.run(true);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('Harmony QA source snapshot is stale');
+    expect(project.read(moduleFile)).toBe(original);
+  });
+
+  it('rejects an old HBuilderX export copied under a fresh QA source snapshot', async () => {
+    const project = await fixture('export default class EntryAbility extends UniEntryAbility {}', true);
+    const original = project.read(moduleFile);
+    project.writeProject(buildstamp, String(Date.parse('2026-11-25T06:00:00.000Z')));
+    const result = project.run(true);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('HBuilderX export predates the Harmony QA source snapshot');
+    expect(project.read(moduleFile)).toBe(original);
+  });
+
+  it('registers before existing initialization and ignores mentions of onCreate outside the lifecycle method', async () => {
+    const project = await fixture(`// See onCreate() for initialization.
 export default class EntryAbility extends UniEntryAbility {
   override onCreate(
     want: Want,
@@ -154,8 +187,8 @@ export default class EntryAbility extends UniEntryAbility {
     expect(project.read(abilityFile)).toMatch(/\): void \{\s+VoipBridge\.bindPush\(this\)\s+super\.onCreate/);
   });
 
-  it('rejects an asynchronous onCreate before modifying the generated manifest', () => {
-    const project = fixture(`export default class EntryAbility extends UniEntryAbility {
+  it('rejects an asynchronous onCreate before modifying the generated manifest', async () => {
+    const project = await fixture(`export default class EntryAbility extends UniEntryAbility {
   async onCreate(want: Want): Promise<void> {
     await loadConfig(want)
   }

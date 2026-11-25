@@ -21,6 +21,8 @@ internal object ImHeadlessPush {
     private const val TTL = 24 * 60 * 60 * 1000L
     private const val LIMIT = 128
     private const val TAG = "NuwaxImPush"
+    private const val BADGE_HELPER = "uts.sdk.modules.DCloudUniPush.BadgeHelper"
+    private const val BADGE_OPTIONS = "uts.sdk.modules.DCloudUniPush.BadgeOptions"
     private const val PUSH_MESSAGE = "uts.sdk.modules.DCloudUniPush.PushMessage"
     private const val PUSH_MANAGER = "uts.sdk.modules.DCloudUniPush.PushManager__1"
 
@@ -75,6 +77,7 @@ internal object ImHeadlessPush {
             val manager = invokeStaticOrCompanion(PUSH_MANAGER, "getInstance")
                 ?: error("DCloud PushManager unavailable")
             invokeMember(manager, "createNotification", context, message)
+            applyBadge(context, envelope, title)
             // 同进程点击优先命中 SDK 消息表；再次杀进程后由通知 Bundle 重建。
             val bundle = invokeMember(message, "toBundle") as? Bundle
             val appId = bundle?.getString("appid").orEmpty()
@@ -98,6 +101,27 @@ internal object ImHeadlessPush {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return true
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
         return manager?.areNotificationsEnabled() != false
+    }
+
+    /**
+     * headless 透传不会经过 JS 的 setAppBadgeNumber；通知创建后用 DCloud 自带的
+     * BadgeHelper 把服务端未读总数写到 Launcher。App 回前台时仍由现有逻辑清零。
+     */
+    private fun applyBadge(context: Context, envelope: JSONObject, title: String) {
+        val count = field(envelope, "badge").toIntOrNull()?.takeIf { it >= 0 } ?: return
+        runCatching {
+            val optionsType = Class.forName(BADGE_OPTIONS)
+            val options = optionsType.getDeclaredConstructor(String::class.java, String::class.java)
+                .newInstance(title, field(envelope, "content"))
+            val helper = invokeStaticOrCompanion(BADGE_HELPER, "getInstance")
+                ?: error("DCloud BadgeHelper unavailable")
+            invokeMember(helper, "sendBadgeNumber", context, count, options)
+        }.onSuccess {
+            Log.i(TAG, "badge submitted count=$count")
+        }.onFailure { error ->
+            // 角标失败不能回退成第二条通知；通知本身已经成功提交。
+            Log.w(TAG, "badge failed count=$count type=${error.javaClass.simpleName}")
+        }
     }
 
     private fun invokeMember(target: Any, name: String, vararg args: Any?): Any? {

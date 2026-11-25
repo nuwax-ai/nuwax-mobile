@@ -55,6 +55,15 @@ test('headless delivery treats an uninitialized uni-app Activity as no foregroun
   assert.doesNotMatch(headless, /if \(UTSAndroid\.getUniActivity\(\) != null\)/);
 });
 
+test('headless delivery applies the payload unread count through DCloud badge helper', () => {
+  assert.match(headless, /private const val BADGE_HELPER = "uts\.sdk\.modules\.DCloudUniPush\.BadgeHelper"/);
+  assert.match(headless, /invokeMember\(manager, "createNotification", context, message\)\s+applyBadge\(context, envelope, title\)/);
+  assert.match(headless, /field\(envelope, "badge"\)\.toIntOrNull\(\)\?\.takeIf \{ it >= 0 \}/);
+  assert.match(headless, /invokeMember\(helper, "sendBadgeNumber", context, count, options\)/);
+  assert.match(read('../App.uvue'), /setAppIconBadgeSuppressed\(true\)/);
+  assert.match(read('../App.uvue'), /setAppIconBadgeSuppressed\(false\);\s+clearAppIconBadge\(\)/);
+});
+
 function clientGate(vendor = 'none') {
   let now = 20_000, attempts = 0, accepted = false;
   const section = client.slice(client.indexOf('let pushKeepAliveRequestedAt'), client.indexOf('/**\n * 绑定推送消息监听'));

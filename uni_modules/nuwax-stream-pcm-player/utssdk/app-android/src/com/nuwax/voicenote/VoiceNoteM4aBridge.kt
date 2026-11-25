@@ -514,6 +514,29 @@ class VoiceNoteM4aBridge {
         trackIndex = current.addTrack(format)
         current.start()
         muxerStarted = true
+        rememberCsd(format)
+    }
+
+    /** 编码器自己的 AudioSpecificConfig。补封口必须用这份，写死的参数解出来是静音。 */
+    private fun rememberCsd(format: MediaFormat) {
+        if (!format.containsKey("csd-0")) {
+            return
+        }
+        val buf = format.getByteBuffer("csd-0") ?: return
+        val dup = buf.duplicate()
+        dup.position(0)
+        if (dup.remaining() <= 0) {
+            return
+        }
+        val bytes = ByteArray(dup.remaining())
+        dup.get(bytes)
+        if (currentPath.isEmpty()) {
+            return
+        }
+        try {
+            File("$currentPath.csd").writeBytes(bytes)
+        } catch (_e: Exception) {
+        }
     }
 
     private fun closeEncoder() {
@@ -621,6 +644,8 @@ class VoiceNoteM4aBridge {
         }
         if (delete && path.isNotEmpty()) {
             File(path).delete()
+            val stem = if (path.endsWith(".frames")) path.removeSuffix(".frames") else path
+            File("$stem.csd").delete()
         }
     }
 
@@ -672,6 +697,7 @@ class VoiceNoteM4aBridge {
         if (sizes.isEmpty()) {
             return "0:nosizes"
         }
+        val csd = readCsd("$path.csd")
         val tmp = File("$path.sealed")
         if (tmp.exists()) {
             tmp.delete()
@@ -681,7 +707,7 @@ class VoiceNoteM4aBridge {
         format.setInteger(MediaFormat.KEY_BIT_RATE, 64000)
         format.setInteger(MediaFormat.KEY_SAMPLE_RATE, SAMPLE_RATE)
         format.setInteger(MediaFormat.KEY_CHANNEL_COUNT, 1)
-        format.setByteBuffer("csd-0", ByteBuffer.wrap(byteArrayOf(0x14, 0x08)))
+        format.setByteBuffer("csd-0", ByteBuffer.wrap(csd))
         val muxer = try {
             MediaMuxer(tmp.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         } catch (_e: Exception) {
@@ -698,7 +724,9 @@ class VoiceNoteM4aBridge {
                 if (size <= 0 || offset + size > payload.size) {
                     break
                 }
-                val packet = ByteBuffer.wrap(payload, offset, size)
+                val packet = ByteBuffer.allocateDirect(size)
+                packet.put(payload, offset, size)
+                packet.flip()
                 info.set(0, size, index * 1024L * 1000000L / SAMPLE_RATE, 0)
                 muxer.writeSampleData(track, packet, info)
                 offset += size
@@ -745,7 +773,20 @@ class VoiceNoteM4aBridge {
         }
         backup.delete()
         File("$path.frames").delete()
+        File("$path.csd").delete()
         return "1"
+    }
+
+    private fun readCsd(path: String): ByteArray {
+        val file = File(path)
+        if (!file.isFile || file.length() <= 0L || file.length() > 64L) {
+            return byteArrayOf(0x14, 0x08)
+        }
+        return try {
+            file.readBytes()
+        } catch (_e: Exception) {
+            byteArrayOf(0x14, 0x08)
+        }
     }
 
     private fun readFrameSizes(path: String): IntArray {

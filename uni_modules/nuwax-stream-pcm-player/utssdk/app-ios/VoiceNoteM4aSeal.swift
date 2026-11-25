@@ -1,7 +1,8 @@
 //
 //  进程被杀掉时 AVAudioRecorder 来不及 stop()，m4a 里只有 ftyp 和 mdat，没有 moov。
-//  录音参数是固定的：AAC-LC、16000 Hz、单声道、64 kbps。按这个参数把 mdat 里的 AAC 帧拆开，
-//  再写成一份带 moov 的 m4a，替换原文件。原文件在新文件确认能打开之前不会被删掉。
+//  录音参数是固定的：AAC-LC、16000 Hz、单声道、64 kbps。每帧字节数不固定。
+//  先用解码器确认一种固定长度，对不上就逐帧找出真实边界，再按这个长度写入。
+//  解不开就不改原文件。原文件在新文件确认能打开之前不会被删掉。
 //
 import AudioToolbox
 import Foundation
@@ -100,30 +101,16 @@ public enum VoiceNoteM4aSeal {
     }
 
     private static func frameRanges(_ payload: Data) -> [Range<Int>]? {
-        let decoder = AacDecoder()
-        if decoder == nil {
-            lastDetail = AacDecoder.lastError
-            // 解码器建不起来时，仍按开录码率的固定帧长封口。64000bps、16kHz、1024 采样正好 512 字节。
-            if let ranges = uniformRanges(payload, packetBytes: 512) {
-                NSLog("[voice-note] m4a seal fallback 512 frames=\(ranges.count)")
-                return ranges
-            }
+        guard let decoder = AacDecoder() else {
+            lastDetail = AacDecoder.lastError.isEmpty ? "decoder" : AacDecoder.lastError
             return nil
         }
         for size in preferredPacketBytes {
-            if let ranges = fixedRanges(payload, packetBytes: size, decoder: decoder!) {
+            if let ranges = fixedRanges(payload, packetBytes: size, decoder: decoder) {
                 return ranges
             }
         }
-        if payload.count <= 128 * 1024, let ranges = searchedRanges(payload) {
-            return ranges
-        }
-        if let ranges = uniformRanges(payload, packetBytes: 512) {
-            NSLog("[voice-note] m4a seal fallback 512 frames=\(ranges.count)")
-            lastDetail = ""
-            return ranges
-        }
-        return nil
+        return searchedRanges(payload, decoder: decoder)
     }
 
     /// 按固定长度切帧。杀进程留下的半帧丢掉。
@@ -159,30 +146,30 @@ public enum VoiceNoteM4aSeal {
             indexes.append(count - 1)
         }
         var decoded = 0
-        var errors = 0
         for index in indexes {
             let samples = decoder.decode(payload, start: ranges[index].lowerBound, length: packetBytes, reset: true)
             if samples < 0 {
-                errors += 1
-            } else if samples >= 1024 {
+                return nil
+            }
+            if samples >= 1024 {
                 decoded += 1
+            } else if index != 0 {
+                return nil
             }
         }
-        if decoded == 0 && errors > 0 {
+        if decoded == 0 {
             return nil
         }
         return ranges
     }
 
     /// 固定长度对不上时，用解码器逐帧找出边界。只允许末尾留一个不完整帧。
-    private static func searchedRanges(_ payload: Data) -> [Range<Int>]? {
-        guard let decoder = AacDecoder() else {
-            return nil
-        }
+    private static func searchedRanges(_ payload: Data, decoder: AacDecoder) -> [Range<Int>]? {
         var ranges: [Range<Int>] = []
         var offset = 0
+        var hint = 512
         while offset + minFrameBytes <= payload.count {
-            guard let length = frameLength(payload, offset: offset, decoder: decoder) else {
+            guard let length = frameLength(payload, offset: offset, decoder: decoder, hint: hint) else {
                 break
             }
             if decoder.decode(payload, start: offset, length: length, reset: false) < 1024 {
@@ -190,6 +177,7 @@ public enum VoiceNoteM4aSeal {
             }
             ranges.append(offset..<(offset + length))
             offset += length
+            hint = length
             if ranges.count > 200000 {
                 return nil
             }
@@ -201,13 +189,20 @@ public enum VoiceNoteM4aSeal {
     }
 
     /// 截断的帧解不开，长度够了才能解开。取能解开的最短长度。
-    private static func frameLength(_ payload: Data, offset: Int, decoder: AacDecoder) -> Int? {
+    private static func frameLength(_ payload: Data, offset: Int, decoder: AacDecoder, hint: Int) -> Int? {
         let remain = payload.count - offset
         if remain < minFrameBytes {
             return nil
         }
+        let cap = min(maxFrameBytes, remain)
+        let guess = min(max(hint, minFrameBytes), cap)
+        if decoder.decode(payload, start: offset, length: guess, reset: true) >= 1024 {
+            if guess == minFrameBytes || decoder.decode(payload, start: offset, length: guess - 1, reset: true) < 1024 {
+                return guess
+            }
+        }
         var low = minFrameBytes
-        var high = min(maxFrameBytes, remain)
+        var high = cap
         var found = 0
         while low <= high {
             let mid = (low + high) / 2

@@ -857,8 +857,9 @@ function writeFileBytes(path: string, raw: ArrayBuffer): boolean {
 }
 
 /**
- * 64kbps、16kHz、单声道 AAC-LC，每帧 512 字节、1024 个采样。
- * 进程被杀掉时 AVRecorder.stop() 没写 moov，这里按固定帧长补上。
+ * 进程被杀掉时 AVRecorder.stop() 没写 moov。
+ * 当前 MediaKit 没有音频编码器输出回调，也没有解码器，录的时候拿不到每帧长度。
+ * AVRecorder 按 64000bps、16kHz、1024 采样写出的就是固定 512 字节一帧，这里按这个长度原样拷贝。
  */
 function sealUnsealedM4a(path: string): string {
   const source = readFileBytes(path)

@@ -96,8 +96,11 @@ object VoipCallPolicyTest {
         check(!gate.publish("direct", incoming = true, uiVisible = false))
         check(gate.publish("fallback", incoming = true))
         check(!gate.wasPresented("fallback"))
+        check(gate.hasUnpresentedAlert("fallback"))
+        check(!gate.hasUnpresentedAlert("direct"))
         check(!gate.takeReplacedAlert("fallback"))
         check(gate.publish("fallback", incoming = true, uiVisible = true))
+        check(!gate.hasUnpresentedAlert("fallback"))
         check(gate.wasPresented("fallback"))
         check(!gate.wasPresentedFirst("fallback"))
         check(!gate.publish("fallback", incoming = true, uiVisible = true))
@@ -107,6 +110,7 @@ object VoipCallPolicyTest {
         check(!gate.takeReplacedAlert("fallback"))
         gate.reset()
         check(!gate.wasPresented("fallback"))
+        check(!gate.hasUnpresentedAlert("fallback"))
     }
     private fun endingOrAnsweringReleasesTheIncomingNotificationSlot() {
         val gate = VoipIncomingNotificationGate()
@@ -116,6 +120,9 @@ object VoipCallPolicyTest {
         check(!gate.wasPresentedFirst("call-a"))
         check(gate.publish("call-a", false))
         check(gate.publish("call-b", true))
+        check(gate.hasUnpresentedAlert("call-b"))
+        check(gate.publish("call-b", false))
+        check(!gate.hasUnpresentedAlert("call-b"))
         gate.reset() // hangup/logout/media failure must not leave a notification owner
         check(gate.publish("call-c", true))
         gate.reset() // failed publication may retry

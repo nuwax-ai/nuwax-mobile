@@ -40,6 +40,7 @@ import LiveKitClient
     private var connected = false, peerReady = false, readySent = false
     private var microphone = true, camera = false, audioActive = false
     private var ownsCallAudio = false
+    private var visibleCallPageID: String?
     private var pushRegistry: PKPushRegistry?
     private var callUUIDs: [String: UUID] = [:]
     private struct PendingPush { let invitation: NuwaxVoipPushInvitation; var declined = false }
@@ -227,7 +228,15 @@ import LiveKitClient
         case "switchCamera":
             Task { guard self.snapshot?["callId"] as? String == commandId else { return }; if let track = self.room?.localParticipant.videoTracks.first?.track as? LocalVideoTrack,
                       let capturer = track.capturer as? CameraCapturer { _ = try? await capturer.switchCameraPosition() } }
+        case "callPageVisibility":
+            if command["visible"] as? Bool == true, commandId == snapshot?["callId"] as? String {
+                visibleCallPageID = commandId
+            } else if visibleCallPageID == commandId {
+                visibleCallPageID = nil
+            }
+            updateProximity()
         case "background":
+            updateProximity(pageForeground: command["hidden"] as? Bool != true)
             let target = room, id = snapshot?["callId"] as? String, run = generation
             Task {
                 guard run == self.generation, self.snapshot?["callId"] as? String == id, self.room === target else { return }
@@ -647,6 +656,7 @@ import LiveKitClient
         if let previous = snapshot, previous["callId"] as? String == id, let oldRank = ranks.firstIndex(of: previous["state"] as? String ?? ""), rank < oldRank { return }
         if snapshot?["callId"] as? String != id { microphone = true; camera = value["mediaType"] as? String == "video"; systemPaused = false; audioInterrupted = false }
         snapshot = value; observeHistory(value); emitSnapshot(value)
+        updateProximity()
         if state == "ended" { finish(); return }
         expiryTask?.cancel(); expiryTask = nil
         if state == "ringing" || state == "connecting" {
@@ -852,6 +862,8 @@ import LiveKitClient
         }
         if !reason.isEmpty { emit("localEnded", ["reason": reason]) }
         snapshot = nil; connected = false; peerReady = false; readySent = false
+        visibleCallPageID = nil
+        updateProximity()
     }
     private func closeServerCall(_ reason: String = "") {
         if business { if let call = snapshot { notifyBusinessEnd(call, reason: reason) }; return }
@@ -1081,6 +1093,7 @@ import LiveKitClient
         do { try AudioManager.shared.setEngineAvailability(enabled ? .default : .none) }
         catch { emit("error", ["code": "CALL_AUDIO_ROUTE_UNAVAILABLE"]) }
         emit("audioInterrupted", ["enabled": systemPaused || audioInterrupted || !audioActive])
+        updateProximity()
     }
     private func selectAudioRoute(_ route: String) {
         let session = AVAudioSession.sharedInstance()
@@ -1097,7 +1110,20 @@ import LiveKitClient
             emitAudioRoutes()
         } catch { emit("error", ["code": "CALL_AUDIO_ROUTE_UNAVAILABLE"]); emitAudioRoutes() }
     }
+    private func updateProximity(pageForeground: Bool = true) {
+        let phase = snapshot?["state"] as? String
+        let id = snapshot?["callId"] as? String
+        let shouldMonitor = pageForeground && UIApplication.shared.applicationState == .active &&
+            id != nil && visibleCallPageID == id && (phase == "connecting" || phase == "active") &&
+            snapshot?["mediaType"] as? String == "audio" && audioActive && !systemPaused && !audioInterrupted &&
+            AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .builtInReceiver }
+        let device = UIDevice.current
+        if device.isProximityMonitoringEnabled != shouldMonitor {
+            device.isProximityMonitoringEnabled = shouldMonitor
+        }
+    }
     private func emitAudioRoutes() {
+        updateProximity()
         guard snapshot != nil else { return }
         let session = AVAudioSession.sharedInstance()
         let speaker = session.currentRoute.outputs.contains { $0.portType == .builtInSpeaker }

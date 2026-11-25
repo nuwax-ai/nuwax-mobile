@@ -8,6 +8,8 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.media.AudioAttributes
 import android.media.AudioManager
 import android.media.Ringtone
@@ -15,6 +17,7 @@ import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -27,6 +30,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.IconCompat
 import androidx.core.telecom.*
 import com.caverock.androidsvg.SVG
 import com.caverock.androidsvg.SVGParseException
@@ -103,7 +107,11 @@ object VoipBridge {
     private var nativeUiId = ""
     private var appCallUiId = ""
     private var incomingUiWait: Job? = null
+    private var incomingAvatarJob: Job? = null
+    private var incomingAvatar: Bitmap? = null
     private var speaker = false
+    private var onEarpiece = false
+    private var proximityLock: PowerManager.WakeLock? = null
     private val terminal = LinkedHashSet<String>()
     private val incomingNotifications = VoipIncomingNotificationGate()
     private val views = mutableMapOf<FrameLayout, String>()
@@ -225,6 +233,68 @@ object VoipBridge {
             } catch (_: java.io.IOException) { null }
         }
     }
+
+    private fun prepareIncomingAvatar(call: JSONObject) {
+        clearIncomingAvatar()
+        val run = generation
+        val id = call.optString("callId")
+        val caller = call.optString("callerId")
+        val settings = config
+        incomingAvatarJob = scope.launch {
+            var url = (call.opt("callerAvatar") as? String)?.trim().orEmpty()
+            if (url.isEmpty() && business() && caller.isNotEmpty()) {
+                url = lookupCallerAvatar(caller, settings)
+                val active = current ?: return@launch
+                if (run != generation || active.optString("callId") != id || active.optString("callerId") != caller) return@launch
+                if (url.isNotEmpty() && (active.opt("callerAvatar") as? String).isNullOrBlank()) {
+                    active.put("callerAvatar", url)
+                    if (active.optString("scene") != "meeting") {
+                        active.put("version", active.optLong("version") + 1)
+                        emitSnapshot(active)
+                    }
+                }
+            }
+            if (url.isEmpty()) return@launch
+            val bitmap = loadPeerAvatar(url, 64) ?: return@launch
+            if (run == generation && current?.optString("callId") == id) incomingAvatar = bitmap
+        }
+    }
+
+    private suspend fun lookupCallerAvatar(caller: String, settings: JSONObject): String {
+        val contacts = try {
+            api("/api/instant-message/contacts", absolute = true, captured = settings).optJSONArray("items")
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { return "" }
+        if (contacts == null) return ""
+        for (index in 0 until contacts.length()) {
+            val contact = contacts.optJSONObject(index) ?: continue
+            if (contact.optString("userId") == caller && contact.optInt("subjectType") == 1 && contact.optInt("status") == 1) {
+                return (contact.opt("avatar") as? String)?.trim().orEmpty()
+            }
+        }
+        return ""
+    }
+
+    private fun clearIncomingAvatar() {
+        incomingAvatarJob?.cancel()
+        incomingAvatarJob = null
+        incomingAvatar = null
+    }
+
+    private fun callerInitialAvatar(displayName: String): Bitmap {
+        val name = displayName.trim().ifEmpty { "?" }
+        val initial = name.substring(0, Character.charCount(name.codePointAt(0)))
+        return Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888).also { bitmap ->
+            val canvas = Canvas(bitmap)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(113, 134, 124) }
+            canvas.drawCircle(48f, 48f, 48f, paint)
+            paint.color = Color.WHITE
+            paint.textAlign = Paint.Align.CENTER
+            paint.textSize = 48f
+            canvas.drawText(initial, 48f, 48f - (paint.ascent() + paint.descent()) / 2, paint)
+        }
+    }
+
     private fun decodeSvgAvatar(bytes: ByteArray, sizePx: Int): Bitmap? {
         val content = bytes.toString(Charsets.UTF_8)
         // The profile uploader accepts SVG. Profile images need no XML entities.
@@ -252,6 +322,7 @@ object VoipBridge {
             nativeUiId = id
             updatePresentedIncoming(id)
         } else if (!visible && nativeUiId == id) nativeUiId = ""
+        updateProximity()
         scope.launch {
             try {
                 if (room != null) VoipCallService.enableCapture(camera && cameraVisible())
@@ -293,6 +364,7 @@ object VoipBridge {
                     "switchCamera" -> (room?.localParticipant?.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack)?.switchCamera()
                     "background" -> {
                         hidden = command.optBoolean("hidden")
+                        updateProximity()
                         if (!hidden && appCallUiId.isNotEmpty()) updatePresentedIncoming(appCallUiId)
                         room?.localParticipant?.setCameraEnabled(camera && cameraVisible())
                         if (room != null) VoipCallService.enableCapture(camera && cameraVisible())
@@ -307,6 +379,7 @@ object VoipBridge {
                             appCallUiId = id
                             updatePresentedIncoming(id)
                         } else if (!visible && appCallUiId == id) appCallUiId = ""
+                        updateProximity()
                     }
                     "audioRoute" -> setAudioRoute(command.optString("route"))
                 }
@@ -535,6 +608,7 @@ object VoipBridge {
             .put("calleeDisplayName", config.optString("userId"))
             .put("expiresAt", deadline)
         current = next
+        prepareIncomingAvatar(next)
         trace("meeting invitation accepted")
         expiryJob?.cancel()
         expiryJob = scope.launch {
@@ -567,6 +641,7 @@ object VoipBridge {
         current = null
         expiryJob?.cancel(); expiryJob = null
         clearIncomingUiWait()
+        clearIncomingAvatar()
         incomingNotifications.reset()
         try { VoipCallService.removeNotification() } catch (_: Exception) { }
         ctx?.stopService(Intent(ctx, VoipCallService::class.java))
@@ -678,8 +753,9 @@ object VoipBridge {
         if (old?.optString("callId") == id && snapshot.optLong("version") <= old.optLong("version")) return
         if (snapshot.optString("state") == "ringing" && snapshot.optLong("expiresAt") <= System.currentTimeMillis()) return
         val first = old == null || old.optString("callId") != id
-        if (first) { microphone = true; camera = snapshot.optString("mediaType") == "video"; speaker = false }
+        if (first) { microphone = true; camera = snapshot.optString("mediaType") == "video"; speaker = false; onEarpiece = false }
         current = snapshot; emitSnapshot(snapshot)
+        updateProximity()
         if (snapshot.optString("state") == "ended") { finish(); return }
         expiryJob?.cancel(); expiryJob = null
         val phase = snapshot.optString("state")
@@ -699,7 +775,10 @@ object VoipBridge {
         val callee = snapshot.optString("calleeId") == uid
         if (callee && accepted.isNotEmpty() && accepted != config.optString("deviceId")) { finish("answeredElsewhere"); return }
         if (!caller && !callee) return
-        if (first && callee && phase == "ringing" && !hidden) requestIncomingCallUi(id, fallbackToAppPage = true)
+        if (first && callee && phase == "ringing") {
+            prepareIncomingAvatar(snapshot)
+            if (!hidden) requestIncomingCallUi(id, fallbackToAppPage = true)
+        }
         if (telecomJob == null) addTelecom(snapshot, !caller)
         if (control != null) publishCall()
         if ((snapshot.optString("state") != "ringing" || (business() && caller)) && (caller || accepted == config.optString("deviceId"))) connectMedia(snapshot)
@@ -735,7 +814,16 @@ object VoipBridge {
                     if (incoming && ownsCall()) requestBackgroundCallUi(id)
                     publishCall()
                     launch { isMuted.collect { muted -> if (control === owner) setMicrophone(!muted) } }
-                    launch { currentCallEndpoint.collect { endpoint -> if (control === owner) { speaker = endpoint.type == CallEndpointCompat.TYPE_SPEAKER; emit("speaker", "enabled", speaker) } } }
+                    launch {
+                        currentCallEndpoint.collect { endpoint ->
+                            if (control === owner) {
+                                speaker = endpoint.type == CallEndpointCompat.TYPE_SPEAKER
+                                onEarpiece = endpoint.type == CallEndpointCompat.TYPE_EARPIECE
+                                emit("speaker", "enabled", speaker)
+                                updateProximity()
+                            }
+                        }
+                    }
                 }
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) {
@@ -794,6 +882,29 @@ object VoipBridge {
 
     private fun callUiVisible(id: String) = nativeUiId == id || (!hidden && appCallUiId == id)
 
+    private fun updateProximity() {
+        val call = current
+        val phase = call?.optString("state")
+        val shouldMonitor = call != null && onEarpiece && callUiVisible(call.optString("callId")) &&
+            call.optString("mediaType") == "audio" && (phase == "connecting" || phase == "active")
+        if (!shouldMonitor) {
+            val lock = proximityLock
+            proximityLock = null
+            if (lock?.isHeld == true) lock.release(PowerManager.RELEASE_FLAG_WAIT_FOR_NO_PROXIMITY)
+            return
+        }
+        if (proximityLock?.isHeld == true) return
+        val power = context?.getSystemService(PowerManager::class.java) ?: return
+        if (!power.isWakeLockLevelSupported(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK)) return
+        try {
+            val lock = power.newWakeLock(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK, "Nuwax:VoipProximity")
+            lock.acquire()
+            proximityLock = lock
+        } catch (_: SecurityException) {
+            trace("proximity wake lock unavailable")
+        }
+    }
+
     private fun isRingingIncoming(call: JSONObject) =
         call.optString("state") == "ringing" && call.optString("calleeId") == config.optString("userId")
 
@@ -842,6 +953,23 @@ object VoipBridge {
         if (incoming && incomingUiWait != null && !visible) return
         clearIncomingUiWait()
         if (!incomingNotifications.publish(id, incoming, visible)) return
+        val avatarJob = incomingAvatarJob
+        if (incoming && !visible && avatarJob?.isActive == true) {
+            // Start the fallback alert within Telecom's five-second window.
+            // A second post just for the avatar can interrupt the system ringtone.
+            val run = generation
+            scope.launch {
+                withTimeoutOrNull(1_800L) { avatarJob.join() }
+                val active = current ?: return@launch
+                if (run == generation && active.optString("callId") == id && isRingingIncoming(active) &&
+                    incomingNotifications.hasUnpresentedAlert(id)) postCallNotification(ctx, id, incoming, visible)
+            }
+            return
+        }
+        postCallNotification(ctx, id, incoming, visible)
+    }
+
+    private fun postCallNotification(ctx: Context, id: String, incoming: Boolean, visible: Boolean) {
         // Once the call page is visible, its CallStyle drops the full-screen Intent.
         // Post it through the phoneCall foreground service so the system accepts it.
         if (incoming && Build.VERSION.SDK_INT >= 31 && !visible) {
@@ -1021,6 +1149,7 @@ object VoipBridge {
         if (id.isNotEmpty()) { terminal.add(id); if (terminal.size > 128) terminal.remove(terminal.first()) }
         expiryJob?.cancel(); expiryJob = null
         clearIncomingUiWait()
+        clearIncomingAvatar()
         releaseMedia(); mediaJob?.cancel(); mediaJob = null; mediaId = ""
         val c = control; control = null
         val job = telecomJob; telecomJob = null
@@ -1040,7 +1169,8 @@ object VoipBridge {
         context?.stopService(Intent(context, VoipCallService::class.java))
         context?.getSystemService(NotificationManager::class.java)?.cancel(9090)
         if (reason.isNotEmpty()) emit("localEnded", "reason", reason)
-        current = null; nativeUiId = ""; appCallUiId = ""
+        current = null; nativeUiId = ""; appCallUiId = ""; onEarpiece = false
+        updateProximity()
     }
     private fun expireSession() {
         val event = JSONObject().put("type", "localEnded").put("scope", config.optString("scope")).put("callId", current?.optString("callId")).put("reason", "sessionExpired")
@@ -1201,7 +1331,11 @@ object VoipBridge {
         val meeting = s.optString("scene") == "meeting"
         val personName = if (meeting) "${label("meetingInvitation")} · ${s.optString("title")}" else
             s.optString(if (s.optString("callerId") == config.optString("userId")) "calleeDisplayName" else "callerDisplayName", "Nuwax")
-        val person = Person.Builder().setName(personName).setImportant(true).build()
+        val avatar = if (s.optString("calleeId") == config.optString("userId")) {
+            incomingAvatar ?: callerInitialAvatar(s.optString("callerDisplayName"))
+        } else null
+        val person = Person.Builder().setName(personName).setImportant(true)
+            .apply { if (avatar != null) setIcon(IconCompat.createWithBitmap(avatar)) }.build()
         val style = if (incoming) NotificationCompat.CallStyle.forIncomingCall(person, intent("reject"), answer)
             .setIsVideo(!meeting && s.optString("mediaType") == "video")
             else NotificationCompat.CallStyle.forOngoingCall(person, intent(if (s.optString("state") == "ringing") "cancel" else "end"))
@@ -1223,6 +1357,7 @@ object VoipBridge {
             .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_ALL)
             .setPriority(priority).setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setOngoing(true).setOnlyAlertOnce(!incoming)
+        if (avatar != null) builder.setLargeIcon(avatar)
         if (meeting && incoming) {
             // CallStyle 的接听文案由系统生成；会议用明确的「入会」动作。
             builder.addAction(android.R.drawable.ic_menu_close_clear_cancel, label("meetingIgnore"), intent("reject"))

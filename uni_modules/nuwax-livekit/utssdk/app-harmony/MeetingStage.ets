@@ -47,6 +47,7 @@ interface BrowserEvent {
   type: string
   id: number
   connection?: string
+  left?: boolean
   people?: number
   mic?: boolean
   remoteAudio?: boolean
@@ -123,7 +124,7 @@ export class MeetingStageSession {
 
   static releaseIdleHost(): void {
     if (MeetingStageSession.mount || MeetingStageSession.isConnected() ||
-        MeetingStageSession.connection === 'connecting') return
+        MeetingStageSession.connection === 'connecting' || MeetingStageSession.host?.leaving) return
     const host = MeetingStageSession.host
     MeetingStageSession.host = undefined
     host?.dispose()
@@ -144,18 +145,20 @@ export class MeetingStageSession {
   static flush(): void {
     const command = MeetingStageSession.pending
     const host = MeetingStageSession.host
-    if (!command || !host?.ready) return
+    if (!command || !host?.ready || host.leaving) return
     MeetingStageSession.pending = undefined
     host.send(command)
   }
 
-  static disconnect(): void {
+  static disconnect(): Promise<boolean> {
+    const host = MeetingStageSession.host
+    const connection = MeetingStageSession.connection
+    let leaving = host?.leaving
+    if (!leaving && host && connection.length > 0 && connection !== 'disconnected' && !MeetingStageSession.pending) {
+      leaving = host.leave(MeetingStageSession.id)
+    }
     MeetingStageSession.releaseShare()
-    MeetingStageSession.releaseBackgroundTask()
-    const command = new Command()
-    command.type = 'disconnect'
-    command.id = MeetingStageSession.id
-    MeetingStageSession.host?.send(command)
+    MeetingStageSession.releaseBackgroundTask(leaving)
     MeetingStageSession.id += 1
     MeetingStageSession.pending = undefined
     MeetingStageSession.connection = ''
@@ -180,6 +183,7 @@ export class MeetingStageSession {
     MeetingStageSession.metadata = ''
     MeetingStageSession.videos = ''
     MeetingStageSession.messages = []
+    return leaving ?? Promise.resolve(true)
   }
 
   static isConnected(): boolean {
@@ -236,11 +240,13 @@ export class MeetingStageSession {
     })
   }
 
-  private static releaseBackgroundTask(): void {
+  private static releaseBackgroundTask(leaving?: Promise<boolean>): void {
     const owner = MeetingStageSession.backgroundOwner
     if (owner.length === 0) return
     MeetingStageSession.backgroundOwner = ''
-    EntryVoipBackgroundTask.release(owner).catch((error: BusinessError) => {
+    // A detached ArkWeb session may still need to send the final leave before the process is suspended.
+    const afterLeave = leaving ?? Promise.resolve(true)
+    afterLeave.then(() => EntryVoipBackgroundTask.release(owner)).catch((error: BusinessError) => {
       console.warn('[MeetingStage] background task release failed code=' + error.code)
     })
   }
@@ -399,6 +405,10 @@ export class MeetingStageHost {
   private context: common.UIAbilityContext
   private stage: BuilderNode<[MeetingStageHost]> | undefined
   private pipLabel: string = ''
+  leaving: Promise<boolean> | undefined
+  private leavingId: number = -1
+  private leaveTimer: number = -1
+  private finishLeaving: ((left: boolean) => void) | undefined
   private tasks: Promise<void> = Promise.resolve()
 
   constructor(context: common.UIAbilityContext) {
@@ -439,9 +449,39 @@ export class MeetingStageHost {
     return EntryVoipBackgroundTask.acquire(owner, this.context, needed)
   }
 
+  leave(id: number): Promise<boolean> {
+    if (!this.ready) return Promise.resolve(false)
+    const leaving = new Promise<boolean>((resolve) => { this.finishLeaving = resolve })
+    this.leaving = leaving
+    this.leavingId = id
+    this.leaveTimer = setTimeout(() => { this.completeLeave(id, false) }, 2500)
+    const command = new Command()
+    command.type = 'disconnect'
+    command.id = id
+    this.send(command)
+    return leaving
+  }
+
+  private completeLeave(id: number, left: boolean): void {
+    if (id !== this.leavingId || !this.finishLeaving) return
+    clearTimeout(this.leaveTimer)
+    this.leaveTimer = -1
+    this.leavingId = -1
+    this.leaving = undefined
+    const finish = this.finishLeaving
+    this.finishLeaving = undefined
+    finish(left)
+    MeetingStageSession.flush()
+    MeetingStageSession.releaseIdleHost()
+  }
+
   postMessage(raw: string): void {
     if (MeetingStageSession.host !== this || !this.ready || raw.length > 16384) return
-    try { MeetingStageSession.receive(JSON.parse(raw) as BrowserEvent) } catch (_) {}
+    try {
+      const event = JSON.parse(raw) as BrowserEvent
+      if (event.type === 'leaveComplete') this.completeLeave(event.id, event.left === true)
+      else MeetingStageSession.receive(event)
+    } catch (_) {}
   }
 
   loaded(url: string): void {
@@ -486,6 +526,7 @@ export class MeetingStageHost {
     this.ready = false
     this.screenSupported = false
     MeetingStageSession.disconnect()
+    this.completeLeave(this.leavingId, false)
     MeetingStageSession.error = 'connect'
   }
 
@@ -518,6 +559,10 @@ export class MeetingStageHost {
     try {
       await this.controller.runJavaScript('window.meetingMedia.dispatch(' + encoded + ')')
     } catch (_) {
+      if (command.type === 'disconnect') {
+        this.completeLeave(id, false)
+        return
+      }
       if (MeetingStageSession.host !== this || MeetingStageSession.id !== id) return
       if (command.type === 'connect') MeetingStageSession.error = 'connect'
       if (command.type === 'prepareShare') {

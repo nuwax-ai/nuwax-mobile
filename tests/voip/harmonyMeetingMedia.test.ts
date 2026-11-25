@@ -99,6 +99,41 @@ describe('Harmony LiveKit room', () => {
     expect(local.setMicrophoneEnabled).toHaveBeenCalledWith(true);
   });
 
+  it('confirms leave only after the LiveKit disconnection promise resolves', async () => {
+    const { media, room, post } = connection();
+    await waitForOperations();
+    let close!: () => void;
+    room.disconnect.mockImplementationOnce(() => new Promise(resolve => { close = resolve; }));
+    media.dispatch({ id: 0, type: 'disconnect' });
+    expect(room.disconnect).not.toHaveBeenCalled();
+    media.dispatch({ id: 1, type: 'disconnect' });
+    expect(room.disconnect).toHaveBeenCalledOnce();
+    await waitForOperations();
+    expect(post).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'leaveComplete' }));
+    close();
+    await waitForOperations();
+    expect(post).toHaveBeenLastCalledWith({ type: 'leaveComplete', id: 1, left: true });
+  });
+
+  it('does not join if a connect command arrives after leave for the same generation', async () => {
+    const media = createMeetingMedia(vi.fn(), vi.fn());
+    media.dispatch({ id: 1, type: 'disconnect' });
+    media.dispatch({ id: 1, type: 'connect', url: 'wss://room.test', token: 'room-token' });
+    expect(rooms).toHaveLength(0);
+    media.dispatch({ id: 2, type: 'connect', url: 'wss://room.test', token: 'next-token' });
+    await waitForOperations();
+    expect(rooms[0].connect).toHaveBeenCalledExactlyOnceWith('wss://room.test', 'next-token');
+  });
+
+  it('does not report successful leave if the SDK fails to disconnect', async () => {
+    const { media, room, post } = connection();
+    await waitForOperations();
+    room.disconnect.mockRejectedValueOnce(new Error('disconnection failed'));
+    media.dispatch({ id: 1, type: 'disconnect' });
+    await waitForOperations();
+    expect(post).toHaveBeenLastCalledWith({ type: 'leaveComplete', id: 1, left: false });
+  });
+
   it('switches facing mode on the published local camera without recreating the room', async () => {
     const { media, room } = connection();
     await waitForOperations();

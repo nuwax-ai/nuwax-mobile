@@ -85,6 +85,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     livekitRequestScreenShare() { if (!configThrows) assert.equal(configured, true); operations.push('share'); },
     apiImMeetingTakeShareHolder: async () => { claims++; return claimResult(); },
     livekitDisconnect: () => { connected = false; operations.push('disconnect'); },
+    livekitDisconnectConfirmed: async () => { connected = false; operations.push('disconnect'); return true; },
     livekitSendMeetingMessage: () => operations.push('chat'),
     livekitSetHandRaised: on => operations.push(on ? 'raise' : 'lower'),
     livekitStopScreenShare: () => operations.push('stopShare'),
@@ -260,7 +261,8 @@ test('页面返回/退后台自动更新小窗，原会话不断开，点击小�
 function pageFunctions(names, platform = 'APP-IOS') {
   const source = readFileSync(new URL('../subpackages/pages/im-meeting/im-meeting-room.uvue', import.meta.url), 'utf8');
   return names.map(name => {
-    const start = source.indexOf(`  function ${name}(`);
+    const plainStart = source.indexOf(`  function ${name}(`);
+    const start = plainStart >= 0 ? plainStart : source.indexOf(`  async function ${name}(`);
     assert.notEqual(start, -1);
     const end = source.indexOf('\n  }', start);
     return forPlatform(source.slice(start, end + 4), platform);
@@ -726,4 +728,24 @@ test('鸿蒙未开放提前入会时，预检会阻止媒体连接', async () =>
   assert.equal(await h.join(), false);
   assert.equal(h.api.meetingMediaState().errorText, 'notStarted');
   assert.deepEqual(h.operations, []);
+});
+
+
+test('鸿蒙最后一位参会者只在退席确认后请求结束空房', async () => {
+  const room = '123456789';
+  for (const [left, rejoined, expected] of [[true, false, [room]], [false, false, []], [true, true, []]]) {
+    let finishLeave;
+    const deleted = [];
+    const context = vm.createContext({
+      meetingMediaDisconnect: () => new Promise(resolve => { finishLeave = resolve; }),
+      meetingMediaActiveRoom: () => rejoined ? room : '',
+      apiImMeetingDeleteRoom: async room => { deleted.push(room); },
+    });
+    vm.runInContext(stripTypeScriptTypes(pageFunctions(['deleteRoomAfterLeaving'], 'APP-HARMONY')), context);
+    const result = context.deleteRoomAfterLeaving(room);
+    assert.deepEqual(deleted, []);
+    finishLeave(left);
+    await result;
+    assert.deepEqual(deleted, expected);
+  }
 });

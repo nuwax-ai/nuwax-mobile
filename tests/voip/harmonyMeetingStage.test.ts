@@ -87,7 +87,7 @@ describe('Harmony meeting native stage', () => {
       .toEqual(["window.meetingMedia.setPictureInPictureLabel(\"Picture in picture\")"]);
   });
 
-  it('ignores a stale unmount and disposes the detached frame after leaving', () => {
+  it('ignores a stale unmount and disposes the detached frame only after the SDK confirms leave', async () => {
     const { session, stages } = nativeStage();
     const old = session.attach({}, 'Picture in picture');
     const frame = old.makeNode({});
@@ -100,8 +100,14 @@ describe('Harmony meeting native stage', () => {
     expect(session.releaseView(old.id)).toBe(false);
     expect(restored.makeNode({})).toBe(frame);
     expect(session.releaseView(restored.id)).toBe(true);
-    session.disconnect();
+    const id = session.id;
+    const leaving = session.disconnect();
+    expect(session.disconnect()).toBe(leaving);
     session.releaseIdleHost();
+    host.postMessage(JSON.stringify({ type: 'leaveComplete', id: id - 1, left: true }));
+    expect(stages[0].dispose).not.toHaveBeenCalled();
+    host.postMessage(JSON.stringify({ type: 'leaveComplete', id, left: true }));
+    expect(await leaving).toBe(true);
     expect(stages[0].dispose).toHaveBeenCalledOnce();
     expect(session.host).toBeUndefined();
     expect(session.isConnected()).toBe(false);
@@ -235,7 +241,11 @@ describe('Harmony meeting background lifecycle', () => {
     expect(task.acquire).not.toHaveBeenCalled();
     session.setAppForeground(true);
     expect(task.acquire).toHaveBeenCalledOnce();
-    session.disconnect();
+    const leaving = session.disconnect();
+    await settle();
+    expect(task.release).not.toHaveBeenCalled();
+    session.host.postMessage(JSON.stringify({ type: 'leaveComplete', id, left: true }));
+    await leaving;
     await settle();
     expect(task.release).toHaveBeenCalledExactlyOnceWith('meeting:' + id);
   });
@@ -280,4 +290,19 @@ it('requests OS permissions only for media the participant can publish in the fo
   permissions.checkAccessTokenSync.mockReturnValue(0);
   expect(session.host.captureResourceAllowed('audio')).toBe(false);
   expect(session.host.captureResourceAllowed('video')).toBe(true);
+});
+
+
+it('cleans up a detached ArkWeb host when leave confirmation times out', async () => {
+  const { session, mount, stages, timers } = connectedStage();
+  const host = session.host;
+  const id = session.id;
+  const leaving = session.disconnect();
+  session.releaseView(mount.id);
+  expect(stages[0].dispose).not.toHaveBeenCalled();
+  [...timers.values()].find(timer => timer.delay === 2500)!.callback();
+  expect(await leaving).toBe(false);
+  expect(stages[0].dispose).toHaveBeenCalledOnce();
+  host.postMessage(JSON.stringify({ type: 'leaveComplete', id, left: true }));
+  expect(session.host).toBeUndefined();
 });

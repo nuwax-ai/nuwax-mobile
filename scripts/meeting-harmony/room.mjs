@@ -8,6 +8,8 @@ setLogLevel(LogLevel.silent);
 
 export function createMeetingMedia(post, render) {
   let current;
+  let leaving = Promise.resolve(true);
+  let closedThrough = -1;
   const active = (session) => current === session;
 
   function holder(room) {
@@ -72,14 +74,14 @@ export function createMeetingMedia(post, render) {
     const session = current;
     current = undefined;
     render([], undefined, []);
-    if (session) {
-      stopShare(session);
-      void session.room.disconnect().catch(() => {});
-    }
+    if (!session) return leaving;
+    stopShare(session);
+    leaving = session.room.disconnect().then(() => true, () => false);
+    return leaving;
   }
 
   async function connect(command) {
-    disconnect();
+    void disconnect();
     const session = { id: command.id, room: new Room({ adaptiveStream: true, dynacast: true }), operations: Promise.resolve() };
     current = session;
     const { room } = session;
@@ -110,7 +112,7 @@ export function createMeetingMedia(post, render) {
     } catch {
       if (active(session)) {
         post({ type: 'error', id: session.id, error: 'connect' });
-        disconnect();
+        void disconnect();
       }
     }
   }
@@ -167,15 +169,19 @@ export function createMeetingMedia(post, render) {
 
   function dispatch(command) {
     if (command.type === 'connect') {
-      void connect(command);
+      if (command.id > closedThrough) void connect(command);
       return;
     }
     const session = current;
-    if (!session || session.id !== command.id) return;
     if (command.type === 'disconnect') {
-      disconnect();
+      if (session && session.id !== command.id) return;
+      closedThrough = Math.max(closedThrough, command.id);
+      void disconnect().then((left) => {
+        post({ type: 'leaveComplete', id: command.id, left });
+      });
       return;
     }
+    if (!session || session.id !== command.id) return;
     if (command.type === 'prepareShare') {
       if (!session.share) {
         session.share = { id: session.id, shareId: command.shareId, label: command.text, cancel: command.name };

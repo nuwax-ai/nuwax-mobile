@@ -137,9 +137,10 @@ object VoipBridge {
             .put("channelEnabled", channel == null || channel.importance >= NotificationManager.IMPORTANCE_HIGH)
             .put("channelId", channel?.id ?: VoipNotificationChannels.INCOMING)
             .put("channelImportance", channel?.importance ?: -1)
-            .put("channelSoundEnabled", channel?.sound != null)
+            .put("channelSoundEnabled", channel?.sound?.let { it != Uri.EMPTY } == true)
             .put("presentedChannelExists", presented != null && channel != null && channel.importance > NotificationManager.IMPORTANCE_DEFAULT)
-            .put("presentedChannelAudible", presented != null && presented.importance >= NotificationManager.IMPORTANCE_DEFAULT && presented.sound != null)
+            .put("presentedChannelAudible", presented != null && presented.importance >= NotificationManager.IMPORTANCE_DEFAULT &&
+                presented.sound?.let { it != Uri.EMPTY } == true)
             .put("ringerMode", audio.ringerMode).put("ringVolume", audio.getStreamVolume(AudioManager.STREAM_RING))
             .put("interruptionFilter", interruptionFilter)
             .put("doNotDisturbActive", interruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL &&
@@ -169,6 +170,7 @@ object VoipBridge {
             }
             "overlay" -> Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, packageUri)
             "fullScreen" -> Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT, packageUri)
+            "background" -> return startSettings(ctx, Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri))
             else -> return false
         }
         if (startSettings(ctx, intent)) return true

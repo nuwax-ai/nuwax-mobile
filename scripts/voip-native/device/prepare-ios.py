@@ -2,7 +2,7 @@
 """Generate isolated iOS 5.34 test or full business App hosts; never print signing material."""
 import os, json, plistlib, re, shutil, subprocess
 from pathlib import Path
-from ios_push_config import selected_push_configuration
+from ios_push_config import IOS_LAUNCH_STORYBOARD, IOS_VOIP_RINGTONE, selected_push_configuration
 ROOT=Path(__file__).resolve().parents[3]
 SDK=Path(os.environ['UNIAPPX_SDK_ROOT']).resolve()
 BUSINESS=os.environ.get('NUWAX_VOIP_BUSINESS_HOST')=='1'
@@ -97,6 +97,9 @@ info.update(CFBundleIdentifier='$(PRODUCT_BUNDLE_IDENTIFIER)',CFBundleExecutable
  UIBackgroundModes=['audio','voip','remote-notification'])
 info['uniapp-x']={'appid':'__UNI__8BF05E4','uniRuntimeVersion':'5.34','ipatype':2,'dcloud_appkey':os.environ['DCLOUD_APPKEY']}
 info['NSAppTransportSecurity']={'NSAllowsLocalNetworking':True,'NSAllowsArbitraryLoads':True}
+# UIKit uses the launch storyboard declaration to size the app on older iPhones.
+assert (APP/'Base.lproj'/f'{IOS_LAUNCH_STORYBOARD}.storyboard').is_file(), 'Missing SDK launch storyboard'
+info['UILaunchStoryboardName']=IOS_LAUNCH_STORYBOARD
 info.pop('UIMainStoryboardFile',None)
 info.pop('UILaunchScreen',None)
 for scenes in info.get('UIApplicationSceneManifest',{}).get('UISceneConfigurations',{}).values():
@@ -189,6 +192,10 @@ spec['targets']['UniAppX']['sources'] += [
  {'path':str(SDK/'SDK/Resources/uni-static'),'type':'folder','buildPhase':'resources'},
  {'path':str(SDK/'SDK/Resources/uni-prompt.bundle'),'buildPhase':'resources'},
  {'path':str(SDK/'SDK/Resources/DCSVProgressHUD.bundle'),'buildPhase':'resources'}]
+if 'unimoduleNuwaxVoip' in spec['targets']:
+ assert IOS_VOIP_RINGTONE.is_file(), 'Missing native iOS VoIP ringtone source'
+ # CallKit and LiveCommunicationKit resolve the sound by name in the host App bundle.
+ spec['targets']['UniAppX']['sources'].append({'path':str(IOS_VOIP_RINGTONE),'buildPhase':'resources'})
 (OUT/'project.json').write_text(json.dumps(spec,indent=2))
 print('Generated isolated iOS host:',OUT,'with',len(modules),'UTS modules and',len(frameworks),'SDK frameworks')
 subprocess.run(['xcodegen','generate','--spec',str(OUT/'project.json'),'--project',str(OUT)],check=True)

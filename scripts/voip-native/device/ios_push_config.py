@@ -7,6 +7,23 @@ import zipfile
 from pathlib import Path
 
 
+IOS_VOIP_RINGTONE = (Path(__file__).resolve().parents[3]
+    / 'uni_modules/nuwax-voip/utssdk/app-ios/Resources/nuwax_voip_ring.wav')
+IOS_LAUNCH_STORYBOARD = 'LaunchScreen'
+
+
+def verify_bundled_ringtone(app):
+    embedded = app / IOS_VOIP_RINGTONE.name
+    if not embedded.is_file() or embedded.read_bytes() != IOS_VOIP_RINGTONE.read_bytes():
+        raise ValueError('Missing or stale native VoIP ringtone in the main iOS App bundle')
+
+
+def verify_launch_storyboard(app, info):
+    if (info.get('UILaunchStoryboardName') != IOS_LAUNCH_STORYBOARD
+            or not (app / 'Base.lproj' / f'{IOS_LAUNCH_STORYBOARD}.storyboardc' / 'Info.plist').is_file()):
+        raise ValueError('Missing launch storyboard declaration or compiled resource in the iOS App bundle')
+
+
 def validate_getui(config):
     keys = ('appid', 'appKey', 'appSecret')
     if not isinstance(config, dict) or any(
@@ -154,7 +171,9 @@ if __name__ == '__main__':
         raise ValueError('Cannot read signed App entitlements')
     info = plistlib.loads((app / 'Info.plist').read_bytes())
     verify_signed_push(info, plistlib.loads(result.stdout))
+    verify_launch_storyboard(app, info)
     if not info.get('NuwaxVoipDeviceTest'):
+        verify_bundled_ringtone(app)
         verify_native_launch_restore(app, info)
     if os.environ.get('NUWAX_IOS_QA_PROJECT'):
         verify_business_qa(app, info, os.environ['NUWAX_IOS_QA_PROJECT'])

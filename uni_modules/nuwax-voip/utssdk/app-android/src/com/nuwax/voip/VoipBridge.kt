@@ -1159,15 +1159,22 @@ object VoipBridge {
     internal fun presentedRingtoneChannel(ctx: Context): NotificationChannel? {
         if (Build.VERSION.SDK_INT < 31) return null
         val call = current ?: return null
-        if (!isRingingIncoming(call) ||
-            !incomingNotifications.wasPresentedFirst(call.optString("callId"))) return null
+        val id = call.optString("callId")
+        if (!isRingingIncoming(call) || !incomingNotifications.wasPresented(id)) return null
         val manager = ctx.getSystemService(NotificationManager::class.java)
         val channel = manager.getNotificationChannel(VoipNotificationChannels.presentedIncoming(ctx)) ?: return null
-        if (!manager.areNotificationsEnabled() || channel.importance < NotificationManager.IMPORTANCE_DEFAULT ||
-            channel.sound == null || channel.sound == Uri.EMPTY) return null
         val filter = manager.currentInterruptionFilter
-        if (filter != NotificationManager.INTERRUPTION_FILTER_ALL &&
-            (filter != NotificationManager.INTERRUPTION_FILTER_PRIORITY || !channel.canBypassDnd())) return null
+        fun permitsRinging(value: NotificationChannel): Boolean =
+            value.importance >= NotificationManager.IMPORTANCE_DEFAULT &&
+                value.sound != null && value.sound != Uri.EMPTY &&
+                (filter == NotificationManager.INTERRUPTION_FILTER_ALL ||
+                    (filter == NotificationManager.INTERRUPTION_FILTER_PRIORITY && value.canBypassDnd()))
+
+        if (!manager.areNotificationsEnabled() || !permitsRinging(channel)) return null
+        // Updating the notification when the call page opens can stop its ringtone.
+        // Respect the original channel's sound settings before taking over playback.
+        if (!incomingNotifications.wasPresentedFirst(id) &&
+            VoipNotificationChannels.incoming(manager)?.let(::permitsRinging) != true) return null
         val audio = ctx.getSystemService(AudioManager::class.java)
         return channel.takeIf { audio.ringerMode == AudioManager.RINGER_MODE_NORMAL && audio.getStreamVolume(AudioManager.STREAM_RING) > 0 }
     }

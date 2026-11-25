@@ -11,9 +11,6 @@ from pathlib import Path
 
 ANDROID = "{http://schemas.android.com/apk/res/android}"
 TOOLS = "{http://schemas.android.com/tools}"
-STOCK_RECEIVER = "uts.sdk.modules.DCloudUniPush.UniPushIntentService"
-CALL_RECEIVER = "com.nuwax.voip.VoipUniPushIntentService"
-CALL_RECEIVER_FILE = "app/src/main/java/com/nuwax/voip/VoipUniPushIntentService.kt"
 VIVO_STOCK_RECEIVER = "com.igexin.sdk.VivoPushMessageReceiver"
 VIVO_PUSH_RECEIVER = "com.nuwax.voip.VivoVoipPushMessageReceiver"
 VIVO_CALL_RECEIVER = "com.nuwax.voip.VivoVoipCallReceiver"
@@ -33,26 +30,18 @@ def clear_previous_configuration(project: Path) -> None:
     application = tree.getroot().find("application")
     if application is None:
         raise SystemExit("Android application manifest element is missing")
-    owned = any(node.get(ANDROID + "name") == "nuwax.voip.uniPush" for node in application.findall("meta-data")) or any(
-        node.get(ANDROID + "name") == CALL_RECEIVER for node in application.findall("service")
-    )
+    owned = any(node.get(ANDROID + "name") == "nuwax.voip.uniPush" for node in application.findall("meta-data"))
     if owned:
         names = {"GETUI_APPID", "PUSH_APPID", "GETUI_APP_ID", "MIPUSH_APPID", "MIPUSH_APPKEY", "com.huawei.hms.client.appid", "com.hihonor.push.app_id", "dcloud_unipush_auto_notification", "nuwax.voip.uniPush", "com.vivo.push.app_id", "com.vivo.push.api_key"}
         names.update(("OPPOPUSH_APPKEY", "OPPOPUSH_APPSECRET"))
         for node in list(application.findall("meta-data")):
             if node.get(ANDROID + "name") in names:
                 application.remove(node)
-        for node in list(application.findall("service")):
-            if node.get(ANDROID + "name") == CALL_RECEIVER or (
-                node.get(ANDROID + "name") == STOCK_RECEIVER and node.get(TOOLS + "node") == "remove"
-            ):
-                application.remove(node)
         for node in list(application.findall("receiver")):
             if node.get(ANDROID + "name") in (VIVO_PUSH_RECEIVER, VIVO_CALL_RECEIVER) or (
                 node.get(ANDROID + "name") == VIVO_STOCK_RECEIVER and node.get(TOOLS + "node") == "remove"
             ):
                 application.remove(node)
-        (project / CALL_RECEIVER_FILE).unlink(missing_ok=True)
         (project / VIVO_RECEIVER_FILE).unlink(missing_ok=True)
         tree.write(manifest, encoding="utf-8", xml_declaration=True)
 
@@ -105,6 +94,7 @@ def configure(project: Path, config_file: Path | None, *, enable_vivo_voip: bool
 
     vivo = config.get("vivo")
     voip_module = (project / "uts-nuwax-voip").is_dir()
+    push_module = (project / "uts-nuwax-push-keepalive").is_dir()
     vivo_voip = enable_vivo_voip and vivo is not None and voip_module
     if vivo is not None:
         app_id_vivo = vivo.get("appId") if isinstance(vivo, dict) else None
@@ -176,17 +166,13 @@ def configure(project: Path, config_file: Path | None, *, enable_vivo_voip: bool
             node = ET.SubElement(application, "meta-data", {ANDROID + "name": name})
         node.set(ANDROID + "value", value)
         node.set(TOOLS + "replace", "android:value")
-    # Getui 3.x discovers the one GTIntentService declared in the merged manifest.
-    # Its subclass keeps UniPush behavior and can receive before UTS/JS is resumed.
-    if voip_module:
-        source = Path(__file__).resolve().parents[3] / "uni_modules/nuwax-voip/native/android-unipush"
-        target = project / CALL_RECEIVER_FILE
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source / target.name, target)
-        ET.SubElement(application, "service", {ANDROID + "name": STOCK_RECEIVER, TOOLS + "node": "remove"})
-        ET.SubElement(application, "service", {ANDROID + "name": CALL_RECEIVER, ANDROID + "exported": "false"})
+    # 保留 DCloud UniPush 自带的 GTIntentService；nuwax-push-keepalive 在模块内部包装
+    # PushActionHolder 回调。替换/禁用该 Service 会让 Getui 重启时反复启动失败。
+    if push_module or voip_module:
         if vivo_voip:
+            source = Path(__file__).resolve().parents[3] / "uni_modules/nuwax-voip/native/android-unipush"
             target = project / VIVO_RECEIVER_FILE
+            target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source / target.name, target)
             ET.SubElement(application, "receiver", {ANDROID + "name": VIVO_STOCK_RECEIVER, TOOLS + "node": "remove"})
             receiver = ET.SubElement(application, "receiver", {

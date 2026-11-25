@@ -4,7 +4,9 @@
 前置阅读：[im-offline-push.md](im-offline-push.md)（现有 uni-push 2.0 链路）、
 [im-push-fallback-plan.md](im-push-fallback-plan.md)（2026-11-04 的 FGS + WebSocket 兜底计划，本文是其**简化替代方案**）。
 
-状态：**方案稿**（2026-11-24）。调研基于真机 + 反编译实证，代码未落地。
+状态：**代码已修订，待重打 Android 自定义基座后真机验证**（2026-11-24）。本轮仅做静态检查与脚本级回归。
+
+第 1–3 节保留早期设备调查记录，不作为当前版本端到端送达证明；当前实现以第 4 节为准。
 
 ---
 
@@ -284,157 +286,62 @@ if (status.vendor != "none" || !status.manualSettingsRequired) return;
 
 ---
 
-## 4. 技术方案
+## 4. 当前实现与验收
 
-### 4.1 总体链路
+### 4.1 完整链路
 
-```
-用户划掉最近任务
-  └─ 三星 killTaskProcessesIfPossible → 包内所有进程 kill("remove task")
-       ├─ 主进程                              消失（正常，下次启动重建）
-       └─ :pushservice（含个推长连接）        消失
-            ↓ ~1000ms（AMS 服务重启退避，首次 1s）
-  └─ AMS 发现有一个 START_STICKY 且 startRequested 的服务 → Start proc :pushservice
-       └─ PushKeepAliveService.onCreate / onStartCommand
-            └─ startService("uts.sdk.modules.DCloudUniPush.UniPushService")
-                 └─ 个推 SDK 重新初始化 → 重连长连接 → 服务端离线消息下发
-```
-
-### 4.2 新增 UTS 插件 `uni_modules/nuwax-push-keepalive`
-
-平台范围：**仅 `app-android`**（iOS/鸿蒙不涉及）。
-
-目录结构（照抄 `nuwax-stream-pcm-player` 的既有模式）：
-
-```
-uni_modules/nuwax-push-keepalive/
-├── package.json
-└── utssdk/
-    └── app-android/
-        ├── config.json
-        ├── AndroidManifest.xml
-        ├── index.uts                     ← 桥接层：ensurePushKeepAlive()
-        └── src/com/nuwax/pushkeepalive/
-            └── PushKeepAliveService.kt   ← 服务本体
+```text
+登录后 users/me 确认账号 + 当前推送偏好
+  → 保存原生闸门（用户 ID、环境、开关；无 token）
+  → 非厂商设备启动主进程 PushKeepAliveService
+  → 系统允许时通过 START_STICKY 重建服务
+  → 官方 initialize + startService 请求连接
+  → PushRuntime 在 PushActionHolder 外安装无 Activity 回调桥
+  → SDK online / CID / transmission 独立回调
+  → 来电保持原生 VoIP 分流
+  → 普通消息：有 Activity 交给原 UTS；无 Activity 由 ImHeadlessPush 补通知
+  → 复用 SDK 通知渠道、payload、点击 Intent 和 click 事件
 ```
 
-> **为什么服务本体用 Kotlin 而不是 UTS**：项目已有明确结论（`nuwax-stream-pcm-player` 注释）——
-> 「UTS 里 `extends Service` 生成的父类声明不带构造调用，Release 编不过」。沿用 Kotlin。
+主进程存在、初始化返回、缓存 CID 存在都不是在线或通知送达证明。STICKY 没有固定一秒重启、后台常驻或强制停止后恢复的保证。
 
-#### `PushKeepAliveService.kt` 关键点
+### 4.2 修正的断点
 
-```kotlin
-class PushKeepAliveService : Service() {
-    override fun onBind(intent: Intent?): IBinder? = null
+- `PushKeepAliveService.kt` 去掉进程级永久 initialized 标记。已受理请求限流 10 秒，明确异常最多重试 3 次，下次前台请求可再次尝试。SDK 内部吞错仍只能由在线/收包回调识别，不使用私有 PushCore 入口。
+- `index.uts` 启动返回是否受理；没有 Activity 或发生异常返回 false，外层不再永久标记成功。
+- `PushRuntime.kt` 保留 DCloud 的 `UniPushIntentService`，通过公开的 `PushActionHolder.setPushAction` 包装标准 `UserPushAction`。普通消息先做 VoIP/无 Activity 分流，未处理时完整转发 DCloud 原回调；不依赖有 Activity 的 initPush，也不修改组件启用状态。
+- `ImHeadlessPush.kt` 只补非厂商设备普通透传，直接复用 SDK 的 PushMessage/createNotification，不等待业务 receive 回调、不全局修改 force_notification。已处理消息不再进入父类排队，避免重复展示。
+- 原生闸门由 imPushPreference.uts 在身份确认及偏好变化时同步；imSessionScope.uts 在退出、切账号或会话失效时先关闭原生展示并停止锚点服务。
+- 原生通知检查通知权限和载荷环境；去重仅保存用户/环境/消息定位的哈希与时间，最多 128 条、24 小时。普通推送仍依赖服务端 CID/设备绑定路由，没有收件人字段的载荷不作为原生接收者鉴权证明。
 
-    override fun onCreate() {
-        super.onCreate()
-        ensureGeTuiOnline()
-    }
+来电/会议原生邀请先走原有 VoIP 校验，不降级成普通聊天通知。有 Activity 的展示和厂商通道保持原路径。
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        ensureGeTuiOnline()
-        return START_STICKY          // ★ 唯一的目的：让 AMS 在进程被杀后重新拉起
-    }
+### 4.3 打包边界
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        super.onTaskRemoved(rootIntent)
-        ensureGeTuiOnline()          // 对走 stopService 而非直接 kill 的 ROM 兜底
-    }
+本次包含 Kotlin 服务和新增源码，**不能仅热更 uvue/uts 验证**。云打包须重新提交一次完整 Android 包；本地路线须重新生成 App 资源并重打 Android 自定义基座。
 
-    private fun ensureGeTuiOnline() {
-        try {
-            val i = Intent().setClassName(packageName, GETUI_SERVICE)
-            startService(i)          // ★ 不能用 startForegroundService
-        } catch (_: Throwable) {
-        }
-    }
+云打包从 `uni_modules/nuwax-push-keepalive/utssdk/app-android/src` 直接编译 `PushRuntime.kt` 与 `ImHeadlessPush.kt`。项目和插件 manifest 都不再移除、替换或禁用 DCloud 默认接收器；`configure_unipush.py` 的本地基座路线同样保留 SDK 原组件。标准基座或旧包不具备原生兜底。
 
-    companion object {
-        private const val GETUI_SERVICE = "uts.sdk.modules.DCloudUniPush.UniPushService"
-    }
-}
+桥接接口按本机 HBuilderX 5.34 / gtsdk 3.3.7.0 AAR 核对；升级 SDK 后需重新核对接口及点击行为。
+
+### 4.4 验收
+
+日志分四步，不输出正文、token 或完整 CID：
+
+1. NuwaxPushKeepAlive / connection requested：仅表示启动请求提交。
+2. NuwaxImPush / sdk online=true：在线回调；CID callback 仅表示获得 CID。
+3. NuwaxImPush / native transmission received：原生已经收包。
+4. NuwaxImPush / notification submitted：调用通知链路完成，仍需确认通知栏可见及点击进会话。
+
+无需平台编译的回归：
+
+```bash
+node --test scripts/im-push-keepalive.test.mjs scripts/im-push-cid.test.mjs
+pnpm exec vitest run tests/im/pushPreference.test.ts tests/im/pushBindingSwitch.test.ts tests/voip/unipushBuild.test.ts tests/voip/pushSend.test.ts
+git diff --check
 ```
 
-四个必须遵守的约束：
-
-1. **返回 `START_STICKY`** —— 这是整个方案生效的唯一原因。
-2. **不能对 `UniPushService` 用 `startForegroundService`** —— 它不会在 5 秒内调 `startForeground`，
-   会触发 `RemoteServiceException` 直接崩溃。
-3. **用类名字符串而不是类型引用** —— 避免编译期依赖 uni-push 的 aar。
-4. **不调用 `startForeground`** —— 产品上不挂常驻通知（钉钉的做法也没有前台服务）。
-
-#### `AndroidManifest.xml` 片段
-
-```xml
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="uts.sdk.modules.nuwaxPushKeepalive">
-  <application>
-    <service
-        android:name="com.nuwax.pushkeepalive.PushKeepAliveService"
-        android:exported="false"
-        android:process=":pushservice" />
-  </application>
-</manifest>
-```
-
-`android:process=":pushservice"` 是刻意的：让锚点服务与个推**同进程**，进程被拉起时个推 SDK 的
-静态状态也在同一进程，重连成本最低。不需要 `android:stopWithTask`（默认 `false` 即可）。
-
-#### `index.uts` 桥接
-
-```ts
-const KEEPALIVE_SERVICE = "com.nuwax.pushkeepalive.PushKeepAliveService"
-
-/** 幂等：重复调用只会重新 startService。 */
-export function ensurePushKeepAlive(): void {
-  const activity = UTSAndroid.getUniActivity()
-  if (activity == null) return
-  try {
-    const intent = new Intent()
-    intent.setClassName(activity, KEEPALIVE_SERVICE)
-    activity.startService(intent)
-  } catch (e) {
-    console.warn("[push-keepalive] start failed " + e)
-  }
-}
-```
-
-### 4.3 接入点
-
-已落地在 `utils/im/imPushClient.uts` 的 `bindImPushClient()`：
-
-- `bindImPushClient()` 是幂等的推送监听绑定入口，登录后由 `scheduleImPushAfterLogin` 调用，
-  已登录冷启动还会经 `bindImPushClientIfLoggedIn` 在 `onLaunch` 提前绑定一次 —— 两条路径都覆盖。
-- 启动语句放在 `if (pushBound) return` **之前**：本函数存在「冷启动已绑定、登录后又调一次」
-  的情况，放守卫之后会漏启动。函数内部有自己的 `pushKeepAliveEnsured` 一次性闸门，
-  重复调用无副作用。
-- 时机在 `registerPushListener()`（即 `uni.onPushMessage`）之前，但锚点服务本身不做 SDK 依赖，
-  它只是把 `UniPushService` start 起来，SDK 未就绪时由该服务自己完成初始化。
-
-```ts
-// #ifdef APP-ANDROID
-function ensurePushKeepAliveIfNoVendorChannel(): void {
-  if (pushKeepAliveEnsured) return;
-  pushKeepAliveEnsured = true;
-  try {
-    const oem = classifyOemPushVendor(`${Build.MANUFACTURER}`, `${Build.BRAND}`);
-    if (oem != "none") return;          // ★ 厂商通道设备不启动
-    ensurePushKeepAlive();
-  } catch (e) {
-    console.warn(`[ImPush] 保活锚点启动失败: ${e}`);
-  }
-}
-// #endif
-```
-
-合规：`bindImPushClient` 本身已经会初始化个推 SDK（`onPushMessage`），锚点服务不额外
-引入「同意前初始化第三方 SDK」的问题。
-
-### 4.4 需要重新打包
-
-新增原生 Service + Manifest 声明，**热更无效**，必须重新打自定义基座（或云打包）。
-仅改 uvue/uts 业务代码时不受影响。
+重打基座后分别验：普通划掉、系统强制停止、锁屏短时/长时、断网恢复；同时检查前台不重复、退出/关闭推送不展示、来电分流、通知点击跳转。记录包版本、消息标识和四阶段日志，不能只凭进程重启判定通过。
 
 ---
 

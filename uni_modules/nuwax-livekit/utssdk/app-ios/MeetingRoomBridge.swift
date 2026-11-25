@@ -32,7 +32,7 @@ import Combine
  */
 public class MeetingRoomBridge: NSObject {
   /// 与页面诊断配套；只有重新制作原生基座才会更新。
-  private static let probeBuild = "ios-meeting-20261123-p10"
+  private static let probeBuild = "ios-meeting-20261125-p12"
   private static var broadcastConfigurationText = "unchecked"
   /// iOS → Android 共享流参数。写入 diag，方便仅凭真机日志确认新基座是否生效。
   private static let screenSharePublishProfile = "bounded720p30-3Mbps-single-h264"
@@ -624,7 +624,6 @@ public class MeetingRoomBridge: NSObject {
         screenShareLock.unlock()
         broadcastPending = false
         MeetingPictureInPicture.shared.setCapturePromptVisible(false)
-        if UIApplication.shared.applicationState == .background { _ = MeetingPictureInPicture.shared.start() }
         broadcastTimeout?.cancel()
         screenShareErrorText = ""
         bridgeLog("screen share published mode=\(useBroadcastExtension ? "broadcast" : "in-app") profile=\(screenSharePublishProfile)")

@@ -1,20 +1,47 @@
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 describe('UniPush native call adapter packaging', () => {
-  it('rebuilds the same single receiver and restores SDK behavior when disabled', () => {
+  it('keeps the DCloud receiver and wraps its callbacks for headless delivery', () => {
+    const root = resolve(import.meta.dirname, '../..');
+    const plugin = resolve(root, 'uni_modules/nuwax-push-keepalive/utssdk/app-android');
+    const appManifest = readFileSync(resolve(root, 'AndroidManifest.xml'), 'utf8');
+    const manifest = readFileSync(resolve(plugin, 'AndroidManifest.xml'), 'utf8');
+    const config = JSON.parse(readFileSync(resolve(plugin, 'config.json'), 'utf8'));
+    const headless = readFileSync(resolve(plugin,
+      'src/com/nuwax/pushkeepalive/ImHeadlessPush.kt'), 'utf8');
+    const runtime = readFileSync(resolve(plugin,
+      'src/com/nuwax/pushkeepalive/PushRuntime.kt'), 'utf8');
+    expect(manifest).not.toContain('DCloudUniPush.UniPushIntentService');
+    expect(manifest).not.toContain('NuwaxUniPushIntentService');
+    expect(appManifest).not.toContain('DCloudUniPush.UniPushIntentService');
+    expect(appManifest).not.toContain('NuwaxUniPushIntentService');
+    expect(config.dependencies[0].source).toContain("compileOnly('com.getui:gtsdk:3.3.7.0')");
+    expect(config.project.repositories.join(' ')).toContain('mvn.getui.com');
+    expect(headless).toContain('Class.forName(PUSH_MESSAGE)');
+    expect(headless).not.toContain('import uts.sdk.modules.DCloudUniPush');
+    expect(runtime).toContain('uts.sdk.modules.DCloudUniPush.PushActionHolder');
+    expect(runtime).toContain('invokeStatic(INDEX, "getGTCallBack")');
+    expect(runtime).toContain('setPushAction(action)');
+    expect(runtime).toContain('ImHeadlessPush.receive(app, raw, null)');
+    expect(runtime).not.toMatch(/setComponentEnabledSetting|registerPushIntentService/);
+  });
+
+  it('preserves the SDK receiver while rebuilding optional vendor adapters', () => {
     const result = execFileSync('python3', ['-c', `
 import json, os, runpy, shutil, sys, tempfile
 from pathlib import Path
 import xml.etree.ElementTree as ET
 sys.path.insert(0, sys.argv[1])
-from configure_unipush import configure, ANDROID, TOOLS, CALL_RECEIVER, STOCK_RECEIVER, CALL_RECEIVER_FILE
+from configure_unipush import configure, ANDROID, TOOLS
 from configure_unipush import VIVO_STOCK_RECEIVER, VIVO_PUSH_RECEIVER, VIVO_CALL_RECEIVER, VIVO_RECEIVER_FILE
 with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     root = Path(directory)
     (root / 'app/src/main').mkdir(parents=True)
     (root / 'uts-nuwax-voip/src/main').mkdir(parents=True)
+    (root / 'uts-nuwax-push-keepalive/src/main').mkdir(parents=True)
     (root / 'app/build.gradle').write_text('android { defaultConfig { } }\\ndependencies { }\\n')
     (root / 'settings.gradle').write_text('repositories { }\\n')
     manifest = root / 'app/src/main/AndroidManifest.xml'
@@ -28,9 +55,7 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     configure(root, config)
     app = ET.parse(manifest).getroot().find('application')
     services = list(app.findall('service'))
-    assert len([s for s in services if s.get(ANDROID+'name') == CALL_RECEIVER]) == 1
-    assert len([s for s in services if s.get(ANDROID+'name') == STOCK_RECEIVER and s.get(TOOLS+'node') == 'remove']) == 1
-    assert 'super.onReceiveMessageData' in (root / CALL_RECEIVER_FILE).read_text()
+    assert [s.get(ANDROID+'name') for s in services] == ['example.OrdinaryService']
     assert (root / 'app/build.gradle').read_text().count("com.getui:gtsdk:3.3.7.0") == 1
     gradle = (root / 'app/build.gradle').read_text()
     assert gradle.count('com.getui.opt:hwp:3.1.4') == 1
@@ -71,7 +96,6 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     app = ET.parse(manifest).getroot().find('application')
     assert not app.findall('receiver') and not (root / VIVO_RECEIVER_FILE).exists()
     assert [s.get(ANDROID+'name') for s in app.findall('service')] == ['example.OrdinaryService']
-    assert not (root / CALL_RECEIVER_FILE).exists()
     assert 'com.getui:gtsdk' not in (root / 'app/build.gradle').read_text()
     assert 'com.getui.opt:honor' not in (root / 'app/build.gradle').read_text()
     assert 'com.assist-v3:vivo' not in (root / 'app/build.gradle').read_text()
@@ -83,7 +107,11 @@ with tempfile.TemporaryDirectory(prefix='voip-push-build-') as directory:
     assert not app.findall('receiver') and not (root / VIVO_RECEIVER_FILE).exists()
     assert (root / 'app/build.gradle').read_text().count('com.assist-v3:vivo:3.1.2') == 1
     assert [s.get(ANDROID+'name') for s in app.findall('service')] == ['example.OrdinaryService']
-    assert not (root / CALL_RECEIVER_FILE).exists()
+    configure(root, None)
+    shutil.rmtree(root / 'uts-nuwax-push-keepalive')
+    configure(root, config, enable_vivo_voip=True)
+    app = ET.parse(manifest).getroot().find('application')
+    assert [s.get(ANDROID+'name') for s in app.findall('service')] == ['example.OrdinaryService']
 print('adapter packaging and SDK fallback verified')
 `, resolve(import.meta.dirname, '../../scripts/voip-native/device')], {
       encoding: 'utf8', timeout: 10_000,

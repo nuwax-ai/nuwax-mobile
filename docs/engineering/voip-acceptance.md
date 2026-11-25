@@ -442,7 +442,7 @@ iPhone 加号面板曾出现能力日志 enabled=true、原生布局只显示文
 ## 2026-11-09 UniPush 原生接收排查
 
 - 后端只读刷新到 `nuwax-im/feat-video-meeting@c626558ead9c427c713335dd38426f81151b7406`，确认 `UniPushChannel` 仍发送 `force_notification=true`。5.34 的普通 UniPush 接收器会直接生成通知，原有 UTS receive 分流不足以触发原生来电。详细协议核对文档的其余接口仍以原记录版本为准，本轮没有修改后端。
-- 来电接收器、最小载荷解析均归属 `uni_modules/nuwax-voip`；生成脚本在完整 App 原生模块注册唯一 SDK 接收器子类，普通推送和 CID 回调沿用父类。载荷只接受有效 convId/msgId，不信任推送凭据；会话、消息参与方、时效、重复与终态仍由既有原生流程检查。关闭适配后恢复 SDK 接收器。
+- 当前唯一 Getui 接收器归属 `uni_modules/nuwax-push-keepalive`，由云打包直接编译，本地生成脚本复用同一源码；VoIP 最小载荷解析仍归属 `uni_modules/nuwax-voip`，接收器通过反射进行可选分流。载荷只接受有效 convId/msgId，不信任推送凭据；会话、消息参与方、时效、重复与终态仍由既有原生流程检查。
 - `pnpm voip:test`：10 个文件、57 项通过；`pnpm voip:android:push:check` 在真实 Kotlin/JSONObject 中运行 5 项载荷测试，0 失败。验证强制通知包装、字符串包装、int64、拒绝浮点舍入值、载荷界限和普通消息回退。未因本轮修改重跑全量测试，不将前批全量数据当作本批结果。
 - HBuilderX 5.34 完整 Android/iOS App 资源导出通过；Android 本地完整基座 `out/voip-business-packages/android_debug-20261109-181005.apk` 构建成功，manifest 有 `VoipUniPushIntentService`、`VoipCallService`，无 SDK 旧接收器重复声明、专用测试监听或 deviceTest 标记。18:18 由 HBuilderX 覆盖安装，未卸载/清数据。HX 调试资源同步缺少的 8002 reverse 端口补齐后，18:20:51 App 启动并完成真实业务控制鉴权，未重启 ADB、未修改主 checkout、未上传基座。
 - 实机持久化的 Getui 接收器为新原生类，SDK CID 与 UTS 已登记 CID 一致；当前本地配置有 Getui AppID，未配置 Xiaomi 适配。不能由“已取得 CID”或“服务端返回成功”推导厂商推送到达。

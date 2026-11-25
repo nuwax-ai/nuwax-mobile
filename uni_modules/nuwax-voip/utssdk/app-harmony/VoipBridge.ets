@@ -63,6 +63,9 @@ interface PendingIncoming {
 export class VoipBridge {
   static context: common.UIAbilityContext | null = null
   static mediaContext: common.UIAbilityContext | null = null
+  static mediaForeground = false
+  static mediaContentLoaded = false
+  private static pendingVideoAnswer = ''
   static nativeVoiceStart: ((context: common.UIAbilityContext, callId: string,
     endpoint: string, token: string, microphone: boolean) => Promise<void>) | null = null
   static nativeVoiceStop: (() => void) | null = null
@@ -512,6 +515,13 @@ export class VoipBridge {
     const call = VoipBridge.current, run = VoipBridge.generation, token = VoipBridge.configuration?.accessToken; if (!call) return
     if (action === 'accept') {
       if (call.state !== 'ringing' || call.calleeId !== VoipBridge.configuration?.userId || VoipBridge.answering === call.callId || !['audio', 'video'].includes(mediaType) || (mediaType === 'video' && call.mediaType !== 'video')) return
+      if (systemAnswer && mediaType === 'video' && (!VoipBridge.mediaForeground || !VoipBridge.mediaContentLoaded)) {
+        // The system video answer opens the media Ability. Its window must be ready before asking for permission.
+        VoipBridge.pendingVideoAnswer = call.callId
+        VoipBridge.traceIncoming('systemVideoWaitingForWindow', call.callId)
+        return
+      }
+      VoipBridge.pendingVideoAnswer = ''
       VoipBridge.answering = call.callId
       try {
         const allowed = await VoipBridge.ensurePermissions(mediaType)
@@ -537,6 +547,12 @@ export class VoipBridge {
       if (VoipBridge.current?.callId === call.callId) VoipBridge.adopt(next)
     } catch (_) { if (run !== VoipBridge.generation || token !== VoipBridge.configuration?.accessToken || VoipBridge.current?.callId !== call.callId) return; if (action !== 'ready') VoipBridge.finish('failed'); VoipBridge.emit('error', 'CALL_ACTION_FAILED') }
   }
+  static resumeSystemVideoAnswer(): void {
+    const id = VoipBridge.pendingVideoAnswer
+    if (!id || !VoipBridge.mediaForeground || !VoipBridge.mediaContentLoaded || VoipBridge.current?.callId !== id) return
+    VoipBridge.pendingVideoAnswer = ''
+    VoipBridge.action('accept', 'video', true)
+  }
   static async ensurePermissions(mediaType: string): Promise<boolean> {
     const context = VoipBridge.mediaContext ?? VoipBridge.context
     if (!context) return false
@@ -545,9 +561,14 @@ export class VoipBridge {
     try {
       const manager = abilityAccessCtrl.createAtManager()
       const token = context.applicationInfo.accessTokenId
-      if (permissions.every(permission => manager.checkAccessTokenSync(token, permission) === 0)) return true
-      const result = await manager.requestPermissionsFromUser(context, permissions)
-      return result.authResults.length === permissions.length && result.authResults.every(value => value === 0)
+      const missing = permissions.filter(permission => manager.checkAccessTokenSync(token, permission) !== 0)
+      if (!missing.length) return true
+      const id = VoipBridge.current?.callId ?? ''
+      VoipBridge.traceIncoming(`permissionRequest media=${mediaType}`, id)
+      const result = await manager.requestPermissionsFromUser(context, missing)
+      const allowed = result.authResults.length === missing.length && result.authResults.every(value => value === 0)
+      VoipBridge.traceIncoming(`permissionResult media=${mediaType} allowed=${allowed} dialog=${result.dialogShownResults?.includes(true) === true}`, id)
+      return allowed
     } catch (_) { return false }
   }
   static async setCamera(enabled: boolean): Promise<void> {
@@ -586,7 +607,7 @@ export class VoipBridge {
       return
     }
     VoipBridge.media(JSON.stringify({ op: 'connect', protocol: call.protocol, callId: call.callId, serverUrl: credentials.serverUrl, participantToken: credentials.participantToken, mediaType: call.mediaType, microphoneEnabled: VoipBridge.microphone, cameraEnabled: VoipBridge.camera }))
-    VoipBridge.showMedia()
+    if (!VoipBridge.mediaForeground) VoipBridge.showMedia()
   }
   static showMedia(): void {
     const call = VoipBridge.current, context = VoipBridge.context
@@ -907,6 +928,7 @@ export class VoipBridge {
   }
   static finish(reason: string = '', notifyRemote: boolean = true): void {
     VoipBridge.clearPendingIncoming()
+    VoipBridge.pendingVideoAnswer = ''
     const call = VoipBridge.current
     if (notifyRemote && call && VoipBridge.business()) VoipBridge.notifyBusinessEnd(call, reason)
     if (notifyRemote && !VoipBridge.business() && call && reason && reason !== 'answeredElsewhere' && reason !== 'sessionChanged') {

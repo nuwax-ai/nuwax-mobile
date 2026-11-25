@@ -59,6 +59,8 @@ beforeEach(() => {
   if (VoipBridge.expiry >= 0) clearTimeout(VoipBridge.expiry);
   VoipBridge.expiry = -1; VoipBridge.mediaId = ''; VoipBridge.nativeId = ''; VoipBridge.connected = false; VoipBridge.readySent = false;
   VoipBridge.peerReady = false;
+  VoipBridge.mediaForeground = false;
+  VoipBridge.mediaContentLoaded = false;
   VoipBridge.answeredNativeId = ''; VoipBridge.ability = null; VoipBridge.systemRegistered = false;
   VoipBridge.clearPendingIncoming();
   token.get.mockReset();
@@ -185,6 +187,45 @@ describe('Harmony system call cold start', () => {
     expect(kits.createPicture).not.toHaveBeenCalled();
     expect(source.release).toHaveBeenCalledOnce();
     expect(picture.release).toHaveBeenCalledOnce();
+  });
+
+  it.each(['foreground', 'content'])('requests video access once when %s is ready last', async last => {
+    setup();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    const permission = vi.spyOn(VoipBridge, 'ensurePermissions').mockResolvedValue(true);
+    const media = vi.spyOn(VoipBridge, 'startMedia').mockImplementation(() => {});
+    await VoipBridge.incoming(push());
+    VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'answer-video' } as any);
+
+    VoipBridge.mediaForeground = last === 'content';
+    VoipBridge.mediaContentLoaded = last === 'foreground';
+    VoipBridge.resumeSystemVideoAnswer();
+    expect(permission).not.toHaveBeenCalled();
+    expect(media).not.toHaveBeenCalled();
+
+    VoipBridge.mediaForeground = true;
+    VoipBridge.mediaContentLoaded = true;
+    VoipBridge.resumeSystemVideoAnswer();
+    VoipBridge.resumeSystemVideoAnswer();
+    await vi.waitFor(() => expect(media).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      callId, state: 'connecting', mediaType: 'video',
+    })));
+    expect(permission).toHaveBeenCalledExactlyOnceWith('video');
+  });
+
+  it('does not request camera access when the caller cancels before the window is ready', async () => {
+    setup();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    const permission = vi.spyOn(VoipBridge, 'ensurePermissions');
+    await VoipBridge.incoming(push());
+    VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'answer-video' } as any);
+    VoipBridge.receiveSignal({ eventType: 'voip:cancel', payload: { convId, callId } } as any);
+
+    VoipBridge.mediaForeground = true;
+    VoipBridge.mediaContentLoaded = true;
+    VoipBridge.resumeSystemVideoAnswer();
+    expect(permission).not.toHaveBeenCalled();
+    expect(VoipBridge.current).toBeNull();
   });
 
   it('rings on time when decoding is slow and releases the late avatar', async () => {

@@ -968,7 +968,7 @@ function edgeHasMoov(view: DataView, fileLength: number): boolean {
   if (scanMoov(view, fileLength, 0, 65536)) {
     return true
   }
-  const tail = fileLength > 262144 ? fileLength - 262144 : 0
+  const tail = fileLength > 4194304 ? fileLength - 4194304 : 0
   return scanMoov(view, fileLength, tail, fileLength - tail)
 }
 
@@ -978,10 +978,12 @@ function scanMoov(view: DataView, fileLength: number, from: number, limit: numbe
   if (end > fileLength) {
     end = fileLength
   }
-  while (pos + 8 <= end) {
+  while (pos + 20 <= end) {
     if (view.getUint32(pos + 4) == BOX_MOOV) {
       const size = view.getUint32(pos)
-      if (size == 0 || (size >= 8 && pos + size <= fileLength)) {
+      const header = size == 1 ? 16 : 8
+      const typeAt = pos + header + 4
+      if (typeAt + 4 <= fileLength && view.getUint32(typeAt) == BOX_MVHD) {
         return true
       }
     }

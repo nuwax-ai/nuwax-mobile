@@ -329,7 +329,7 @@ public enum VoiceNoteM4aSeal {
         if scanMoov(data, from: 0, limit: 65536) {
             return true
         }
-        let tail = data.count > 262144 ? data.count - 262144 : 0
+        let tail = data.count > 4 * 1024 * 1024 ? data.count - 4 * 1024 * 1024 : 0
         return scanMoov(data, from: tail, limit: data.count - tail)
     }
 
@@ -339,10 +339,14 @@ public enum VoiceNoteM4aSeal {
             pos = 0
         }
         let end = min(data.count, pos + limit)
-        while pos + 8 <= end {
+        while pos + 20 <= end {
             if data[pos + 4] == 0x6d && data[pos + 5] == 0x6f && data[pos + 6] == 0x6f && data[pos + 7] == 0x76 {
                 let size = readU32(data, pos)
-                if size == 0 || (size >= 8 && pos + Int(size) <= data.count) {
+                let header = size == 1 ? 16 : 8
+                let typeAt = pos + header + 4
+                if typeAt + 4 <= data.count &&
+                    data[typeAt] == 0x6d && data[typeAt + 1] == 0x76 &&
+                    data[typeAt + 2] == 0x68 && data[typeAt + 3] == 0x64 {
                     return true
                 }
             }

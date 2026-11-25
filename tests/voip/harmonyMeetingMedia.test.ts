@@ -174,18 +174,24 @@ describe('Harmony LiveKit room', () => {
     expect(render).toHaveBeenLastCalledWith([{ participant, track: camera }], undefined, [voice], undefined);
   });
 
-  it('starts capture from the confirmation gesture after ownership and stops it on takeover', async () => {
+  it('waits for both ownership and publication permission before capture, then stops on takeover', async () => {
     const { media, room, render, post } = connection();
     await waitForOperations();
     const { track, stream } = fakeScreen();
     const getDisplayMedia = vi.fn(async () => stream);
     vi.stubGlobal('navigator', { mediaDevices: { getDisplayMedia } });
+    room.localParticipant.permissions.canPublishSources = [Track.sourceToProto(Track.Source.Camera)];
     media.dispatch({ id: 1, type: 'prepareShare', shareId: 2, text: 'Share the entire screen', name: 'Cancel' });
     expect(render.mock.lastCall?.[3]).toBeUndefined();
     room.metadata = JSON.stringify({ shareHolder: room.localParticipant.identity });
     room.emit(RoomEvent.RoomMetadataChanged);
+    expect(render.mock.lastCall?.[3]).toBeUndefined();
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ captureAllowed: false, awaitingCapture: false }));
+    room.localParticipant.permissions.canPublishSources.push(Track.sourceToProto(Track.Source.ScreenShare));
+    room.emit(RoomEvent.ParticipantPermissionsChanged);
     const request = render.mock.lastCall?.[3];
     expect(request.label).toBe('Share the entire screen');
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ captureAllowed: true, awaitingCapture: true }));
     const capture = media.startCapture(request);
     expect(getDisplayMedia).toHaveBeenCalledWith({ video: true, audio: false });
     await capture;
@@ -211,6 +217,47 @@ describe('Harmony LiveKit room', () => {
     room.emit(RoomEvent.RoomMetadataChanged);
     expect(render.mock.lastCall?.[3]).toBeUndefined();
     expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: 'shareError', shareId: 2, error: 'stopped' }));
+  });
+
+  it('stops an already published screen if the server removes its publication right', async () => {
+    const { media, room, render, post } = connection();
+    await waitForOperations();
+    const { track, stream } = fakeScreen();
+    vi.stubGlobal('navigator', { mediaDevices: { getDisplayMedia: vi.fn(async () => stream) } });
+    const local = room.localParticipant;
+    room.metadata = JSON.stringify({ shareHolder: local.identity });
+    media.dispatch({ id: 1, type: 'prepareShare', shareId: 3, text: 'Share', name: 'Cancel' });
+    await media.startCapture(render.mock.lastCall?.[3]);
+    expect(local.publishTrack).toHaveBeenCalledOnce();
+
+    local.permissions.canPublishSources = [Track.sourceToProto(Track.Source.Camera)];
+    room.emit(RoomEvent.ParticipantPermissionsChanged);
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(local.unpublishTrack).toHaveBeenCalledWith(track);
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'shareError', shareId: 3, error: 'screen_capture_permission',
+    }));
+  });
+
+  it('does not publish a capture returned after permission is revoked during OS consent', async () => {
+    const { media, room, render, post } = connection();
+    await waitForOperations();
+    const { track, stream } = fakeScreen();
+    let resolveCapture!: (result: typeof stream) => void;
+    vi.stubGlobal('navigator', { mediaDevices: { getDisplayMedia: () => new Promise(resolve => { resolveCapture = resolve; }) } });
+    const local = room.localParticipant;
+    room.metadata = JSON.stringify({ shareHolder: local.identity });
+    media.dispatch({ id: 1, type: 'prepareShare', shareId: 4, text: 'Share', name: 'Cancel' });
+    const consent = media.startCapture(render.mock.lastCall?.[3]);
+    local.permissions.canPublish = false;
+    room.emit(RoomEvent.ParticipantPermissionsChanged);
+    resolveCapture(stream);
+    await consent;
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(local.publishTrack).not.toHaveBeenCalled();
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'shareError', shareId: 4, error: 'screen_capture_permission',
+    }));
   });
 
   it('discards a late system capture result after cancellation or leaving', async () => {

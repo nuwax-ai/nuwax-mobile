@@ -33,9 +33,14 @@ export function createMeetingMedia(post, render) {
     });
     const shareHolder = holder(room);
     const ownsShare = shareHolder === local.identity;
+    const canPublishScreen = canPublish(local, Track.Source.ScreenShare);
+    const connected = room.state === ConnectionState.Connected;
     if (session.share && ownsShare) session.share.owned = true;
     if (session.share?.owned && !ownsShare) stopShare(session, 'stopped');
+    if (session.share?.started && connected && !canPublishScreen) stopShare(session, 'screen_capture_permission');
     if (room.state === ConnectionState.Disconnected) stopShare(session);
+    const captureAllowed = !!session.share && connected && ownsShare && canPublishScreen;
+    const awaitingCapture = captureAllowed && !session.share.started;
     const shared = remotes.find((participant) => participant.identity === shareHolder);
     const share = shared?.getTrackPublication(Track.Source.ScreenShare);
     const audioPublications = remotes.flatMap((participant) => [...participant.audioTrackPublications.values()]);
@@ -43,7 +48,7 @@ export function createMeetingMedia(post, render) {
       cameras,
       share?.track && !share.isMuted ? { participant: shared, track: share.track } : undefined,
       audioPublications.flatMap((publication) => publication.track ? [publication.track] : []),
-      session.share && !session.share.started && ownsShare ? session.share : undefined,
+      awaitingCapture ? session.share : undefined,
     );
     post({
       type: 'state', id: session.id, connection: room.state,
@@ -56,7 +61,7 @@ export function createMeetingMedia(post, render) {
       videos: cameras.filter(({ participant }) => participant !== local).map(({ participant }) => participant.identity).join(','),
       shared: !!share?.track && !share.isMuted, sharing: session.share?.published === true,
       shareId: session.share?.shareId,
-      awaitingCapture: !!session.share && !session.share.started && ownsShare,
+      captureAllowed, awaitingCapture,
     });
   }
 
@@ -131,17 +136,23 @@ export function createMeetingMedia(post, render) {
     const session = current;
     if (!session || !request || request !== session.share || request.started ||
         session.room.state !== ConnectionState.Connected ||
-        holder(session.room) !== session.room.localParticipant.identity) return;
+        holder(session.room) !== session.room.localParticipant.identity ||
+        !canPublish(session.room.localParticipant, Track.Source.ScreenShare)) return;
     request.started = true;
     update(session);
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
       const track = stream.getVideoTracks()[0];
-      const valid = () => active(session) && session.share === request &&
-        holder(session.room) === session.room.localParticipant.identity;
-      if (!track || !valid()) {
+      const local = session.room.localParticipant;
+      const stillOwnsRequest = () => active(session) && session.share === request &&
+        holder(session.room) === local.identity;
+      if (!track || !stillOwnsRequest() || session.room.state !== ConnectionState.Connected ||
+          !canPublish(local, Track.Source.ScreenShare)) {
         stream.getTracks().forEach((item) => item.stop());
-        if (valid()) throw new Error('missing screen track');
+        if (stillOwnsRequest()) {
+          stopShare(session, track ? 'screen_capture_permission' : 'screen_capture_failed');
+          update(session);
+        }
         return;
       }
       request.track = track;
@@ -150,10 +161,14 @@ export function createMeetingMedia(post, render) {
         stopShare(session, 'stopped');
         update(session);
       }, { once: true });
-      const local = session.room.localParticipant;
       await local.publishTrack(track, { source: Track.Source.ScreenShare, simulcast: false });
-      if (!valid()) {
-        track.stop();
+      if (!stillOwnsRequest() || !canPublish(local, Track.Source.ScreenShare)) {
+        if (stillOwnsRequest()) {
+          stopShare(session, 'screen_capture_permission');
+          update(session);
+        } else {
+          track.stop();
+        }
         await local.unpublishTrack(track);
         return;
       }

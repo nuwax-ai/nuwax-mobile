@@ -46,6 +46,7 @@ function nativeStage() {
     EntryVoipBackgroundTask: task,
     abilityAccessCtrl: { createAtManager: () => permissions },
     ProtectedResourceType: { AUDIO_CAPTURE: 'audio', VIDEO_CAPTURE: 'video' },
+    WebCaptureMode: { HOME_SCREEN: 0 },
     console: { info: vi.fn(), warn: vi.fn() },
     http: {
       createHttp: () => ({ request, destroy }),
@@ -305,4 +306,30 @@ it('cleans up a detached ArkWeb host when leave confirmation times out', async (
   expect(stages[0].dispose).toHaveBeenCalledOnce();
   host.postMessage(JSON.stringify({ type: 'leaveComplete', id, left: true }));
   expect(session.host).toBeUndefined();
+});
+
+
+it('only grants the current authorized ArkWeb screen capture request once', async () => {
+  const { session } = connectedStage();
+  const origin = 'https://nuwax-meeting.invalid';
+  const handler = { getOrigin: vi.fn(() => origin), grant: vi.fn(), deny: vi.fn() };
+  expect(session.prepareShare('Share', 'Cancel', releaseURL, 'token')).toBe(true);
+  session.host.requestScreenCapture(handler);
+  expect(handler.grant).not.toHaveBeenCalled();
+
+  session.receive({ type: 'state', id: session.id, connection: 'connected', captureAllowed: true, shareId: 99 });
+  session.host.requestScreenCapture(handler);
+  expect(handler.grant).not.toHaveBeenCalled();
+  session.receive({ type: 'state', id: session.id, connection: 'connected', captureAllowed: true, shareId: 1 });
+  handler.getOrigin.mockReturnValueOnce('https://elsewhere.test');
+  session.host.requestScreenCapture(handler);
+  expect(handler.grant).not.toHaveBeenCalled();
+
+  session.host.requestScreenCapture(handler);
+  session.host.requestScreenCapture(handler);
+  expect(handler.grant).toHaveBeenCalledExactlyOnceWith({ captureMode: 0 });
+  expect(handler.deny).toHaveBeenCalledTimes(4);
+  session.stopShare();
+  await settle();
+  expect(session.captureAllowed).toBe(false);
 });

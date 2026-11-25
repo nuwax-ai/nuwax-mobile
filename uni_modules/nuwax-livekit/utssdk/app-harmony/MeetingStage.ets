@@ -61,6 +61,7 @@ interface BrowserEvent {
   shared?: boolean
   sharing?: boolean
   awaitingCapture?: boolean
+  captureAllowed?: boolean
   shareId?: number
   error?: string
   message?: MeetingMessage
@@ -90,6 +91,7 @@ export class MeetingStageSession {
   static awaitingCapture: boolean = false
   static shareError: string = ''
   static captureArmed: boolean = false
+  static captureAllowed: boolean = false
   private static shareLease: ShareLease | undefined
   private static nextShareId: number = 0
   private static shareStartTimer: number = -1
@@ -323,6 +325,7 @@ export class MeetingStageSession {
   private static releaseShare(): void {
     MeetingStageSession.clearShareStartTimer()
     MeetingStageSession.captureArmed = false
+    MeetingStageSession.captureAllowed = false
     MeetingStageSession.sharing = false
     MeetingStageSession.awaitingCapture = false
     const lease = MeetingStageSession.shareLease
@@ -384,6 +387,7 @@ export class MeetingStageSession {
       const currentShare = lease != null && lease.id === event.shareId
       MeetingStageSession.sharing = currentShare && event.sharing === true
       MeetingStageSession.awaitingCapture = currentShare && event.awaitingCapture === true
+      MeetingStageSession.captureAllowed = currentShare && event.captureAllowed === true
       if (MeetingStageSession.sharing) MeetingStageSession.clearShareStartTimer()
       MeetingStageSession.updateBackgroundTask()
     } else if (event.type === 'shareError') {
@@ -536,7 +540,8 @@ export class MeetingStageHost {
 
   requestScreenCapture(handler: ScreenCaptureHandler): void {
     if (MeetingStageSession.host !== this || !MeetingStageSession.isConnected() ||
-      !MeetingStageSession.captureArmed || !this.captureOriginAllowed(handler.getOrigin())) {
+      !MeetingStageSession.captureArmed || !MeetingStageSession.captureAllowed ||
+      !this.captureOriginAllowed(handler.getOrigin())) {
       handler.deny()
       return
     }

@@ -196,6 +196,12 @@
   let segBaseMs: number = 0;
   /** 切段期间屏蔽 onEnded 重入，避免换 src 时被当成上一段结束。 */
   let switchingSeg: boolean = false;
+  /** 本次打开音频段的时间。安卓换源后会补发上一段的 onEnded。 */
+  let segmentOpenedAt: number = 0;
+  /** 这一段里已经接受的段内进度，用来判断是不是真的播到了结尾。 */
+  let segmentHeardMs: number = 0;
+  /** 同一次打开里，提前结束只续播一次，避免 seek 再触发 onEnded 打成循环。 */
+  let prematureEndedRetries: number = 0;
   let advanceSerial: number = 0;
   /** 切段后 src 未就绪时挂起的段内 seek（onCanplay 后补做） */
   let segPendingSeekMs: number = -1;
@@ -355,6 +361,9 @@
     }
     currentSegIndex = index;
     segBaseMs = segmentBaseMs(index);
+    segmentOpenedAt = Date.now();
+    segmentHeardMs = offsetMs > 0 ? offsetMs : 0;
+    prematureEndedRetries = 0;
     segPendingSeekMs = offsetMs;
     holdSeekOffsetMs = offsetMs > 0 ? offsetMs : -1;
     if (offsetMs > 0) {
@@ -515,7 +524,7 @@
 
   /**
    * 切换到下一段并续播（NW-269 分段连播）。
-   * 末段走原有「重置到起点并 ended」的结束语义。
+   * 末段停在结尾，高亮留在最后一句。下次点播放再从头开始。
    */
   const advanceSegment = () => {
     if (audioCtx == null) return;
@@ -523,11 +532,14 @@
     const nextIndex = currentSegIndex + 1;
     if (nextIndex >= audioSegments.length) {
       playing.value = false;
-      currentTimeMs.value = 0;
-      progressPercent.value = 0;
+      const endMs = resolveDurationMs();
+      if (endMs > 0) {
+        currentTimeMs.value = endMs;
+        progressPercent.value = 100;
+        syncActiveFromTime(endMs, false);
+      }
       segBaseMs = 0;
-      currentSegIndex = 0;
-      syncActiveFromTime(0, false);
+      currentSegIndex = -1;
       emit("ended");
       return;
     }
@@ -554,19 +566,11 @@
     }
     if (isNaN(cur) || cur < 0) return;
     let localMs = Math.floor(cur * 1000);
+    let segDur = 0;
     // 分段口径：全局进度 = 当前段基址 + 段内偏移（截到段有效时长）
-    if (audioSegments.length > 0 && currentSegIndex >= 0) {
-      const segDur = audioSegments[currentSegIndex].durationMs;
+    if (audioSegments.length > 0 && currentSegIndex >= 0 && currentSegIndex < audioSegments.length) {
+      segDur = audioSegments[currentSegIndex].durationMs;
       if (segDur > 0 && localMs > segDur) localMs = segDur;
-      // 段有效时长将尽且还有下一段：提前切段，跳过预签名音频尾部静音
-      if (
-        playing.value && segDur > 0 &&
-        currentSegIndex < audioSegments.length - 1 &&
-        localMs >= segDur - SEGMENT_TAIL_CUT_MS
-      ) {
-        advanceSegment();
-        return;
-      }
     }
     let ms = segBaseMs + localMs;
     if (seekGuardTargetMs >= 0) {
@@ -588,6 +592,17 @@
         setBuffering(false);
         switchingSeg = false;
       }
+    }
+    segmentHeardMs = localMs;
+    // 跳转落地之后才允许提前切段，避免安卓在 seek 完成前把 currentTime 报成段尾
+    if (
+      playing.value && segDur > 0 &&
+      currentSegIndex >= 0 &&
+      currentSegIndex < audioSegments.length - 1 &&
+      localMs >= segDur - SEGMENT_TAIL_CUT_MS
+    ) {
+      advanceSegment();
+      return;
     }
     const durMs = resolveDurationMs();
     syncDisplayDuration();
@@ -675,6 +690,9 @@
     segIndexOfTranscript.value = [] as number[];
     currentSegIndex = -1;
     segBaseMs = 0;
+    segmentOpenedAt = 0;
+    segmentHeardMs = 0;
+    prematureEndedRetries = 0;
     switchingSeg = false;
     segPendingSeekMs = -1;
     audioLoaded.value = false;
@@ -733,7 +751,48 @@
     audioCtx = uni.createInnerAudioContext();
     audioCtx!!.onTimeUpdate(() => updateProgress());
     audioCtx!!.onEnded(() => {
-      if (!playing.value) return;
+      if (!playing.value || switchingSeg) return;
+      // 安卓点后面的句子跳转、或刚切到下一段时，会把上一段的结束再回调一次。
+      // 这一段还没真正听到结尾，就保持当前段继续，不能当成整段结束跳回第一条。
+      const age = Date.now() - segmentOpenedAt;
+      let segDur = 0;
+      if (currentSegIndex >= 0 && currentSegIndex < audioSegments.length) {
+        segDur = audioSegments[currentSegIndex].durationMs;
+      }
+      const startedNearEnd = segDur > 0 && segmentHeardMs >= segDur - 1000;
+      if (age >= 0 && age < 800 && !startedNearEnd) {
+        let curMs = 0;
+        let fileDurMs = 0;
+        try {
+          curMs = Math.floor(audioCtx!!.currentTime * 1000);
+          const fileDur = audioCtx!!.duration;
+          if (!isNaN(fileDur) && fileDur > 0) {
+            fileDurMs = Math.floor(fileDur * 1000);
+          }
+        } catch (_endedTime) {
+          curMs = 0;
+        }
+        const completed = fileDurMs > 0 && curMs >= fileDurMs - 500;
+        const rewound = curMs < 500 && segmentHeardMs > 1500;
+        if ((completed || rewound) && prematureEndedRetries < 1 && audioCtx != null) {
+          prematureEndedRetries = prematureEndedRetries + 1;
+          playing.value = true;
+          if (segmentHeardMs > 0) {
+            holdSeekOffsetMs = segmentHeardMs;
+            seekPlayIssued = false;
+            seekSent = false;
+            pendingAutoplay = true;
+            sourceReady = true;
+            issueHoldSeek();
+          } else {
+            try {
+              audioCtx!!.play();
+            } catch (_resume) {
+            }
+          }
+        }
+        return;
+      }
       advanceSegment();
     });
     audioCtx!!.onCanplay(() => {

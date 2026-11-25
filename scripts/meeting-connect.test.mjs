@@ -67,6 +67,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     livekitCameraEnabled: () => false,
     livekitSpeakerEnabled: () => true,
     livekitSetMic: on => operations.push(on ? 'unmute' : 'mute'),
+    livekitSetSpeaker: on => operations.push(on ? 'speaker' : 'earpiece'),
     livekitRemoteVideoIdentities: () => '',
     livekitRemoteScreenVisible: () => remoteScreen,
     livekitScreenCaptureSupported: () => screenSupported,
@@ -697,6 +698,17 @@ test('鸿蒙单聊来电优先，通知返回请求不会在挂断后跳到旧�
   assert.deepEqual(h.navigations, []);
 });
 
+test('鸿蒙会议在原生单聊占用通话路由时不切换扬声器', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  await h.join();
+  h.complete();
+  h.voipActive(true);
+  h.api.meetingMediaSetSpeaker(false);
+  assert.equal(h.operations.includes('earpiece'), false);
+  h.voipActive(false);
+  h.api.meetingMediaSetSpeaker(false);
+  assert.equal(h.operations.at(-1), 'earpiece');
+});
 
 test('鸿蒙提前入会时媒体舞台已挂载，收到进行中详情时不重建', async () => {
   const page = readFileSync(new URL('../subpackages/pages/im-meeting/im-meeting-room.uvue', import.meta.url), 'utf8');

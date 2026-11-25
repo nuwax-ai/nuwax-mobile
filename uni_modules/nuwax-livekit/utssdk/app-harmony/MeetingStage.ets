@@ -209,6 +209,7 @@ export class MeetingStageSession {
     MeetingStageSession.foreground = foreground
     if (foreground) {
       MeetingStageSession.host?.keepActive()
+      if (MeetingStageSession.isConnected()) MeetingStageSession.host?.readSpeaker()
       MeetingStageSession.updateBackgroundTask()
     }
   }
@@ -367,10 +368,9 @@ export class MeetingStageSession {
   static receive(event: BrowserEvent): void {
     if (event.id !== MeetingStageSession.id) return
     if (event.type === 'state') {
-      if (event.connection === 'connected' && MeetingStageSession.connection === 'connecting') {
-        MeetingStageSession.host?.readSpeaker(event.id)
-      }
+      const becameConnected = event.connection === 'connected' && MeetingStageSession.connection !== 'connected'
       MeetingStageSession.connection = event.connection ?? ''
+      if (becameConnected) MeetingStageSession.host?.readSpeaker()
       if (MeetingStageSession.connection === 'disconnected') MeetingStageSession.releaseShare()
       MeetingStageSession.people = event.people ?? 0
       MeetingStageSession.mic = event.mic === true
@@ -580,8 +580,13 @@ export class MeetingStageHost {
     this.tasks = this.tasks.then(async () => {
       if (MeetingStageSession.host !== this || MeetingStageSession.id !== command.id) return
       if (command.type === 'speaker') {
-        await this.routeSpeaker(command.on === true)
-        if (MeetingStageSession.id === command.id) MeetingStageSession.speaker = command.on === true
+        if (!MeetingStageSession.isConnected()) return
+        const on = command.on === true
+        const routing = audio.getAudioManager().getRoutingManager()
+        await routing.setCommunicationDevice(audio.CommunicationDeviceType.SPEAKER, on)
+        if (MeetingStageSession.host !== this || MeetingStageSession.id !== command.id ||
+            !MeetingStageSession.isConnected()) return
+        if (!this.readSpeaker() || MeetingStageSession.speaker !== on) MeetingStageSession.controlError = command.type
         return
       }
       if (command.on && (command.type === 'mic' || command.type === 'camera')) {
@@ -600,15 +605,14 @@ export class MeetingStageHost {
     })
   }
 
-  readSpeaker(id: number): void {
-    audio.getAudioManager().getRoutingManager().isCommunicationDeviceActive(audio.CommunicationDeviceType.SPEAKER)
-      .then((on) => {
-        if (MeetingStageSession.host === this && MeetingStageSession.id === id) MeetingStageSession.speaker = on
-      }).catch(() => {})
-  }
-
-  private async routeSpeaker(on: boolean): Promise<void> {
-    await audio.getAudioManager().getRoutingManager().setCommunicationDevice(audio.CommunicationDeviceType.SPEAKER, on)
+  readSpeaker(): boolean {
+    try {
+      const routing = audio.getAudioManager().getRoutingManager()
+      MeetingStageSession.speaker = routing.isCommunicationDeviceActiveSync(audio.CommunicationDeviceType.SPEAKER)
+      return true
+    } catch (_) {
+      return false
+    }
   }
 
   captureResourceAllowed(resource: string): boolean {

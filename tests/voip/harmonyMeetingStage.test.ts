@@ -18,6 +18,10 @@ function nativeStage() {
     checkAccessTokenSync: vi.fn((_token: number, _permission: string) => -1),
     requestPermissionsFromUser: vi.fn(async (_context: unknown, _names: string[]) => ({ authResults: [0] })),
   };
+  const routing = {
+    setCommunicationDevice: vi.fn(async (_device: number, _active: boolean) => {}),
+    isCommunicationDeviceActiveSync: vi.fn((_device: number) => true),
+  };
   const destroy = vi.fn();
   const request = vi.fn().mockResolvedValue({ responseCode: 200, result: '{"code":"0000"}' });
   const timers = new Map<number, { callback: () => void; delay: number }>();
@@ -44,6 +48,10 @@ function nativeStage() {
     wrapBuilder: (builder: unknown) => builder,
     buildMeetingStage: vi.fn(),
     EntryVoipBackgroundTask: task,
+    audio: {
+      CommunicationDeviceType: { SPEAKER: 2 },
+      getAudioManager: () => ({ getRoutingManager: () => routing }),
+    },
     abilityAccessCtrl: { createAtManager: () => permissions },
     ProtectedResourceType: { AUDIO_CAPTURE: 'audio', VIDEO_CAPTURE: 'video' },
     WebCaptureMode: { HOME_SCREEN: 0 },
@@ -60,7 +68,7 @@ function nativeStage() {
     clearTimeout(id: number) { timers.delete(id); },
   });
   const session = vm.runInContext(stripTypeScriptTypes(hostSource) + '\nMeetingStageSession;', context);
-  return { session, stages, request, destroy, timers, task, permissions };
+  return { session, stages, request, destroy, timers, task, permissions, routing };
 }
 
 describe('Harmony meeting native stage', () => {
@@ -143,6 +151,43 @@ function connectedStage() {
 function settle() {
   return new Promise(resolve => setImmediate(resolve));
 }
+
+it('reads back the system speaker state after switching and on return to the foreground', async () => {
+  const { session, routing } = connectedStage();
+  session.control('speaker', false);
+  await settle();
+  expect(routing.setCommunicationDevice).toHaveBeenCalledWith(2, false);
+  expect(session.speaker).toBe(true);
+  expect(session.controlError).toBe('speaker');
+
+  session.setAppForeground(false);
+  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
+  session.setAppForeground(true);
+  expect(session.speaker).toBe(false);
+
+  routing.isCommunicationDeviceActiveSync.mockReturnValue(true);
+  session.control('speaker', true);
+  await settle();
+  expect(session.speaker).toBe(true);
+});
+
+it('ignores a speaker change that finishes after the room generation changes', async () => {
+  const { session, routing } = connectedStage();
+  let finish!: () => void;
+  routing.setCommunicationDevice.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+  session.control('speaker', false);
+  await settle();
+  expect(routing.setCommunicationDevice).toHaveBeenCalledOnce();
+
+  void session.disconnect();
+  session.connect('wss://other-room.test', 'new-token');
+  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
+  finish();
+  await settle();
+  expect(routing.isCommunicationDeviceActiveSync).not.toHaveBeenCalled();
+  expect(session.speaker).toBe(true);
+  expect(session.controlError).toBe('');
+});
 
 describe('Harmony meeting share lease', () => {
   it('releases the seat on OS capture stop even with all business views detached', async () => {

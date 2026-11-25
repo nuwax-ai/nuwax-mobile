@@ -174,9 +174,8 @@ public class VoiceNoteM4aBridge {
 
     private func startSegmentOnMain(_ segmentKey: String) -> String {
         lastError = ""
-        // 系统电话未挂断时不能开下一段。飞书不发挂断通知，过了短暂保护后允许尝试；
-        // 麦克风还被占用时 record() 会失败，页面保持暂停，挂断后下一次就会成功。
-        if phoneBusy() || (interruptHold && !interruptEnded && !interruptGraceDone() && !returnedToForeground()) {
+        // 飞书还没挂断时不能开下一段。只等挂断通知，避免前台刚暂停又马上继续计时。
+        if phoneBusy() || (interruptHold && !interruptEnded) {
             lastError = "音频仍被占用"
             return ""
         }
@@ -349,9 +348,8 @@ public class VoiceNoteM4aBridge {
                 self.resumeRecordingAfterInterrupt()
                 self.pushEvent("ended")
             }
-            // 飞书经常不发挂断通知。回到录音页后按麦克风已经空出来继续录。
-            if self.interruptHold && self.returnedToForeground() && self.interruptGraceDone() && !self.phoneBusy() {
-                self.interruptEnded = true
+            // 挂断通知已经到了，但当时在后台没能开录。回到前台再试一次。通话未结束不能试。
+            if self.interruptHold && self.interruptEnded && self.returnedToForeground() && !self.phoneBusy() {
                 self.resumeRecordingAfterInterrupt()
                 self.pushEvent("ended")
             }
@@ -413,12 +411,11 @@ public class VoiceNoteM4aBridge {
         }
     }
 
-    /// 回到录音页时继续。飞书不发挂断通知时，页面轮询也要能开下一段。
+    /// 挂断通知到了但后台没开成。回到前台再试。人还在通话里时不能因为回到页面就继续计时。
     private func resumeAfterReturning() {
-        guard interruptHold, returnedToForeground(), !userPaused, !phoneBusy(), interruptGraceDone() else {
+        guard interruptHold, interruptEnded, returnedToForeground(), !userPaused, !phoneBusy() else {
             return
         }
-        interruptEnded = true
         scheduleResumeAttempts()
         pushEvent("ended")
     }
@@ -504,11 +501,11 @@ public class VoiceNoteM4aBridge {
             return
         }
         resumeRecordingAfterInterrupt()
-        if !interruptHold || resumeAttempt >= 8 {
+        if !interruptHold || resumeAttempt >= 20 {
             return
         }
         resumeAttempt += 1
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.pumpResumeAttempt()
         }
     }
@@ -617,8 +614,8 @@ public class VoiceNoteM4aBridge {
         if silencePlayer?.isPlaying != true && !phoneBusy() {
             _ = silencePlayer?.play()
         }
-        // 前台、后台都靠这里试。通话中麦克风被占着会失败，界面继续暂停；挂断后这一次就会录上。
-        guard interruptHold, !userPaused, !phoneBusy(), interruptGraceDone() else {
+        // 只有挂断之后才试。通话过程中不能把计时和波浪又打开。
+        guard interruptHold, interruptEnded, !userPaused, !phoneBusy() else {
             return
         }
         let holding = interruptHold
@@ -660,12 +657,24 @@ public class VoiceNoteM4aBridge {
             return
         }
         beginWake()
+        ignoreBeganUntil = Date().addingTimeInterval(1.5)
+        // 后台里重新设置会话类别经常失败。先直接启动接通前准备好的录音器。
+        if let armed = armedRecorder, !armedPath.isEmpty {
+            try? AVAudioSession.sharedInstance().setActive(true)
+            if armed.record() {
+                recorder = armed
+                currentPath = armedPath
+                armedRecorder = nil
+                armedPath = ""
+                finishInterruptResume(currentPath)
+                return
+            }
+        }
         guard activateSession() else {
             keepAliveForInterrupt = true
             startSilence()
             return
         }
-        ignoreBeganUntil = Date().addingTimeInterval(1.5)
         if let armed = armedRecorder, !armedPath.isEmpty, armed.record() {
             recorder = armed
             currentPath = armedPath
@@ -736,9 +745,17 @@ public class VoiceNoteM4aBridge {
         keepAliveForInterrupt = false
         suppressBeganUntil = Date().addingTimeInterval(1.2)
         startSilence()
+        armNextRecorderLater()
         endWake()
         pushEvent("ended")
         NSLog("[voice-note] resumed after interruption \(path)")
+    }
+
+    /// 录音已经开始后再准备下一段，避免和当前录音器抢会话。
+    private func armNextRecorderLater() {
+        DispatchQueue.main.async { [weak self] in
+            self?.armNextRecorder()
+        }
     }
 
     private func beginWake() {

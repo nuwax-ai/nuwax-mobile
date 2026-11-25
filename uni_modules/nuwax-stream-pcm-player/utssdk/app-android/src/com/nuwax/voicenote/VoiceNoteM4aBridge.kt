@@ -13,6 +13,7 @@ import android.media.MediaMuxer
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.SystemClock
+import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
@@ -716,15 +717,31 @@ class VoiceNoteM4aBridge {
         // 残片不到预期的一半，说明音频基本没落盘，补出来只会是一段没有声音的 m4a。
         // 这种情况直接判失败，交给引擎重试/丢弃，绝不能当成补封口成功上传。
         var expected = 0
+        var maxFrame = 0
+        var minFrame = Int.MAX_VALUE
         for (size in sizes) {
             expected += size
+            if (size > maxFrame) maxFrame = size
+            if (size < minFrame) minFrame = size
         }
         if (expected <= 0) {
             return "0:nosizes"
         }
+        val avgFrame = expected / sizes.size
+        // 诊断：帧长正常（几百字节）说明采到了声音，静音输出就是封口写错；
+        // 帧长极小（几字节）说明采集阶段本来就是静音，问题不在封口。
+        Log.i(
+            "NuwaxVoiceNote",
+            "seal expected=$expected payload=${payload.size} frames=${sizes.size} min=$minFrame max=$maxFrame avg=$avgFrame",
+        )
         if (payload.size * 2 < expected) {
             return "0:partial"
         }
+        // 被 kill 时 MediaMuxer 的 mdat 头会被这里多算 8 字节（16 字节头按 8 字节头解），
+        // 取出的 payload 开头就多出 8 字节，后面每一帧都错位、解出来整段静音（但有 moov、有档长）。
+        // 帧长已经对齐到 mdat 尾部，把多出来的这点从开头剔掉即可。
+        val lead = payload.size - expected
+        val base = if (lead in 1..16) lead else 0
         val csd = readCsd("$path.csd")
         val tmp = File("$path.sealed")
         if (tmp.exists()) {
@@ -741,6 +758,7 @@ class VoiceNoteM4aBridge {
         } catch (_e: Exception) {
             return "0:create"
         }
+        var framesWritten = 0
         try {
             val track = muxer.addTrack(format)
             muxer.start()
@@ -749,17 +767,18 @@ class VoiceNoteM4aBridge {
             var index = 0
             while (index < sizes.size) {
                 val size = sizes[index]
-                if (size <= 0 || offset + size > payload.size) {
+                if (size <= 0 || base + offset + size > payload.size) {
                     break
                 }
                 val packet = ByteBuffer.allocateDirect(size)
-                packet.put(payload, offset, size)
+                packet.put(payload, base + offset, size)
                 packet.flip()
                 info.set(0, size, index * 1024L * 1000000L / SAMPLE_RATE, 0)
                 muxer.writeSampleData(track, packet, info)
                 offset += size
                 index += 1
             }
+            framesWritten = index
             if (index <= 0) {
                 throw IllegalStateException("no frame")
             }
@@ -802,7 +821,16 @@ class VoiceNoteM4aBridge {
         backup.delete()
         File("$path.frames").delete()
         File("$path.csd").delete()
-        return "1"
+        var csdHex = ""
+        for (b in csd) {
+            csdHex += "%02x".format(b.toInt() and 0xff)
+        }
+        val realMin = if (minFrame == Int.MAX_VALUE) 0 else minFrame
+        val stats = "n=" + sizes.size + ",w=" + framesWritten + ",min=" + realMin +
+            ",max=" + maxFrame + ",avg=" + avgFrame + ",tot=" + expected +
+            ",pay=" + payload.size + ",lead=" + lead + ",base=" + base + ",csd=" + csdHex
+        Log.i("NuwaxVoiceNote", "seal ok " + stats)
+        return "1|" + stats
     }
 
     private fun readCsd(path: String): ByteArray {
@@ -934,14 +962,15 @@ class VoiceNoteM4aBridge {
             var header = 8
             var boxSize = size32
             if (size32 == 1) {
-                if (pos + 16 > bytes.size || mp4Be32(bytes, pos + 8) != 0) {
-                    if (typeM && pos + header < bytes.size) {
-                        return bytes.copyOfRange(pos + header, bytes.size)
-                    }
+                // 64 位（large size）头固定 16 字节。被 kill 时 MediaMuxer 还没回填 64 位长度，
+                // 高 32 位是占位值；如果据此退回 8 字节头，样本会整体后移 8 字节、解出来整段静音。
+                if (pos + 16 > bytes.size) {
                     return null
                 }
-                boxSize = mp4Be32(bytes, pos + 12)
                 header = 16
+                val high = mp4Be32(bytes, pos + 8)
+                val low = mp4Be32(bytes, pos + 12)
+                boxSize = if (high == 0 && low >= 16 && pos + low <= bytes.size) low else bytes.size - pos
             } else if (size32 == 0 || size32 == -1) {
                 boxSize = bytes.size - pos
             }

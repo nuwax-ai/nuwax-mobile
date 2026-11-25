@@ -1,4 +1,4 @@
-import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit'
+import { abilityAccessCtrl, common, Permissions, Want } from '@kit.AbilityKit'
 import { webview } from '@kit.ArkWeb'
 import { audio } from '@kit.AudioKit'
 import { util } from '@kit.ArkTS'
@@ -77,6 +77,7 @@ export class MeetingStageSession {
   private static backgroundOwner: string = ''
   private static backgroundRetryAt: number = 0
   private static foreground: boolean = true
+  private static restoreRequested: boolean = false
   static camera: boolean = false
   static speaker: boolean = true
   static shared: boolean = false
@@ -95,10 +96,11 @@ export class MeetingStageSession {
   static videos: string = ''
   static messages: MeetingMessage[] = []
 
-  static attach(context: common.UIAbilityContext): MeetingStageMount {
+  static attach(context: common.UIAbilityContext, pipLabel: string): MeetingStageMount {
     MeetingStageSession.mount?.detach()
     const host = MeetingStageSession.host ?? new MeetingStageHost(context)
     MeetingStageSession.host = host
+    host.setPictureInPictureLabel(pipLabel)
     MeetingStageSession.nextMountId += 1
     const mount = new MeetingStageMount(MeetingStageSession.nextMountId, host)
     MeetingStageSession.mount = mount
@@ -158,6 +160,7 @@ export class MeetingStageSession {
     MeetingStageSession.mic = false
     MeetingStageSession.remoteAudio = false
     MeetingStageSession.backgroundRetryAt = 0
+    MeetingStageSession.restoreRequested = false
     MeetingStageSession.camera = false
     MeetingStageSession.speaker = true
     MeetingStageSession.shared = false
@@ -176,6 +179,18 @@ export class MeetingStageSession {
   static isConnected(): boolean {
     const state = MeetingStageSession.connection
     return state === 'connected' || state === 'reconnecting' || state === 'signalReconnecting'
+  }
+
+  static handleBackgroundWant(want: Want): void {
+    if (MeetingStageSession.isConnected() && EntryVoipBackgroundTask.acceptsNotification(want)) {
+      MeetingStageSession.restoreRequested = true
+    }
+  }
+
+  static consumeRestoreRequest(): boolean {
+    const restore = MeetingStageSession.restoreRequested && MeetingStageSession.isConnected()
+    MeetingStageSession.restoreRequested = false
+    return restore
   }
 
   static setAppForeground(foreground: boolean): void {
@@ -371,6 +386,7 @@ export class MeetingStageHost {
   screenSupported: boolean = false
   private context: common.UIAbilityContext
   private stage: BuilderNode<[MeetingStageHost]> | undefined
+  private pipLabel: string = ''
   private tasks: Promise<void> = Promise.resolve()
 
   constructor(context: common.UIAbilityContext) {
@@ -390,6 +406,15 @@ export class MeetingStageHost {
     if (this.ready) {
       try { this.controller.onActive() } catch (_) {}
     }
+  }
+
+  setPictureInPictureLabel(label: string): void {
+    this.pipLabel = label
+    if (this.ready) this.controller.runJavaScript('window.meetingMedia.setPictureInPictureLabel(' + JSON.stringify(label) + ')').catch(() => {})
+  }
+
+  closePictureInPicture(): void {
+    if (this.ready) this.controller.runJavaScript('if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {})').catch(() => {})
   }
 
   dispose(): void {
@@ -414,8 +439,10 @@ export class MeetingStageHost {
       if (MeetingStageSession.host !== this) return
       this.ready = result === '1' || result === '2'
       this.screenSupported = result === '2'
-      if (this.ready) MeetingStageSession.flush()
-      else MeetingStageSession.error = 'connect'
+      if (this.ready) {
+        this.setPictureInPictureLabel(this.pipLabel)
+        MeetingStageSession.flush()
+      } else MeetingStageSession.error = 'connect'
     }).catch(() => {
       if (MeetingStageSession.host === this) MeetingStageSession.error = 'connect'
     })
@@ -546,7 +573,9 @@ export class MeetingStageMount extends NodeController {
   }
 
   aboutToAppear(): void {
-    if (this.attached) this.host.keepActive()
+    if (!this.attached) return
+    this.host.keepActive()
+    this.host.closePictureInPicture()
   }
 
   detach(): void {

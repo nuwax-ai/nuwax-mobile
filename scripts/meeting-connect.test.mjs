@@ -27,7 +27,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
   const timers = new Map(), logs = [], operations = [], presentations = [], navigations = [];
   let restoreRequested = false, persistentRestore = false;
   let restoreAcks = 0;
-  let pageReady = true, navigationFails = false, deferNavigation = false;
+  let pageReady = true, navigationFails = false, deferNavigation = false, voipActive = false;
   let routes = ['pages/tab-shell/tab-shell'];
   let nativeSnapshot = '';
   const backDeltas = [];
@@ -61,6 +61,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
       configured = true;
     },
     getApiBaseUrl: () => apiOrigin,
+    hasNativeVoipCall: () => voipActive,
     livekitMicEnabled: () => microphone,
     livekitCameraEnabled: () => false,
     livekitSpeakerEnabled: () => true,
@@ -138,6 +139,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     requestRestore(persistent = false) { restoreRequested = true; persistentRestore = persistent; },
     restoreAcks: () => restoreAcks,
     pageReady(value) { pageReady = value; },
+    voipActive(value) { voipActive = value; },
     navigationFails(value) { navigationFails = value; },
     routes(value) { routes = value; },
     deferNavigation(value) { deferNavigation = value; },
@@ -659,4 +661,35 @@ test('会议共享请求使用鸿蒙席位，保持 Android 和 iOS 请求形状
     assert.equal(sent.method, 'POST');
     assert.equal(sent.data?.platform, platform === 'APP-HARMONY' ? 'harmonyos' : undefined);
   }
+});
+
+
+test('鸿蒙点击系统通知时复用当前会议并等待回到前台', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  const resume = '/subpackages/pages/im-meeting/im-meeting-room?room=123456789';
+  h.api.meetingMediaSetResumeURL(resume);
+  await h.join(); h.complete();
+  h.api.meetingMediaSetAppForeground(false);
+  h.requestRestore();
+  h.api.meetingMediaReconcile();
+  assert.deepEqual(h.navigations, []);
+  h.api.meetingMediaSetAppForeground(true);
+  h.api.meetingMediaReconcile();
+  assert.deepEqual(h.navigations, [resume]);
+  assert.deepEqual(h.operations, ['connect']);
+});
+
+test('鸿蒙单聊来电优先，通知返回请求不会在挂断后跳到旧会议页', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  h.api.meetingMediaSetResumeURL('/subpackages/pages/im-meeting/im-meeting-room?room=123456789');
+  await h.join(); h.complete();
+  h.pageReady(false);
+  h.requestRestore();
+  h.api.meetingMediaReconcile();
+  h.voipActive(true);
+  h.pageReady(true);
+  h.api.meetingMediaReconcile();
+  h.voipActive(false);
+  h.api.meetingMediaReconcile();
+  assert.deepEqual(h.navigations, []);
 });

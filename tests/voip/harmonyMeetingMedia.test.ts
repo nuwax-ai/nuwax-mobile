@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RoomEvent, Track } from 'livekit-client';
-import { createMeetingMedia } from '../../scripts/meeting-harmony/room.mjs';
+import { createMeetingMedia, createMeetingPictureInPicture } from '../../scripts/meeting-harmony/room.mjs';
 
 const rooms = vi.hoisted(() => [] as MockRoom[]);
 vi.mock('livekit-client', async (importOriginal) => {
@@ -156,5 +156,83 @@ describe('Harmony LiveKit room', () => {
     expect(track.stop).toHaveBeenCalledOnce();
     expect(room.localParticipant.publishTrack).not.toHaveBeenCalled();
     expect(room.disconnect).toHaveBeenCalledOnce();
+  });
+});
+
+
+describe('Harmony system picture in picture', () => {
+  function fixture(enabled: boolean) {
+    const page = {
+      pictureInPictureEnabled: enabled,
+      pictureInPictureElement: null as object | null,
+      exitPictureInPicture: vi.fn(async () => { page.pictureInPictureElement = null; }),
+    };
+    const button = Object.assign(new EventTarget(), {
+      hidden: true, textContent: 'Picture in picture', setAttribute: vi.fn(),
+    });
+    const onError = vi.fn();
+    const pip = createMeetingPictureInPicture(page, button, onError);
+    function video(videoWidth = 1280) {
+      const candidate = {
+        videoWidth,
+        disablePictureInPicture: false,
+        requestPictureInPicture: vi.fn(async () => { page.pictureInPictureElement = candidate; }),
+      };
+      return candidate;
+    }
+    return { page, button, pip, onError, video };
+  }
+
+  it('only offers picture in picture on capable devices with decoded video', () => {
+    const { page, button, pip, video } = fixture(false);
+    pip.update([video()]);
+    expect(button.hidden).toBe(true);
+    page.pictureInPictureEnabled = true;
+    const loading = video(0);
+    pip.update([loading]);
+    expect(button.hidden).toBe(true);
+    loading.videoWidth = 640;
+    pip.refresh();
+    expect(button.hidden).toBe(false);
+  });
+
+  it('requests the first usable video from the click gesture and closes it when that track ends', async () => {
+    const { page, button, pip, video } = fixture(true);
+    const screen = video(), camera = video();
+    pip.update([screen, camera]);
+    button.dispatchEvent(new Event('click'));
+    expect(screen.requestPictureInPicture).toHaveBeenCalledOnce();
+    expect(camera.requestPictureInPicture).not.toHaveBeenCalled();
+    await waitForOperations();
+    expect(button.setAttribute).toHaveBeenLastCalledWith('aria-pressed', 'true');
+    pip.update([camera]);
+    await waitForOperations();
+    expect(page.exitPictureInPicture).toHaveBeenCalledOnce();
+  });
+
+  it('closes a late picture in picture after its track was removed', async () => {
+    const { page, button, pip, video } = fixture(true);
+    const screen = video();
+    let finish!: () => void;
+    screen.requestPictureInPicture.mockImplementationOnce(() => new Promise(resolve => {
+      finish = () => { page.pictureInPictureElement = screen; resolve(); };
+    }));
+    pip.update([screen]);
+    button.dispatchEvent(new Event('click'));
+    pip.update([]);
+    finish();
+    await waitForOperations();
+    expect(page.exitPictureInPicture).toHaveBeenCalledOnce();
+    expect(button.hidden).toBe(true);
+  });
+
+  it('reports when the platform rejects picture in picture for a live track', async () => {
+    const { button, pip, onError, video } = fixture(true);
+    const camera = video();
+    camera.requestPictureInPicture.mockRejectedValueOnce(new Error('unsupported'));
+    pip.update([camera]);
+    button.dispatchEvent(new Event('click'));
+    await waitForOperations();
+    expect(onError).toHaveBeenCalledOnce();
   });
 });

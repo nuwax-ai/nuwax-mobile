@@ -12,6 +12,7 @@ function nativeStage() {
   const task = {
     acquire: vi.fn(async (_owner: string, _context: unknown, needed: () => boolean) => needed()),
     release: vi.fn(async (_owner: string) => {}),
+    acceptsNotification: vi.fn((_want: unknown) => false),
   };
   const destroy = vi.fn();
   const request = vi.fn().mockResolvedValue({ responseCode: 200, result: '{"code":"0000"}' });
@@ -58,7 +59,7 @@ function nativeStage() {
 describe('Harmony meeting native stage', () => {
   it('reuses the same ArkWeb frame and connection after minimizing and returning', () => {
     const { session, stages } = nativeStage();
-    const initial = session.attach({});
+    const initial = session.attach({}, 'Picture in picture');
     const frame = initial.makeNode({});
     const host = session.host;
     host.ready = true;
@@ -71,23 +72,24 @@ describe('Harmony meeting native stage', () => {
     expect(initial.makeNode({})).toBeNull();
     expect(host.controller.onActive).toHaveBeenCalledOnce();
     expect(stages[0].dispose).not.toHaveBeenCalled();
-    const restored = session.attach({});
+    const restored = session.attach({}, 'Picture in picture');
     expect(restored.makeNode({})).toBe(frame);
     expect(stages).toHaveLength(1);
     expect(session.id).toBe(roomGeneration);
     expect(session.isConnected()).toBe(true);
-    expect(host.controller.runJavaScript).not.toHaveBeenCalled();
+    expect(host.controller.runJavaScript.mock.calls.map(([command]: [string]) => command))
+      .toEqual(["window.meetingMedia.setPictureInPictureLabel(\"Picture in picture\")"]);
   });
 
   it('ignores a stale unmount and disposes the detached frame after leaving', () => {
     const { session, stages } = nativeStage();
-    const old = session.attach({});
+    const old = session.attach({}, 'Picture in picture');
     const frame = old.makeNode({});
     const host = session.host;
     host.ready = true;
     session.connect('wss://room.test', 'seat-token');
     session.connection = 'connected';
-    const restored = session.attach({});
+    const restored = session.attach({}, 'Picture in picture');
 
     expect(session.releaseView(old.id)).toBe(false);
     expect(restored.makeNode({})).toBe(frame);
@@ -101,7 +103,7 @@ describe('Harmony meeting native stage', () => {
 
   it('disposes a page that never joined a room', () => {
     const { session, stages } = nativeStage();
-    const mount = session.attach({});
+    const mount = session.attach({}, 'Picture in picture');
     mount.makeNode({});
     expect(session.releaseView(mount.id)).toBe(true);
     expect(stages[0].dispose).toHaveBeenCalledOnce();
@@ -115,7 +117,7 @@ const releaseURL = 'https://testagent.xspaceagi.com/api/instant-message/meetings
 function connectedStage() {
   const fixture = nativeStage();
   const { session } = fixture;
-  const mount = session.attach({});
+  const mount = session.attach({}, 'Picture in picture');
   mount.makeNode({});
   session.host.ready = true;
   session.host.screenSupported = true;
@@ -231,4 +233,21 @@ describe('Harmony meeting background lifecycle', () => {
     await settle();
     expect(task.release).toHaveBeenCalledExactlyOnceWith('meeting:' + id);
   });
+});
+
+
+it('queues only a valid task notification while connected and consumes the return request once', () => {
+  const { session, task } = connectedStage();
+  session.handleBackgroundWant({});
+  expect(session.consumeRestoreRequest()).toBe(false);
+
+  task.acceptsNotification.mockReturnValue(true);
+  session.handleBackgroundWant({});
+  expect(session.consumeRestoreRequest()).toBe(true);
+  expect(session.consumeRestoreRequest()).toBe(false);
+  session.handleBackgroundWant({});
+  session.disconnect();
+  expect(session.consumeRestoreRequest()).toBe(false);
+  session.handleBackgroundWant({});
+  expect(session.consumeRestoreRequest()).toBe(false);
 });

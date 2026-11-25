@@ -214,7 +214,59 @@ export function createMeetingMedia(post, render) {
     });
   }
 
-  return { dispatch, disconnect, startCapture };
+  function pictureInPictureFailed() {
+    if (current) post({ type: 'error', id: current.id, error: 'pictureInPicture' });
+  }
+
+  return { dispatch, disconnect, startCapture, pictureInPictureFailed };
+}
+
+export function createMeetingPictureInPicture(page, button, onError) {
+  let videos = [];
+  let changing = false;
+
+  function candidate() {
+    if (!page.pictureInPictureEnabled) return undefined;
+    return videos.find((video) => video?.videoWidth > 0 && !video.disablePictureInPicture &&
+      typeof video.requestPictureInPicture === 'function');
+  }
+
+  function refresh() {
+    const active = !!page.pictureInPictureElement;
+    button.hidden = !button.textContent || (!active && !candidate());
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+
+  async function toggle() {
+    if (changing) return;
+    const video = candidate();
+    changing = true;
+    try {
+      if (page.pictureInPictureElement) await page.exitPictureInPicture();
+      else if (video) {
+        await video.requestPictureInPicture();
+        if (!videos.includes(video) && page.pictureInPictureElement === video) {
+          await page.exitPictureInPicture();
+        }
+      }
+    } catch {
+      if (videos.includes(video)) onError();
+    } finally {
+      changing = false;
+      refresh();
+    }
+  }
+
+  function update(nextVideos) {
+    videos = nextVideos;
+    if (page.pictureInPictureElement && !videos.includes(page.pictureInPictureElement)) {
+      void page.exitPictureInPicture().catch(() => {});
+    }
+    refresh();
+  }
+
+  button.addEventListener('click', toggle);
+  return { update, refresh };
 }
 
 function mount() {
@@ -224,6 +276,7 @@ function mount() {
   const confirm = document.querySelector('#start-capture');
   const cancel = document.querySelector('#cancel-capture');
   const actions = document.querySelector('#capture-actions');
+  const pipButton = document.querySelector('#meeting-pip');
   const tracks = new Map();
   let fullscreen = false;
   let capture;
@@ -247,6 +300,11 @@ function mount() {
         const media = document.createElement(participant ? 'video' : 'audio');
         media.autoplay = true;
         media.playsInline = true;
+        if (participant) {
+          for (const event of ['loadedmetadata', 'emptied', 'enterpictureinpicture', 'leavepictureinpicture']) {
+            media.addEventListener(event, pip.refresh);
+          }
+        }
         if (participant && track.source === Track.Source.Camera) media.muted = true;
         const element = participant ? document.createElement('figure') : media;
         const caption = participant ? document.createElement('figcaption') : undefined;
@@ -265,6 +323,10 @@ function mount() {
     share.hidden = !shared;
     stage.classList.toggle('shared', !!shared);
     stage.classList.toggle('fullscreen', fullscreen);
+    const remoteCameras = cameras.filter(({ track }) => !track.isLocal);
+    const localCameras = cameras.filter(({ track }) => track.isLocal);
+    pip.update([...(shared ? [shared] : []), ...remoteCameras, ...localCameras]
+      .map(({ track }) => tracks.get(track).media));
   }
 
   share.addEventListener('click', () => {
@@ -272,11 +334,16 @@ function mount() {
     stage.classList.toggle('fullscreen', fullscreen);
   });
   const media = createMeetingMedia((event) => window.NuwaxMeeting?.postMessage(JSON.stringify(event)), render);
+  const pip = createMeetingPictureInPicture(document, pipButton, media.pictureInPictureFailed);
+  function setPictureInPictureLabel(label) {
+    pipButton.textContent = label;
+    pip.refresh();
+  }
   confirm.addEventListener('click', () => { void media.startCapture(capture); });
   cancel.addEventListener('click', () => {
     if (capture) media.dispatch({ type: 'cancelShare', id: capture.id, shareId: capture.shareId });
   });
-  window.meetingMedia = media;
+  window.meetingMedia = { ...media, setPictureInPictureLabel };
   window.addEventListener('pagehide', media.disconnect);
 }
 

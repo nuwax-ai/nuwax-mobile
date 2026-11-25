@@ -81,6 +81,7 @@ export default class EntryAbility extends UniEntryAbility {
     expect(project.read(`${media}/call-icons/microphone-off-ink.png`).length).toBeGreaterThan(0);
     expect(abilities[0].backgroundModes).toBeUndefined();
     expect(source).not.toContain('HarmonyNativeVoice');
+    expect(source).not.toContain('handleMeetingBackgroundWant');
     expect(() => project.read(`${entry}/resources/rawfile/nuwax-meeting/media.html`)).toThrow();
     const bridge = project.read(`${plugin}/utssdk/app-harmony/VoipBridge.ets`);
     expect(bridge).not.toContain('if (config.apiBaseUrl !== VoipBridge.nativeVoiceTestOrigin) return');
@@ -96,6 +97,8 @@ export default class EntryAbility extends UniEntryAbility {
     expect(project.read(`${entry}/resources/rawfile/nuwax-meeting/room.js`)).toContain('NuwaxMeeting');
     const prepared = project.read(abilityFile);
     expect(prepared.match(/VoipBridge\.nativeVoiceStart =/g)).toHaveLength(1);
+    expect(prepared.match(/nuwax-meeting-task-return/g)).toHaveLength(1);
+    expect(prepared).toMatch(/onNewWant\([^)]*\): void \{\s+if \(VoipBridge\.current == null\) handleMeetingBackgroundWant\(want\) .*\n\s+super\.onNewWant\(/);
     expect(prepared).toMatch(/VoipBridge\.bindPush\(this\)\s+VoipBridge\.nativeVoiceStart/);
     expect(JSON.parse(project.read(moduleFile)).module.abilities[0].backgroundModes).toEqual(['voip']);
     expect(project.read('unpackage/app-harmony/entry/libs/arm64-v8a/libnuwax_harmony_rtc.so')).toBe('fixture');
@@ -104,6 +107,18 @@ export default class EntryAbility extends UniEntryAbility {
     expect(bridge).toContain('if (config.apiBaseUrl !== VoipBridge.nativeVoiceTestOrigin) return');
     expect(bridge).toContain('if (config && config.apiBaseUrl === VoipBridge.nativeVoiceTestOrigin)');
     expect(project.run().stderr).toContain('Generated QA output contains native voice');
+  });
+
+  it('keeps an existing onNewWant body and uses the declared Want parameter', () => {
+    const project = fixture(`export default class EntryAbility extends UniEntryAbility {
+      override onNewWant(incoming: Want, launch: AbilityConstant.LaunchParam): void { super.onNewWant(incoming, launch) }
+    }`, true);
+    const result = project.run(true);
+    expect(result.status, result.stderr).toBe(0);
+    const ability = project.read(abilityFile);
+    expect(ability).toContain('if (VoipBridge.current == null) handleMeetingBackgroundWant(incoming)');
+    expect(ability).toContain('\n super.onNewWant(incoming, launch) }');
+    expect(ability.match(/onNewWant\(incoming: Want/g)).toHaveLength(1);
   });
 
   it('rejects staging the native voice library in the standard project', () => {

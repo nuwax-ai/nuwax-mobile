@@ -6,12 +6,15 @@ const kits = vi.hoisted(() => ({
   createRenderer: vi.fn(),
   startBackground: vi.fn(),
   stopBackground: vi.fn(),
+  makeWantAgent: vi.fn(async (_info: unknown) => ({})),
+  makeId: vi.fn(),
 }));
 vi.mock('@kit.AbilityKit', () => ({ wantAgent: {
-  getWantAgent: vi.fn(async () => ({})),
+  getWantAgent: kits.makeWantAgent,
   OperationType: { START_ABILITY: 0 },
   WantAgentFlags: { UPDATE_PRESENT_FLAG: 0 },
 } }));
+vi.mock('@kit.ArkTS', () => ({ util: { generateRandomUUID: kits.makeId } }));
 vi.mock('@kit.AudioKit', () => ({ audio: {
   createAudioCapturer: kits.createCapturer,
   createAudioRenderer: kits.createRenderer,
@@ -51,6 +54,7 @@ const capturer = audioResource(), renderer = audioResource();
 
 beforeEach(() => {
   vi.clearAllMocks();
+  kits.makeId.mockReset().mockReturnValue('491a4fb1-fdde-4d52-bb37-767044110e00');
   kits.createCapturer.mockReset().mockResolvedValue(capturer);
   kits.createRenderer.mockReset().mockResolvedValue(renderer);
   kits.startBackground.mockReset().mockResolvedValue(undefined);
@@ -158,4 +162,26 @@ describe('Harmony EntryAbility VOIP task ownership', () => {
     expect(await EntryVoipBackgroundTask.acquire('meeting:43', context, () => false)).toBe(false);
     expect(kits.startBackground).toHaveBeenCalledOnce();
   });
+});
+
+
+it('recognizes only the current background task notification and invalidates it after release', async () => {
+  await EntryVoipBackgroundTask.acquire('meeting:42', context, () => true);
+  const first = kits.makeWantAgent.mock.lastCall?.[0] as { requestCode: number; wants: { parameters: object }[] };
+  const want = first.wants[0];
+  expect(EntryVoipBackgroundTask.acceptsNotification(want)).toBe(true);
+  expect(EntryVoipBackgroundTask.acceptsNotification({ parameters: {} })).toBe(false);
+  await EntryVoipBackgroundTask.release('meeting:42');
+  expect(EntryVoipBackgroundTask.acceptsNotification(want)).toBe(false);
+
+  kits.makeId.mockReturnValueOnce('36e2c832-9601-43a9-9105-a2ac966dfd43');
+  await EntryVoipBackgroundTask.acquire('meeting:43', context, () => true);
+  try {
+    const second = kits.makeWantAgent.mock.lastCall?.[0] as typeof first;
+    expect(second.requestCode).not.toBe(first.requestCode);
+    expect(EntryVoipBackgroundTask.acceptsNotification(want)).toBe(false);
+    expect(EntryVoipBackgroundTask.acceptsNotification(second.wants[0])).toBe(true);
+  } finally {
+    await EntryVoipBackgroundTask.release('meeting:43');
+  }
 });

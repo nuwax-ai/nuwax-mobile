@@ -37,6 +37,38 @@ export function pinVoiceQaBridge(source) {
     .replace(restore, restore.replace('if (config)', 'if (config && config.apiBaseUrl === VoipBridge.nativeVoiceTestOrigin)'));
 }
 
+function wireMeetingTaskReturn(source) {
+  const marker = '// nuwax-meeting-task-return';
+  const hook = name => `if (VoipBridge.current == null) handleMeetingBackgroundWant(${name}) ${marker}`;
+  const imports = "import { handleMeetingBackgroundWant } from '@uni_modules/nuwax-livekit'\n";
+  const entryClass = /^[ \t]*export\s+default\s+class\s+EntryAbility\s+extends\s+\w+\s*\{/m;
+  const lifecycle = /^[ \t]*(?:(?:public|protected|override)\s+)*onNewWant\s*\(\s*(\w+)\s*:\s*[\w.]+\s*,\s*\w+\s*:\s*[\w.]+\s*\)\s*(?::\s*void\s*)?\{/m;
+  const declaration = /^[ \t]*(?:(?:public|protected|override|async)\s+)*onNewWant\s*\(/m;
+  const entry = entryClass.exec(source);
+  if (!entry) throw new Error('Could not find EntryAbility for the meeting notification');
+  const bodyStart = entry.index + entry[0].length;
+  const body = source.slice(bodyStart);
+  const existing = lifecycle.exec(body);
+  if (source.includes(marker)) {
+    if (!existing || !source.includes(imports) ||
+      !body.slice(existing.index + existing[0].length).trimStart().startsWith(hook(existing[1]))) {
+      throw new Error('The existing meeting notification hook in EntryAbility is incomplete');
+    }
+    return source;
+  }
+  if (existing) {
+    const at = bodyStart + existing.index + existing[0].length;
+    return imports + source.slice(0, at) + '\n    ' + hook(existing[1]) + '\n' + source.slice(at);
+  }
+  if (declaration.test(body)) throw new Error('EntryAbility.onNewWant must accept an Ability Kit Want and LaunchParam');
+  const types = "import { Want as MeetingTaskWant, AbilityConstant as MeetingTaskAbilityConstant } from '@kit.AbilityKit'\n";
+  return imports + types + source.slice(0, bodyStart) + `
+  onNewWant(want: MeetingTaskWant, launchParam: MeetingTaskAbilityConstant.LaunchParam): void {
+    ${hook('want')}
+    super.onNewWant(want, launchParam)
+  }` + body;
+}
+
 export async function stageVoiceQa(project, library, entryAbility, abilitySource, abilityConfig) {
   const entry = `${project}/entry`;
   const nativeLibrary = `${entry}/libs/arm64-v8a/${libraryName}`;
@@ -53,6 +85,8 @@ export async function stageVoiceQa(project, library, entryAbility, abilitySource
     throw new Error('Native Harmony voice conflicts with the generated QA entry configuration');
   }
 
+  const unhooked = abilitySource.replace(importHook, '').replace('\n' + voiceHooks, '');
+  const prepared = wireMeetingTaskReturn(unhooked.replace(anchor, anchor + '\n' + voiceHooks));
   await mkdir(dirname(nativeLibrary), { recursive: true });
   await mkdir(types, { recursive: true });
   if (library !== nativeLibrary) await copyFile(library, nativeLibrary);
@@ -65,6 +99,5 @@ export async function stageVoiceQa(project, library, entryAbility, abilitySource
 
   abilityConfig.backgroundModes ??= [];
   if (!abilityConfig.backgroundModes.includes('voip')) abilityConfig.backgroundModes.push('voip');
-  const unhooked = abilitySource.replace(importHook, '').replace('\n' + voiceHooks, '');
-  await writeFile(entryAbility, importHook + unhooked.replace(anchor, anchor + '\n' + voiceHooks));
+  await writeFile(entryAbility, importHook + prepared);
 }

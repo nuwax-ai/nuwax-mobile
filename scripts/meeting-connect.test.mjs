@@ -67,6 +67,8 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     livekitCameraEnabled: () => false,
     livekitSpeakerEnabled: () => true,
     livekitSetMic: on => operations.push(on ? 'unmute' : 'mute'),
+    livekitSetCamera: on => operations.push(on ? 'cameraOn' : 'cameraOff'),
+    livekitSwitchCamera: () => operations.push('flipCamera'),
     livekitSetSpeaker: on => operations.push(on ? 'speaker' : 'earpiece'),
     livekitRemoteVideoIdentities: () => '',
     livekitRemoteScreenVisible: () => remoteScreen,
@@ -708,6 +710,25 @@ test('鸿蒙会议在原生单聊占用通话路由时不切换扬声器', async
   h.voipActive(false);
   h.api.meetingMediaSetSpeaker(false);
   assert.equal(h.operations.at(-1), 'earpiece');
+});
+
+test('鸿蒙原生单聊占用设备期间会议只能关闭本地麦克风和摄像头', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  await h.join();
+  h.complete();
+  h.voipActive(true);
+  h.api.meetingMediaSetMic(true);
+  h.api.meetingMediaSetCamera(true);
+  h.api.meetingMediaSwitchCamera();
+  h.api.meetingMediaSetMic(false);
+  h.api.meetingMediaSetCamera(false);
+  assert.deepEqual(h.operations, ['connect', 'mute', 'cameraOff']);
+
+  h.voipActive(false);
+  h.api.meetingMediaSetMic(true);
+  h.api.meetingMediaSetCamera(true);
+  h.api.meetingMediaSwitchCamera();
+  assert.deepEqual(h.operations.slice(-3), ['unmute', 'cameraOn', 'flipCamera']);
 });
 
 test('鸿蒙提前入会时媒体舞台已挂载，收到进行中详情时不重建', async () => {

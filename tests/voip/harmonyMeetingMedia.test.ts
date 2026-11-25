@@ -99,6 +99,28 @@ describe('Harmony LiveKit room', () => {
     expect(local.setMicrophoneEnabled).toHaveBeenCalledWith(true);
   });
 
+  it.each(['reconnecting', 'signalReconnecting'])('honors mute and camera-off during %s', async state => {
+    const { media, room, post } = connection();
+    await waitForOperations();
+    const local = room.localParticipant;
+    local.isMicrophoneEnabled = true;
+    local.isCameraEnabled = true;
+    room.state = state;
+    room.emit(RoomEvent.ConnectionStateChanged);
+    media.dispatch({ id: 1, type: 'mic', on: false });
+    media.dispatch({ id: 1, type: 'camera', on: false });
+    media.dispatch({ id: 1, type: 'mic', on: true });
+    media.dispatch({ id: 1, type: 'camera', on: true });
+    await waitForOperations();
+    expect(local.setMicrophoneEnabled).toHaveBeenCalledExactlyOnceWith(false);
+    expect(local.setCameraEnabled).toHaveBeenCalledExactlyOnceWith(false, { facingMode: 'user' });
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ connection: state, mic: false, camera: false }));
+
+    room.state = 'connected';
+    room.emit(RoomEvent.ConnectionStateChanged);
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ connection: 'connected', mic: false, camera: false }));
+  });
+
   it('confirms leave only after the LiveKit disconnection promise resolves', async () => {
     const { media, room, post } = connection();
     await waitForOperations();

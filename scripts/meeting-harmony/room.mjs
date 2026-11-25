@@ -214,7 +214,12 @@ export function createMeetingMedia(post, render) {
       return;
     }
     session.operations = session.operations.then(async () => {
-      if (!active(session) || session.room.state !== ConnectionState.Connected) return;
+      if (!active(session)) return;
+      const state = session.room.state;
+      const reconnecting = state === ConnectionState.Reconnecting || state === ConnectionState.SignalReconnecting;
+      const closingDevice = command.on === false && (command.type === 'mic' || command.type === 'camera');
+      // Allow participants to mute their existing tracks while the room is reconnecting.
+      if (state !== ConnectionState.Connected && !(reconnecting && closingDevice)) return;
       const local = session.room.localParticipant;
       switch (command.type) {
         case 'mic':

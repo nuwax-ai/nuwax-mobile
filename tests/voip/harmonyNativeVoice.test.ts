@@ -28,9 +28,12 @@ vi.mock('@kit.BackgroundTasksKit', () => ({ backgroundTaskManager: {
   stopBackgroundRunning: kits.stopBackground,
 } }));
 vi.mock('@uni_modules/nuwax-voip', () => ({ VoipBridge: kits.bridge }));
+vi.mock('@uni_modules/nuwax-livekit', () =>
+  import('../../uni_modules/nuwax-livekit/utssdk/app-harmony/EntryVoipBackgroundTask.ets'));
 vi.mock('libnuwax_harmony_rtc.so', () => ({ default: { start: () => 1, stop: vi.fn(), mute: vi.fn(), status: () => 0 } }));
 
 import { HarmonyNativeVoice } from '../../scripts/voip-native/harmony-voice-qa/HarmonyNativeVoice.ets';
+import { EntryVoipBackgroundTask } from '../../uni_modules/nuwax-livekit/utssdk/app-harmony/EntryVoipBackgroundTask.ets';
 
 function audioResource() {
   return { start: vi.fn(async () => {}), stop: vi.fn(async () => {}), release: vi.fn(async () => {}), on: vi.fn() };
@@ -109,5 +112,50 @@ describe('Harmony native voice hangup', () => {
     expect(kits.bridge.traceIncoming).toHaveBeenCalledWith('nativeVoiceResourceReleaseFailed resource=backgroundTask code=801', 'voice-call');
     expect(kits.bridge.traceIncoming).toHaveBeenCalledWith('nativeVoiceReleaseFailed', 'voice-call');
     expect(kits.bridge.traceIncoming).not.toHaveBeenCalledWith('nativeVoiceReleased', 'voice-call');
+  });
+});
+
+
+describe('Harmony EntryAbility VOIP task ownership', () => {
+  it('keeps the task while a meeting remains after native voice hangs up', async () => {
+    await EntryVoipBackgroundTask.acquire('meeting:42', context, () => true);
+    try {
+      await startCall();
+      await HarmonyNativeVoice.current?.taskStartup;
+      expect(kits.startBackground).toHaveBeenCalledOnce();
+      HarmonyNativeVoice.stop();
+      await HarmonyNativeVoice.cleanup;
+      expect(kits.stopBackground).not.toHaveBeenCalled();
+      expect(kits.bridge.traceIncoming).toHaveBeenCalledWith('nativeVoiceReleased', 'voice-call');
+    } finally {
+      HarmonyNativeVoice.stop();
+      await HarmonyNativeVoice.cleanup;
+      await EntryVoipBackgroundTask.release('meeting:42');
+    }
+    expect(kits.stopBackground).toHaveBeenCalledExactlyOnceWith(context);
+  });
+
+  it('keeps native voice alive when the meeting leaves first', async () => {
+    await startCall();
+    try {
+      await HarmonyNativeVoice.current?.taskStartup;
+      await EntryVoipBackgroundTask.acquire('meeting:42', context, () => true);
+      await EntryVoipBackgroundTask.release('meeting:42');
+      expect(kits.startBackground).toHaveBeenCalledOnce();
+      expect(kits.stopBackground).not.toHaveBeenCalled();
+    } finally {
+      HarmonyNativeVoice.stop();
+      await HarmonyNativeVoice.cleanup;
+    }
+    expect(kits.stopBackground).toHaveBeenCalledExactlyOnceWith(context);
+  });
+
+  it('does not stop a task it could not acquire or one outside the registry', async () => {
+    kits.startBackground.mockRejectedValueOnce({ code: 9800005 });
+    await expect(EntryVoipBackgroundTask.acquire('meeting:42', context, () => true)).rejects.toEqual({ code: 9800005 });
+    await EntryVoipBackgroundTask.release('meeting:42');
+    expect(kits.stopBackground).not.toHaveBeenCalled();
+    expect(await EntryVoipBackgroundTask.acquire('meeting:43', context, () => false)).toBe(false);
+    expect(kits.startBackground).toHaveBeenCalledOnce();
   });
 });

@@ -9,6 +9,10 @@ function nativeStage() {
   // and component lifecycle are tested on a device, outside this suite.
   const hostSource = source.split('\n@Builder\n')[0].replace(/^import .*$/gm, '').replace(/^export /gm, '');
   const stages: MockBuilderNode[] = [];
+  const task = {
+    acquire: vi.fn(async (_owner: string, _context: unknown, needed: () => boolean) => needed()),
+    release: vi.fn(async (_owner: string) => {}),
+  };
   const destroy = vi.fn();
   const request = vi.fn().mockResolvedValue({ responseCode: 200, result: '{"code":"0000"}' });
   const timers = new Map<number, { callback: () => void; delay: number }>();
@@ -34,6 +38,8 @@ function nativeStage() {
     webview: { WebviewController: MockController },
     wrapBuilder: (builder: unknown) => builder,
     buildMeetingStage: vi.fn(),
+    EntryVoipBackgroundTask: task,
+    console: { info: vi.fn(), warn: vi.fn() },
     http: {
       createHttp: () => ({ request, destroy }),
       RequestMethod: { POST: 'POST' },
@@ -46,7 +52,7 @@ function nativeStage() {
     clearTimeout(id: number) { timers.delete(id); },
   });
   const session = vm.runInContext(stripTypeScriptTypes(hostSource) + '\nMeetingStageSession;', context);
-  return { session, stages, request, destroy, timers };
+  return { session, stages, request, destroy, timers, task };
 }
 
 describe('Harmony meeting native stage', () => {
@@ -190,5 +196,39 @@ describe('Harmony meeting share lease', () => {
     expect(session.sharing).toBe(false);
     expect(request).toHaveBeenCalledOnce();
     await settle();
+  });
+});
+
+
+describe('Harmony meeting background lifecycle', () => {
+  it('abstains while the room has no media and acquires when remote audio arrives', async () => {
+    const { session, task, mount } = connectedStage();
+    const id = session.id;
+    session.receive({ type: 'state', id, connection: 'connected' });
+    expect(task.acquire).not.toHaveBeenCalled();
+    session.receive({ type: 'state', id, connection: 'connected', remoteAudio: true });
+    expect(task.acquire).toHaveBeenCalledOnce();
+    expect(task.acquire.mock.lastCall?.[0]).toBe('meeting:' + id);
+
+    session.releaseView(mount.id);
+    session.setAppForeground(false);
+    session.receive({ type: 'state', id, connection: 'reconnecting', remoteAudio: true });
+    expect(task.release).not.toHaveBeenCalled();
+    session.receive({ type: 'state', id, connection: 'disconnected' });
+    await settle();
+    expect(task.release).toHaveBeenCalledExactlyOnceWith('meeting:' + id);
+  });
+
+  it('waits for the foreground to start a task and stops holding it when the room leaves', async () => {
+    const { session, task } = connectedStage();
+    const id = session.id;
+    session.setAppForeground(false);
+    session.receive({ type: 'state', id, connection: 'connected', mic: true });
+    expect(task.acquire).not.toHaveBeenCalled();
+    session.setAppForeground(true);
+    expect(task.acquire).toHaveBeenCalledOnce();
+    session.disconnect();
+    await settle();
+    expect(task.release).toHaveBeenCalledExactlyOnceWith('meeting:' + id);
   });
 });

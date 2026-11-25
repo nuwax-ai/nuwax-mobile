@@ -4,6 +4,8 @@ import { audio } from '@kit.AudioKit'
 import { util } from '@kit.ArkTS'
 import { http } from '@kit.NetworkKit'
 import { BuilderNode, FrameNode, NodeController, UIContext } from '@kit.ArkUI'
+import { BusinessError } from '@kit.BasicServicesKit'
+import { EntryVoipBackgroundTask } from './EntryVoipBackgroundTask.ets'
 
 export const meetingAsset = 'nuwax-meeting/media.html'
 // The reserved HTTPS origin provides a secure context for WebRTC capture.
@@ -47,6 +49,7 @@ interface BrowserEvent {
   connection?: string
   people?: number
   mic?: boolean
+  remoteAudio?: boolean
   camera?: boolean
   level?: number
   raised?: boolean
@@ -70,6 +73,10 @@ export class MeetingStageSession {
   static error: string = ''
   static controlError: string = ''
   static mic: boolean = false
+  private static remoteAudio: boolean = false
+  private static backgroundOwner: string = ''
+  private static backgroundRetryAt: number = 0
+  private static foreground: boolean = true
   static camera: boolean = false
   static speaker: boolean = true
   static shared: boolean = false
@@ -138,6 +145,7 @@ export class MeetingStageSession {
 
   static disconnect(): void {
     MeetingStageSession.releaseShare()
+    MeetingStageSession.releaseBackgroundTask()
     const command = new Command()
     command.type = 'disconnect'
     command.id = MeetingStageSession.id
@@ -148,6 +156,8 @@ export class MeetingStageSession {
     MeetingStageSession.error = ''
     MeetingStageSession.controlError = ''
     MeetingStageSession.mic = false
+    MeetingStageSession.remoteAudio = false
+    MeetingStageSession.backgroundRetryAt = 0
     MeetingStageSession.camera = false
     MeetingStageSession.speaker = true
     MeetingStageSession.shared = false
@@ -166,6 +176,52 @@ export class MeetingStageSession {
   static isConnected(): boolean {
     const state = MeetingStageSession.connection
     return state === 'connected' || state === 'reconnecting' || state === 'signalReconnecting'
+  }
+
+  static setAppForeground(foreground: boolean): void {
+    MeetingStageSession.foreground = foreground
+    if (foreground) {
+      MeetingStageSession.host?.keepActive()
+      MeetingStageSession.updateBackgroundTask()
+    }
+  }
+
+  private static updateBackgroundTask(): void {
+    if (MeetingStageSession.connection === 'disconnected') {
+      MeetingStageSession.releaseBackgroundTask()
+      return
+    }
+    const host = MeetingStageSession.host
+    if (!host || !MeetingStageSession.foreground || MeetingStageSession.connection !== 'connected' ||
+        MeetingStageSession.backgroundOwner.length > 0 || Date.now() < MeetingStageSession.backgroundRetryAt ||
+        (!MeetingStageSession.mic && !MeetingStageSession.remoteAudio && !MeetingStageSession.sharing)) return
+    const owner = 'meeting:' + MeetingStageSession.id
+    MeetingStageSession.backgroundOwner = owner
+    host.acquireBackgroundTask(owner, () => {
+      return MeetingStageSession.backgroundOwner === owner && MeetingStageSession.foreground &&
+        MeetingStageSession.isConnected() && (MeetingStageSession.mic || MeetingStageSession.remoteAudio || MeetingStageSession.sharing)
+    }).then((granted) => {
+      if (MeetingStageSession.backgroundOwner !== owner) return
+      if (granted) {
+        console.info('[MeetingStage] background task running')
+      } else {
+        MeetingStageSession.backgroundOwner = ''
+      }
+    }).catch((error: BusinessError) => {
+      if (MeetingStageSession.backgroundOwner !== owner) return
+      MeetingStageSession.backgroundOwner = ''
+      MeetingStageSession.backgroundRetryAt = Date.now() + 5000
+      console.warn('[MeetingStage] background task failed code=' + error.code)
+    })
+  }
+
+  private static releaseBackgroundTask(): void {
+    const owner = MeetingStageSession.backgroundOwner
+    if (owner.length === 0) return
+    MeetingStageSession.backgroundOwner = ''
+    EntryVoipBackgroundTask.release(owner).catch((error: BusinessError) => {
+      console.warn('[MeetingStage] background task release failed code=' + error.code)
+    })
   }
 
   static control(type: string, on: boolean = false): void {
@@ -284,6 +340,7 @@ export class MeetingStageSession {
       if (MeetingStageSession.connection === 'disconnected') MeetingStageSession.releaseShare()
       MeetingStageSession.people = event.people ?? 0
       MeetingStageSession.mic = event.mic === true
+      MeetingStageSession.remoteAudio = event.remoteAudio === true
       MeetingStageSession.camera = event.camera === true
       MeetingStageSession.level = event.level ?? 0
       MeetingStageSession.raised = event.raised === true
@@ -295,6 +352,7 @@ export class MeetingStageSession {
       MeetingStageSession.sharing = currentShare && event.sharing === true
       MeetingStageSession.awaitingCapture = currentShare && event.awaitingCapture === true
       if (MeetingStageSession.sharing) MeetingStageSession.clearShareStartTimer()
+      MeetingStageSession.updateBackgroundTask()
     } else if (event.type === 'shareError') {
       MeetingStageSession.shareFailed(event.shareId ?? 0, event.error ?? '')
     } else if (event.type === 'message' && event.message) {
@@ -338,6 +396,10 @@ export class MeetingStageHost {
     this.ready = false
     this.stage?.dispose()
     this.stage = undefined
+  }
+
+  acquireBackgroundTask(owner: string, needed: () => boolean): Promise<boolean> {
+    return EntryVoipBackgroundTask.acquire(owner, this.context, needed)
   }
 
   postMessage(raw: string): void {

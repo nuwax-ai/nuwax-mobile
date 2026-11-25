@@ -11,7 +11,7 @@ const abilityFile = `${entry}/ets/entryability/EntryAbility.ets`;
 const moduleFile = `${entry}/module.json5`;
 const listener = 'action.ohos.push.listener';
 
-function fixture(abilitySource: string, qa = false) {
+function fixture(abilitySource: string, qa = false, meetingBuilt = true) {
   mkdirSync(join(root, 'out'), { recursive: true });
   const directory = mkdtempSync(join(root, 'out/voip-harmony-fixture-'));
   fixtures.push(directory);
@@ -40,6 +40,8 @@ function fixture(abilitySource: string, qa = false) {
   writeProject(`${plugin}/utssdk/app-harmony/VoipBridge.ets`, '');
   writeProject(`${entry}/resources/base/profile/main_pages.json`, '{"src":["pages/Index"]}');
   writeProject('unpackage/app-harmony/entry/oh-package.json5', '{"dependencies":{}}');
+  const dependencies = qa && meetingBuilt ? { '@uni_modules/nuwax-livekit': './uni_modules/nuwax-livekit' } : {};
+  writeProject('unpackage/app-harmony/oh-package.json5', JSON.stringify({ dependencies }));
   write('static/app/voip/media.html', '<html><head></head><body></body></html>');
   write('native-voice-fixture.so', 'fixture');
   const run = (voice = false) => spawnSync(process.execPath, ['scripts/prepare-voip-harmony.mjs', prefix + 'unpackage/app-harmony'], {
@@ -97,6 +99,7 @@ export default class EntryAbility extends UniEntryAbility {
     expect(prepared).toMatch(/VoipBridge\.bindPush\(this\)\s+VoipBridge\.nativeVoiceStart/);
     expect(JSON.parse(project.read(moduleFile)).module.abilities[0].backgroundModes).toEqual(['voip']);
     expect(project.read('unpackage/app-harmony/entry/libs/arm64-v8a/libnuwax_harmony_rtc.so')).toBe('fixture');
+    expect(project.read(`${entry}/ets/voip/HarmonyNativeVoice.ets`)).toContain("from '@uni_modules/nuwax-livekit'");
     const bridge = project.read(`${plugin}/utssdk/app-harmony/VoipBridge.ets`);
     expect(bridge).toContain('if (config.apiBaseUrl !== VoipBridge.nativeVoiceTestOrigin) return');
     expect(bridge).toContain('if (config && config.apiBaseUrl === VoipBridge.nativeVoiceTestOrigin)');
@@ -110,6 +113,15 @@ export default class EntryAbility extends UniEntryAbility {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('isolated VoIP business QA output');
     expect(project.read(moduleFile)).toBe(original);
+  });
+
+  it('rejects a stale QA project without the shared task module before patching it', () => {
+    const project = fixture('export default class EntryAbility extends UniEntryAbility {}', true, false);
+    const original = project.read(abilityFile);
+    const result = project.run(true);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('include nuwax-livekit');
+    expect(project.read(abilityFile)).toBe(original);
   });
 
   it('registers before existing initialization and ignores mentions of onCreate outside the lifecycle method', () => {

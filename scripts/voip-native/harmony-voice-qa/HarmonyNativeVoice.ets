@@ -1,8 +1,8 @@
-import { common, wantAgent } from '@kit.AbilityKit'
+import { common } from '@kit.AbilityKit'
 import { audio } from '@kit.AudioKit'
-import { backgroundTaskManager } from '@kit.BackgroundTasksKit'
 import { BusinessError } from '@kit.BasicServicesKit'
 import { VoipBridge } from '@uni_modules/nuwax-voip'
+import { EntryVoipBackgroundTask } from '@uni_modules/nuwax-livekit'
 import rtc from 'libnuwax_harmony_rtc.so'
 
 class VoiceSession {
@@ -108,18 +108,10 @@ export class HarmonyNativeVoice {
   }
 
   static async startTask(session: VoiceSession): Promise<void> {
-    const context = session.context
     try {
-      const target = await wantAgent.getWantAgent({
-        wants: [{ bundleName: context.abilityInfo.bundleName, moduleName: context.abilityInfo.moduleName,
-          abilityName: 'EntryAbility' }],
-        actionType: wantAgent.OperationType.START_ABILITY, requestCode: 9091,
-        actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
-      })
-      if (HarmonyNativeVoice.current !== session) return
-      await backgroundTaskManager.startBackgroundRunning(context, backgroundTaskManager.BackgroundMode.VOIP, target)
-      session.backgroundTask = true
-      if (HarmonyNativeVoice.current === session) {
+      session.backgroundTask = await EntryVoipBackgroundTask.acquire(
+        'voice:' + session.callId, session.context, () => HarmonyNativeVoice.current === session)
+      if (session.backgroundTask && HarmonyNativeVoice.current === session) {
         VoipBridge.traceIncoming('nativeVoiceBackgroundRunning', session.callId)
       }
     } catch (error) {
@@ -213,7 +205,7 @@ export class HarmonyNativeVoice {
     await session.taskStartup
     if (!session.backgroundTask) return
     await HarmonyNativeVoice.releaseResource(session, 'backgroundTask', () => {
-      return backgroundTaskManager.stopBackgroundRunning(session.context)
+      return EntryVoipBackgroundTask.release('voice:' + session.callId)
     })
   }
 

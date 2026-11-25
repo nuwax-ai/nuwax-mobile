@@ -20,6 +20,10 @@ export async function verifyVoiceQaTarget(root, project) {
   if (metadata.flavor !== 'voip-business-qa' || metadata.apiOrigin !== testOrigin) {
     throw new Error('Native Harmony voice requires the VoIP business QA test origin');
   }
+  const dependencies = JSON5.parse(await readFile(`${project}/oh-package.json5`, 'utf8')).dependencies;
+  if (!dependencies?.['@uni_modules/nuwax-livekit']) {
+    throw new Error('Regenerate the Harmony QA project from the current source to include nuwax-livekit');
+  }
 }
 
 export function pinVoiceQaBridge(source) {

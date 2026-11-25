@@ -30,17 +30,18 @@ export function createMeetingMedia(post, render) {
     if (room.state === ConnectionState.Disconnected) stopShare(session);
     const shared = remotes.find((participant) => participant.identity === shareHolder);
     const share = shared?.getTrackPublication(Track.Source.ScreenShare);
+    const audioPublications = remotes.flatMap((participant) => [...participant.audioTrackPublications.values()]);
     render(
       cameras,
       share?.track && !share.isMuted ? { participant: shared, track: share.track } : undefined,
-      remotes.flatMap((participant) => [...participant.audioTrackPublications.values()]
-        .flatMap((publication) => publication.track ? [publication.track] : [])),
+      audioPublications.flatMap((publication) => publication.track ? [publication.track] : []),
       session.share && !session.share.started && ownsShare ? session.share : undefined,
     );
     post({
       type: 'state', id: session.id, connection: room.state,
       people: room.state === ConnectionState.Disconnected ? 0 : 1 + remotes.length,
       mic: local.isMicrophoneEnabled, camera: local.isCameraEnabled, level: local.audioLevel,
+      remoteAudio: audioPublications.some((publication) => publication.track && !publication.isMuted),
       raised: local.attributes.handRaised === '1', metadata: room.metadata || '',
       videos: cameras.filter(({ participant }) => participant !== local).map(({ participant }) => participant.identity).join(','),
       shared: !!share?.track && !share.isMuted, sharing: session.share?.published === true,

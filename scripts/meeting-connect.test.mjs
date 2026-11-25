@@ -4,9 +4,7 @@ import { readFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import vm from 'node:vm';
 
-// 执行业务状态机，原生桥和网络为桩；不调用 HBuilderX/设备或真实接口。
-function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = false, preCode = '0', tokenCode = '0' } = {}) {
-  const raw = readFileSync(new URL('../utils/meeting/meetingMedia.uts', import.meta.url), 'utf8');
+function forPlatform(raw, platform) {
   const stack = [true];
   const lines = [];
   for (const line of raw.split('\n')) {
@@ -17,7 +15,14 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     } else if (/^\s*\/\/ #endif/.test(line)) stack.pop();
     else if (stack.at(-1)) lines.push(line);
   }
-  const source = lines.join('\n').replace(/^import[\s\S]*?;\s*$/gm, '');
+  return lines.join('\n');
+}
+
+// 执行业务状态机，原生桥和网络为桩；不调用 HBuilderX/设备或真实接口。
+function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = false, preCode = '0', tokenCode = '0',
+  apiOrigin = 'https://testagent.xspaceagi.com', screenSupported = true } = {}) {
+  const raw = readFileSync(new URL('../utils/meeting/meetingMedia.uts', import.meta.url), 'utf8');
+  const source = forPlatform(raw, platform).replace(/^import[\s\S]*?;\s*$/gm, '');
   const timers = new Map(), logs = [], operations = [], presentations = [], navigations = [];
   let restoreRequested = false, persistentRestore = false;
   let restoreAcks = 0;
@@ -28,6 +33,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
   const navigationObservers = new Map();
   let now = 10000;
   let nextTimer = 0, connected = false, configured = false, claims = 0;
+  let microphone = false, remoteScreen = false, shareError = '', releases = 0;
   const globals = {
     console: { error: value => logs.push(String(value)) },
     Date: { now: () => now },
@@ -53,7 +59,17 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
       if (configThrows) throw new Error('missing bridge method: secret-seat-token');
       configured = true;
     },
-    livekitIsScreenShareOn: () => false, livekitScreenShareError: () => '',
+    getApiBaseUrl: () => apiOrigin,
+    livekitMicEnabled: () => microphone,
+    livekitCameraEnabled: () => false,
+    livekitSpeakerEnabled: () => true,
+    livekitSetMic: on => operations.push(on ? 'unmute' : 'mute'),
+    livekitRemoteVideoIdentities: () => '',
+    livekitRemoteScreenVisible: () => remoteScreen,
+    livekitScreenCaptureSupported: () => screenSupported,
+    livekitAwaitingScreenCapture: () => false,
+    livekitPrepareScreenCapture: (label, cancel) => operations.push(label + '/' + cancel),
+    livekitIsScreenShareOn: () => false, livekitScreenShareError: () => shareError,
     livekitIsScreenShareStopping: () => {
       if (configThrows) throw new Error('旧基座不能调用新增导出');
       return false;
@@ -64,7 +80,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     livekitSendMeetingMessage: () => operations.push('chat'),
     livekitSetHandRaised: on => operations.push(on ? 'raise' : 'lower'),
     livekitStopScreenShare: () => operations.push('stopShare'),
-    apiImMeetingGuestReleaseShareHolder: async () => ({ code: '0' }),
+    apiImMeetingGuestReleaseShareHolder: async () => { releases++; return { code: '0' }; },
     livekitSetMeetingPresentation(visible, foreground) {
       if (configThrows) throw new Error('旧基座没有自动小窗');
       presentations.push({ visible, foreground });
@@ -106,6 +122,8 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     join: () => context.meetingMediaConnect({ room: '123456789', displayName: 'Test', passcode: '' }),
     complete() { connected = true; for (const callback of [...timers.values()]) callback(); },
     claims: () => claims,
+    releases: () => releases,
+    media({ mic = false, shared = false, error = '' }) { microphone = mic; remoteScreen = shared; shareError = error; },
     staleFailure() {
       vm.runInContext('state.connected = false; state.connecting = false; state.errorText = "exception";', context);
     },
@@ -230,13 +248,13 @@ test('页面返回/退后台自动更新小窗，原会话不断开，点击小�
   assert.equal(h.operations.includes('disconnect'), false);
 });
 
-function pageFunctions(names) {
+function pageFunctions(names, platform = 'APP-IOS') {
   const source = readFileSync(new URL('../subpackages/pages/im-meeting/im-meeting-room.uvue', import.meta.url), 'utf8');
   return names.map(name => {
     const start = source.indexOf(`  function ${name}(`);
     assert.notEqual(start, -1);
     const end = source.indexOf('\n  }', start);
-    return source.slice(start, end + 4);
+    return forPlatform(source.slice(start, end + 4), platform);
   }).join('\n');
 }
 
@@ -510,4 +528,43 @@ test('原生页面切换尚未完成：短间隔轮询不能重复压入会议�
   h.advance(250); h.api.meetingMediaReconcile();
   assert.equal(h.navigations.length, 2, '超时仍未显示才重试');
   assert.deepEqual(h.backDeltas, []);
+});
+
+
+test('鸿蒙会议媒体仅在测试环境启用，设备开关跟随实际采集状态', async () => {
+  const production = harness({ platform: 'APP-HARMONY', apiOrigin: 'https://agent.nuwax.com' });
+  await production.join();
+  assert.equal(production.api.meetingMediaSupported(), false);
+  assert.deepEqual(production.operations, []);
+
+  const h = harness({ platform: 'APP-HARMONY' });
+  await h.join(); h.complete();
+  h.api.meetingMediaSetMic(true);
+  assert.ok(h.operations.includes('unmute'));
+  assert.equal(h.api.meetingMediaState().micOn, false);
+  h.media({ mic: true, shared: true }); h.api.meetingMediaReconcile();
+  assert.equal(h.api.meetingMediaState().micOn, true);
+  assert.equal(h.api.meetingMediaState().visualMedia, true);
+});
+
+test('鸿蒙整屏共享先占位，取消系统采集时归还当前席位', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  await h.join(); h.complete();
+  assert.equal(await h.api.meetingMediaStartScreenShare('other', '共享整个屏幕', '取消'), false);
+  assert.equal(h.claims(), 0);
+  assert.equal(await h.api.meetingMediaStartScreenShare('123456789', '共享整个屏幕', '取消'), true);
+  assert.equal(h.claims(), 1);
+  assert.ok(h.operations.includes('共享整个屏幕/取消'));
+  h.media({ error: 'cancelled' }); h.api.meetingMediaReconcile();
+  assert.ok(h.operations.includes('stopShare'));
+  assert.equal(h.releases(), 1);
+  h.api.meetingMediaReconcile();
+  assert.equal(h.releases(), 1);
+});
+
+test('鸿蒙 ArkWeb 无采屏能力时不申请服务端占位', async () => {
+  const h = harness({ platform: 'APP-HARMONY', screenSupported: false });
+  await h.join(); h.complete();
+  assert.equal(await h.api.meetingMediaStartScreenShare('123456789', '共享整个屏幕', '取消'), false);
+  assert.equal(h.claims(), 0);
 });

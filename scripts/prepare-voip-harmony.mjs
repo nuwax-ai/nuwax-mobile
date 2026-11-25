@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir, copyFile, cp, realpath } from 'node:fs/prom
 import { resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSON5 from 'json5';
+import { build } from 'esbuild';
 import { pinVoiceQaBridge, stageVoiceQa, verifyVoiceQaTarget } from './voip-native/harmony-voice-qa/stage.mjs';
 
 function prepareEntryAbility(source) {
@@ -105,7 +106,15 @@ for (const locale of ['base', 'en_US', 'zh_CN', 'zh_TW', 'zh_HK']) {
   for (const [name, value] of Object.entries(values)) { const old = strings.string.find(item => item.name === name); if (old) old.value = value; else strings.string.push({ name, value }); }
   await writeFile(path, JSON.stringify(strings, null, 2) + '\n');
 }
-if (voiceQaLibrary) await stageVoiceQa(project, resolve(voiceQaLibrary), abilityPath, preparedAbility, main);
-else await writeFile(abilityPath, preparedAbility);
+if (voiceQaLibrary) {
+  await stageVoiceQa(project, resolve(voiceQaLibrary), abilityPath, preparedAbility, main);
+  const meeting = `${entry}/resources/rawfile/nuwax-meeting`;
+  await mkdir(meeting, { recursive: true });
+  await build({
+    entryPoints: [`${root}/scripts/meeting-harmony/room.mjs`],
+    outfile: `${meeting}/room.js`, bundle: true, format: 'iife', target: 'es2020', minify: true,
+  });
+  await copyFile(`${root}/scripts/meeting-harmony/media.html`, `${meeting}/media.html`);
+} else await writeFile(abilityPath, preparedAbility);
 await writeFile(modulePath, JSON.stringify(config, null, 2) + '\n');
 console.log('[voip] Harmony native call host / push / background configuration regenerated');

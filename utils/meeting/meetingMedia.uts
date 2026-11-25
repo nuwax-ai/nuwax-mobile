@@ -1,25 +1,6 @@
 /**
- * 会议媒体层适配（Android / iOS 接 LiveKit，鸿蒙留逻辑占位）。
- *
- * <h2>三端策略（2026-11-14 定）</h2>
- * <ul>
- *   <li><b>Android / iOS</b>：接 LiveKit 原生 SDK。桥接放在独立 UTS 插件
- *       `uni_modules/nuwax-livekit`（Android 走 Maven/AAR，iOS 走 CocoaPods/XCFramework），
- *       业务侧只经本文件调用，**页面不直接持有 SDK 对象**（方案 §5.2）。</li>
- *   <li><b>鸿蒙</b>：LiveKit 官方无 HarmonyOS 客户端，先**留逻辑占位**：插件 `app-harmony`
- *       是空实现、能力恒为 false，会中页只提供会议信息；后续基于鸿蒙自研的 LiveKitClient
- *       （ArkTS + 原生 RTC + 原生视频渲染组件）在插件里补实现，本文件不用改。</li>
- *   <li><b>H5 / 小程序</b>：不做实时会议，恒为 false。</li>
- * </ul>
- *
- * <h2>★★插件未随包时的行为</h2>
- * <p>插件的 `isSupported()` 现在返回 false（SDK 还没随自定义基座），此时本文件不会发任何
- * 网络请求、也不会改任何状态：会中页据此把麦克风/摄像头/扬声器标成「接入中」，
- * **绝不显示假的开关状态**。等 LiveKit SDK 随基座打进真机跑通（连上自建 LiveKit、
- * 收发流、退后台重连）后，插件把 `isSupported()` 改 true，业务层自动放开。
- *
- * <h2>一场会只有一个媒体会话</h2>
- * <p>与方案 §4.1-7 一致：模块级单例，加入新会议前必须显式断开上一场（不自动结束别人的会）。
+ * 会议媒体适配。Android 和 iOS 使用 LiveKit 原生 SDK，鸿蒙隔离测试包使用 ArkWeb。
+ * 各端复用服务端令牌和会议协议，每次只管理本端的一场会议。插件未就绪时只展示会议信息。
  */
 
 import { SUCCESS_CODE } from "@/constants/codes.constants";
@@ -31,9 +12,7 @@ import eventBus from "@/utils/eventBus";
 import { rememberMeetingResumeState, restoreMeetingResumeState, acknowledgeMeetingRestoreRequest } from "@/uni_modules/nuwax-livekit";
 // #endif
 
-// ★只在 Android/iOS 引原生桥接插件：鸿蒙没有 LiveKit 客户端（插件内是占位实现，
-//   本文件连都不连），H5/小程序更没有——条件编译保证这些平台不解析该 import。
-// #ifdef APP-ANDROID || APP-IOS
+// #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
 import {
   connect as livekitConnect,
   disconnect as livekitDisconnect,
@@ -64,9 +43,21 @@ import {
 } from "@/uni_modules/nuwax-livekit";
 // #endif
 
-// 远端视频订阅：Android / iOS 都已实现（鸿蒙无 RTC 客户端）
-// #ifdef APP-ANDROID || APP-IOS
+// #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
 import { remoteVideoIdentities as livekitRemoteVideoIdentities } from "@/uni_modules/nuwax-livekit";
+// #endif
+// #ifdef APP-HARMONY
+import { getApiBaseUrl } from "@/constants/config";
+import {
+  isMicEnabled as livekitMicEnabled,
+  isCameraEnabled as livekitCameraEnabled,
+  isSpeakerEnabled as livekitSpeakerEnabled,
+  isRemoteScreenVisible as livekitRemoteScreenVisible,
+  isScreenCaptureSupported as livekitScreenCaptureSupported,
+  isAwaitingScreenCapture as livekitAwaitingScreenCapture,
+  prepareScreenCapture as livekitPrepareScreenCapture,
+  consumeMeetingControlError as livekitConsumeControlError,
+} from "@/uni_modules/nuwax-livekit";
 // #endif
 
 /** 媒体状态变更（连接/断开、麦克风/摄像头/扬声器切换）。载荷为空对象。 */
@@ -102,6 +93,9 @@ export class MeetingMediaState {
   meetingStartedAtMs: number = 0;
   /** 最近一次失败的简短原因（页面可直出，不需要 i18n 时留空）。 */
   errorText: string = "";
+  // #ifdef APP-HARMONY
+  visualMedia: boolean = false;
+  // #endif
 }
 
 /** LiveKit 房间 metadata 快照；字段与 PC `RoomSettings` 保持一致。 */
@@ -375,7 +369,7 @@ function startConnectPoll(): void {
     ticks = ticks + 1;
     let connected = false;
     let err = "";
-    // #ifdef APP-ANDROID || APP-IOS
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
     try {
       connected = livekitIsConnected();
       err = livekitLastError();
@@ -407,7 +401,7 @@ function startConnectPoll(): void {
     if (ticks > 40) {
       stopConnectPoll();
       // 超时后不能让原生稍后再连成一个无人管理的后台会议。
-      // #ifdef APP-ANDROID || APP-IOS
+      // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
       try { livekitDisconnect(); } catch (_e) {}
       // #endif
       state.connecting = false;
@@ -448,8 +442,9 @@ export function meetingMediaSupported(): boolean {
   }
   // #endif
   // #ifdef APP-HARMONY
-  // ★鸿蒙占位：无 LiveKit 客户端，后续基于自研 LiveKitClient 在插件里打开
-  supported = false;
+  try {
+    supported = getApiBaseUrl() == "https://testagent.xspaceagi.com" && livekitIsSupported();
+  } catch (_error) {}
   // #endif
   return supported;
 }
@@ -480,8 +475,11 @@ export function meetingMediaState(): MeetingMediaState {
   copy.plannedDurationSec = state.plannedDurationSec;
   copy.meetingStartedAtMs = state.meetingStartedAtMs;
   copy.errorText = state.errorText;
+  // #ifdef APP-HARMONY
+  copy.visualMedia = state.visualMedia;
+  // #endif
   // 已连接时以插件实时人数为准（会中人员进出由 RoomEvent 更新，这里再兜一道）
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try {
     const live = livekitParticipantCount();
     if (live > 0) {
@@ -535,7 +533,7 @@ function flushMeetingResume(): void {
   });
 }
 export function meetingMediaReleasePageViews(): void {
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try { livekitReleaseMeetingPageViews(); } catch (_e) {}
   // #endif
 }
@@ -652,21 +650,13 @@ export async function meetingMediaConnect(options: MeetingMediaOptions): Promise
     // ---------------------------------------------------------------- 交给原生插件
     // Android/iOS：nuwax-livekit 里包 LiveKit 官方 SDK；SDK 未随基座时插件回报
     // `livekit_sdk_missing` 且不置 connected（见插件文件头）。
-    // 鸿蒙：无 LiveKit 客户端，插件是占位实现（harmony_rtc_unsupported）。
-    // #ifdef APP-ANDROID || APP-IOS
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
     // 状态经回调持续回报（连上/断开/人数变化），这里不等同步结果
     // 入会默认：**麦克风关**（由用户主动点开）、摄像头关
     // ★不传回调（UTS 回调跨到 Swift 会变成 UTSCallback 编不过），改为轮询状态
     activeMeetingToken = token;
     livekitConnect(wsUrl, token, options.room, options.displayName, false, false);
     startConnectPoll();
-    // #endif
-
-    // #ifdef APP-HARMONY
-    // 鸿蒙占位：等 HarmonyOS LiveKitClient 落地后在这里接同一套接口
-    state.connecting = false;
-    state.errorText = "harmony_rtc_unsupported";
-    changed();
     // #endif
 
     return state.connected;
@@ -691,15 +681,12 @@ export async function meetingMediaDisconnect(): Promise<void> {
     void meetingMediaStopScreenShare(activeRoom);
   }
   // Android/iOS：交给插件退房（停采集、停前台服务/通知、归还音频会话）
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try {
     livekitDisconnect();
   } catch (_e) {
     // 基座不含插件时静默：本来也没连上
   }
-  // #endif
-  // #ifdef APP-HARMONY
-  // 鸿蒙占位：等 LiveKitClient 落地后在这里断开 RTC 并退出 VOIP 长时任务
   // #endif
   resetState();
   changed();
@@ -720,9 +707,12 @@ export function meetingMediaSetMic(on: boolean): void {
     console.error(`[Meeting] setMic throw: ${_e}`);
   }
   console.error(`[Meeting] setMic ${on} <- native`);
-  // #endif
   state.micOn = on;
   changed();
+  // #endif
+  // #ifdef APP-HARMONY
+  try { livekitSetMic(on); } catch (_error) {}
+  // #endif
 }
 
 /** 摄像头开关（默认关；关闭时**不保留最后一帧**，由插件侧销毁渲染）。 */
@@ -738,9 +728,12 @@ export function meetingMediaSetCamera(on: boolean): void {
     console.error(`[Meeting] setCamera throw: ${_e}`);
   }
   console.error(`[Meeting] setCamera ${on} <- native`);
-  // #endif
   state.cameraOn = on;
   changed();
+  // #endif
+  // #ifdef APP-HARMONY
+  try { livekitSetCamera(on); } catch (_error) {}
+  // #endif
 }
 
 /** 扬声器 / 听筒切换（iOS 需要 AVAudioSession 路由，Android 走 AudioManager 路由）。 */
@@ -753,9 +746,12 @@ export function meetingMediaSetSpeaker(on: boolean): void {
     livekitSetSpeaker(on);
   } catch (_e) {
   }
-  // #endif
   state.speakerOn = on;
   changed();
+  // #endif
+  // #ifdef APP-HARMONY
+  try { livekitSetSpeaker(on); } catch (_error) {}
+  // #endif
 }
 
 /**
@@ -764,7 +760,7 @@ export function meetingMediaSetSpeaker(on: boolean): void {
  */
 export function meetingMediaLocalAudioLevel(): number {
   let level = 0.0;
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try {
     level = livekitLocalAudioLevel();
   } catch (_e) {
@@ -786,7 +782,7 @@ export function meetingMediaLocalAudioLevel(): number {
  */
 export function meetingMediaRemoteVideoIdentities(): string[] {
   const out: string[] = [];
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   if (state.connected) {
     try {
       const raw = livekitRemoteVideoIdentities();
@@ -811,7 +807,7 @@ export function meetingMediaRemoteVideoIdentities(): string[] {
  */
 export function meetingMediaRoomMetadata(): MeetingRoomMetadata {
   const out = new MeetingRoomMetadata();
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   if (state.connected) {
     try {
       const raw = livekitRoomMetadata();
@@ -842,7 +838,7 @@ export function meetingMediaSetHandRaised(on: boolean): void {
   if (!state.connected) {
     return;
   }
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try {
     livekitSetHandRaised(on);
   } catch (_e) {
@@ -855,7 +851,7 @@ export function meetingMediaLocalHandRaised(): boolean {
   if (!state.connected) {
     return false;
   }
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try {
     return livekitLocalHandRaised();
   } catch (_e) {
@@ -867,22 +863,28 @@ export function meetingMediaLocalHandRaised(): boolean {
 /** Send a reliable PC-compatible chat/danmaku packet in the active room. */
 export function meetingMediaSendMessage(text: string, displayName: string, asDanmaku: boolean): void {
   if (!state.connected || text.trim().length == 0 || text.trim().length > 120) return;
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try { livekitSendMeetingMessage(text.trim(), displayName, asDanmaku); } catch (_e) {}
   // #endif
 }
 
 /** Messages queued by the native DataChannel listener, serialized as a JSON array. */
 export function meetingMediaDrainMessages(): string {
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try { return livekitDrainMeetingMessages(); } catch (_e) { return "[]"; }
   // #endif
   return "[]";
 }
 
 /** Acquire server ownership before prompting the platform screen-capture consent UI. */
-export async function meetingMediaStartScreenShare(room: string): Promise<boolean> {
-  if (!state.connected || (meetingMediaPlatform() != "android" && meetingMediaPlatform() != "ios")) return false;
+export async function meetingMediaStartScreenShare(room: string, label: string = "", cancelLabel: string = ""): Promise<boolean> {
+  if (!state.connected || activeRoom != room) return false;
+  // #ifndef APP-HARMONY
+  if (meetingMediaPlatform() != "android" && meetingMediaPlatform() != "ios") return false;
+  // #endif
+  // #ifdef APP-HARMONY
+  if (!livekitScreenCaptureSupported() || label.length == 0 || cancelLabel.length == 0) return false;
+  // #endif
   // 后台整屏共享是新增能力；旧基座仍走原有 requestScreenShare，不能禁用已验证的应用内共享。
   if (shareRequested || shareRequestInFlight || shareStopping) return false;
   // #ifdef APP-ANDROID || APP-IOS
@@ -917,6 +919,10 @@ export async function meetingMediaStartScreenShare(room: string): Promise<boolea
     livekitRequestScreenShare();
     shareNativeRequested = true;
     // #endif
+    // #ifdef APP-HARMONY
+    livekitPrepareScreenCapture(label, cancelLabel);
+    shareNativeRequested = true;
+    // #endif
     return true;
   } catch (_e) {
     if (generation == connectGeneration) {
@@ -940,7 +946,7 @@ export async function meetingMediaStopScreenShare(room: string): Promise<void> {
   shareNativeRequested = false;
   shareObservedOn = false;
   shareAttemptStartedAt = 0;
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try { livekitStopScreenShare(); } catch (_e) {}
   // #endif
   // 使用席位凭据仅释放自己，主持人也不能误释放刚接管共享的其他成员。
@@ -981,6 +987,33 @@ export function meetingMediaReconcile(expectedRoom: string = ""): void {
     }
   } catch (_e) {}
   // #endif
+  // #ifdef APP-HARMONY
+  try {
+    if (!state.connected) return;
+    if (!livekitIsConnected()) {
+      void meetingMediaDisconnect();
+      return;
+    }
+    const mic = livekitMicEnabled();
+    const camera = livekitCameraEnabled();
+    const speaker = livekitSpeakerEnabled();
+    const visual = camera || livekitAwaitingScreenCapture() ||
+      livekitRemoteScreenVisible() || livekitRemoteVideoIdentities().length > 0;
+    const sharing = livekitIsScreenShareOn();
+    if (sharing) shareObservedOn = true;
+    else if (shareObservedOn || (shareNativeRequested && livekitScreenShareError().length > 0) ||
+      (shareRequested && shareAttemptStartedAt > 0 && Date.now() - shareAttemptStartedAt > 65000)) {
+      void meetingMediaStopScreenShare(activeRoom);
+    }
+    const deviceChanged = mic != state.micOn || camera != state.cameraOn ||
+      speaker != state.speakerOn || visual != state.visualMedia;
+    state.micOn = mic;
+    state.cameraOn = camera;
+    state.speakerOn = speaker;
+    state.visualMedia = visual;
+    if (deviceChanged) changed();
+  } catch (_error) {}
+  // #endif
   if (sessionPollTimer == -1) sessionPollTimer = setInterval(() => { meetingMediaReconcile(); }, 2000);
   startMeetingResumePoll();
   pollMeetingResume();
@@ -988,14 +1021,14 @@ export function meetingMediaReconcile(expectedRoom: string = ""): void {
 }
 
 export function meetingMediaScreenShareOn(): boolean {
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try { return livekitIsScreenShareOn(); } catch (_e) { return false; }
   // #endif
   return false;
 }
 
 export function meetingMediaScreenShareError(): string {
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try { return livekitScreenShareError(); } catch (_e) { return ""; }
   // #endif
   return "";
@@ -1003,7 +1036,7 @@ export function meetingMediaScreenShareError(): string {
 
 /** 切换前后摄像头（默认前置）。 */
 export function meetingMediaSwitchCamera(): void {
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try {
     livekitSwitchCamera();
   } catch (_e) {
@@ -1030,7 +1063,7 @@ export function meetingMediaDebugLine(): string {
   let nativeErr = "";
   let nativeRemotes = "";
   let nativeDiag = "";
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try {
     nativeConnected = livekitIsConnected();
     nativePeople = livekitParticipantCount();
@@ -1063,3 +1096,12 @@ export function meetingMediaDebugLine(): string {
 export function meetingMediaReset(): void {
   resetState();
 }
+
+// #ifdef APP-HARMONY
+export function meetingMediaCanCaptureScreen(): boolean {
+  try { return livekitScreenCaptureSupported(); } catch (_error) { return false; }
+}
+export function meetingMediaConsumeDeviceError(): string {
+  try { return livekitConsumeControlError(); } catch (_error) { return ""; }
+}
+// #endif

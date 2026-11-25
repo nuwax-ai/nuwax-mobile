@@ -1,5 +1,7 @@
 import AVFoundation
 import AVKit
+import CoreMedia
+import CoreVideo
 import UIKit
 import LiveKitClient
 
@@ -9,7 +11,7 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
   private var controller: AVPictureInPictureController?
   private var content: AVPictureInPictureVideoCallViewController?
   private var video: VideoView?
-  private var preview: UIImageView?
+  private var preview: MeetingPiPPreviewView?
   private var previewSnapshot: UIImage?
   private var snapshotObserver: NSObjectProtocol?
   private var source: UIView?
@@ -26,7 +28,10 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
   private var orientationObserver: NSObjectProtocol?
   private var restoreRequested = false
   private var pageVisible = true
-  private var foreground = true
+  private var leavingForeground = false
+  private var lifecycleID = 0
+  private var startedDuringTransition = false
+  private var startTrigger = "none"
   private var possibilityObservation: NSKeyValueObservation?
 
   func makeSourceView() -> UIView {
@@ -51,34 +56,38 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     self.source = source
     backgroundObserver = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
       guard let self else { return }
-      NSLog("[MeetingPiP] didEnterBackground")
-      self.foreground = false
-      _ = self.start()
-      // 系统刚切后台时 contentSource 的可见性可能还没结算，补一次重试。
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-        guard let self, UIApplication.shared.applicationState == .background else { return }
-        _ = self.start()
-      }
+      self.leavingForeground = true
+      self.logState("didEnterBackground")
+      self.observeAutomaticStart()
     }
     foregroundObserver = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
       guard let self else { return }
+      self.leavingForeground = false
+      self.lifecycleID += 1
+      // 只在真正回到前台时收窗，页面轮询不能打断正在进入 PiP 的动画。
+      if self.starting || self.controller?.isPictureInPictureActive == true {
+        self.stoppingForForeground = true
+        self.controller?.stopPictureInPicture()
+      }
       self.setPresentation(pageVisible: self.pageVisible, foreground: true)
     }
     orientationObserver = NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
       self?.layoutEdgeHandle()
     }
-    guard AVPictureInPictureController.isPictureInPictureSupported() else { return source }
+    guard AVPictureInPictureController.isPictureInPictureSupported() else {
+      lastFailure = "unsupported"
+      refreshDiagnostics()
+      return source
+    }
     let content = AVPictureInPictureVideoCallViewController()
     content.preferredContentSize = CGSize(width: 320, height: 180)
     // 未挂到 PiP 窗口前 view 的 bounds 是零，子视图按零尺寸布局会导致内容层不可见。
     content.view.frame = CGRect(x: 0, y: 0, width: 320, height: 180)
     content.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
-    // 没有远端视频轨时用退后台前的会议画面快照兜底，不显示黑底文案。
-    let preview = UIImageView()
-    preview.contentMode = .scaleAspectFill
+    // 无远端视频时也必须提供可由系统合成的视频层；UIImageView 不是 PiP 媒体源。
+    let preview = MeetingPiPPreviewView(frame: content.view.bounds)
     preview.clipsToBounds = true
     preview.backgroundColor = UIColor(white: 0.12, alpha: 1)
-    preview.frame = content.view.bounds
     preview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     content.view.addSubview(preview)
     let video = VideoView()
@@ -91,15 +100,18 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     video.frame = content.view.bounds
     video.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     content.view.addSubview(video)
-    // 系统在 App 真正进入后台前就会截走 PiP 内容，必须在失活前把会议画面抓下来。
+    // iOS 的“自动开启画中画”受系统设置影响；退后台时主动请求一次，
+    // canStartPictureInPictureAutomaticallyFromInline 继续作为系统兜底。
     snapshotObserver = NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
       guard let self else { return }
+      self.lifecycleID += 1
+      self.startedDuringTransition = self.controller?.isPictureInPictureActive == true
+      self.lastFailure = ""
+      self.leavingForeground = true
       self.capturePreviewSnapshot()
-      self.source?.isHidden = false
-      self.foreground = false
-      // 必须同步调用：等一次 runloop 后 applicationState 已经变成 .inactive，
-      // 那时再调 startPictureInPicture 会被 AVKit 直接拒绝（-1001）。
-      _ = self.startForBackground()
+      self.preview?.redisplay()
+      self.requestStartForBackground()
+      self.logState("willResignActive")
     }
     let controller = AVPictureInPictureController(contentSource: .init(
       activeVideoCallSourceView: source, contentViewController: content
@@ -113,58 +125,70 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     sourceAnchor = source
     possibilityObservation = controller.observe(\.isPictureInPicturePossible, options: [.new]) { [weak self] _, _ in
       DispatchQueue.main.async {
-        guard let self, !self.foreground, UIApplication.shared.applicationState == .background else { return }
-        _ = self.start()
+        self?.logState("possibleChanged")
       }
     }
     return source
   }
 
-  func setPresentation(pageVisible: Bool, foreground: Bool) {
+  func setPresentation(pageVisible: Bool, foreground _: Bool) {
+    let wasPageVisible = self.pageVisible
+    if wasPageVisible && !pageVisible { capturePreviewSnapshot() }
     self.pageVisible = pageVisible
     // 业务 onHide 可能因页面/授权弹窗晚到；是否进入系统 PiP 以 OS 生命周期为准。
     let appState = UIApplication.shared.applicationState
-    self.foreground = appState != .background
     if source == nil { _ = makeSourceView() }
     guard let source else { return }
     let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
       .first { $0.activationState == .foregroundActive || $0.activationState == .foregroundInactive }
     let hostWindow = scene?.windows.first(where: { $0.isKeyWindow })
       ?? UIApplication.shared.windows.first(where: { $0.isKeyWindow && !$0.isHidden })
-    if let window = hostWindow, source.window !== window {
+    if appState == .active && !leavingForeground && !starting,
+       controller?.isPictureInPictureActive != true,
+       let window = hostWindow, source.window !== window {
       source.removeFromSuperview()
       window.addSubview(source)
     }
     guard let window = source.window else { return }
-    if appState == .active {
-      starting = false
-      if controller?.isPictureInPictureActive == true {
-        stoppingForForeground = true
-        controller?.stopPictureInPicture()
-      }
+    if appState == .active && !leavingForeground && !starting && controller?.isPictureInPictureActive != true {
       source.isHidden = pageVisible
       layoutEdgeHandle()
       if !pageVisible { window.bringSubviewToFront(source) }
-      // 来源优先用根视图：系统拿它的布局区域判断视频通话在屏幕上的位置，
-      // 36x64 的把手太小。updateSourceAnchor 内部只在变化时重建一次。
-      if let root = window.rootViewController?.view, root.window != nil, !root.isHidden {
-        updateSourceAnchor(root)
-      } else {
-        sourceAnchor = source
-      }
-    } else if appState == .background {
-      // 前台时把手按页面可见性隐藏；进后台必须让它重新可见，
-      // 否则系统会把 video call 来源判为不可见，PiP 起不来。
-      source.isHidden = false
-      // willResignActive 偶发没赶上时在这里补一张，保证 PiP 不是黑块。
-      if video?.track == nil { capturePreviewSnapshot() }
-      _ = start()
+      // uni-app 页面可能由 presented/navigation 控制器承载；根视图挂在 window
+      // 并不代表它可见。离开会议页后，以实际显示的返回会议入口作为来源。
+      let anchor = pageVisible ? (visiblePageView(in: window) ?? source) : source
+      let anchorChanged = sourceAnchor !== anchor
+      updateSourceAnchor(anchor)
+      if anchor === source { source.isHidden = false }
+      if anchorChanged || !wasPageVisible || previewSnapshot == nil { capturePreviewSnapshot() }
+      if preview?.hasFrame != true { preview?.displayPlaceholder() }
     }
+    refreshDiagnostics()
   }
 
   func setCapturePromptVisible(_ visible: Bool) {
     capturePromptVisible = visible
     controller?.canStartPictureInPictureAutomaticallyFromInline = !visible
+    logState(visible ? "capturePromptShown" : "capturePromptDismissed")
+  }
+
+  private func visiblePageView(in window: UIWindow) -> UIView? {
+    var current = window.rootViewController
+    while let candidate = current {
+      if let presented = candidate.presentedViewController,
+         !presented.isBeingDismissed, !(presented is UIAlertController) {
+        current = presented
+      } else if let navigation = candidate as? UINavigationController, let visible = navigation.visibleViewController {
+        current = visible
+      } else if let tabs = candidate as? UITabBarController, let selected = tabs.selectedViewController {
+        current = selected
+      } else {
+        break
+      }
+    }
+    guard let view = current?.viewIfLoaded, view.window === window,
+          !view.isHidden, view.alpha > 0, !view.bounds.isEmpty else { return nil }
+    return view
   }
 
   private func layoutEdgeHandle() {
@@ -176,8 +200,8 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
 
   /// 只在来源真正变化时重建 contentSource；同一实例反复赋值会让系统丢掉 PiP 能力。
   private func updateSourceAnchor(_ anchor: UIView) {
-    guard sourceAnchor !== anchor, let content else { return }
-    controller?.contentSource = .init(activeVideoCallSourceView: anchor, contentViewController: content)
+    guard sourceAnchor !== anchor, let content, let controller else { return }
+    controller.contentSource = .init(activeVideoCallSourceView: anchor, contentViewController: content)
     sourceAnchor = anchor
   }
 
@@ -198,91 +222,76 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
   }
 
   func update(_ track: (any VideoTrack)?) {
-    if video?.track !== track { video?.track = track }
+    let trackChanged = video?.track !== track
+    if trackChanged { video?.track = track }
     video?.isHidden = track == nil
-    // 没有可订阅的画面时退回静态会议快照；两者都没有才露出深色底。
-    preview?.isHidden = track != nil || previewSnapshot == nil
+    // 保留封面视频层在下方，避免切轨时异步创建的 LiveKit renderer 留出空白。
+    if track == nil && (trackChanged || preview?.hasFrame != true) { preview?.redisplay() }
   }
 
-  /// 抓一眼当前窗口画面给 PiP 当封面。会议室里通常没有远端视频，
-  /// 靠黑底文案会让后台浮窗看起来像坏了。
+  /// 只截会议页，离开会议后保留最后一帧，不能把聊天/设置页带进系统小窗。
   private func capturePreviewSnapshot() {
-    guard previewSnapshot == nil || video?.track == nil,
-          let window = source?.window ?? UIApplication.shared.windows.first(where: { $0.isKeyWindow }) else { return }
-    let renderer = UIGraphicsImageRenderer(bounds: window.bounds)
+    guard pageVisible, !capturePromptVisible, UIApplication.shared.applicationState != .background,
+          let anchor = sourceAnchor, anchor !== source, anchor.window != nil,
+          !anchor.isHidden, !anchor.bounds.isEmpty else { return }
+    let scale = min(1, 640 / max(anchor.bounds.width, anchor.bounds.height))
+    let size = CGSize(width: anchor.bounds.width * scale, height: anchor.bounds.height * scale)
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    format.opaque = true
+    let renderer = UIGraphicsImageRenderer(size: size, format: format)
     let image = renderer.image { context in
-      window.layer.render(in: context.cgContext)
+      context.cgContext.scaleBy(x: scale, y: scale)
+      context.cgContext.translateBy(x: -anchor.bounds.minX, y: -anchor.bounds.minY)
+      anchor.layer.render(in: context.cgContext)
     }
     guard image.size.width > 0, image.size.height > 0 else { return }
     previewSnapshot = image
-    preview?.image = image
-    preview?.isHidden = video?.track != nil
+    preview?.display(image)
   }
 
-  /// 退后台前的最后一帧前台时机。系统要求 PiP 在前台发起，
-  /// 进入 .background 再调会被静默忽略（连失败回调都没有）。
-  private func startForBackground() -> Bool {
-    // 退后台前只做准备，真正启动交给系统自动 PiP：
-    // startPictureInPicture() 在 .inactive/.background 调用会被 AVKit 以 -1001 拒绝。
-    guard let source else { return false }
-    source.isHidden = false
-    let state = UIApplication.shared.applicationState
-    let handleIsAnchor = controller?.contentSource?.activeVideoCallSourceView === source
-    NSLog("[MeetingPiP] resign state=%d anchorWindow=%d possible=%d handleAnchor=%d hidden=%d audio=%@",
-      state.rawValue, sourceAnchor?.window != nil ? 1 : 0,
-      controller?.isPictureInPicturePossible == true ? 1 : 0,
-      handleIsAnchor ? 1 : 0, source.isHidden ? 1 : 0,
-      AVAudioSession.sharedInstance().category.rawValue)
+  /// 自动 PiP 只是“允许系统启动”，用户关闭系统自动画中画后不会触发任何 delegate。
+  /// 在 willResignActive 的前台退出窗口主动请求，避免进入 background 后再调用被 AVKit 拒绝。
+  private func requestStartForBackground() {
     guard !capturePromptVisible, let controller else {
-      NSLog("[MeetingPiP] resign blocked prompt=%d ctrl=%d",
-        capturePromptVisible ? 1 : 0, self.controller == nil ? 0 : 1)
-      return false
+      lastFailure = capturePromptVisible ? "capture_prompt" : "controller_missing"
+      return
     }
-    guard controller.canStartPictureInPictureAutomaticallyFromInline else {
-      NSLog("[MeetingPiP] auto PiP disabled")
-      return false
+    if controller.isPictureInPictureActive || starting { return }
+    guard controller.isPictureInPicturePossible else {
+      lastFailure = "not_possible_at_resign"
+      return
     }
-    // 仍处于前台活跃时才允许手动补一次；其余交给系统。
-    guard state == .active, controller.isPictureInPicturePossible else {
-      NSLog("[MeetingPiP] resign skip state=%d possible=%d preview=%d",
-        state.rawValue, controller.isPictureInPicturePossible ? 1 : 0,
-        previewSnapshot == nil ? 0 : 1)
-      return false
-    }
-    if controller.isPictureInPictureActive || starting { return true }
     starting = true
+    startTrigger = "manual"
+    lastFailure = ""
     controller.startPictureInPicture()
-    NSLog("[MeetingPiP] startPictureInPicture requested state=%d preview=%d",
-      state.rawValue, previewSnapshot == nil ? 0 : 1)
-    // 系统静默拒绝时没有 delegate 回调，超时复位避免 starting 卡死。
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-      guard let self, let controller = self.controller, !controller.isPictureInPictureActive else { return }
+    let expectedLifecycle = lifecycleID
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak controller] in
+      guard let self, let controller, self.controller === controller,
+            self.lifecycleID == expectedLifecycle, self.starting,
+            !self.startedDuringTransition, !controller.isPictureInPictureActive else { return }
       self.starting = false
-      NSLog("[MeetingPiP] start timeout possible=%d", controller.isPictureInPicturePossible ? 1 : 0)
+      if self.lastFailure.isEmpty { self.lastFailure = "manual_start_timeout" }
+      self.logState("manualStartNotObserved")
     }
-    return true
   }
 
-  func start() -> Bool {
-    let appState = UIApplication.shared.applicationState
-    source?.isHidden = false
-    let anchorAlive = sourceAnchor?.window != nil
-    NSLog("[MeetingPiP] start state=%d prompt=%d anchor=%d ctrl=%d possible=%d",
-      appState.rawValue, capturePromptVisible ? 1 : 0, anchorAlive ? 1 : 0,
-      self.controller == nil ? 0 : 1,
-      controller?.isPictureInPicturePossible == true ? 1 : 0)
-    // 后台/失活状态调用 startPictureInPicture 必被 AVKit 以 -1001 拒绝，
-    // 这里只落状态；起 PiP 由 canStartPictureInPictureAutomaticallyFromInline 交给系统。
-    guard appState == .active, !capturePromptVisible,
-          anchorAlive, let controller else { return false }
-    if controller.isPictureInPictureActive || starting { return true }
-    guard controller.isPictureInPicturePossible else {
-      lastFailure = "not_possible"
-      return false
+  /// 观察主动请求和系统自动兜底的最终结果。
+  private func observeAutomaticStart() {
+    guard let expectedController = controller, !capturePromptVisible else { return }
+    let expectedLifecycle = lifecycleID
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self, weak expectedController] in
+      guard let self, let expectedController, self.controller === expectedController,
+            self.lifecycleID == expectedLifecycle, UIApplication.shared.applicationState == .background,
+            !self.capturePromptVisible, !self.startedDuringTransition,
+            !expectedController.isPictureInPictureActive else { return }
+      if self.lastFailure.isEmpty {
+        self.lastFailure = expectedController.isPictureInPicturePossible ? "auto_start_timeout" : "not_possible"
+      }
+      self.starting = false
+      self.logState("autoStartNotObserved")
     }
-    starting = true
-    controller.startPictureInPicture()
-    return true
   }
 
   func stop() {
@@ -310,6 +319,11 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     stoppingForForeground = false
     capturePromptVisible = false
     lastFailure = ""
+    leavingForeground = false
+    lifecycleID += 1
+    startedDuringTransition = false
+    startTrigger = "none"
+    refreshDiagnostics()
   }
 
   func diag() -> String {
@@ -322,29 +336,59 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
   }
 
   private func refreshDiagnostics() {
-    let value = "pip[possible=\(controller?.isPictureInPicturePossible == true ? 1 : 0),active=\(controller?.isPictureInPictureActive == true ? 1 : 0),source=\(sourceAnchor?.window == nil ? 0 : 1),err=\(lastFailure)]"
+    let anchor = controller?.contentSource?.activeVideoCallSourceView
+    let value = "pip[build=ios-pip-20261125-p12,possible=\(controller?.isPictureInPicturePossible == true ? 1 : 0),active=\(controller?.isPictureInPictureActive == true ? 1 : 0),starting=\(starting ? 1 : 0),trigger=\(startTrigger),source=\(anchor?.window == nil ? 0 : 1),hidden=\(anchor?.isHidden == true ? 1 : 0),frame=\(preview?.hasFrame == true ? 1 : 0),previewStatus=\(preview?.displayLayer.status.rawValue ?? -1),videoLayer=\(video?.avSampleBufferDisplayLayer == nil ? 0 : 1),app=\(UIApplication.shared.applicationState.rawValue),auto=\(controller?.canStartPictureInPictureAutomaticallyFromInline == true ? 1 : 0),prompt=\(capturePromptVisible ? 1 : 0),err=\(lastFailure)]"
     diagnosticLock.lock()
     diagnosticSnapshot = value
     diagnosticLock.unlock()
   }
 
+  private func logState(_ event: String) {
+    refreshDiagnostics()
+    let anchor = controller?.contentSource?.activeVideoCallSourceView
+    NSLog("[MeetingPiP] %@ %@ anchor=%@ rect=%@ audio=%@", event, diag(),
+      anchor.map { String(describing: type(of: $0)) } ?? "nil",
+      NSCoder.string(for: anchor.map { $0.convert($0.bounds, to: $0.window) } ?? .zero),
+      AVAudioSession.sharedInstance().category.rawValue)
+  }
+
+  func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+    starting = true
+    startedDuringTransition = true
+    if startTrigger == "none" { startTrigger = "automatic" }
+    lastFailure = ""
+    logState("willStart")
+  }
+
   func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
     starting = false
+    startedDuringTransition = true
     lastFailure = ""
-    // 这里不能再回调 setPresentation：前台分支会把刚落地的 PiP 立刻停掉。
-    NSLog("[MeetingPiP] didStart")
+    logState("didStart")
+    // 快速切回 App 时，didBecomeActive 可能早于启动动画完成。
+    if stoppingForForeground { pictureInPictureController.stopPictureInPicture() }
   }
 
   func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+    starting = false
+    startTrigger = "none"
     stoppingForForeground = false
+    logState("didStop")
+    if UIApplication.shared.applicationState == .active && !leavingForeground {
+      setPresentation(pageVisible: pageVisible, foreground: true)
+    }
   }
 
   func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
     failedToStartPictureInPictureWithError error: Error) {
     starting = false
+    stoppingForForeground = false
     let failure = error as NSError
     lastFailure = "\(failure.domain):\(failure.code)"
-    NSLog("[MeetingPiP] failed: %@", lastFailure)
+    let underlying = failure.userInfo[NSUnderlyingErrorKey] as? NSError
+    NSLog("[MeetingPiP] failed: %@ description=%@ underlying=%@", lastFailure,
+      failure.localizedDescription, underlying.map { "\($0.domain):\($0.code) \($0.localizedDescription)" } ?? "none")
+    logState("failed")
   }
 
   func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController,
@@ -352,6 +396,102 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     // 原页面可能已返回退栈；交给业务层恢复路由，复用原 Room 而不是重新入会。
     if !stoppingForForeground { restoreRequested = true }
     completionHandler(source?.window != nil)
+  }
+}
+
+/// 无远端画面时仍保留一个真正的媒体层。只缓存一张低分辨率会议封面，
+/// 不启动摄像头、不发布本地轨道，也不依赖后台继续截图。
+private final class MeetingPiPPreviewView: UIView {
+  override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
+  var displayLayer: AVSampleBufferDisplayLayer { layer as! AVSampleBufferDisplayLayer }
+  private var pixelBuffer: CVPixelBuffer?
+  private(set) var hasFrame = false
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    displayLayer.videoGravity = .resizeAspect
+  }
+
+  required init?(coder: NSCoder) {
+    super.init(coder: coder)
+    displayLayer.videoGravity = .resizeAspect
+  }
+
+  func displayPlaceholder() {
+    guard pixelBuffer == nil else { redisplay(); return }
+    let size = CGSize(width: 320, height: 180)
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    format.opaque = true
+    let image = UIGraphicsImageRenderer(size: size, format: format).image { context in
+      UIColor(white: 0.12, alpha: 1).setFill()
+      context.fill(CGRect(origin: .zero, size: size))
+      UIImage(systemName: "person.2.fill")?.withTintColor(.lightGray, renderingMode: .alwaysOriginal)
+        .draw(in: CGRect(x: 128, y: 66, width: 64, height: 48))
+    }
+    display(image)
+  }
+
+  func display(_ image: UIImage) {
+    guard let cgImage = image.cgImage else { return }
+    let attributes = [
+      kCVPixelBufferCGImageCompatibilityKey as String: true,
+      kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
+      kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+    ] as CFDictionary
+    var buffer: CVPixelBuffer?
+    let result = CVPixelBufferCreate(kCFAllocatorDefault, cgImage.width, cgImage.height,
+      kCVPixelFormatType_32BGRA, attributes, &buffer)
+    guard result == kCVReturnSuccess, let buffer else {
+      NSLog("[MeetingPiP] preview pixel buffer failed status=%d", result)
+      return
+    }
+    do {
+      guard CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { return }
+      defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+      guard let address = CVPixelBufferGetBaseAddress(buffer),
+            let context = CGContext(data: address, width: cgImage.width, height: cgImage.height,
+              bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+              space: CGColorSpaceCreateDeviceRGB(),
+              bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue) else { return }
+      context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+    }
+    pixelBuffer = buffer
+    redisplay()
+  }
+
+  func redisplay() {
+    guard let pixelBuffer else { return }
+    var description: CMVideoFormatDescription?
+    let formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
+      imageBuffer: pixelBuffer, formatDescriptionOut: &description)
+    guard formatStatus == noErr, let description else {
+      NSLog("[MeetingPiP] preview format failed status=%d", formatStatus)
+      return
+    }
+    var timing = CMSampleTimingInfo(duration: .invalid,
+      presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()), decodeTimeStamp: .invalid)
+    var sample: CMSampleBuffer?
+    let sampleStatus = CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault,
+      imageBuffer: pixelBuffer, formatDescription: description, sampleTiming: &timing, sampleBufferOut: &sample)
+    guard sampleStatus == noErr, let sample else {
+      NSLog("[MeetingPiP] preview sample failed status=%d", sampleStatus)
+      return
+    }
+    guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
+          CFArrayGetCount(attachments) > 0 else { return }
+    let attachment = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+    CFDictionarySetValue(attachment,
+      Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+      Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+    if displayLayer.status == .failed {
+      NSLog("[MeetingPiP] preview renderer failed: %@", displayLayer.error?.localizedDescription ?? "unknown")
+      displayLayer.flush()
+      hasFrame = false
+    }
+    guard displayLayer.isReadyForMoreMediaData else { return }
+    displayLayer.enqueue(sample)
+    hasFrame = true
   }
 }
 

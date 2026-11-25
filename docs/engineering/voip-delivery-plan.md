@@ -58,7 +58,7 @@ APNs VoIP 是苹果的电话投递机制，不意味着要另部署一个 APNs �
 
 1. **正式业务入口和构建闸门**：当前 Android 原生 initialize／receiveUniPush 接受 qaAccepted，或 Debug 且 businessEnabled；当前通话放行仍受测试范围限制。后续须完成真实发行构建的能力授权和环境配置，测试与正式使用相同业务协议和推送接收实现，不依靠 QA 标志或开发监听维持功能。先完成本地实现及测试，生产开关仍在具体变更确认后开启，本次不自动放开。
 2. **有效邀请的投递**：复用现有 IM 与 UniPush 电话路由，按真实账号／设备／登记版本选择目标，不机械跳过在线 WS。对已无执行进程的设备，必须证明厂商投递会使原生接收层执行；仅出现普通通知、只有点击回调或重新打开 App 后补收均不满足。
-3. **原生冷启动**：沿用 VoipUniPushIntentService → VoipBridge.receiveUniPush／incoming → 业务校验 → Telecom／CallStyle → 用户接听后的 LiveKit。验证加密身份恢复、退出撤销、凭据失效、去重／终态、后台执行时限、铃声和系统来电展示；不能以提前存在的自身前台服务规避无进程条件。
+3. **原生冷启动**：沿用 NuwaxUniPushIntentService → VoipBridge.receiveUniPush／incoming → 业务校验 → Telecom／CallStyle → 用户接听后的 LiveKit。验证加密身份恢复、退出撤销、凭据失效、去重／终态、后台执行时限、铃声和系统来电展示；不能以提前存在的自身前台服务规避无进程条件。
 4. **逐厂商能力**：普通厂商透传无法保证拉起被杀进程。先对已部署聚合路线实证；不能满足的厂商核对获准的通话／VoIP 能力、SDK 与对应回调，仍接入现有插件及同一后端调度。支持范围按厂商／ROM／版本记录，不因为华为或荣耀一台通过就推定所有 Android 可用。[个推官方限制](https://docs.getui.com/getui/mobile/vendor/androidstudio/)
 
 ### 必须取得的 Android 证据

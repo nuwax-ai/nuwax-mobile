@@ -1,10 +1,12 @@
 import Intent from 'android.content.Intent';
+import PushDeliverySession from 'com.nuwax.pushkeepalive.PushDeliverySession';
+import PushRuntime from 'com.nuwax.pushkeepalive.PushRuntime';
 
 /**
  * nuwax-push-keepalive · app-android
  *
- * 推送保活锚点服务：进程被系统「划掉任务」杀掉后，由 AMS 因 START_STICKY 重新拉起
- * :pushservice 进程，并在进程里把个推的 UniPushService 重新 start，让长连接自己重连。
+ * 主进程恢复入口：START_STICKY 请求系统重建服务，再请求个推恢复连接。
+ * 是否在线以 SDK 回调为准；无 Activity 消息由 DCloud 回调桥补系统通知。
  *
  * 服务本体见 src/com/nuwax/pushkeepalive/PushKeepAliveService.kt
  * （UTS 里 extends Service 生成的父类声明不带构造调用，Release 编不过，所以用 Kotlin）。
@@ -17,34 +19,77 @@ import Intent from 'android.content.Intent';
 const KEEPALIVE_SERVICE = "com.nuwax.pushkeepalive.PushKeepAliveService"
 
 /**
+ * 必须在 uni.onPushMessage / uni.getPushClientId 首次触发 Getui 初始化之前调用。
+ * 保留 Getui 固定启动的 DCloud Service，只包装 PushActionHolder 中的回调；
+ * 有 Activity 时完整转发 DCloud 原逻辑，无 Activity 时才补普通 IM 通知。
+ * 不申请权限、不读写登录凭据，且本函数只会在已登录流程中调用。
+ */
+export function preparePushReceiver(): boolean {
+  const context = UTSAndroid.getAppContext()
+  if (context == null) return false
+  try {
+    return PushRuntime.installDCloudBridge(context)
+  } catch (e) {
+    console.warn(`[push-keepalive] receiver registration failed: ${e}`)
+    return false
+  }
+}
+
+/**
  * 启动保活锚点（幂等：重复调用只是重新 startService）。
  * 建议在个推 SDK 初始化成功之后调用（bindImPushClient / getPushClientId 成功回调），
  * 不要在隐私弹窗同意之前调用。
  */
-export function ensurePushKeepAlive(): void {
+export function ensurePushKeepAlive(): boolean {
   const activity = UTSAndroid.getUniActivity()
-  if (activity == null) return
+  if (activity == null) return false
   try {
     const intent = new Intent()
     intent.setClassName(activity, KEEPALIVE_SERVICE)
-    activity.startService(intent)
+    return activity.startService(intent) != null
   } catch (e) {
     console.warn(`[push-keepalive] start failed: ${e}`)
+    return false
   }
 }
 
 /**
  * 停止保活锚点。
- * 正常业务不会用到（vendor 是设备属性，恒定不变），保留给联调与兜底场景。
+ * 登出或关闭推送偏好后停用；同一账号重新开启时可以再次启动。
  */
 export function stopPushKeepAlive(): void {
-  const activity = UTSAndroid.getUniActivity()
-  if (activity == null) return
+  const context = UTSAndroid.getAppContext()
+  if (context == null) return
   try {
     const intent = new Intent()
-    intent.setClassName(activity, KEEPALIVE_SERVICE)
-    activity.stopService(intent)
+    intent.setClassName(context, KEEPALIVE_SERVICE)
+    context.stopService(intent)
   } catch (e) {
     console.warn(`[push-keepalive] stop failed: ${e}`)
+  }
+}
+
+/** 仅在 users/me 已确认当前账号后同步；不初始化 SDK、不保存凭据。 */
+export function syncNativePushSession(user: string, environment: string, enabled: boolean, fallback: boolean): void {
+  const context = UTSAndroid.getAppContext()
+  if (context == null) return
+  try {
+    PushDeliverySession.sync(context, user, environment, enabled, fallback)
+    if (enabled && fallback) ensurePushKeepAlive()
+    else stopPushKeepAlive()
+  } catch (e) {
+    console.warn(`[push-keepalive] session sync failed: ${e}`)
+  }
+}
+
+/** 登出、切账号、切环境时先关闭原生展示，再异步注销服务端设备。 */
+export function clearNativePushSession(): void {
+  const context = UTSAndroid.getAppContext()
+  if (context == null) return
+  try {
+    PushDeliverySession.clear(context)
+    stopPushKeepAlive()
+  } catch (e) {
+    console.warn(`[push-keepalive] session clear failed: ${e}`)
   }
 }

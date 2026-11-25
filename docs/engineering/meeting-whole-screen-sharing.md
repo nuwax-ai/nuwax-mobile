@@ -8,7 +8,7 @@
 - 不提供“小窗”按钮或“最小化”选择。返回其他页面自动保留会议并显示贴右边沿的白底灰色会议图标（36×64、仅左侧圆角），可以上下拖动，点击回到会议。会议页不显示该入口，会议列表不再重复显示顶部返回横条；旧基座使用相同外形的业务组件备用入口。
 - Android 退后台使用 `TYPE_APPLICATION_OVERLAY`，与 App 内相同的白底灰色会议图标（36×64、左侧圆角、可上下拖动），不再自动进入系统 PiP。首次在会中前台展示悬浮窗权限说明，用户点击“去设置”后开启“显示在其他应用上层”；拒绝后不重复弹窗，可从系统通知返回会议，之后也可在系统应用设置中手动授权。回前台隐藏桌面入口，会议页面隐藏 App 内入口；录屏授权期间和锁屏时隐藏桌面入口。
 - Android 桌面窗口使用 Application context，生命周期由原生会议和前台服务持有，`stopWithTask=false`，移除最近任务/销毁 Activity 不主动断会或移除桌面入口。离会、断连或服务销毁必须移除窗口，不持久化或自动重建已结束的会议。部分厂商清理最近任务会同时杀死进程；强制停止或系统杀进程后无法保留窗口和通话。
-- iOS 仍使用系统 PiP 展示后台会议，不支持 Android 式跨应用任意浮窗。本次只统一 iOS App 内入口的白底灰图标样式；系统 PiP 外形仍由系统管理。
+- iOS 仍使用系统 PiP 展示后台会议，不支持 Android 式跨应用任意浮窗。App 内入口为白底灰色会议图标；系统 PiP 外形由系统管理，内容与启动修复见下文 p12 排障记录。
 - 小窗由原生会话持有，不随会议页面销毁；不回显本端共享屏幕以避免镜像递归。右上角退出仍按主持人/参会人权限处理。另一场会议不能覆盖尚未离开的会议。
 - 旧基座缺少后台配置/自动小窗导出时，仍保留原有入会、聊天、举手和 `requestScreenShare`（iOS 旧实现仅共享本 App），App 内保留返回会议提示。原生已连接但页面残留 exception 时按真实状态校准，不能误报要求更新组件。
 - 录屏不包含其他应用的内部音频；会议麦克风继续使用原音轨。受系统保护内容可能不可录制，强制终止 App 不承诺继续会议。
@@ -72,7 +72,7 @@ ruby -c scripts/ios-broadcast/generate.rb
 node --test scripts/meeting-connect.test.mjs
 ```
 
-真机需验证：授权取消/等待超过 60 秒、共享后 Home/切换其他 App、横竖屏、系统停止录屏、返回上一页会议图标与上下拖动（拖动结束不能误入会）、点击回会、其他端接管共享、后台被结束会议、离会时仍在授权弹窗、权限拒绝、断网重连、小窗关闭/恢复、系统关闭自动 PiP 后仍能继续会议。Android 与 iOS 对看时同时记录实际 codec/尺寸/fps，不能只看 `nativeOn=true` 判定传输流畅。预期基座诊断标记：Android `android-meeting-20261123-p11`，iOS `ios-meeting-20261123-p10`。
+真机需验证：授权取消/等待超过 60 秒、共享后 Home/切换其他 App、横竖屏、系统停止录屏、返回上一页会议图标与上下拖动（拖动结束不能误入会）、点击回会、其他端接管共享、后台被结束会议、离会时仍在授权弹窗、权限拒绝、断网重连、小窗关闭/恢复、系统关闭自动 PiP 后仍能继续会议并由主动请求出窗。Android 与 iOS 对看时同时记录实际 codec/尺寸/fps，不能只看 `nativeOn=true` 判定传输流畅。预期基座诊断标记：Android `android-meeting-20261123-p11`，iOS `ios-meeting-20261125-p12`。
 
 后台释放请求失败会记录简短诊断，回前台由媒体层再次校准；网络中断或 JWT 过期期间不能保证服务端占位立即释放。
 
@@ -92,6 +92,36 @@ node --test scripts/meeting-connect.test.mjs
 4. 录屏授权、锁屏/解锁、横竖屏、设置中撤销悬浮权限分别验证，没有重复窗口、授权页遮挡或崩溃。
 5. 正常离会、主持人结束会议、网络断开后最终离线：窗口和前台通知移除，旧入口不能打开下一场会议。
 6. 两台设备验证后台音频及整屏共享继续工作；此改动不调整 LiveKit 发布、订阅或编码参数。
+
+### iOS PiP 排障与本次修复（p12，待真机验收）
+
+已有本地真机日志反映了两类问题，不能只通过 `possible=1` 判断系统已经出窗：
+
+- `/private/tmp/pip-console12.log` 中 7 次启动请求均超时，没有 `didStart`；请求时已是前台且 `possible=1`，已入会、麦克风开启，远端没有视频轨。检查现有 IPA 已包含 `audio` 后台模式，因此本次不重复添加后台权限，也不把问题归因于未入会。
+- `/private/tmp/pip-console8.log` 中曾有 9 次 `didStart`，部分请求发生在 inactive 状态。旧注释“inactive 一定启动失败”与日志不符；这些回调也不能证明当时用户实际看到了有效内容。
+- 当前 LiveKit 2.19.0 在没有轨道/视图隐藏时不创建 sample-buffer renderer。旧封面只有 UIImageView，设置 `.renderMode = .sampleBuffer` 本身不能补出媒体层。
+- 来源从独立入口改成根视图后，最新日志均未启动成功。根视图可能被 uni-app 的 presented 页面遮挡，这是需要修正的来源选择风险，尚不能仅凭日志证明它就是唯一原因。
+
+本次源码修改：
+
+1. 无远端视频时，将会议封面转换成 CVPixelBuffer / CMSampleBuffer，交给 AVSampleBufferDisplayLayer；前台先准备首帧，会议页面尚未可截图时使用会议图标。只更新会议页封面，离开会议后保留最后一帧，不截取聊天或设置页。
+2. 会议页使用当前 presented / navigation / tab 控制器的可见视图作为动画来源，其他页面使用实际显示的返回会议入口；来源引用与 controller.contentSource 始终同步，后台切换期间不重新挂载或替换来源。
+3. p11 真机日志确认来源、首帧、系统能力均正常，但只设置 `canStartPictureInPictureAutomaticallyFromInline` 没有产生任何启动 delegate，最终为 `auto_start_timeout`。p12 在 `willResignActive` 同步主动请求 `startPictureInPicture()`，系统自动 PiP继续作为兜底；进入 background 后不再发起无效重试。
+4. 增加 willStart / didStart / didStop、首帧入队、renderer 状态、来源类型/位置、系统状态、启动来源 `trigger=manual|automatic` 与底层错误日志。主动请求无回调记录 `manual_start_timeout`，自动兜底未观察到记录 `auto_start_timeout`。
+
+按 Apple 的视频通话 PiP 接入说明，内容使用视频层，并在退后台时通过自动 PiP 启动。参考：[Adopting Picture in Picture for video calls](https://developer.apple.com/documentation/avkit/adopting-picture-in-picture-for-video-calls)。本次没有新增摄像头采集或向会议发布封面。
+
+验收必须重新构建并安装 iOS 自定义基座；Swift 修改不能仅靠业务热更新生效。预期桥接标记为 `ios-meeting-20261125-p12`，PiP 标记为 `ios-pip-20261125-p12`。旧包未包含本次修复。
+
+待验证：
+
+1. 单人入会、摄像头关闭、没有远端视频：会议页 Home / 切换其他 App，确认出现有内容的 PiP，同时记录 `willStart → didStart`。
+2. 远端开摄像头/共享、远端停止画面：分别退后台，确认远端画面与会议封面能切换。
+3. 返回聊天或设置页再 Home：来源为返回会议入口，PiP 不能出现聊天或设置页截图。
+4. 快速连续前后台切换、展开/关闭小窗、录屏授权取消/完成、锁屏/解锁、离会再入会：不能立即收掉新窗口、重复出窗或被旧超时回调改写状态。
+5. 分别开启、关闭系统“自动开启画中画”后退后台，都应出现 PiP。诊断优先看到 `trigger=manual`；如果由系统接管则为 `trigger=automatic`。
+
+`frame=1` 只代表封面帧已入队；`possible=1` 只代表当时具备启动条件。需结合 `active=1`、`didStart` 和设备上的实际显示验收。本次仅做代码静态检查与既有会议业务测试，未运行平台编译、重打基座或验证真机显示。
 
 ### 全局入口与返回路由
 

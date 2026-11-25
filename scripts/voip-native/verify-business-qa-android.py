@@ -71,7 +71,8 @@ for icon in ["hangup", "phone", "video", "video_off", "switch_camera", "micropho
     native = ROOT / RESOURCE_PATH / "drawable-nodpi" / (name + ".png")
     assert native.read_bytes() == shared.read_bytes(), f"Native call drawable differs from the in-app icon: {name}"
 assert "nuwax.voip.qaApiOrigin" in xml and ORIGIN in xml
-assert "com.nuwax.voip.VoipUniPushIntentService" in xml
+assert "uts.sdk.modules.DCloudUniPush.UniPushIntentService" in xml
+assert "com.nuwax.pushkeepalive.NuwaxUniPushIntentService" not in xml
 assert "com.igexin.sdk.HonorPushMessageService" in xml and "com.igexin.sdk.HmsPushMessageService" in xml
 assert "com.nuwax.voip.VoipIncomingActivity" in xml and "com.nuwax.voip.VoipCallService" in xml
 for excluded in ["DCLOUD_DEBUG", "nuwax.voip.deviceTest", 'android:name(0x01010003)="com.nuwax.voip.VoipDevControlService"']:
@@ -94,6 +95,7 @@ with zipfile.ZipFile(APK) as archive:
     assert count > 100
     dex = b"".join(archive.read(name) for name in archive.namelist() if re.fullmatch(r"classes[0-9]*\.dex", name))
     for value in [ORIGIN, "Lcom/nuwax/voip/VoipBridge;", "Lcom/nuwax/voip/VoipNativeCallView;", "Lcom/igexin/sdk/HonorPushMessageService;", "Lcom/igexin/sdk/HmsPushMessageService;",
+                  "Lcom/nuwax/pushkeepalive/PushRuntime;", "DCloud push action bridge installed",
                   "nuwax-voip-incoming-v2", "nuwax-voip-ongoing-v1", "pushPreviousRegistrationId", "/push-binding"]:
         assert value.encode() in dex, f"Missing compiled implementation: {value}"
     if "vivo" in vendor_adapters:
@@ -104,8 +106,8 @@ with zipfile.ZipFile(APK) as archive:
 native = ROOT / "uni_modules/nuwax-voip/utssdk/app-android/src/com/nuwax/voip"
 for path in native.glob("*.kt"):
     assert path.read_bytes() == (PROJECT / "uts-nuwax-voip/src/main/java/com/nuwax/voip" / path.name).read_bytes(), f"Stale native source: {path.name}"
-receiver = ROOT / "uni_modules/nuwax-voip/native/android-unipush/VoipUniPushIntentService.kt"
-assert receiver.read_bytes() == (PROJECT / "app/src/main/java/com/nuwax/voip" / receiver.name).read_bytes()
+runtime = ROOT / "uni_modules/nuwax-push-keepalive/utssdk/app-android/src/com/nuwax/pushkeepalive/PushRuntime.kt"
+assert runtime.read_bytes() == (PROJECT / "uts-nuwax-push-keepalive/src/main/java/com/nuwax/pushkeepalive" / runtime.name).read_bytes()
 for path, data in localized_labels(ROOT).items():
     assert (ROOT / RESOURCE_PATH / path).read_bytes() == data
     assert (PROJECT / "uts-nuwax-voip/src/main/res" / path).read_bytes() == data

@@ -21,7 +21,7 @@ import notificationManager from "@ohos.notificationManager";
 // #ifdef APP-ANDROID
 import Build from "android.os.Build";
 import { classifyOemPushVendor } from "@/utils/push/pushBackgroundPolicy";
-import { ensurePushKeepAlive } from "@/uni_modules/nuwax-push-keepalive";
+import { ensurePushKeepAlive, preparePushReceiver } from "@/uni_modules/nuwax-push-keepalive";
 // #endif
 
 /**
@@ -367,8 +367,8 @@ function showLocalNoticeForAndroid(data: UTSJSONObject | null): void {
 }
 
 // #ifdef APP-ANDROID
-/** 保活锚点是否已尝试过（模块级一次性闸门，避免重复 startService）。 */
-let pushKeepAliveEnsured = false;
+/** 仅限流已受理的启动请求；失败或下次回前台允许重试。 */
+let pushKeepAliveRequestedAt = 0;
 
 /**
  * 只有「没有厂商推送通道」的设备才启动自己的 START_STICKY 锚点服务。
@@ -377,8 +377,8 @@ let pushKeepAliveEnsured = false;
  *   `:pushservice` 连同主进程一起 kill（reason = "remove task"）；而 uni-push 的
  *   UniPushService 继承的 com.igexin.sdk.PushService.onStartCommand 硬编码
  *   return START_NOT_STICKY，系统不会重启它 —— 长连接断了就再也回不来，离线推送全丢。
- *   锚点服务返回 START_STICKY，被杀后由 AMS 约 1s 重新拉起进程，并在进程里把
- *   UniPushService 重新 start，让个推自己重连。
+ *   锚点返回 START_STICKY 请求系统重建服务，再请求个推重连；不承诺重启时间或在线。
+ *   冷启动收包、通知展示另由原生 UniPush 适配器补齐。
  *   详见 docs/engineering/push-swipe-kill-sticky-keepalive.md
  *
  * 为什么在这里判定而不是直接调 getPushBackgroundStatus()：
@@ -392,16 +392,18 @@ let pushKeepAliveEnsured = false;
  *   设置好后就变 false、不再弹窗），但设备始终是非厂商通道设备，划掉照样被杀。
  */
 function ensurePushKeepAliveIfNoVendorChannel(): void {
-  if (pushKeepAliveEnsured) return;
-  pushKeepAliveEnsured = true;
+  const now = Date.now();
+  if (pushKeepAliveRequestedAt > 0 && now - pushKeepAliveRequestedAt < 10000) return;
   try {
     const oem = classifyOemPushVendor(`${Build.MANUFACTURER}`, `${Build.BRAND}`);
     if (oem != "none") {
       console.log(`[ImPush] 保活锚点跳过，厂商通道=${oem}`);
       return;
     }
-    ensurePushKeepAlive();
-    console.log("[ImPush] 保活锚点已启动（无厂商通道设备）");
+    if (ensurePushKeepAlive()) {
+      pushKeepAliveRequestedAt = now;
+      console.log("[ImPush] 保活启动请求已受理，推送在线状态以原生回调为准");
+    }
   } catch (e) {
     // 保活属于增强能力，失败绝不能影响推送主链路
     console.warn(`[ImPush] 保活锚点启动失败: ${e}`);
@@ -418,8 +420,12 @@ function ensurePushKeepAliveIfNoVendorChannel(): void {
  */
 export function bindImPushClient(): void {
   // #ifdef APP-ANDROID
+  // 必须早于 pushBound 守卫和任何 uni-push API：无 Activity 的进程恢复不会执行
+  // DCloud initPush，PushActionHolder 可能为空。桥接安装幂等，失败仍保留 DCloud 原链路，
+  // 不阻断前台推送或 WebSocket。
+  preparePushReceiver();
   // ★放在 pushBound 守卫之前：已登录冷启动时本函数可能被调用多次，锚点启动要保证每次
-  //   都能走到（内部 pushKeepAliveEnsured 自带一次性闸门，重复调用无副作用）。
+  //   都能走到（只限流已受理的请求，启动失败不会永久锁住重试）。
   ensurePushKeepAliveIfNoVendorChannel();
   // #endif
   if (pushBound) {
@@ -440,6 +446,11 @@ export function bindImPushClient(): void {
  *     曾被注销，后端需要重新拿一次有效注册（见 syncImPushOnForeground）。
  */
 export function syncImPushClientId(forceReport: boolean = false): void {
+  // #ifdef APP-ANDROID
+  // 该函数是导出 API，设置页等入口可能不经 bindImPushClient；再次安装桥接，确保
+  // getPushClientId 初始化前已有无 Activity 回调，不替换 DCloud 接收器。
+  preparePushReceiver();
+  // #endif
   // ★ 云打包开关：同 bindImPushClient。
   try {
     uni.getPushClientId({

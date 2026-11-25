@@ -53,14 +53,12 @@ class PushKeepAliveService : Service() {
         if (reason != "retry") retryCount = 0
         handler.removeCallbacks(retry)
         try {
-            val registered = PushRuntime.installDCloudBridge(applicationContext)
+            PushRuntime.installDCloudBridge(applicationContext)
             PushManager.getInstance().initialize(applicationContext)
             val service = startService(Intent().setClassName(packageName, GETUI_SERVICE))
             check(service != null) { "Getui service was not resolved" }
             lastRequestedAt = now
             retryCount = 0
-            // SDK 可能内部吞错；调用返回、Service 存在及缓存 CID 都不是在线证明。
-            Log.i(TAG, "connection requested reason=$reason receiver=$registered; await native online/receive callbacks")
         } catch (error: Exception) {
             Log.w(TAG, "connection request failed reason=$reason type=${error.javaClass.simpleName}")
             // 仅重试明确失败；不无限拉活、不轮询 SDK 私有状态。下次前台调用仍可再试。

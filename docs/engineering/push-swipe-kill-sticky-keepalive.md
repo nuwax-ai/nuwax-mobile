@@ -4,7 +4,10 @@
 前置阅读：[im-offline-push.md](im-offline-push.md)（现有 uni-push 2.0 链路）、
 [im-push-fallback-plan.md](im-push-fallback-plan.md)（2026-11-04 的 FGS + WebSocket 兜底计划，本文是其**简化替代方案**）。
 
-状态：**代码已修订，待重打 Android 自定义基座后真机验证**（2026-11-24）。本轮仅做静态检查与脚本级回归。
+状态：**三星 One UI 真机已验证普通 IM 通知链路可用**（2026-11-25）：用户从最近任务划掉 App 后，
+PC 端发送真实消息，手机仍能在下拉通知面板收到系统通知。随后补齐了 headless 场景的桌面数字角标，
+角标继续使用服务端下发的未读总数，App 打开后的既有清零／校准逻辑保持不变。系统「强行停止」及
+三星 MARs autorun 未授权导致的 force-stop 仍不在本方案可恢复范围内。
 
 第 1–3 节保留早期设备调查记录，不作为当前版本端到端送达证明；当前实现以第 4 节为准。
 
@@ -301,6 +304,8 @@ if (status.vendor != "none" || !status.manualSettingsRequired) return;
   → 来电保持原生 VoIP 分流
   → 普通消息：有 Activity 交给原 UTS；无 Activity 由 ImHeadlessPush 补通知
   → 复用 SDK 通知渠道、payload、点击 Intent 和 click 事件
+  → 读取同一 payload.badge，通过 DCloud BadgeHelper 更新 Launcher 数字角标
+  → App 打开／回前台后仍由既有 unread-total 链路清零或校准角标
 ```
 
 主进程存在、初始化返回、缓存 CID 存在都不是在线或通知送达证明。STICKY 没有固定一秒重启、后台常驻或强制停止后恢复的保证。
@@ -311,6 +316,8 @@ if (status.vendor != "none" || !status.manualSettingsRequired) return;
 - `index.uts` 启动返回是否受理；没有 Activity 或发生异常返回 false，外层不再永久标记成功。
 - `PushRuntime.kt` 保留 DCloud 的 `UniPushIntentService`，通过公开的 `PushActionHolder.setPushAction` 包装标准 `UserPushAction`。普通消息先做 VoIP/无 Activity 分流，未处理时完整转发 DCloud 原回调；不依赖有 Activity 的 initPush，也不修改组件启用状态。
 - `ImHeadlessPush.kt` 只补非厂商设备普通透传，直接复用 SDK 的 PushMessage/createNotification，不等待业务 receive 回调、不全局修改 force_notification。已处理消息不再进入父类排队，避免重复展示。
+- 划掉 App 后 uni-app 运行时可能尚未初始化 `currentApp`，直接调用 `UTSAndroid.getUniActivity()` 会抛 `UninitializedPropertyAccessException`。当前实现用安全探测把该状态识别为「无 Activity」，避免原生收包后在创建通知前崩溃。
+- headless 通知不会执行 JS/UTS 的 `setAppBadgeNumber`。当前实现从与现有角标同源的 `payload.badge` 读取服务端未读总数，通过基座内置 `BadgeHelper.sendBadgeNumber` 写入 Launcher；角标失败只记录警告，不重复创建通知，也不影响通知本身。
 - 原生闸门由 imPushPreference.uts 在身份确认及偏好变化时同步；imSessionScope.uts 在退出、切账号或会话失效时先关闭原生展示并停止锚点服务。
 - 原生通知检查通知权限和载荷环境；去重仅保存用户/环境/消息定位的哈希与时间，最多 128 条、24 小时。普通推送仍依赖服务端 CID/设备绑定路由，没有收件人字段的载荷不作为原生接收者鉴权证明。
 
@@ -318,20 +325,50 @@ if (status.vendor != "none" || !status.manualSettingsRequired) return;
 
 ### 4.3 打包边界
 
-本次包含 Kotlin 服务和新增源码，**不能仅热更 uvue/uts 验证**。云打包须重新提交一次完整 Android 包；本地路线须重新生成 App 资源并重打 Android 自定义基座。
+本次包含 Kotlin 服务、接收桥和 Android Manifest 声明，**不能仅热更 uvue/uts 验证**。旧云基座里没有
+这些原生类时，即使业务资源编译成功也不会凭空生成接收器。必须重新云打 Android 自定义基座；本地路线
+则须重新生成 App 资源并重打 Android 自定义基座。新基座确认已包含原生类和 Service 后，普通 uvue/uts
+业务改动才可继续复用该基座运行。
 
 云打包从 `uni_modules/nuwax-push-keepalive/utssdk/app-android/src` 直接编译 `PushRuntime.kt` 与 `ImHeadlessPush.kt`。项目和插件 manifest 都不再移除、替换或禁用 DCloud 默认接收器；`configure_unipush.py` 的本地基座路线同样保留 SDK 原组件。标准基座或旧包不具备原生兜底。
 
 桥接接口按本机 HBuilderX 5.34 / gtsdk 3.3.7.0 AAR 核对；升级 SDK 后需重新核对接口及点击行为。
 
-### 4.4 验收
+### 4.4 2026-11-25 三星真机结论
 
-日志分四步，不输出正文、token 或完整 CID：
+| 验证项 | 结果 | 说明 |
+|---|---|---|
+| 新云基座包含新增原生实现 | 通过 | Kotlin 接收桥、STICKY Service 与 Manifest 声明进入 APK；旧基座不能验证本方案 |
+| App 前台普通消息 | 通过 | 沿用现有 UniPush/UTS/WebSocket 逻辑，没有改为 headless 展示 |
+| 从最近任务划掉后普通消息 | **通过** | PC 端发送真实消息后，三星下拉通知面板出现系统通知 |
+| 连续消息通知 | 通过 | 划掉后可继续收到实时通知，不只首条有效 |
+| headless 通知崩溃 | 已修复 | 未初始化 `currentApp` 时安全判定为无 Activity，再创建通知 |
+| 桌面数字角标 | 已修复实现 | 从服务端 `payload.badge` 写入 DCloud BadgeHelper，不再固定为 1 |
+| 打开 App 后角标清零／校准 | 保持原逻辑 | 继续由现有 unread-total 与 `setAppBadgeNumber` 链路处理，没有被原生兜底覆盖 |
+| 系统强行停止／MARs force-stop | 不支持恢复 | Android stopped 状态会清除 Service 重启调度，必须由用户重新打开 App |
 
-1. NuwaxPushKeepAlive / connection requested：仅表示启动请求提交。
-2. NuwaxImPush / sdk online=true：在线回调；CID callback 仅表示获得 CID。
-3. NuwaxImPush / native transmission received：原生已经收包。
-4. NuwaxImPush / notification submitted：调用通知链路完成，仍需确认通知栏可见及点击进会话。
+本次成功的关键不是单独「拉起个推 Service」，而是四段必须同时成立：
+
+1. 非厂商设备启用可由 AMS 重建的 `START_STICKY` 主进程锚点；
+2. 重建后重新安装 DCloud 回调桥并调用官方 `PushManager.initialize`／`UniPushService`；
+3. 在没有 Activity/UTS 运行时的进程内，原生完成普通消息通知、点击数据登记、去重和角标；
+4. 用户登录、推送偏好、环境和退出状态同步到最小原生会话闸门，避免错账号或关闭推送后仍展示。
+
+### 4.5 对原功能的影响边界
+
+- **不修改 WebSocket 协议、重连或消息处理**；App 活跃时仍由原有 WebSocket/UTS 链路刷新页面。
+- **不替换 UniPush／个推 SDK**；只包装 DCloud 已有回调，未处理的回调完整转发原实现。
+- **厂商通道设备不启动锚点服务**；华为、荣耀、小米、OPPO、vivo 等继续走原厂商离线通道。
+- **有 Activity 时不创建第二条通知**；headless 处理返回 false，交还原 UTS 逻辑，避免重复通知。
+- **VoIP／会议载荷不降级成聊天通知**；继续交给原生通话校验和分流。
+- 登录失效、切账号、切环境、退出或用户关闭消息推送时，先关闭原生会话并停止锚点服务。
+- 回调桥或角标增强失败时保留 DCloud 原流程；异常只留 `Log.w`，不因增强失败阻断登录、WebSocket 或原推送初始化。
+
+### 4.6 日志与静态回归
+
+验收阶段使用过的 `connection requested`、`sdk online`、`native transmission received`、
+`notification submitted`、`badge submitted` 等状态日志已删除，避免生产环境持续输出。当前仅保留桥接、连接、
+通知和角标失败的警告日志；正常链路以系统通知、角标、ActivityManager Service 状态和真实消息结果验收。
 
 无需平台编译的回归：
 
@@ -341,7 +378,7 @@ pnpm exec vitest run tests/im/pushPreference.test.ts tests/im/pushBindingSwitch.
 git diff --check
 ```
 
-重打基座后分别验：普通划掉、系统强制停止、锁屏短时/长时、断网恢复；同时检查前台不重复、退出/关闭推送不展示、来电分流、通知点击跳转。记录包版本、消息标识和四阶段日志，不能只凭进程重启判定通过。
+重打基座后分别验：普通划掉、系统强制停止、锁屏短时/长时、断网恢复；同时检查前台不重复、退出/关闭推送不展示、来电分流、通知点击跳转、角标连续递增及打开 App 后清零。记录包版本和消息标识，不能只凭进程重启判定通过。
 
 ---
 
@@ -357,19 +394,22 @@ git diff --check
    STICKY 不生效、App 进入 stopped 状态（连开机广播都收不到）。必须在系统设置里授权自动运行，
    且**重装 App 会导致授权失效**（uid 变化）—— 安装引导/客服话术里必须包含这一步。
    详见 §2.6。
-5. **不能 100% 等价于厂商通道**。这是「显著改善」，不是「彻底解决」。厂商通道由系统级服务投递，
+5. **系统通知权限必须开启**。原生层收到透传后会先检查通知权限；权限关闭时不创建系统通知。三星桌面
+   数字角标还受 Launcher 的「应用图标角标／显示数字」设置控制，系统不支持数字角标的桌面只能显示圆点。
+6. **不能 100% 等价于厂商通道**。这是「显著改善」，不是「彻底解决」。厂商通道由系统级服务投递，
    进程死不死都能收；自建通道永远受进程存活约束。
 
 ---
 
 ## 6. 验证方法（真机）
 
-前置：重打基座并安装后，登录 → 确认 `vendor == "none"` 设备上服务已启动。
+前置：重打基座并安装后，登录 → 开启系统通知权限 → 在三星允许自动运行／后台不受限制 →
+确认 `vendor == "none"` 设备上服务已启动。
 
 ```bash
 ADB=/Applications/HBuilderX.app/Contents/HBuilderX/plugins/launcher-tools/tools/adbs/adb
 
-# 1. 确认锚点服务已启动（应出现在 :pushservice 进程）
+# 1. 确认锚点服务已启动（最终实现必须在主进程；个推连接仍使用 :pushservice）
 $ADB shell "dumpsys activity services com.nuwax.app" | grep -E "ServiceRecord|stopIfKilled"
 
 # 2. 从最近任务划掉 App
@@ -381,17 +421,25 @@ $ADB logcat -d -v time | grep -E "nuwax" | grep -iE "Killing|Scheduling restart|
 #   Killing <pid>:com.nuwax.app:pushservice (adj 500): remove task
 #   Killing <pid>:com.nuwax.app (adj 100): remove task
 #   Scheduling restart of crashed service ...PushKeepAliveService in 1000ms for start-requested
-#   Start proc <newpid>:com.nuwax.app:pushservice for service {...PushKeepAliveService}
+#   Start proc <newpid>:com.nuwax.app for service {...PushKeepAliveService}
+#   随后 SDK 按需恢复 com.nuwax.app:pushservice
 
 # 4. 确认进程回来了且个推服务在跑
 $ADB shell "ps -A | grep nuwax"
 $ADB shell "dumpsys activity services com.nuwax.app" | grep UniPushService
 
-# 5. 端到端：划掉后从另一台设备发一条 IM 消息，观察本机是否收到通知
+# 5. 端到端：划掉后从另一台设备发多条 IM 消息
+#    - 下拉通知面板应逐条出现系统通知
+#    - 支持数字角标的三星 Launcher 应显示 payload.badge 的未读总数，而不是固定 1
+#    - 打开 App 后由现有 unread-total 链路清零或校准
 ```
 
-失败判据：划掉后 30 秒内 `ps -A | grep nuwax` 仍为空 → 锚点服务未生效（检查 manifest 是否进了包、
-是否返回了 `START_STICKY`）。
+失败判据：
+
+- 划掉后 30 秒内 `ps -A | grep nuwax` 仍为空：先区分 `remove task` 与 `MARs #2`／force-stop；后者应检查三星自动运行／后台无限制设置，而不是继续改 STICKY 代码。
+- 进程已恢复但没有通知：检查通知权限、原生会话闸门、环境、真实透传是否到达及 DCloud 通知失败警告。
+- 通知存在但角标不变：检查 payload 是否包含正确 `badge`、Launcher 数字角标开关及 `BadgeHelper` 失败警告。
+- 打开 App 后角标未清：检查既有 unread-total 校准链路，不在 headless 接收器里强行写 0。
 
 ---
 

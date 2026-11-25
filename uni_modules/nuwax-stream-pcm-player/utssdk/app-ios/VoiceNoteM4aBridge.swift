@@ -46,8 +46,16 @@ public class VoiceNoteM4aBridge {
     private var interruptEnded = false
     /// 这次打断里离开过前台。回到录音页时即使没有挂断通知，也要继续录。
     private var resignedDuringHold = false
+    /// 这次打断开始时（或第一次被发现时）App 已经在后台。飞书在后台挂断常常不再补 ended，
+    /// 只有「后台打断」允许回到前台后按挂断处理；前台打断仍只认系统 ended，避免通话中把计时打开。
+    private var holdInBackground = false
+    /// 录音期间退过后台。录音器在后台被系统悄悄停掉时，用来判断这是一次后台打断。
+    private var backgroundedWhileRecording = false
+    /// 最近一次看到其他 App 还在出声的时间。后台打断靠它确认通话真的结束，避免刚挂断就又去抢会话。
+    private var otherAudioSeenAt = Date.distantPast
     private var resignObserver: NSObjectProtocol?
     private var activeObserver: NSObjectProtocol?
+    private var backgroundObserver: NSObjectProtocol?
     /// 不设置 delegate 时 calls 一直是空的，系统电话会被当成已经挂断。
     private let callWatch = CallWatch()
     private let callObserver = CXCallObserver()
@@ -100,6 +108,13 @@ public class VoiceNoteM4aBridge {
         ) { [weak self] _ in
             self?.noteBecameActive()
         }
+        backgroundObserver = center.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.noteEnteredBackground()
+        }
     }
 
     deinit {
@@ -116,6 +131,9 @@ public class VoiceNoteM4aBridge {
             NotificationCenter.default.removeObserver(observer)
         }
         if let observer = activeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = backgroundObserver {
             NotificationCenter.default.removeObserver(observer)
         }
         stopSilence()
@@ -198,6 +216,8 @@ public class VoiceNoteM4aBridge {
         }
         if openRecorder(path) {
             interruptHold = false
+            holdInBackground = false
+            backgroundedWhileRecording = false
             userPaused = false
             startSilence()
             return path
@@ -209,6 +229,8 @@ public class VoiceNoteM4aBridge {
         }
         if openRecorder(path) {
             interruptHold = false
+            holdInBackground = false
+            backgroundedWhileRecording = false
             userPaused = false
             startSilence()
             return path
@@ -270,6 +292,8 @@ public class VoiceNoteM4aBridge {
             self.interruptHold = false
             self.holdIsPhone = false
             self.interruptEnded = false
+            self.holdInBackground = false
+            self.backgroundedWhileRecording = false
             self.keepAliveForInterrupt = false
             self.pendingEvents.removeAll()
             self.armedRecorder?.stop()
@@ -329,6 +353,13 @@ public class VoiceNoteM4aBridge {
     /// 结束后系统经常不发 interruption ended，会话空出来后补一次结束。
     public func takeInterruption() -> String {
         return onMain {
+            if self.otherAppPlaying() {
+                self.otherAudioSeenAt = Date()
+            }
+            // 录音器一直在正常录，说明之前那次退后台和这次打断无关。
+            if self.recorder?.isRecording == true && UIApplication.shared.applicationState == .active {
+                self.backgroundedWhileRecording = false
+            }
             // 电话进来时经常没有 interruption 通知，录音器已经被系统停掉。页面仍在计时。
             let ready = Date() >= self.ignoreBeganUntil || self.sessionBusy()
             if !self.userPaused && !self.interruptHold && !self.currentPath.isEmpty && ready {
@@ -336,7 +367,7 @@ public class VoiceNoteM4aBridge {
                     self.interruptBeganAt = Date()
                     self.sealActiveFileForInterrupt()
                     self.pushEvent("began")
-                    NSLog("[voice-note] m4a recorder stopped without interruption")
+                    self.logState("m4a recorder stopped without interruption")
                 }
             }
             if self.interruptHold && self.phoneBusy() {
@@ -348,10 +379,15 @@ public class VoiceNoteM4aBridge {
                 self.resumeRecordingAfterInterrupt()
                 self.pushEvent("ended")
             }
+            // 后台打断经常收不到 ended，回到前台后按挂断处理，让下面的恢复流程去探麦克风。
+            self.adoptBackgroundHoldEndIfReady()
             // 挂断通知已经到了，但当时在后台没能开录。回到前台再试一次。通话未结束不能试。
             if self.interruptHold && self.interruptEnded && self.returnedToForeground() && !self.phoneBusy() {
-                self.resumeRecordingAfterInterrupt()
-                self.pushEvent("ended")
+                // 后台打断还要确认其他音频确实安静下来，避免通话间隙又把会话抢走。
+                if !self.holdInBackground || !self.otherAppPlaying() {
+                    self.resumeRecordingAfterInterrupt()
+                    self.pushEvent("ended")
+                }
             }
             if self.pendingEvents.isEmpty {
                 return ""
@@ -382,31 +418,39 @@ public class VoiceNoteM4aBridge {
         return String(level)
     }
 
-    /// 打断期间离开过界面，并且现在已经回到前台。
+    /// 打断期间离开过界面，并且现在已经回到前台。后台打断来不及标 resigned 时也算回来过。
     private func returnedToForeground() -> Bool {
-        return resignedDuringHold && UIApplication.shared.applicationState == .active
+        guard UIApplication.shared.applicationState == .active else {
+            return false
+        }
+        return resignedDuringHold || holdInBackground
     }
 
     private func noteLeftForeground() {
-        if Thread.isMainThread {
-            if interruptHold {
-                resignedDuringHold = true
-            }
-            return
-        }
-        DispatchQueue.main.sync {
+        onMainVoid {
             if self.interruptHold {
                 self.resignedDuringHold = true
             }
         }
     }
 
-    private func noteBecameActive() {
-        if Thread.isMainThread {
-            resumeAfterReturning()
-            return
+    /// 退到后台。录音器在后台被系统停掉时，这里留下「在后台录过」的标记，回到前台才知道要补一次结束。
+    private func noteEnteredBackground() {
+        onMainVoid {
+            if self.recorder?.isRecording == true || !self.currentPath.isEmpty {
+                self.backgroundedWhileRecording = true
+            }
+            if self.interruptHold {
+                self.resignedDuringHold = true
+            }
+            self.logState("entered background")
         }
-        DispatchQueue.main.sync {
+    }
+
+    private func noteBecameActive() {
+        onMainVoid {
+            self.logState("became active")
+            self.adoptBackgroundHoldEndIfReady()
             self.resumeAfterReturning()
         }
     }
@@ -418,6 +462,47 @@ public class VoiceNoteM4aBridge {
         }
         scheduleResumeAttempts()
         pushEvent("ended")
+    }
+
+    /// 后台打断时飞书常常不再补 ended。回到前台、其他音频已经安静下来后，按挂断处理，
+    /// 让后面的恢复流程去试麦克风。前台打断不在这里放行，避免通话没挂断就把计时和波浪又打开。
+    private func adoptBackgroundHoldEndIfReady() {
+        guard interruptHold, !interruptEnded, holdInBackground, !userPaused, !phoneBusy() else {
+            return
+        }
+        if otherAppPlaying() {
+            otherAudioSeenAt = Date()
+            return
+        }
+        guard returnedToForeground(), interruptGraceDone() else {
+            return
+        }
+        // 通话中的安静间隙不算结束，要连续 2 秒没有其他音频才认。
+        guard Date().timeIntervalSince(otherAudioSeenAt) >= 2.0 else {
+            return
+        }
+        interruptEnded = true
+        pushEvent("ended")
+        NSLog("[voice-note] background hold: no ended notification, treating call as finished")
+    }
+
+    private func onMainVoid(_ work: @escaping () -> Void) {
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.sync(execute: work)
+        }
+    }
+
+    /// 联调日志：打断、前后台、恢复每一步都打印原生状态。真机复现时看 HBuilderX logcat 里的 [voice-note]。
+    private func logState(_ tag: String) {
+        let state = UIApplication.shared.applicationState
+        let app = state == .active ? "active" : (state == .background ? "background" : "inactive")
+        let recording = recorder?.isRecording == true ? "1" : "0"
+        let path = currentPath.isEmpty ? "-" : (currentPath as NSString).lastPathComponent
+        NSLog(
+            "[voice-note] \(tag) app=\(app) hold=\(interruptHold) ended=\(interruptEnded) bgHold=\(holdInBackground) resigned=\(resignedDuringHold) userPaused=\(userPaused) recording=\(recording) armed=\(armedRecorder != nil) phone=\(phoneBusy()) other=\(otherAudioBusy()) playing=\(otherAppPlaying()) path=\(path)"
+        )
     }
 
     private func handleInterruption(_ notification: Notification) {
@@ -439,17 +524,22 @@ public class VoiceNoteM4aBridge {
         }
         beginWake()
         if type == .began {
+            logState("interruption began notification")
             guard recorder != nil, !currentPath.isEmpty else {
+                logState("interruption began ignored: no active file")
                 return
             }
             // 开录时会话激活会自己发一次中断。真有电话或语音占用时不能忽略。
             if userPaused {
+                logState("interruption began ignored: user paused")
                 return
             }
             if Date() < suppressBeganUntil {
+                logState("interruption began ignored: suppressed")
                 return
             }
             if Date() < ignoreBeganUntil && !sessionBusy() {
+                logState("interruption began ignored: session idle")
                 return
             }
             if !interruptHold {
@@ -461,6 +551,7 @@ public class VoiceNoteM4aBridge {
             return
         }
         silencePlayer?.play()
+        logState("interruption ended notification")
         guard interruptHold else {
             return
         }
@@ -485,6 +576,7 @@ public class VoiceNoteM4aBridge {
     }
 
     private func resumeIfRouteFree() {
+        adoptBackgroundHoldEndIfReady()
         guard interruptHold, interruptEnded, !userPaused, !phoneBusy(), !otherAudioBusy() else {
             return
         }
@@ -539,6 +631,12 @@ public class VoiceNoteM4aBridge {
             return true
         }
         return false
+    }
+
+    /// 其他 App 此刻是否真的在出声。只看 isOtherAudioPlaying：
+    /// secondaryAudio 提示在飞书挂断后会残留，拿来当「通话还没结束」会把恢复一直卡住。
+    private func otherAppPlaying() -> Bool {
+        return AVAudioSession.sharedInstance().isOtherAudioPlaying
     }
 
     private func pushEvent(_ event: String) {
@@ -611,6 +709,11 @@ public class VoiceNoteM4aBridge {
         guard keepAliveForInterrupt || silencePlayer != nil else {
             return
         }
+        if otherAppPlaying() {
+            otherAudioSeenAt = Date()
+        }
+        // 后台打断收不到 ended 时，回到前台靠这里补一次结束。
+        adoptBackgroundHoldEndIfReady()
         if silencePlayer?.isPlaying != true && !phoneBusy() {
             _ = silencePlayer?.play()
         }
@@ -636,13 +739,19 @@ public class VoiceNoteM4aBridge {
         if phoneBusy() {
             holdIsPhone = true
         }
-        if UIApplication.shared.applicationState != .active {
+        let state = UIApplication.shared.applicationState
+        if state == .background || backgroundedWhileRecording {
+            // 后台里被打断（或回到前台才发现被打断）：飞书不会补 ended，恢复要靠回到前台后试探麦克风。
+            holdInBackground = true
+        }
+        if state != .active {
             resignedDuringHold = true
         }
         keepAliveForInterrupt = true
         armNextRecorder()
         startSilence()
         NSLog("[voice-note] interruption began")
+        logState("sealed for interruption")
     }
 
     /// 在挂断回调里直接开下一段。这时页面定时器通常是停的。
@@ -658,6 +767,7 @@ public class VoiceNoteM4aBridge {
         }
         beginWake()
         ignoreBeganUntil = Date().addingTimeInterval(1.5)
+        logState("resume after interruption attempt")
         // 后台里重新设置会话类别经常失败。先直接启动接通前准备好的录音器。
         if let armed = armedRecorder, !armedPath.isEmpty {
             try? AVAudioSession.sharedInstance().setActive(true)
@@ -669,8 +779,11 @@ public class VoiceNoteM4aBridge {
                 finishInterruptResume(currentPath)
                 return
             }
+            NSLog("[voice-note] armed recorder refused to start")
         }
         guard activateSession() else {
+            NSLog("[voice-note] resume failed: audio session not active")
+            lastError = "音频会话未激活"
             keepAliveForInterrupt = true
             startSilence()
             return
@@ -692,11 +805,16 @@ public class VoiceNoteM4aBridge {
             resumeKey = "\(segmentLocalId)|\(indexName)"
         }
         guard let path = preparePath(resumeKey) else {
+            NSLog("[voice-note] resume failed: bad path")
             return
         }
         if openRecorder(path) {
             finishInterruptResume(path)
             return
+        }
+        NSLog("[voice-note] resume failed: recorder did not start")
+        if lastError.isEmpty {
+            lastError = "录音器未能开始"
         }
         keepAliveForInterrupt = true
         startSilence()
@@ -741,6 +859,8 @@ public class VoiceNoteM4aBridge {
         holdIsPhone = false
         interruptEnded = false
         resignedDuringHold = false
+        holdInBackground = false
+        backgroundedWhileRecording = false
         userPaused = false
         keepAliveForInterrupt = false
         suppressBeganUntil = Date().addingTimeInterval(1.2)
@@ -749,6 +869,7 @@ public class VoiceNoteM4aBridge {
         endWake()
         pushEvent("ended")
         NSLog("[voice-note] resumed after interruption \(path)")
+        logState("resumed after interruption")
     }
 
     /// 录音已经开始后再准备下一段，避免和当前录音器抢会话。

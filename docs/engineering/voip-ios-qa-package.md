@@ -6,9 +6,7 @@
 
 签名用团队的 `nuwax-signing/local-secrets.env`，也可以设置 `NUWAX_SIGNING_ENV` 指向本机受控配置。先将 Apple Development 证书和私钥导入钥匙串，并在 Xcode 安装描述文件。参考 [签名配置示例](../../scripts/local-secrets.env.example)，填写 `DCLOUD_APPKEY`、`IOS_DEVELOPMENT_TEAM`、`IOS_PROVISIONING_PROFILE_UUID` 和 `IOS_PROVISIONING_PROFILE_PATH`。Getui 客户端配置由 `NUWAX_IOS_UNIPUSH_CLIENT_IPA` 指定的同应用基座提供，请保存在 `unpackage/debug` 之外。脚本验签时核对包名与 Getui 客户端配置。证书、描述文件、密钥、SDK 和签名包通过团队渠道管理。
 
-**周一（11 月 23 日）签名待办**
-
-- [ ] 与签名负责人确认新申请的 Apple Development 证书及对应私钥的配置方式。确认 `com.nuwax.app` 的开发描述文件包含该证书、同事的真机 UDID，并带 `aps-environment=development`。补齐同应用的 DCloud AppKey 和测试 UniPush 客户端配置后，由同事在自己的 Mac 构建并覆盖安装一次。
+开发描述文件须包含对应的 Apple Development 证书、目标手机的 UDID，并带 `aps-environment=development`。如果同一份 IPA 要安装到 iPhone 13 和 iPhone 16，描述文件需覆盖两台设备。使用仓库内的本机签名配置时，先按示例填写，再执行 `export NUWAX_SIGNING_ENV="$PWD/scripts/local-secrets.env"`。
 
 ### 日常调试基座
 
@@ -22,6 +20,8 @@ pnpm hx:ios:device -- --playground custom --customType device \
 基座输出到 `unpackage/debug/iOS_debug.ipa`。运行前，将 `IPHONE_ID` 设为 `pnpm hx:ios:devices` 列出的设备序列号，也可在 HBuilderX 中选择“使用自定义基座运行”。只改业务页面时可以复用已生成的基座。修改 Swift 或其他原生插件后，重新生成资源并打基座。需要调试 HX 生成的 Swift 时，见 [HBuilderX 5.34 的 iOS 原生复用](voip-business-integration.md#hbuilderx-534-的-ios-原生复用)。
 
 ### 可直接安装的测试 IPA
+
+iOS 的测试出包入口是 `make ios-tester`，对应 Android 的 `make android-tester`。在仓库根目录执行：
 
 ```bash
 make ios-tester
@@ -40,19 +40,29 @@ HBuilderX 生成本地 iOS 发行资源，随后离线 SDK 构建 Debug 原生�
 
 `verify-business-qa-ios.py` 校验包名、真实产品名称、测试环境、发行宿主模式、后台模式、无 DebugServe、导出资源和内置资源逐文件一致、当前原生 Swift 实现一致及有效签名。签名与构建通过仍不代表实机启动或通话矩阵已验收。
 
-## 安装和账号
+## 首次安装与覆盖更新
 
-1. iPhone 开启开发者模式，解锁并用 USB 连接。可以用 Apple Configurator 安装 IPA，也可以用 CoreDevice 安装本机生成且已签名的 `.app`。
-2. 这是同一 `com.nuwax.app` 的测试包，安装会覆盖现有同包名 App。测试环境原账号可继续使用；若现有安装曾登录生产环境，须退出后重新登录测试账号，不能把旧生产凭据当作测试凭据。
-3. 两台手机分别登录不同测试账号，在真实联系人单聊中点「＋ → 语音通话/视频通话」。不用填写 LAN 地址、Alice/Bob 或 RTC JWT。
-4. 本机记录从同一加号面板的「通话记录」进入；只显示该账号在这台手机上观察到的呼叫。回拨重新创建呼叫和检查能力，不复用旧 callId。
+iPhone 解锁后用 USB 连接 Mac，确认信任电脑并开启开发者模式。运行 `xcrun devicectl list devices`，核对机型，再复制该行的 **Identifier**。注册开发描述文件时使用的是设备 UDID。
+
+从仓库根目录运行 [安装脚本](../../scripts/voip-native/install-nuwax-ios.sh)。iPhone 13 和 iPhone 16 使用相同命令，每次传入目标设备的 Identifier 和本次构建的 IPA。脚本也接受打包生成的 `out/voip-business-qa-ios-derived/Build/Products/Debug-iphoneos/UniAppX.app`。
 
 ```bash
-# 将 COREDEVICE_ID 设为下列命令返回的目标设备 ID。
 xcrun devicectl list devices
-xcrun devicectl device install app --device "$COREDEVICE_ID" \
-  out/voip-business-qa-ios-derived/Build/Products/Debug-iphoneos/UniAppX.app
+COREDEVICE_ID='替换为目标 iPhone 的 Identifier'
+IPA='/path/to/Nuwax-iOS-Test-本次时间戳.ipa'
+shasum -a 256 "$IPA"
+bash scripts/voip-native/install-nuwax-ios.sh "$COREDEVICE_ID" "$IPA"
 ```
+
+首次安装和更新都用上述脚本。它先验证 `com.nuwax.app` 的签名，直接安装或覆盖，再回读手机上的版本和构建号。出现「设备回读通过」后，在手机上打开「女娲Nuwax」，确认能进入 App。两次打包可能沿用同一版本和构建号，交接时请记录本次 IPA 的 SHA-256。Apple Configurator 也可用于安装已签名的 IPA。
+
+如果安装失败，保留现有 App 和数据，先检查连接、信任、解锁状态、开发者模式，以及描述文件是否覆盖该手机、是否与签名证书匹配。
+
+## 测试账号
+
+1. 测试环境原账号可继续使用；若现有安装曾登录生产环境，须退出后重新登录测试账号，不能把旧生产凭据当作测试凭据。
+2. 两台手机分别登录不同测试账号，在真实联系人单聊中点「＋ → 语音通话/视频通话」。不用填写 LAN 地址、Alice/Bob 或 RTC JWT。
+3. 本机记录从同一加号面板的「通话记录」进入；只显示该账号在这台手机上观察到的呼叫。回拨重新创建呼叫和检查能力，不复用旧 callId。
 
 ## 分层测试
 

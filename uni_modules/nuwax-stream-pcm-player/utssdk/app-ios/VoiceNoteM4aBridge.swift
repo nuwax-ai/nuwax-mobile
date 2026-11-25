@@ -27,11 +27,23 @@ public class VoiceNoteM4aBridge {
     /// 用户自己点的暂停。这种停止不能当成电话打断，否则挂断后又会自动录。
     private var userPaused = false
     private var resumeNotBefore = Date()
-    /// 飞书、微信语音不是系统电话。停掉录音器后进程会被挂起，挂断通知要等回到前台。
-    /// 这段时间用静音播放留在后台，挂断后才能马上开下一段。
+    /// 飞书、微信语音不是系统电话。接通时同步封口，挂断通知里同步开下一段。
+    /// 静音播放用来让系统在后台把挂断通知送回来。静音文件不进录音。
     private var keepAliveForInterrupt = false
     private var silencePlayer: AVAudioPlayer?
     private var silenceTimer: Timer?
+    /// 当前这段的编号。挂断后原生自己开下一段时用来生成不重复的文件名。
+    private var segmentLocalId = ""
+    private var segmentIndexName = ""
+    /// 同一次挂断只使用一个文件名，失败重试时不另起一堆空文件。
+    private var resumeKey = ""
+    private var wakeTask: UIBackgroundTaskIdentifier = .invalid
+    /// 自己激活会话时会再收到一次 began。这段时间内不能把刚开的下一段又封掉。
+    private var suppressBeganUntil = Date()
+    /// 这次暂停来自系统电话。电话没有 ended 通知时，靠通话列表变空来恢复。
+    private var holdIsPhone = false
+    /// 已经收到挂断。挂断前不能开下一段，否则计时和波浪会在通话中继续走。
+    private var interruptEnded = false
     /// 不设置 delegate 时 calls 一直是空的，系统电话会被当成已经挂断。
     private let callWatch = CallWatch()
     private let callObserver = CXCallObserver()
@@ -122,9 +134,12 @@ public class VoiceNoteM4aBridge {
 
     private func startSegmentOnMain(_ segmentKey: String) -> String {
         lastError = ""
-        if phoneBusy() {
+        if phoneBusy() || (interruptHold && !interruptEnded) {
             lastError = "音频仍被占用"
             return ""
+        }
+        if let recorder = recorder, recorder.isRecording, !currentPath.isEmpty {
+            return currentPath
         }
         let session = AVAudioSession.sharedInstance()
         if session.recordPermission == .denied {
@@ -136,21 +151,28 @@ public class VoiceNoteM4aBridge {
             return ""
         }
         ignoreBeganUntil = Date().addingTimeInterval(1.5)
-        interruptHold = false
-        userPaused = false
+        let holding = interruptHold
         guard activateSession() else {
             return ""
         }
         if openRecorder(path) {
+            interruptHold = false
+            userPaused = false
+            startSilence()
             return path
         }
         // 第一次 record() 失败后，重新激活会话，再用去掉码率的参数试一次。
         guard activateSession() else {
+            interruptHold = holding
             return ""
         }
         if openRecorder(path) {
+            interruptHold = false
+            userPaused = false
+            startSilence()
             return path
         }
+        interruptHold = holding
         return ""
     }
 
@@ -205,6 +227,8 @@ public class VoiceNoteM4aBridge {
         return onMain {
             self.userPaused = false
             self.interruptHold = false
+            self.holdIsPhone = false
+            self.interruptEnded = false
             self.keepAliveForInterrupt = false
             self.pendingEvents.removeAll()
             self.stopSilence()
@@ -212,14 +236,33 @@ public class VoiceNoteM4aBridge {
         }
     }
 
-    /// 电话或第三方语音打断。封上当前文件，但不要退出后台，挂断后还要接着录。
+    /// 电话或第三方语音打断。正在写的下一段不能再关。已经停掉的文件只补一次封口。
     public func sealForInterruption() -> String {
         return onMain {
+            if let recorder = self.recorder, recorder.isRecording {
+                return "1"
+            }
             self.userPaused = false
             self.keepAliveForInterrupt = true
             self.startSilence()
             return self.closeRecorder()
         }
+    }
+
+    /// 原生在挂断后已经开好的文件。页面轮询停住时用它接着录，避免再开一个。
+    public func currentRecordingPath() -> String {
+        if let recorder = recorder, recorder.isRecording {
+            return currentPath
+        }
+        return ""
+    }
+
+    /// 下一段已经录了多久。页面恢复计时时从这里接着走，不把通话那一段算进去。
+    public func currentRecordingElapsedMs() -> String {
+        guard let recorder = recorder, recorder.isRecording else {
+            return "0"
+        }
+        return String(max(Int(recorder.currentTime * 1000), 0))
     }
 
     /// 进程被杀掉后，给没有 moov 的 m4a 补封口。已经封口的文件原样返回成功。
@@ -246,14 +289,18 @@ public class VoiceNoteM4aBridge {
             if !self.userPaused && !self.interruptHold && !self.currentPath.isEmpty && ready {
                 if let recorder = self.recorder, !recorder.isRecording {
                     self.interruptBeganAt = Date()
-                    self.interruptHold = true
-                    self.keepAliveForInterrupt = true
-                    self.startSilence()
+                    self.sealActiveFileForInterrupt()
                     self.pushEvent("began")
                     NSLog("[voice-note] m4a recorder stopped without interruption")
                 }
             }
-            if self.interruptHold && self.interruptGraceDone() && !self.sessionBusy() {
+            if self.interruptHold && self.phoneBusy() {
+                self.holdIsPhone = true
+            }
+            // 只有系统电话才在通话列表变空时补一次结束。飞书、微信要等真正的挂断通知，否则页面计时会在通话中恢复。
+            if self.interruptHold && self.holdIsPhone && self.interruptGraceDone() && !self.phoneBusy() {
+                self.interruptEnded = true
+                self.resumeRecordingAfterInterrupt()
                 self.pushEvent("ended")
             }
             if self.pendingEvents.isEmpty {
@@ -286,49 +333,55 @@ public class VoiceNoteM4aBridge {
     }
 
     private func handleInterruption(_ notification: Notification) {
+        // 必须在这次通知里做完。再丢到下一轮主线程的话，飞书切到后台后进程会被挂起，暂停和恢复都要等回到页面。
+        if Thread.isMainThread {
+            applyInterruption(notification)
+            return
+        }
+        DispatchQueue.main.sync {
+            self.applyInterruption(notification)
+        }
+    }
+
+    private func applyInterruption(_ notification: Notification) {
         guard let info = notification.userInfo,
               let typeRaw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else {
             return
         }
+        beginWake()
         if type == .began {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self, self.recorder != nil, !self.currentPath.isEmpty else {
-                    return
-                }
-                // 开录时会话激活会自己发一次中断。真有电话或语音占用时不能忽略。
-                if self.userPaused {
-                    return
-                }
-                if Date() < self.ignoreBeganUntil && !self.sessionBusy() {
-                    return
-                }
-                // 系统经常先停掉录音器再发通知。这时 isRecording 已经是 false，仍然要通知页面暂停。
-                if let recorder = self.recorder, recorder.isRecording {
-                    recorder.pause()
-                }
-                if !self.interruptHold {
-                    self.interruptBeganAt = Date()
-                }
-                self.interruptHold = true
-                self.keepAliveForInterrupt = true
-                self.startSilence()
-                self.pushEvent("began")
+            guard recorder != nil, !currentPath.isEmpty else {
+                return
             }
+            // 开录时会话激活会自己发一次中断。真有电话或语音占用时不能忽略。
+            if userPaused {
+                return
+            }
+            if Date() < suppressBeganUntil {
+                return
+            }
+            if Date() < ignoreBeganUntil && !sessionBusy() {
+                return
+            }
+            if !interruptHold {
+                interruptBeganAt = Date()
+            }
+            // 立刻 stop。只 pause 的话，飞书占用期间文件时间轴还在长，中间会变成无法播放的一段。
+            sealActiveFileForInterrupt()
+            pushEvent("began")
             return
         }
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else {
-                return
-            }
-            if self.keepAliveForInterrupt {
-                self.silencePlayer?.play()
-            }
-            guard self.interruptHold, self.interruptGraceDone(), !self.sessionBusy() else {
-                return
-            }
-            self.pushEvent("ended")
+        silencePlayer?.play()
+        guard interruptHold else {
+            return
         }
+        // 挂断通知本身就是结束。飞书没有系统电话，不能再看 phoneBusy 或 secondaryAudio。
+        interruptEnded = true
+        if !phoneBusy() {
+            resumeRecordingAfterInterrupt()
+        }
+        pushEvent("ended")
     }
 
     private func interruptGraceDone() -> Bool {
@@ -391,7 +444,6 @@ public class VoiceNoteM4aBridge {
 
     private func openRecorder(_ path: String) -> Bool {
         let holding = keepAliveForInterrupt
-        stopSilencePlayback()
         closeRecorder()
         if writeRecorder(path, bitRate: 64000) {
             keepAliveForInterrupt = false
@@ -415,7 +467,7 @@ public class VoiceNoteM4aBridge {
             let url = silenceFileURL()
             silencePlayer = try? AVAudioPlayer(contentsOf: url)
             silencePlayer?.numberOfLoops = -1
-            silencePlayer?.volume = 0.01
+            silencePlayer?.volume = 0
             silencePlayer?.prepareToPlay()
         }
         _ = silencePlayer?.play()
@@ -429,17 +481,89 @@ public class VoiceNoteM4aBridge {
     }
 
     private func pokeSilence() {
-        guard keepAliveForInterrupt else {
-            stopSilence()
+        guard keepAliveForInterrupt || silencePlayer != nil else {
             return
         }
-        if silencePlayer?.isPlaying != true && !sessionBusy() {
+        if silencePlayer?.isPlaying != true && !phoneBusy() {
             _ = silencePlayer?.play()
+        }
+        // 通话还没挂断时只保持静音，不开下一段。计时和波浪要停住。
+        if interruptEnded && interruptHold && !phoneBusy() {
+            resumeRecordingAfterInterrupt()
         }
     }
 
-    private func stopSilencePlayback() {
-        silencePlayer?.stop()
+    /// 打断一开始就封口，不等页面轮询。飞书切走后页面代码不会再跑。
+    private func sealActiveFileForInterrupt() {
+        beginWake()
+        if !currentPath.isEmpty {
+            _ = closeRecorder()
+        }
+        interruptHold = true
+        interruptEnded = false
+        if phoneBusy() {
+            holdIsPhone = true
+        }
+        keepAliveForInterrupt = true
+        startSilence()
+    }
+
+    /// 在挂断回调里直接开下一段。这时页面定时器通常是停的。
+    private func resumeRecordingAfterInterrupt() {
+        if phoneBusy() {
+            return
+        }
+        if let recorder = recorder, recorder.isRecording, !currentPath.isEmpty {
+            return
+        }
+        guard !segmentLocalId.isEmpty else {
+            return
+        }
+        if resumeKey.isEmpty {
+            let stamp = Int(Date().timeIntervalSince1970 * 1000)
+            let indexName = segmentIndexName.isEmpty ? "c\(stamp)" : "\(segmentIndexName)c\(stamp)"
+            resumeKey = "\(segmentLocalId)|\(indexName)"
+        }
+        guard let path = preparePath(resumeKey) else {
+            return
+        }
+        ignoreBeganUntil = Date().addingTimeInterval(1.5)
+        beginWake()
+        guard activateSession() else {
+            return
+        }
+        if openRecorder(path) {
+            resumeKey = ""
+            interruptHold = false
+            holdIsPhone = false
+            interruptEnded = false
+            userPaused = false
+            keepAliveForInterrupt = false
+            suppressBeganUntil = Date().addingTimeInterval(1.2)
+            startSilence()
+            endWake()
+            NSLog("[voice-note] resumed after interruption \(path)")
+            return
+        }
+        keepAliveForInterrupt = true
+        startSilence()
+    }
+
+    private func beginWake() {
+        if wakeTask != .invalid {
+            return
+        }
+        wakeTask = UIApplication.shared.beginBackgroundTask(withName: "voice-note-call") { [weak self] in
+            self?.endWake()
+        }
+    }
+
+    private func endWake() {
+        let task = wakeTask
+        wakeTask = .invalid
+        if task != .invalid {
+            UIApplication.shared.endBackgroundTask(task)
+        }
     }
 
     private func stopSilence() {
@@ -550,6 +674,8 @@ public class VoiceNoteM4aBridge {
         guard !localId.isEmpty, !indexName.isEmpty else {
             return nil
         }
+        segmentLocalId = localId
+        segmentIndexName = indexName
         let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first
             ?? NSTemporaryDirectory()
         let dir = (docs as NSString).appendingPathComponent("voice-notes/\(localId)")

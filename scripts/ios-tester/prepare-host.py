@@ -205,6 +205,7 @@ def module_targets(resources, project, host, embedded, linked):
             "dependencies": dependencies,
             "settings": {"base": {
                 "PRODUCT_BUNDLE_IDENTIFIER": f"{BUNDLE_ID}.module.{module}",
+                "PRODUCT_NAME": module,
                 "GENERATE_INFOPLIST_FILE": "YES", "DEFINES_MODULE": "YES",
             }},
         }

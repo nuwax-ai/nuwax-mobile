@@ -58,6 +58,8 @@ NUWAX_BASE_TARGETS=android make base-fetch
 
 ## 11.24 iOS 本地测试包
 
+本节适用于独立的 `feat-2026.11.24`。将它合入 `feat-2026.11` 时，Makefile 保留目标分支的 `ios-tester` 规则，由含会议和 VoIP 的源码生成测试 IPA。合入后的验包使用目标分支的 iOS 测试包规则。
+
 在 Mac 上打开 HBuilderX 5.34，准备 Xcode、XcodeGen、CocoaPods、Python 3、Node.js 和 pnpm，再在 `feat-2026.11.24` 的 checkout 安装依赖。首次打包会使用同版本的原始 iOS 离线 SDK。已有 SDK 可设置 `UNIAPPX_SDK_ROOT`，缺少时打包脚本会下载。
 
 将 Apple Development 证书和私钥导入钥匙串，并在 Xcode 安装 `com.nuwax.app` 的开发描述文件。描述文件需包含目标手机 UDID 和 `aps-environment=development`。同一份 IPA 要装到 iPhone 13 和 iPhone 16 时，描述文件需覆盖两台。按[签名配置示例](../../scripts/local-secrets.env.example)填写 `scripts/local-secrets.env`，或用 `NUWAX_SIGNING_ENV` 指向团队提供的配置。普通 UniPush 使用 `NUWAX_IOS_UNIPUSH_CLIENT_IPA` 指定的同应用基座。

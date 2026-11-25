@@ -1,6 +1,6 @@
 # 本地离线自定义基座（仅出包，不安装/不唤起设备）
 # 详见 docs/local-custom-base-maintenance.md · docs/custom-base-distribution-s3.md
-.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-promote base-fetch base-info base-list sdk-publish sdk-fetch app-resource android-tester android-release ios-tester
+.PHONY: help base-env base-android base-ios-device base-ios-simulator base-all base-ship base-harmony base-publish base-promote base-fetch base-info base-list sdk-publish sdk-fetch app-resource android-tester android-release
 
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 HX_CLI ?= /Applications/HBuilderX.app/Contents/MacOS/cli
@@ -9,13 +9,13 @@ help:
 	@echo "自定义基座 · 只生成包 → unpackage/debug/"
 	@echo "  make base-android         # android_debug.apk"
 	@echo "  make base-ios-device       # iOS_debug.ipa（真机）"
+	@echo "  make ios-tester            # 生成可独立安装的 iOS 测试环境 IPA"
 	@echo "  make base-ios-simulator   # Pandora_simulator_debug.app（模拟器）"
 	@echo "  make base-all             # 上述三份（仅出包，不生成资源、不上 S3）"
 	@echo "  make base-ship            # 一键：appResource → 出包 → 上传 S3"
 	@echo "  make base-env             # 打印路径"
 	@echo "  make app-resource         # 生成本地打包App资源（HX CLI，iOS+Android，需 HX 已启动）"
 	@echo "  make android-tester       # 发测试：appResource → Release APK（无 HX 调试）"
-	@echo "  make ios-tester           # 发测试：生成可独立安装的 iOS 测试环境 IPA"
 	@echo "  make android-release      # 正式上架：生产资源 → 正式签名 APK+AAB"
 	@echo ""
 	@echo "S3 自定义基座（当前分支 → 默认配置）"
@@ -42,8 +42,12 @@ base-android:
 android-tester:
 	@bash "$(ROOT)scripts/android-esp/build_tester_release_apk.sh"
 
+# 合入带 VoIP 的分支后，由该分支的 iOS tester 规则构建完整 App。
+ifeq ($(wildcard $(ROOT)scripts/voip-native/package-business-qa-ios.sh),)
+.PHONY: ios-tester
 ios-tester:
 	@HX_CLI="$(HX_CLI)" bash "$(ROOT)scripts/ios-tester/build.sh"
+endif
 
 # 应用市场正式包：生产配置、正式证书、APK+AAB，并执行签名/版本验收
 android-release:

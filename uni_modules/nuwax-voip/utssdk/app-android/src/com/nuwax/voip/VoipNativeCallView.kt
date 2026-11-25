@@ -36,6 +36,7 @@ internal class VoipNativeCallView(
     companion object {
         val BACKDROP_TOP = Color.rgb(70, 83, 79)
         val BACKDROP_BOTTOM = Color.rgb(32, 40, 39)
+        private val AVATAR_FILL = Color.rgb(113, 134, 124)
         private val LABEL = Color.argb(179, 255, 255, 255)
         private val NEUTRAL = Color.argb(36, 255, 255, 255)
         private val DANGER = Color.rgb(238, 77, 90)
@@ -54,12 +55,14 @@ internal class VoipNativeCallView(
 
     private val kind = label(13f, LABEL)
     private val minimizeText = label(12f, LABEL)
-    private val initials = label(44f, Color.rgb(240, 245, 242))
+    private val initials = label(44f, Color.rgb(240, 245, 242)).apply {
+        background = rounded(AVATAR_FILL, 24)
+    }
     private var avatarUrl = ""
     private var avatarJob: Job? = null
     private val avatarImage = ImageView(context).apply {
         scaleType = ImageView.ScaleType.CENTER_CROP
-        background = rounded(Color.TRANSPARENT, 24)
+        background = rounded(AVATAR_FILL, 24)
         clipToOutline = true
         visibility = GONE
     }
@@ -68,7 +71,6 @@ internal class VoipNativeCallView(
         setPadding(dp(6), dp(6), dp(6), dp(6))
         addView(initials, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         addView(avatarImage, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-        initials.background = rounded(Color.rgb(113, 134, 124), 24)
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
     }
     private val name = label(28f).apply {
@@ -259,10 +261,12 @@ internal class VoipNativeCallView(
         avatarJob?.cancel()
         avatarImage.setImageDrawable(null)
         avatarImage.visibility = GONE
+        initials.visibility = VISIBLE
         if (url.isEmpty()) return
         avatarJob = CoroutineScope(Dispatchers.Main.immediate).launch {
             val bitmap = VoipBridge.loadPeerAvatar(url, dp(104)) ?: return@launch
             avatarImage.setImageBitmap(bitmap)
+            initials.visibility = GONE
             avatarImage.visibility = VISIBLE
         }
     }

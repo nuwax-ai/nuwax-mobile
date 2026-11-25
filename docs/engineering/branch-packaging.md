@@ -56,6 +56,30 @@ NUWAX_BASE_TARGETS=android make base-fetch
    # 预演通过后仅去掉 NUWAX_SDK_DRY_RUN，发布后从干净目录运行 make sdk-fetch 回读
    ```
 
+## 11.24 iOS 本地测试包
+
+在 Mac 上打开 HBuilderX 5.34，准备 Xcode、XcodeGen、CocoaPods、Python 3、Node.js 和 pnpm，再在 `feat-2026.11.24` 的 checkout 安装依赖。首次打包会使用同版本的原始 iOS 离线 SDK。已有 SDK 可设置 `UNIAPPX_SDK_ROOT`，缺少时打包脚本会下载。
+
+将 Apple Development 证书和私钥导入钥匙串，并在 Xcode 安装 `com.nuwax.app` 的开发描述文件。描述文件需包含目标手机 UDID 和 `aps-environment=development`。同一份 IPA 要装到 iPhone 13 和 iPhone 16 时，描述文件需覆盖两台。按[签名配置示例](../../scripts/local-secrets.env.example)填写 `scripts/local-secrets.env`，或用 `NUWAX_SIGNING_ENV` 指向团队提供的配置。普通 UniPush 使用 `NUWAX_IOS_UNIPUSH_CLIENT_IPA` 指定的同应用基座。
+
+```bash
+pnpm install --frozen-lockfile
+make ios-tester
+```
+
+产物在 `out/ios-tester/packages/Nuwax-iOS-Test-<时间>.ipa`，旁边有 SHA-256 和本次构建的 Git 提交及资源摘要。脚本在独立的源码副本里固定测试环境 `https://testagent.xspaceagi.com`，关闭商店更新检查。IPA 内置业务资源，保留普通 UniPush 和录音能力，并通过签名、离线 H5 和 VoIP 特征检查。打包完成后可独立运行。
+
+首次安装和覆盖更新使用同一个[安装脚本](../../scripts/ios-tester/install-nuwax-ios.sh)。解锁 iPhone，开启开发者模式，用 USB 连接并信任 Mac。用下列命令找出本轮要更新的 iPhone 13 或 iPhone 16，复制该行的 **Identifier**。为描述文件注册设备时使用 UDID。
+
+```bash
+xcrun devicectl list devices
+COREDEVICE_ID='替换为目标 iPhone 的 Identifier'
+IPA="$PWD/out/ios-tester/packages/Nuwax-iOS-Test-latest.ipa"
+bash scripts/ios-tester/install-nuwax-ios.sh "$COREDEVICE_ID" "$IPA"
+```
+
+脚本会核对包名和签名，直接覆盖同包名应用，并比对手机上的版本和构建号。看到「设备回读通过」后，打开女娲 App 并确认连接测试环境。安装失败时先查看连接、解锁和开发者模式，再核对签名证书与描述文件是否覆盖该设备。共享 IPA 请选带时间戳的实际文件及对应的校验文件。
+
 ## 11.24 正式云打包
 
 1. 从 GitHub 和 GitLab 回读同名发行分支（本次为 `feat-2026.11.24`）。合并两端的同名分支，保留双方提交。一端已包含另一端的全部提交时，直接快进落后端。历史分叉时，先核对双方独有的改动，合并并验证后将结果同步到两端。两端回读同一 SHA 后，发布人锁定该完整提交和 tree。正式发布前根据上次实际商店发布记录确认 App 版本，`node scripts/check-app-release-version.mjs <上次发布的提交或标签>` 核对两项均递增。当前 11.24 的 `1.3.8 / 138` 与仓库 `v1.3.8` 一致，需要和实际渠道记录核对。

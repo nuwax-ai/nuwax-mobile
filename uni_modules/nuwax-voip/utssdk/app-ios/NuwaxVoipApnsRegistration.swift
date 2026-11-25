@@ -110,6 +110,7 @@ struct NuwaxVoipApnsDevice: Equatable {
     private var generation = 0
     private(set) var current: NuwaxVoipApnsDevice?
     private var inFlightOrRegistered = false
+    private var lastState: (state: String, senderReady: Bool)?
 
     func pause() {
         task?.cancel(); task = nil; generation += 1
@@ -121,13 +122,23 @@ struct NuwaxVoipApnsDevice: Equatable {
          changed: @escaping @MainActor (String, Bool) -> Void) {
         self.current = restored; self.transport = transport; self.sleep = sleep; self.changed = changed
     }
+
+    func replayState() {
+        if let lastState { changed(lastState.state, lastState.senderReady) }
+    }
+
+    private func publish(_ state: String, senderReady: Bool) {
+        lastState = (state, senderReady)
+        changed(state, senderReady)
+    }
+
     func register(_ device: NuwaxVoipApnsDevice) {
         if current == device && inFlightOrRegistered { return }
         if let old = current, !old.sameNamespace(as: device) {
             stop(revoke: true)
         }
         task?.cancel(); generation += 1; let run = generation
-        current = device; inFlightOrRegistered = true; changed("registering", false)
+        current = device; inFlightOrRegistered = true; publish("registering", senderReady: false)
         task = Task { @MainActor in
             for attempt in 0..<5 {
                 guard !Task.isCancelled, run == self.generation else { return }
@@ -138,19 +149,20 @@ struct NuwaxVoipApnsDevice: Equatable {
                     guard !Task.isCancelled, run == self.generation else { return }
                     if device.acknowledges(result) {
                         // registered is storage acknowledgement; nativePush is the sender's declared readiness, not delivery.
-                        self.changed("registered", device.acknowledgement(result)?["nativePush"] as? Bool == true); return
+                        self.publish("registered", senderReady: device.acknowledgement(result)?["nativePush"] as? Bool == true)
+                        return
                     }
                 } catch { if Task.isCancelled || run != self.generation { return } }
             }
             guard run == self.generation, !Task.isCancelled else { return }
             self.inFlightOrRegistered = false
-            self.changed("unavailable", false)
+            self.publish("unavailable", senderReady: false)
         }
     }
     /// Best-effort conditional revoke, using this instance's captured former account transport.
     @discardableResult func stop(revoke: Bool) -> Task<Bool, Never>? {
         pause()
-        let device = current; current = nil; changed("stopped", false)
+        let device = current; current = nil; publish("stopped", senderReady: false)
         guard revoke, let device else { return nil }
         let transport = transport, sleep = sleep
         return Task { @MainActor in

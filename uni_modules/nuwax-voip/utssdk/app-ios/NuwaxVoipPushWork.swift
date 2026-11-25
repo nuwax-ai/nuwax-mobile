@@ -1,6 +1,6 @@
 import Foundation
 
-/// The async PushKit delegate may return as soon as the system report finishes.
+/// PushKit may complete as soon as the system report finishes.
 /// Network verification has a separately owned, cancellable background lifetime.
 @MainActor final class NuwaxVoipPushWork {
     private var task: Task<Void, Never>?
@@ -10,17 +10,24 @@ import Foundation
 
     init(finished: @escaping @MainActor () -> Void) { self.finished = finished }
 
-    func reportThenValidate(report: @MainActor () async throws -> Void,
-                            validate: @escaping @MainActor () async -> Void) async throws {
-        do { try await report() }
-        catch { release(); throw error }
-        guard !cancelled else { release(); return }
-        task = Task { @MainActor in
-            guard !self.cancelled else { self.release(); return }
-            await validate()
-            self.release()
+    typealias ReportCompletion = @MainActor (Result<Void, Error>) -> Void
+
+    func reportThenValidate(report: @MainActor (@escaping ReportCompletion) -> Void,
+                            validate: @escaping @MainActor () async -> Void,
+                            completion: @escaping ReportCompletion) {
+        report { result in
+            switch result {
+            case .success where !self.cancelled:
+                self.task = Task { @MainActor in
+                    guard !self.cancelled else { self.release(); return }
+                    await validate()
+                    self.release()
+                }
+            default:
+                self.release()
+            }
+            completion(result)
         }
-        // No await on task: returning completes PushKit, independently of HTTP.
     }
 
     func cancel() {

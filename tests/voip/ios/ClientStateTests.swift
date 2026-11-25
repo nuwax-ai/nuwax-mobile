@@ -2,6 +2,23 @@ import XCTest
 @testable import VoipPush
 
 final class ClientStateTests: XCTestCase {
+    func testNativeRestoreAndUiBootstrapShareTransportOnlyForTheSameCredentials() {
+        let native = [
+            "apiBaseUrl": "https://test.example", "userId": "user-a", "deviceId": "phone-a",
+            "accessToken": "test-token", "protocol": "im-voip-v1", "pushBusinessEnvironment": "test",
+            "scope": "native-restore"
+        ]
+        var ui = native
+        ui["scope"] = "app-ui"
+        XCTAssertTrue(NuwaxVoipClientPolicy.sharesTransport(native, ui))
+        for key in ["apiBaseUrl", "userId", "deviceId", "accessToken", "protocol", "pushBusinessEnvironment"] {
+            var changed = ui
+            changed[key] = "different"
+            XCTAssertFalse(NuwaxVoipClientPolicy.sharesTransport(native, changed), key)
+        }
+        XCTAssertFalse(NuwaxVoipClientPolicy.sharesTransport([:], [:]))
+    }
+
     func testQASignedHostRejectsStoredProductionContext() {
         let testOrigin = "https://testagent.xspaceagi.com"
         XCTAssertTrue(NuwaxVoipClientPolicy.allowsOrigin(testOrigin, pinnedOrigin: testOrigin))

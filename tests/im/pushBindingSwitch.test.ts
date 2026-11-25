@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getApiBaseUrl, setApiBaseUrl } from '@/constants/config.uts';
-import { apiImDeviceRegister, revokeManagedImPushBinding } from '@/servers/im.uts';
+import { apiImDeviceRegister, apiImDeviceUnregister, getImDeviceId, revokeManagedImPushBinding } from '@/servers/im.uts';
 import { SUCCESS_CODE } from '@/constants/codes.constants';
-import { invalidateImSession } from '@/utils/im/imSessionScope.uts';
+import { ACCESS_TOKEN } from '@/constants/home.constants';
+import { apiResCode, apiResData } from '@/utils/apiResponse';
+import { bindImPushPreferenceUser } from '@/utils/im/imPushPreference';
+import { getImSessionStamp, invalidateImSession } from '@/utils/im/imSessionScope.uts';
 import { IM_DEVICE_BASE_ID_STORAGE_KEY, IM_PUSH_BINDING_KEY } from '@/utils/installScopedStorage.uts';
+import { loadUtsClass } from './runtimeHarness';
 
 const request = vi.hoisted(() => vi.fn());
 vi.mock('@/servers/useRequest.uts', () => ({ default: request }));
@@ -64,6 +68,67 @@ describe('App push binding handoff', () => {
     request.mockResolvedValueOnce({ code: SUCCESS_CODE, data: {} });
     await expect(apiImDeviceRegister('incoming-cid')).resolves.toMatchObject({ code: SUCCESS_CODE });
     expect(request.mock.lastCall?.[0]).toMatchObject({ method: 'POST', data: expect.objectContaining({ pushToken: 'incoming-cid' }) });
+  });
+
+  it('drops device registration already waiting in the queue when sign-out starts', async () => {
+    const registration = apiImDeviceRegister('outgoing-cid');
+    const blocked = expect(registration).rejects.toThrow('IM device session changed');
+    request.mockResolvedValueOnce({ code: SUCCESS_CODE,
+      data: { registrationId: releaseId, environment: 'test', active: false } });
+    expect(await revokeManagedImPushBinding(origin, true, false, true)).toBe(true);
+    await blocked;
+    expect(request.mock.calls.map(([options]) => options.method)).toEqual(['DELETE']);
+  });
+
+  it('drops the old account POST if its identity lookup is pending when sign-out starts', async () => {
+    storage.set(ACCESS_TOKEN, 'outgoing-token');
+    const identity = Promise.withResolvers<{ code: string; data: { userId: string } }>();
+    request.mockReturnValueOnce(identity.promise);
+    const registration = apiImDeviceRegister('outgoing-cid');
+    const blocked = expect(registration).rejects.toThrow('IM device session changed');
+    await vi.waitFor(() => expect(request).toHaveBeenCalledWith({
+      url: '/api/instant-message/users/me', method: 'GET',
+    }));
+
+    request.mockResolvedValueOnce({ code: SUCCESS_CODE,
+      data: { registrationId: releaseId, environment: 'test', active: false } });
+    const release = revokeManagedImPushBinding(origin, true, false, true);
+    identity.resolve({ code: SUCCESS_CODE, data: { userId: '123' } });
+    await blocked;
+    expect(await release).toBe(true);
+    expect(request.mock.calls.map(([options]) => options.method)).toEqual(['GET', 'DELETE']);
+  });
+
+  it('waits for a device POST already sent before running the two sign-out deletes', async () => {
+    storage.set(ACCESS_TOKEN, 'outgoing-token');
+    expect(bindImPushPreferenceUser('123')).toBe(true);
+    const registrationResponse = Promise.withResolvers<{ code: string; data: object }>();
+    request.mockReturnValueOnce(registrationResponse.promise);
+    const registration = apiImDeviceRegister('outgoing-cid');
+    await vi.waitFor(() => expect(request).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST' })));
+
+    const unregister = loadUtsClass('utils/im/imWsClient.uts', 'unregisterImDeviceSafe', {
+      ACCESS_TOKEN, uni: globalThis.uni, isAppWebViewEmbedded: () => true,
+      getImSessionStamp, getApiBaseUrl, getImDeviceId, apiImDeviceUnregister,
+      revokeManagedImPushBinding, apiResCode, apiResData, SUCCESS_CODE,
+    });
+    request.mockResolvedValueOnce({ code: 'UNAVAILABLE' });
+    request.mockResolvedValueOnce({ code: SUCCESS_CODE, data: true });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const signOut = unregister(true);
+      const duplicateSignOut = unregister(true);
+      expect(request).toHaveBeenCalledTimes(1);
+      registrationResponse.resolve({ code: SUCCESS_CODE, data: {} });
+      await registration;
+      await Promise.all([signOut, duplicateSignOut]);
+      expect(request.mock.calls.map(([options]) => options.method)).toEqual(['POST', 'DELETE', 'DELETE']);
+      expect(request.mock.calls[1][0].url).toContain(`/push-binding?registrationId=${activeId}`);
+      expect(request.mock.calls[2][0].url).toBe(`/api/instant-message/devices/${encodeURIComponent(getImDeviceId())}`);
+      expect(warn).toHaveBeenCalledWith('[ImWs] managed push binding release not confirmed');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('uses the outgoing origin’s active receipt and preserves a different origin’s release', async () => {

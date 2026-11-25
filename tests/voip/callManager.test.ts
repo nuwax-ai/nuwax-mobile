@@ -8,6 +8,7 @@ const fake = vi.hoisted(() => ({
   capabilities: vi.fn(),
   permissions: vi.fn(),
   create: vi.fn(),
+  snapshot: vi.fn(),
   claimAudio: vi.fn(),
   settings: vi.fn(),
   background: false,
@@ -18,7 +19,7 @@ vi.mock('vue', () => ({ ref: (value: unknown) => ({ value }) }));
 vi.mock('../../servers/voip.uts', () => ({
   apiCallCapabilities: fake.capabilities,
   apiCreateCall: fake.create,
-  apiCallSnapshot: vi.fn(),
+  apiCallSnapshot: fake.snapshot,
   cancelCreatedVoipCall: vi.fn(),
   readVoipDevSession: () => ({ enabled: true }),
   setVoipDevSession: vi.fn(),
@@ -49,7 +50,7 @@ vi.mock('../../features/voip/audioFocus.uts', () => ({ claimVoipAudio: fake.clai
 vi.mock('../../utils/voice/stopAllSpeechPlayback.uts', () => ({ stopAllSpeechPlayback: vi.fn() }));
 vi.mock('../../utils/i18n.uts', () => ({ t: (key: string) => key }));
 
-import { bootstrapVoip, clearVoipSession, getVoipSnapshot, startVoipCall, answerVoipCall, endVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioInterrupted, voipPermissionPending, voipPushRegistration, setVoipBackground } from '../../features/voip/callManager.uts';
+import { bootstrapVoip, clearVoipSession, getVoipSnapshot, handleVoipInvitation, startVoipCall, answerVoipCall, endVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioInterrupted, voipPermissionPending, voipPushRegistration, setVoipBackground } from '../../features/voip/callManager.uts';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -72,11 +73,54 @@ beforeEach(() => {
   fake.capabilities.mockReset().mockResolvedValue({ enabled: true, audio: true, video: true });
   fake.permissions.mockReset().mockResolvedValue(true);
   fake.create.mockReset().mockRejectedValue(new Error('UNEXPECTED_CREATE'));
+  fake.snapshot.mockReset().mockRejectedValue(new Error('UNEXPECTED_SNAPSHOT'));
   fake.claimAudio.mockClear();
   fake.settings.mockClear();
 });
 
 afterEach(() => { clearVoipSession(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+describe('ordinary notification invitation', () => {
+  function ringingSnapshot() {
+    return { callId: 'incoming', convId: 'chat', version: 1, state: 'ringing',
+      callerId: 'bob', calleeId: 'alice', callerDeviceId: 'b1', mediaType: 'audio',
+      expiresAt: Date.now() + 60_000 };
+  }
+
+  it('restores a valid notification and ignores one already past its own deadline', async () => {
+    fake.snapshot.mockResolvedValue(ringingSnapshot());
+    await handleVoipInvitation('expired', true, '', '', Date.now());
+    expect(fake.snapshot).not.toHaveBeenCalled();
+    await handleVoipInvitation('incoming', true, '', '', Date.now() + 5000);
+    expect(fake.snapshot).toHaveBeenCalledExactlyOnceWith('incoming');
+    expect(fake.commands).toContainEqual(expect.objectContaining({ op: 'watch', snapshot: ringingSnapshot() }));
+  });
+
+  it('does not restore a notification that expires while its message is being fetched', async () => {
+    const fetched = deferred<ReturnType<typeof ringingSnapshot>>();
+    fake.snapshot.mockReturnValue(fetched.promise);
+    const pending = handleVoipInvitation('incoming', true, '', '', Date.now() + 500);
+    await vi.advanceTimersByTimeAsync(501);
+    expect(fake.snapshot).toHaveBeenCalledOnce();
+    fetched.resolve(ringingSnapshot());
+    await pending;
+    expect(fake.commands.some(command => command.op === 'watch')).toBe(false);
+  });
+
+  it('does not open a notification handled across a session clear during bootstrap', async () => {
+    const pending = handleVoipInvitation('incoming', true);
+    clearVoipSession();
+    await pending;
+    expect(fake.snapshot).not.toHaveBeenCalled();
+    expect(fake.commands.some(command => command.op === 'watch')).toBe(false);
+  });
+
+  it('ignores an invitation explicitly addressed to a different account', async () => {
+    await handleVoipInvitation('incoming', true, '', '', Date.now() + 5000, 'former-account');
+    expect(fake.snapshot).not.toHaveBeenCalled();
+    expect(fake.commands.some(command => command.op === 'watch')).toBe(false);
+  });
+});
 
 async function deliverIncoming(presentation: { nativeIncomingUI: boolean; foregroundIncomingPage: boolean } | null = null) {
   const initialized = fake.commands.find(command => command.op === 'initialize');

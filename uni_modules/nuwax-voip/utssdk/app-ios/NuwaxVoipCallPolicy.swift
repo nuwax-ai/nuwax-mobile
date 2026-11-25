@@ -52,6 +52,12 @@ enum NuwaxVoipCallPolicy {
         return !messageID.isEmpty && !callMessageID.isEmpty && messageID == callMessageID
     }
 
+    static func incomingExpiry(messageExpiry: Double, notificationExpiry: Double, now: Double) -> Double? {
+        guard messageExpiry.isFinite, notificationExpiry.isFinite, notificationExpiry >= 0 else { return nil }
+        let expiry = notificationExpiry == 0 ? messageExpiry : min(notificationExpiry, messageExpiry)
+        return expiry > now ? expiry : nil
+    }
+
     static func canDecline(reason: String, state: String) -> Bool { reason == "rejected" && state == "ringing" }
 
     static func endReason(action: String, state: String, callee: Bool) -> String {

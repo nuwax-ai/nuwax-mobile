@@ -75,6 +75,24 @@ import XCTest
         XCTAssertEqual(states.last?.1, false)
         registration.stop(revoke: false)
     }
+    func testUiReattachReplaysReadyRegistrationWithoutAnotherRequest() async {
+        var requests = 0
+        var states: [(String, Bool)] = []
+        let registration = NuwaxVoipApnsRegistration(transport: { body in
+            requests += 1
+            return self.ack(body, ready: true)
+        }, changed: { states.append(($0, $1)) })
+        let record = device()
+        registration.register(record)
+        await until { states.last?.0 == "registered" }
+        registration.replayState()
+        registration.register(record)
+        await Task.yield()
+        XCTAssertEqual(states.map { $0.0 }, ["registering", "registered", "registered"])
+        XCTAssertEqual(states.last?.1, true)
+        XCTAssertEqual(requests, 1)
+    }
+
     func testMissingBackendRetriesFiveTimesWithoutGetuiOrMediaDependency() async {
         var requests = 0, delays: [UInt64] = [], states: [String] = []
         let registration = NuwaxVoipApnsRegistration(transport: { _ in requests += 1; throw URLError(.cannotConnectToHost) },

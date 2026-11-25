@@ -4,6 +4,12 @@ enum NuwaxVoipPermission: String { case authorized, notDetermined, denied }
 enum NuwaxVoipPermissionPlan: Equatable { case ready, request, foreground, settings }
 
 enum NuwaxVoipClientPolicy {
+    static func sharesTransport(_ previous: [String: Any], _ next: [String: Any]) -> Bool {
+        guard let token = previous["accessToken"] as? String, !token.isEmpty else { return false }
+        let transportKeys = ["apiBaseUrl", "userId", "deviceId", "accessToken", "protocol", "pushBusinessEnvironment"]
+        return transportKeys.allSatisfy { previous[$0] as? String == next[$0] as? String }
+    }
+
     static func allowsOrigin(_ origin: String, pinnedOrigin: String?) -> Bool {
         guard let pinnedOrigin else { return true }
         return !pinnedOrigin.isEmpty && origin == pinnedOrigin

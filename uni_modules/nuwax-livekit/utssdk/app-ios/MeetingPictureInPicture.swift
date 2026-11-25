@@ -32,6 +32,10 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
   private var lifecycleID = 0
   private var startedDuringTransition = false
   private var startTrigger = "none"
+  private var enteredBackgroundSinceActive = false
+  private var resignCount = 0
+  private var backgroundCount = 0
+  private var activeCount = 0
   private var possibilityObservation: NSKeyValueObservation?
 
   func makeSourceView() -> UIView {
@@ -57,11 +61,24 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     backgroundObserver = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
       guard let self else { return }
       self.leavingForeground = true
+      self.enteredBackgroundSinceActive = true
+      self.backgroundCount += 1
+      if !self.startedDuringTransition, self.controller?.isPictureInPictureActive != true {
+        self.lastFailure = "awaiting_auto_start"
+      }
       self.logState("didEnterBackground")
       self.observeAutomaticStart()
     }
     foregroundObserver = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
       guard let self else { return }
+      self.activeCount += 1
+      if self.enteredBackgroundSinceActive, !self.startedDuringTransition,
+         self.controller?.isPictureInPictureActive != true,
+         self.lastFailure == "awaiting_auto_start" {
+        // App 在后台很快会被挂起，后台延时任务未必能输出；回前台时补记最终结果。
+        self.lastFailure = "auto_not_observed_after_background"
+      }
+      self.enteredBackgroundSinceActive = false
       self.leavingForeground = false
       self.lifecycleID += 1
       // 只在真正回到前台时收窗，页面轮询不能打断正在进入 PiP 的动画。
@@ -70,6 +87,7 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
         self.controller?.stopPictureInPicture()
       }
       self.setPresentation(pageVisible: self.pageVisible, foreground: true)
+      self.logState("didBecomeActive")
     }
     orientationObserver = NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
       self?.layoutEdgeHandle()
@@ -100,17 +118,18 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     video.frame = content.view.bounds
     video.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     content.view.addSubview(video)
-    // iOS 的“自动开启画中画”受系统设置影响；退后台时主动请求一次，
-    // canStartPictureInPictureAutomaticallyFromInline 继续作为系统兜底。
+    // iOS 的“自动开启画中画”受系统设置影响。这里仅准备最后一帧，
+    // 不能在 applicationState 已变为 inactive 后手动 start，否则 AVKit 会静默忽略，
+    // 并可能与系统自己的自动 PiP 启动竞争。
     snapshotObserver = NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
       guard let self else { return }
       self.lifecycleID += 1
+      self.resignCount += 1
       self.startedDuringTransition = self.controller?.isPictureInPictureActive == true
       self.lastFailure = ""
       self.leavingForeground = true
       self.capturePreviewSnapshot()
       self.preview?.redisplay()
-      self.requestStartForBackground()
       self.logState("willResignActive")
     }
     let controller = AVPictureInPictureController(contentSource: .init(
@@ -250,34 +269,7 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     preview?.display(image)
   }
 
-  /// 自动 PiP 只是“允许系统启动”，用户关闭系统自动画中画后不会触发任何 delegate。
-  /// 在 willResignActive 的前台退出窗口主动请求，避免进入 background 后再调用被 AVKit 拒绝。
-  private func requestStartForBackground() {
-    guard !capturePromptVisible, let controller else {
-      lastFailure = capturePromptVisible ? "capture_prompt" : "controller_missing"
-      return
-    }
-    if controller.isPictureInPictureActive || starting { return }
-    guard controller.isPictureInPicturePossible else {
-      lastFailure = "not_possible_at_resign"
-      return
-    }
-    starting = true
-    startTrigger = "manual"
-    lastFailure = ""
-    controller.startPictureInPicture()
-    let expectedLifecycle = lifecycleID
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak controller] in
-      guard let self, let controller, self.controller === controller,
-            self.lifecycleID == expectedLifecycle, self.starting,
-            !self.startedDuringTransition, !controller.isPictureInPictureActive else { return }
-      self.starting = false
-      if self.lastFailure.isEmpty { self.lastFailure = "manual_start_timeout" }
-      self.logState("manualStartNotObserved")
-    }
-  }
-
-  /// 观察主动请求和系统自动兜底的最终结果。
+  /// 观察系统自动 PiP 的最终结果；后台挂起时由回前台诊断补记。
   private func observeAutomaticStart() {
     guard let expectedController = controller, !capturePromptVisible else { return }
     let expectedLifecycle = lifecycleID
@@ -323,6 +315,10 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
     lifecycleID += 1
     startedDuringTransition = false
     startTrigger = "none"
+    enteredBackgroundSinceActive = false
+    resignCount = 0
+    backgroundCount = 0
+    activeCount = 0
     refreshDiagnostics()
   }
 
@@ -337,7 +333,7 @@ final class MeetingPictureInPicture: NSObject, AVPictureInPictureControllerDeleg
 
   private func refreshDiagnostics() {
     let anchor = controller?.contentSource?.activeVideoCallSourceView
-    let value = "pip[build=ios-pip-20261125-p12,possible=\(controller?.isPictureInPicturePossible == true ? 1 : 0),active=\(controller?.isPictureInPictureActive == true ? 1 : 0),starting=\(starting ? 1 : 0),trigger=\(startTrigger),source=\(anchor?.window == nil ? 0 : 1),hidden=\(anchor?.isHidden == true ? 1 : 0),frame=\(preview?.hasFrame == true ? 1 : 0),previewStatus=\(preview?.displayLayer.status.rawValue ?? -1),videoLayer=\(video?.avSampleBufferDisplayLayer == nil ? 0 : 1),app=\(UIApplication.shared.applicationState.rawValue),auto=\(controller?.canStartPictureInPictureAutomaticallyFromInline == true ? 1 : 0),prompt=\(capturePromptVisible ? 1 : 0),err=\(lastFailure)]"
+    let value = "pip[build=ios-pip-20261125-p13,possible=\(controller?.isPictureInPicturePossible == true ? 1 : 0),active=\(controller?.isPictureInPictureActive == true ? 1 : 0),starting=\(starting ? 1 : 0),trigger=\(startTrigger),source=\(anchor?.window == nil ? 0 : 1),hidden=\(anchor?.isHidden == true ? 1 : 0),frame=\(preview?.hasFrame == true ? 1 : 0),previewStatus=\(preview?.displayLayer.status.rawValue ?? -1),videoLayer=\(video?.avSampleBufferDisplayLayer == nil ? 0 : 1),app=\(UIApplication.shared.applicationState.rawValue),auto=\(controller?.canStartPictureInPictureAutomaticallyFromInline == true ? 1 : 0),prompt=\(capturePromptVisible ? 1 : 0),life=r\(resignCount)b\(backgroundCount)a\(activeCount),err=\(lastFailure)]"
     diagnosticLock.lock()
     diagnosticSnapshot = value
     diagnosticLock.unlock()

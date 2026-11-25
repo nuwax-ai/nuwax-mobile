@@ -486,15 +486,31 @@ import LiveKitClient
         guard let conversation = try? await request("/api/instant-message/conversations/\(conv)", absolute: true),
               run == generation, user == configuration["userId"] as? String,
               conversation["convType"] as? Int == 1, wireString(conversation["peerUserId"]) == sender else { return nil }
-        let profileAvatar = (conversation["peerAvatar"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let callerAvatar = profileAvatar.isEmpty ? (message["senderAvatar"] as? String ?? "") : profileAvatar
+        let callerAvatar = NuwaxVoipClientPolicy.avatarURL(conversation["peerAvatar"])
+            ?? NuwaxVoipClientPolicy.avatarURL(message["senderAvatar"]) ?? ""
         let next: [String: Any] = ["protocol": "im-voip-v1", "callId": id, "roomName": roomName, "msgId": wireString(message["msgId"]), "convId": conv, "version": 1, "state": "ringing", "callerId": sender, "calleeId": configuration["userId"] as? String ?? "", "callerDeviceId": "", "acceptedDeviceId": "", "mediaType": media, "displayName": conversation["peerName"] as? String ?? sender, "callerDisplayName": conversation["peerName"] as? String ?? sender, "calleeDisplayName": configuration["userId"] as? String ?? "", "callerAvatar": callerAvatar, "expiresAt": sent + 60000]
         return next
     }
     private func adoptBusinessInvitation(_ next: [String: Any]) {
         guard let id = next["callId"] as? String, !terminal.contains(id) else { return }
         if snapshot != nil && snapshot?["callId"] as? String != id { notifyBusinessEnd(next, reason: "busy"); rememberTerminal(id); return }
+        let newCall = snapshot == nil
         adopt(next)
+        guard newCall, snapshot?["callId"] as? String == id,
+              NuwaxVoipClientPolicy.avatarURL(next["callerAvatar"]) == nil,
+              let caller = next["callerId"] as? String else { return }
+
+        // Resolve App UI artwork after reporting the call. The system Handle has no avatar field.
+        let run = generation, settings = configuration
+        Task { @MainActor [weak self] in
+            guard let self, run == self.generation,
+                  let response = try? await self.request("/api/instant-message/contacts", absolute: true, captured: settings),
+                  run == self.generation, let current = self.snapshot,
+                  let contacts = response["items"] as? [[String: Any]],
+                  let updated = NuwaxVoipClientPolicy.backfillCallerAvatar(current, callID: id, callerID: caller, contacts: contacts) else { return }
+            self.snapshot = updated
+            self.emitSnapshot(updated)
+        }
     }
     private func receiveSignal(_ event: [String: Any]) {
         guard let payload = event["payload"] as? [String: Any] else { return }

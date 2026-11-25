@@ -27,6 +27,26 @@ final class ClientStateTests: XCTestCase {
         XCTAssertFalse(NuwaxVoipClientPolicy.allowsOrigin(testOrigin, pinnedOrigin: ""))
         XCTAssertTrue(NuwaxVoipClientPolicy.allowsOrigin("https://enterprise.example", pinnedOrigin: nil))
     }
+
+    func testMissingCallerAvatarUsesTheMatchedActiveContactWithoutChangingCallState() throws {
+        let call: [String: Any] = ["callId": "call-a", "callerId": "42", "state": "active",
+                                   "version": 3, "callerAvatar": " "]
+        let contacts: [[String: Any]] = [
+            ["userId": 18, "subjectType": 1, "status": 1, "avatar": "/api/f/other.png"],
+            ["userId": "42", "subjectType": 2, "status": 1, "avatar": "/api/f/agent.png"],
+            ["userId": "42", "subjectType": 1, "status": 2, "avatar": "/api/f/pending.png"],
+            ["userId": 42, "subjectType": 1, "status": 1, "avatar": " /api/f/caller.png "]
+        ]
+        let updated = try XCTUnwrap(NuwaxVoipClientPolicy.backfillCallerAvatar(call, callID: "call-a", callerID: "42", contacts: contacts))
+        XCTAssertEqual(updated["callerAvatar"] as? String, "/api/f/caller.png")
+        XCTAssertEqual(updated["state"] as? String, "active")
+        XCTAssertEqual(updated["version"] as? Int, 4)
+        XCTAssertNil(NuwaxVoipClientPolicy.backfillCallerAvatar(updated, callID: "call-a", callerID: "42", contacts: contacts))
+        XCTAssertNil(NuwaxVoipClientPolicy.backfillCallerAvatar(call, callID: "call-b", callerID: "42", contacts: contacts))
+        XCTAssertNil(NuwaxVoipClientPolicy.backfillCallerAvatar(call, callID: "call-a", callerID: "18", contacts: contacts))
+        XCTAssertNil(NuwaxVoipClientPolicy.backfillCallerAvatar(call, callID: "call-a", callerID: "42", contacts: Array(contacts.dropLast())))
+    }
+
     func testFirstAnswerRequiresForegroundOnlyWhenPermissionUndetermined() {
         XCTAssertEqual(NuwaxVoipClientPolicy.permissionPlan(microphone: .notDetermined, camera: .denied, video: false, foreground: false), .foreground)
         XCTAssertEqual(NuwaxVoipClientPolicy.permissionPlan(microphone: .notDetermined, camera: .denied, video: false, foreground: true), .request)

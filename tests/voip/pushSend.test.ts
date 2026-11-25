@@ -474,6 +474,46 @@ describe('meeting ringing delivery', () => {
     expect(database).not.toHaveBeenCalled();
   });
 
+  it('sends an explicit Harmony meeting through the Huawei test VoIP transport with just the IM locator', async () => {
+    const cid = 'fixture-harmony-meeting-cid';
+    const { call, send, request } = load(latestEntry);
+    const body = {
+      ...envelope, push_clientid: [cid],
+      callRoute: { cid, platform: 'harmonyos', transport: 'harmony-huawei' },
+      payload: { ...ringPayload(), passcode: '1234' },
+    };
+    expect((await call(body)).errCode).toBe(0);
+    const [{ requestData }] = request.mock.calls[0];
+    expect(requestData.audience.cid).toEqual([cid]);
+    expect(requestData.settings.strategy).toEqual({ hoshw: 2 });
+    const channel = requestData.push_channel.harmony.custom.HW;
+    expect(channel.type).toBe('voip_call');
+    const pushed = JSON.parse(JSON.parse(channel.payload).extraData);
+    expect(pushed).toMatchObject({ scene: 'meeting', callId: 'mi-ring', inviteId: 'mi-ring', calleeId: '10002',
+      convId: body.payload.convId, msgId: body.payload.msgId });
+    expect(pushed).not.toHaveProperty('roomName');
+    expect(pushed).not.toHaveProperty('passcode');
+    expect(send).not.toHaveBeenCalled();
+
+    await call({ ...body, payload: { ...body.payload, silent: true } });
+    expect(request).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0][0].payload).toMatchObject({ type: 'meeting_invite', silent: true });
+  });
+
+  it('routes ordinary IM meeting envelopes to the Harmony test channel when explicitly enabled', async () => {
+    const cid = 'registered-harmony-meeting-cid';
+    const { call, send, request, manager } = load(latestEntry, { NUWAX_VOIP_HARMONY_MEETING_RING: '1' });
+    manager.getClientDetailByCid = vi.fn().mockResolvedValue({
+      errCode: 0, data: { validCids: { [cid]: { device_token: 'vendor-token', brand: 'hoshw', phone_type: 7 } } },
+    });
+    const result = await call({ ...envelope, push_clientid: [cid], payload: ringPayload() });
+    expect(result.data.results).toMatchObject([
+      { cid, transport: 'harmony-huawei', delivery: 'native', errCode: 0 },
+    ]);
+    expect(request).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it.each([{ silent: true }, { calleeId: undefined }])('falls back for meetings that cannot ring: %j', async overrides => {
     const { call, send, request } = load(latestEntry, { ...ringEnv, NUWAX_VOIP_ANDROID_TRANSPORTS: 'android-huawei' });
     const cid = 'meeting-recipient';

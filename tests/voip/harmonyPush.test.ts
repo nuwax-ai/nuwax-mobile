@@ -61,6 +61,7 @@ beforeEach(() => {
   VoipBridge.peerReady = false;
   VoipBridge.mediaForeground = false;
   VoipBridge.mediaContentLoaded = false;
+  VoipBridge.context = null;
   VoipBridge.answeredNativeId = ''; VoipBridge.ability = null; VoipBridge.systemRegistered = false;
   VoipBridge.clearPendingIncoming();
   token.get.mockReset();
@@ -103,6 +104,12 @@ describe('Harmony system call cold start', () => {
     vi.mocked(VoipBridge.finish).mockImplementation(actualFinish);
     VoipBridge.initialize(config);
   };
+  const meetingConfig = { ...config, apiBaseUrl: 'https://testagent.xspaceagi.com' };
+  const meetingPush = () => push({ scene: 'meeting', inviteId: 'qa-meeting', roomName: 'untrusted-room', passcode: '4321' });
+  const meetingMessage = () => ({
+    convId, msgId, msgType: 'meeting_invite', senderId: 'bob', sendTime: Date.now(),
+    body: { inviteId: 'qa-meeting', roomName: '123456789', mediaType: 'video', title: '测试会议', passcode: '1234' },
+  });
 
   it('binds the push listener before session restore and preserves the system envelope identifier', async () => {
     const ability = { context: {} } as any;
@@ -327,6 +334,79 @@ describe('Harmony system call cold start', () => {
     expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
     expect(VoipBridge.request).toHaveBeenCalledOnce();
     expect(VoipBridge.current).toBeNull();
+  });
+
+  it('waits for the IM message before routing a cold-start meeting answer to the app', async () => {
+    vi.mocked(VoipBridge.finish).mockImplementation(actualFinish);
+    const startAbility = vi.fn().mockResolvedValue(undefined);
+    VoipBridge.context = { abilityInfo: { bundleName: 'com.nuwax.apphm', moduleName: 'entry' }, startAbility } as any;
+    VoipBridge.initialize(meetingConfig, true);
+    vi.useFakeTimers();
+    let resolveMessage!: (value: any) => void;
+    vi.mocked(VoipBridge.request).mockReturnValueOnce(new Promise(resolve => { resolveMessage = resolve; }));
+    const startMedia = vi.spyOn(VoipBridge, 'startMedia');
+    const pending = VoipBridge.incoming(meetingPush());
+    await vi.advanceTimersByTimeAsync(1800);
+    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      callId: systemId, abilityName: 'EntryAbility', isConferenceCall: true,
+    }));
+
+    VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'answer-voice' } as any);
+    expect(startAbility).not.toHaveBeenCalled();
+    expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([]);
+    resolveMessage(meetingMessage());
+    await pending;
+
+    VoipBridge.initialize({ ...meetingConfig, scope: 'ui-scope' });
+    expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([expect.objectContaining({
+      scope: 'ui-scope', action: 'accept', convId, msgId, inviteId: 'qa-meeting',
+      roomName: '123456789', passcode: '1234', mediaType: 'audio',
+    })]);
+    expect(startAbility).toHaveBeenCalledOnce();
+    expect(kits.reportState).toHaveBeenLastCalledWith(systemId, 'disconnected');
+    expect(VoipBridge.current).toBeNull();
+    expect(startMedia).not.toHaveBeenCalled();
+  });
+
+  it.each(['reject', 'timeout'])('reports a verified meeting %s without carrying the password', async action => {
+    vi.mocked(VoipBridge.finish).mockImplementation(actualFinish);
+    VoipBridge.initialize(meetingConfig);
+    vi.useFakeTimers();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(meetingMessage() as any);
+    await VoipBridge.incoming(meetingPush());
+
+    if (action === 'reject') VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'reject' } as any);
+    else await vi.advanceTimersByTimeAsync(30000);
+    expect(VoipBridge.queue).toContainEqual(expect.objectContaining({
+      type: 'meetingInvite', action, convId, msgId, roomName: '123456789', passcode: '',
+    }));
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
+    expect(VoipBridge.pendingIncoming).toBeNull();
+  });
+
+  it('ignores a duplicate meeting push after the same account handled it on another device', async () => {
+    vi.mocked(VoipBridge.finish).mockImplementation(actualFinish);
+    VoipBridge.initialize(meetingConfig);
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(meetingMessage() as any);
+    await VoipBridge.incoming(meetingPush());
+    VoipBridge.receiveSignal({ eventType: 'meeting:invite-handled', payload: { convId, msgId, userId: 'alice' } } as any);
+    await VoipBridge.incoming({ ...meetingPush(), callId: 'repeat-system-id' });
+
+    expect(kits.report).toHaveBeenCalledOnce();
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
+    expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([]);
+  });
+
+  it.each([{ inviteId: 'other' }, { silent: true }, { mediaType: 'audio' }])('rejects a non-matching IM meeting invitation: %j', async overrides => {
+    vi.mocked(VoipBridge.finish).mockImplementation(actualFinish);
+    VoipBridge.initialize(meetingConfig);
+    const message = meetingMessage();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce({ ...message, body: { ...message.body, ...overrides } } as any);
+    await VoipBridge.incoming(meetingPush());
+
+    expect(VoipBridge.pendingIncoming).toBeNull();
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
+    expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([]);
   });
 });
 

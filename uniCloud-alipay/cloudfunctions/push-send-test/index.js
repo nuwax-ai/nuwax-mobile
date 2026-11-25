@@ -298,7 +298,7 @@ function attachBadgeToPayload(payload, badge) {
 //   cid → 厂商 token / 品牌的档案存在个推服务端，是设备上次在线注册时写入并持久化的，
 //   云函数按 cid 查档案即可，不依赖接收端 App 存活 —— 与普通厂商通知用同一份数据。
 // device_token 非空时按 brand 选路。缺少专用发送能力或查档失败时走普通通知。
-async function resolveAutoCallRoute(cid, invocationId, singleChatCall) {
+async function resolveAutoCallRoute(cid, invocationId, allowHarmony) {
   if (typeof uniPush.getClientDetailByCid !== 'function') return null
   let detail = null
   try {
@@ -319,7 +319,7 @@ async function resolveAutoCallRoute(cid, invocationId, singleChatCall) {
         [k, typeof v === 'string' ? (/token/i.test(k) ? `len:${v.length}` : v.slice(0, 24)) : v]))
     : null
   const phoneType = detail?.phone_type
-  const harmony = singleChatCall && (brand === 'hoshw' || brand === 'hw') &&
+  const harmony = allowHarmony && (brand === 'hoshw' || brand === 'hw') &&
     (phoneType === 7 || phoneType === '7')
   const route = token && harmony
     ? { cid, platform: 'harmonyos', transport: 'harmony-huawei' }
@@ -537,7 +537,7 @@ async function handle(event, invocationId) {
     }))
   }
   const harmonyRoute = body.callRoute?.transport === 'harmony-huawei'
-  const nativeAttempt = scene?.meeting && (!meetingRinging || harmonyRoute) ? null : prepareNativeVoip(body)
+  const nativeAttempt = scene?.meeting && !meetingRinging ? null : prepareNativeVoip(body)
   const nativeVoip = nativeAttempt?.error && strictCids && !harmonyRoute ? null : nativeAttempt
   if (nativeVoip) {
     if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
@@ -559,13 +559,15 @@ async function handle(event, invocationId) {
   // iOS 读 IM 登记，其他设备继续按个推档案选路。普通通知合并发送。
   const invitation = scene?.call ?? (meetingRinging ? ringAttempt : null)
   if (body.callRoute == null && invitation != null) {
+    // Existing Harmony test packages only handle the single-chat native route.
+    const allowHarmony = scene?.call != null || process.env.NUWAX_VOIP_HARMONY_MEETING_RING === '1'
     const results = []
     const notificationCids = []
     for (let i = 0; i < ids.length; i++) {
       const cid = ids[i]
       const iosRoute = iosCallRouteForCid(cid, iosRegistrations,
         process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT || 'development')
-      const route = iosRoute ?? await resolveAutoCallRoute(cid, invocationId, scene?.call != null)
+      const route = iosRoute ?? await resolveAutoCallRoute(cid, invocationId, allowHarmony)
       if (route != null) {
         const native = prepareNativeVoip({
           ...body, push_clientid: cid, payload: invitation.payload, callRoute: route,

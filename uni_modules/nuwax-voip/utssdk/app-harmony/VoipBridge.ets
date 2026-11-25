@@ -143,6 +143,12 @@ export class VoipBridge {
     VoipBridge.listeners.forEach(callback => callback())
   }
   static drain(): string { const result = JSON.stringify(VoipBridge.queue); VoipBridge.queue = []; return result }
+  static meetingInviteState(msgId: string): string {
+    if (!msgId || VoipBridge.configuration?.apiBaseUrl !== VoipBridge.nativeVoiceTestOrigin) return ''
+    if (VoipBridge.handledMeetingMessages.has(msgId)) return 'handled'
+    const pending = VoipBridge.pendingIncoming
+    return pending && pending.invite.scene === 'meeting' && pending.invite.msgId === msgId ? 'pending' : ''
+  }
   static execute(raw: string): void {
     try {
       const command = JSON.parse(raw) as Command

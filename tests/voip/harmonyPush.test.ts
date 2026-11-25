@@ -368,6 +368,18 @@ describe('Harmony system call cold start', () => {
     expect(startMedia).not.toHaveBeenCalled();
   });
 
+  it('exposes native meeting ownership only for a matching meeting message in the test environment', async () => {
+    VoipBridge.initialize(meetingConfig);
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(meetingMessage() as any);
+    await VoipBridge.incoming(meetingPush());
+    expect(VoipBridge.meetingInviteState(msgId)).toBe('pending');
+    expect(VoipBridge.meetingInviteState('different-message')).toBe('');
+    VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'answer-voice' } as any);
+    expect(VoipBridge.meetingInviteState(msgId)).toBe('handled');
+    VoipBridge.reset();
+    expect(VoipBridge.meetingInviteState(msgId)).toBe('');
+  });
+
   it.each(['reject', 'timeout'])('reports a verified meeting %s without carrying the password', async action => {
     vi.mocked(VoipBridge.finish).mockImplementation(actualFinish);
     VoipBridge.initialize(meetingConfig);

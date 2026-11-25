@@ -6,6 +6,9 @@ import { isNativeImVoipEnabled } from "@/features/voip/integration";
 import { isAppInBackground } from "@/utils/appLifecycle.uts";
 import { hideHandledMeetingInviteBanner, showMeetingInviteBanner } from "@/utils/im/meetingInviteBanner";
 import { getMyUserIdSync } from "@/utils/imNoticeBar";
+// #ifdef APP-HARMONY
+import { getNativeMeetingInviteState } from "@/uni_modules/nuwax-voip";
+// #endif
 
 export const IM_CALL_CHANGED_EVENT = "im-call-changed";
 
@@ -30,15 +33,39 @@ const heardMeetingInvites = new Set<string>();
 // #ifdef APP-HARMONY
 let pendingHarmonyMeetingInvite: UTSJSONObject | null = null;
 let pendingHarmonyMeetingSentAt = 0;
+let harmonyMeetingRetryTimer = 0;
+
+function clearPendingHarmonyMeetingInvite(): void {
+  pendingHarmonyMeetingInvite = null;
+  pendingHarmonyMeetingSentAt = 0;
+  if (harmonyMeetingRetryTimer != 0) {
+    clearTimeout(harmonyMeetingRetryTimer);
+    harmonyMeetingRetryTimer = 0;
+  }
+}
 
 export function resumeHarmonyMeetingInvite(): void {
   if (isAppInBackground()) return;
   const pending = pendingHarmonyMeetingInvite;
-  pendingHarmonyMeetingInvite = null;
-  pendingHarmonyMeetingSentAt = 0;
-  if (pending != null && isNativeImVoipEnabled() && Date.now() < parseFloat(readString(pending, "expiresAt"))) {
-    showMeetingInviteBanner(pending);
+  if (pending == null) return;
+  if (!isNativeImVoipEnabled() || Date.now() >= parseFloat(readString(pending, "expiresAt"))) {
+    clearPendingHarmonyMeetingInvite();
+    return;
   }
+  let nativeState = "";
+  try { nativeState = getNativeMeetingInviteState(readString(pending, "msgId")); } catch (_error) {}
+  if (nativeState == "pending") {
+    // 原生可能仍在核实消息。卡片上报失败时，仍有机会在原有效期内显示 WS 备用邀请。
+    if (harmonyMeetingRetryTimer == 0) {
+      harmonyMeetingRetryTimer = setTimeout(() => {
+        harmonyMeetingRetryTimer = 0;
+        resumeHarmonyMeetingInvite();
+      }, 500);
+    }
+    return;
+  }
+  clearPendingHarmonyMeetingInvite();
+  if (nativeState != "handled") showMeetingInviteBanner(pending);
 }
 // #endif
 
@@ -147,14 +174,13 @@ const onMessageReceived = (payload: any): void => {
       const expiresAt = Math.min(sentAt, now) + 60_000;
       if (expiresAt <= now) return;
       banner["expiresAt"] = expiresAt;
-      // 鸿蒙单聊 VoIP 原生通道尚不处理会议。进程仍存活时，回前台展示尚有效的邀请。
-      if (isAppInBackground()) {
-        if (sentAt >= pendingHarmonyMeetingSentAt) {
-          pendingHarmonyMeetingInvite = banner;
-          pendingHarmonyMeetingSentAt = sentAt;
-        }
-        return;
+      // 系统卡片与 WS 备用提示共用消息坐标，优先由已接管的原生卡片处理。
+      if (sentAt >= pendingHarmonyMeetingSentAt) {
+        pendingHarmonyMeetingInvite = banner;
+        pendingHarmonyMeetingSentAt = sentAt;
+        resumeHarmonyMeetingInvite();
       }
+      return;
     }
     // #endif
     console.error(`[MeetingInvite] banner show inviteId=${inviteId} room=${room} sender=${sender}`);
@@ -195,7 +221,16 @@ const onCustomEvent = (payload: any): void => {
   if (eventType == "meeting:invite-handled") {
     const handled = parseBody(obj["payload"]);
     if (handled != null) {
-      hideHandledMeetingInviteBanner(readString(handled, "msgId"), readString(handled, "inviteId"));
+      const msgId = readString(handled, "msgId");
+      const inviteId = readString(handled, "inviteId");
+      hideHandledMeetingInviteBanner(msgId, inviteId);
+      // #ifdef APP-HARMONY
+      const pending = pendingHarmonyMeetingInvite;
+      if (pending != null && ((msgId.length > 0 && readString(pending, "msgId") == msgId) ||
+        (inviteId.length > 0 && readString(pending, "inviteId") == inviteId))) {
+        clearPendingHarmonyMeetingInvite();
+      }
+      // #endif
     }
     return;
   }
@@ -265,8 +300,7 @@ export function finishImCall(detail: string = ""): void {
 
 export function clearImCallSession(): void {
   // #ifdef APP-HARMONY
-  pendingHarmonyMeetingInvite = null;
-  pendingHarmonyMeetingSentAt = 0;
+  clearPendingHarmonyMeetingInvite();
   heardMeetingInvites.clear();
   // #endif
   session = new ImCallSession();

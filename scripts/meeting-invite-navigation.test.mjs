@@ -4,12 +4,13 @@ import { readFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import vm from 'node:vm';
 
-function harness() {
+function harness(platform = 'APP-IOS', origin = 'https://testagent.xspaceagi.com') {
   let background = false, ready = true, activeRoom = '', resumeCount = 0;
   const navigations = [], timers = new Map(), listeners = new Map();
   let timerID = 0;
   const context = vm.createContext({
     isAppInBackground: () => background,
+    getApiBaseUrl: () => origin,
     IM_SESSION_CLEARED: 'cleared', eventBus: { on: (name, fn) => listeners.set(name, fn) },
     meetingMediaActiveRoom: () => activeRoom, meetingMediaResume: () => resumeCount++,
     getCurrentPages: () => ready ? [{}] : [],
@@ -18,13 +19,13 @@ function harness() {
     clearInterval: id => timers.delete(id),
   });
   const raw = readFileSync(new URL('../utils/meeting/meetingInviteNavigation.uts', import.meta.url), 'utf8');
-  vm.runInContext(stripTypeScriptTypes(raw.replace(/^import[^;]+;/gm, '')).replace(/^export /gm, ''), context);
+  vm.runInContext(stripTypeScriptTypes(preprocessHarmony(raw, platform).replace(/^import[^;]+;/gm, '')).replace(/^export /gm, ''), context);
   return { api: context, navigations, timers,
     background: value => { background = value; }, ready: value => { ready = value; },
     activeRoom: value => { activeRoom = value; }, resumes: () => resumeCount,
     clearSession: () => listeners.get('cleared')({}),
     tick: () => { for (const fn of [...timers.values()]) fn(); },
-    open: (id = 'invite-1') => context.openMeetingInvite(id, '123456789', '测试 & 会议', 'video', '12&34'),
+    open: (id = 'invite-1', room = '123456789') => context.openMeetingInvite(id, room, '测试 & 会议', 'video', '12&34'),
     finish(success = true) { const n = navigations.at(-1); if (success) n.success({}); n.complete({}); },
   };
 }
@@ -63,9 +64,43 @@ test('同一会议已在进行时恢复原会议，不重新入会', () => {
   assert.equal(h.resumes(), 1); assert.equal(h.navigations.length, 0); assert.equal(h.timers.size, 0);
 });
 
+test('鸿蒙测试端保持首个接听请求，已在导航时不压入另一场会议', () => {
+  const h = harness('APP-HARMONY');
+  h.background(true);
+  h.open('first', '111111111');
+  h.open('second', '222222222');
+  h.background(false);
+  h.tick();
+  assert.equal(h.navigations.length, 1);
+  assert.match(h.navigations[0].url, /room=111111111/);
+  h.navigations[0].success({});
+  h.open('third', '333333333');
+  assert.equal(h.navigations.length, 1);
+  h.navigations[0].complete({});
+});
+
+test('鸿蒙生产入口仍沿用现有邀请导航行为', () => {
+  const h = harness('APP-HARMONY', 'https://agent.nuwax.com');
+  h.background(true);
+  h.open('first', '111111111');
+  h.open('second', '222222222');
+  h.background(false);
+  h.tick();
+  assert.equal(h.navigations.length, 1);
+  assert.match(h.navigations[0].url, /room=222222222/);
+});
+
+function preprocessHarmony(source, platform) {
+  return source.replace(/^[ \t]*\/\/ #(ifdef|ifndef) APP-HARMONY\n([\s\S]*?)^[ \t]*\/\/ #endif$/gm,
+    (_, condition, body) => (condition === 'ifdef') === (platform === 'APP-HARMONY') ? body : '');
+}
+
 function meetingInviteReceiver(platform, nativeVoip = true) {
   let now = 1_000_000;
   let background = true;
+  let nativeState = '';
+  let nextTimeout = 0;
+  const timeouts = new Map();
   const listeners = new Map();
   const banner = { value: null };
   const context = vm.createContext({
@@ -75,20 +110,27 @@ function meetingInviteReceiver(platform, nativeVoip = true) {
     EVENT_TYPE: { ImMessageReceived: 'message', ImCustomEvent: 'custom' },
     isNativeImVoipEnabled: () => nativeVoip,
     isAppInBackground: () => background,
+    getNativeMeetingInviteState: () => nativeState,
+    setTimeout(fn) { timeouts.set(++nextTimeout, fn); return nextTimeout; },
+    clearTimeout: id => timeouts.delete(id),
     getMyUserIdSync: () => 'callee',
     UTSJSONObject: class {},
     ref: () => banner,
   });
-  const session = readFileSync(new URL('../utils/im/imCallSession.uts', import.meta.url), 'utf8')
-    .replace(/^[ \t]*\/\/ #(ifdef|ifndef) APP-HARMONY\n([\s\S]*?)^[ \t]*\/\/ #endif$/gm,
-      (_, condition, body) => (condition === 'ifdef') === (platform === 'APP-HARMONY') ? body : '');
+  const session = preprocessHarmony(readFileSync(new URL('../utils/im/imCallSession.uts', import.meta.url), 'utf8'), platform);
   const bannerSource = readFileSync(new URL('../utils/im/meetingInviteBanner.uts', import.meta.url), 'utf8');
   for (const source of [bannerSource, session]) {
     vm.runInContext(stripTypeScriptTypes(source.replace(/^import[^;]+;/gm, '')).replace(/^export /gm, ''), context);
   }
   context.bindImCallEvents();
   return {
-    banner,
+    banner, timeouts,
+    nativeStatus: status => { nativeState = status; },
+    tick() {
+      const callbacks = [...timeouts.values()];
+      timeouts.clear();
+      for (const callback of callbacks) callback();
+    },
     advance: elapsed => { now += elapsed; },
     foreground: () => { background = false; context.resumeHarmonyMeetingInvite?.(); },
     invite: (inviteId = 'invite-1', offset = 0) => listeners.get('message')({
@@ -137,4 +179,40 @@ test('iOS 和 Android 继续由原生处理后台会议来电，鸿蒙生产入�
   harmonyProduction.invite();
   assert.equal(harmonyProduction.banner.value.inviteId, 'invite-1');
   assert.equal(harmonyProduction.banner.value.expiresAt, undefined);
+});
+
+
+test('鸿蒙原生已接管会议邀请时不重复弹 WS 邀请条，原生失败后按原期限提示', () => {
+  const h = meetingInviteReceiver('APP-HARMONY');
+  h.invite();
+  h.nativeStatus('pending');
+  h.foreground();
+  assert.equal(h.banner.value, null);
+  assert.equal(h.timeouts.size, 1);
+  h.tick();
+  assert.equal(h.banner.value, null);
+  h.nativeStatus('');
+  h.advance(3500);
+  h.tick();
+  assert.equal(h.banner.value.inviteId, 'invite-1');
+  assert.equal(h.banner.value.expiresAt, 1_060_000);
+  assert.equal(h.timeouts.size, 0);
+});
+
+test('鸿蒙已处理、已过期或清除账号的原生会议邀请不会恢复 WS 弹层', () => {
+  for (const discard of [
+    h => h.nativeStatus('handled'),
+    h => { h.handled(); assert.equal(h.timeouts.size, 0); },
+    h => h.advance(60_000),
+    h => { h.clear(); assert.equal(h.timeouts.size, 0); },
+  ]) {
+    const h = meetingInviteReceiver('APP-HARMONY');
+    h.invite();
+    h.nativeStatus('pending');
+    h.foreground();
+    discard(h);
+    h.tick();
+    assert.equal(h.banner.value, null);
+    assert.equal(h.timeouts.size, 0);
+  }
 });

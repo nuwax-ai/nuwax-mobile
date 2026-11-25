@@ -5,12 +5,16 @@ import { stripTypeScriptTypes } from 'node:module';
 import vm from 'node:vm';
 
 function harness(platform = 'APP-IOS', origin = 'https://testagent.xspaceagi.com') {
-  let background = false, ready = true, activeRoom = '', resumeCount = 0;
+  let background = false, ready = true, activeRoom = '', resumeCount = 0, voipBusy = false;
+  let now = 1_000_000;
   const navigations = [], timers = new Map(), listeners = new Map();
   let timerID = 0;
   const context = vm.createContext({
     isAppInBackground: () => background,
     getApiBaseUrl: () => origin,
+    TEST_PUSH_API_ORIGIN: 'https://testagent.xspaceagi.com',
+    hasNativeVoipCall: () => voipBusy,
+    Date: { now: () => now },
     IM_SESSION_CLEARED: 'cleared', eventBus: { on: (name, fn) => listeners.set(name, fn) },
     meetingMediaActiveRoom: () => activeRoom, meetingMediaResume: () => resumeCount++,
     getCurrentPages: () => ready ? [{}] : [],
@@ -22,10 +26,11 @@ function harness(platform = 'APP-IOS', origin = 'https://testagent.xspaceagi.com
   vm.runInContext(stripTypeScriptTypes(preprocessHarmony(raw, platform).replace(/^import[^;]+;/gm, '')).replace(/^export /gm, ''), context);
   return { api: context, navigations, timers,
     background: value => { background = value; }, ready: value => { ready = value; },
+    voipBusy: value => { voipBusy = value; }, advance: ms => { now += ms; }, now: () => now,
     activeRoom: value => { activeRoom = value; }, resumes: () => resumeCount,
     clearSession: () => listeners.get('cleared')({}),
     tick: () => { for (const fn of [...timers.values()]) fn(); },
-    open: (id = 'invite-1', room = '123456789') => context.openMeetingInvite(id, room, '测试 & 会议', 'video', '12&34'),
+    open: (id = 'invite-1', room = '123456789', expiry = 0) => context.openMeetingInvite(id, room, '测试 & 会议', 'video', '12&34', expiry),
     finish(success = true) { const n = navigations.at(-1); if (success) n.success({}); n.complete({}); },
   };
 }
@@ -79,8 +84,39 @@ test('鸿蒙测试端保持首个接听请求，已在导航时不压入另一�
   h.navigations[0].complete({});
 });
 
+test('鸿蒙锁屏接听后先让单聊来电处理，单聊结束仍在有效期内才入会', () => {
+  const h = harness('APP-HARMONY');
+  h.background(true);
+  h.open('accepted', '123456789', h.now() + 60_000);
+  h.voipBusy(true);
+  h.background(false);
+  h.tick();
+  assert.equal(h.navigations.length, 0);
+  h.voipBusy(false);
+  h.advance(2000);
+  h.tick();
+  assert.equal(h.navigations.length, 1);
+  assert.match(h.navigations[0].url, /room=123456789/);
+});
+
+test('鸿蒙不在解锁或单聊结束后恢复已过期的系统接听', () => {
+  const h = harness('APP-HARMONY');
+  h.background(true);
+  h.open('accepted', '123456789', h.now() + 500);
+  h.advance(500);
+  h.tick();
+  assert.equal(h.timers.size, 0);
+  h.background(false);
+  h.open('late-native-event', '123456789', h.now() - 1);
+  h.tick();
+  assert.equal(h.navigations.length, 0);
+  h.open('fresh');
+  assert.equal(h.navigations.length, 1);
+});
+
 test('鸿蒙生产入口仍沿用现有邀请导航行为', () => {
   const h = harness('APP-HARMONY', 'https://agent.nuwax.com');
+  h.voipBusy(true);
   h.background(true);
   h.open('first', '111111111');
   h.open('second', '222222222');

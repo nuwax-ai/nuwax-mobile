@@ -45,6 +45,7 @@ vi.mock('@kit.AudioKit', () => ({ audio: {} }));
 vi.mock('@kit.ArkWeb', () => ({ webview: {} }));
 
 import { VoipBridge, VoipBusinessPolicy } from '../../uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge.ets';
+import { hasNativeVoipCall } from '../../uni_modules/nuwax-voip/utssdk/app-harmony/index.uts';
 const actualRequest = VoipBridge.request;
 const actualFinish = VoipBridge.finish;
 
@@ -159,6 +160,8 @@ describe('Harmony system call cold start', () => {
     expect(kits.reportError).toHaveBeenCalledWith('duplicate-system-call', 'busy');
     expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'answered');
     expect(media).not.toHaveBeenCalled();
+    expect(VoipBridge.current).toBeNull();
+    expect(hasNativeVoipCall()).toBe(true);
 
     resolveMessage(message()); await pending;
     await vi.waitFor(() => expect(media).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
@@ -350,6 +353,7 @@ describe('Harmony system call cold start', () => {
     expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       callId: systemId, abilityName: 'EntryAbility', isConferenceCall: true,
     }));
+    expect(hasNativeVoipCall()).toBe(false);
 
     VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'answer-voice' } as any);
     expect(startAbility).not.toHaveBeenCalled();
@@ -360,7 +364,7 @@ describe('Harmony system call cold start', () => {
     VoipBridge.initialize({ ...meetingConfig, scope: 'ui-scope' });
     expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([expect.objectContaining({
       scope: 'ui-scope', action: 'accept', convId, msgId, inviteId: 'qa-meeting',
-      roomName: '123456789', passcode: '1234', mediaType: 'audio',
+      roomName: '123456789', passcode: '1234', mediaType: 'audio', handoffExpiresAt: Date.now() + 60_000,
     })]);
     expect(startAbility).toHaveBeenCalledOnce();
     expect(kits.reportState).toHaveBeenLastCalledWith(systemId, 'disconnected');

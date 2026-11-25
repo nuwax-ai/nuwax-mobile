@@ -60,7 +60,7 @@ interface MediaEvent { type: string; callId?: string; code?: string; enabled?: b
 interface CallEvent extends MediaEvent {
   scope: string; snapshot?: CallData; reason?: string; nativeIncomingUI?: boolean;
   action?: string; inviteId?: string; convId?: string; msgId?: string; roomName?: string;
-  title?: string; mediaType?: string; passcode?: string;
+  title?: string; mediaType?: string; passcode?: string; handoffExpiresAt?: number;
 }
 interface PushInvitation {
   type?: string; scene?: string; callId: string; convId: string; msgId: string;
@@ -835,7 +835,7 @@ export class VoipBridge {
       type: 'meetingInvite', scope: config.scope, callId: pending.invite.callId, action,
       inviteId: meeting.inviteId, convId: meeting.convId, msgId: meeting.msgId,
       roomName: meeting.roomName, title: meeting.title, passcode: action === 'accept' ? meeting.passcode : '',
-      mediaType: pending.answerMediaType,
+      mediaType: pending.answerMediaType, handoffExpiresAt: action === 'accept' ? Date.now() + 60_000 : undefined,
     }
     VoipBridge.rememberCallId(VoipBridge.handledMeetingMessages, meeting.msgId)
     VoipBridge.dismissPendingIncoming()

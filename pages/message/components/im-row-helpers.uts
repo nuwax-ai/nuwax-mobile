@@ -6,15 +6,16 @@
  * ★uvue 模板不能直接调用导入函数（invoke 解析失败，plan-cards 同款约束）——
  * 各 uvue 侧须包一层本地 const 再供模板使用。
  *
- * 模块级私有状态 contactDisplayNameByUserId：联系人展示名索引（peerUserId →
- * displayName）。displayConvName 是唯一读方、rebuildContactNameIndex 唯一写方；
- * Android 模板方法调用不收集依赖，名称刷新依赖调用方在索引重建后整表替换行数组
- * （loadContacts 成功路径已强制 copyRows，见 message-content 注释）。
+ * 联系人展示名索引（peerUserId → displayName，状态在 utils/im/contactNameCache）：
+ * displayConvName 是唯一读方、整表重建在 rebuildContactNameIndex；Android 模板方法
+ * 调用不收集依赖，名称刷新依赖调用方在索引变化后整表替换行数组（loadContacts 成功
+ * 路径强制换行身份；消息页回页按索引版本号变化换行身份，见 message-content 注释）。
  */
 
 import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
 import { getChatDraft, getChatDraftMedia } from "@/utils/im/chatDrafts";
 import { setCachedContactRemarks } from "@/utils/im/contactRemarkCache";
+import { applyCachedContactNames, ensureContactNameSession, getCachedContactNames } from "@/utils/im/contactNameCache";
 import { getCachedMyInfo } from "@/utils/im/myInfoCache";
 import { getImSessionStamp } from "@/utils/im/imSessionScope";
 import { getMyUserIdSync } from "@/utils/imNoticeBar";
@@ -269,17 +270,20 @@ function selfDisplayNameForTitle(): string {
 }
 
 // ===== 联系人展示名索引（peerUserId → displayName）=====
-// 服务端联系人接口的 displayName 按我方视角算好（remark > nick > name），而会话
-// 接口的 peerName 只回对方资料昵称、不含我方备注——在智联录改完备注只刷会话列表
-// 名称不变。单聊会话行展示名优先取此索引（非联系人如系统通知回落 peerName），
-// 索引随联系人整表刷新重建；切回消息 tab 时 scroll-view 重挂载会重取名，无需额外刷。
-const contactDisplayNameByUserId = new Map<string, string>();
+// 状态与写入口在 utils/im/contactNameCache（模块级、随会话戳失效）：服务端联系人
+// 接口的 displayName 按我方视角算好（remark > nick > name），而会话接口的 peerName
+// 只回对方资料昵称、不含我方备注。单聊会话行展示名优先取此索引（非联系人如系统
+// 通知回落 peerName）；本文件只负责读（displayConvName）与整表重建（loadContacts
+// 成功后调用），资料页改完备注的单条覆写走 contactNameCache.setCachedContactName。
 
 /** 按已互为联系人列表重建展示名索引（loadContacts 成功后调用）。 */
 /** 重建联系人展示名索引；返回索引是否有变化（无变化时调用方可跳过会话行整表
  *  重建——onShow 每次静默刷联系人，名字没变就不该重渲染会话 pane）。备注缓存
  *  无论有无变化都照刷（其他页 onShow 重算取新值，与会话行渲染无关）。 */
 export function rebuildContactNameIndex(list: ImContactRow[]): boolean {
+  // 先做会话失效校验：换账号后第一轮重建不能拿上个账号的索引做 diff
+  ensureContactNameSession();
+  const current = getCachedContactNames();
   const next = new Map<string, string>();
   const remarks = new Map<string, string>();
   let indexedCount = 0;
@@ -298,23 +302,23 @@ export function rebuildContactNameIndex(list: ImContactRow[]): boolean {
   }
   // 与旧索引比对（先 size 后逐条）：一致则跳过交换——displayConvName 是索引唯一
   // 读方，名字全没变时整表重建会话行是纯多余渲染
-  let changed = contactDisplayNameByUserId.size != indexedCount;
+  let changed = (current == null ? 0 : current.size) != indexedCount;
   if (!changed) {
-    for (let i = 0; i < list.length; i++) {
-      const row = list[i];
-      if (row.userId.length > 0 && row.displayName.length > 0) {
-        if (contactDisplayNameByUserId.get(row.userId) != row.displayName) {
-          changed = true;
-          break;
+    const snapshot = current;
+    if (snapshot != null) {
+      for (let i = 0; i < list.length; i++) {
+        const row = list[i];
+        if (row.userId.length > 0 && row.displayName.length > 0) {
+          if (snapshot.get(row.userId) != row.displayName) {
+            changed = true;
+            break;
+          }
         }
       }
     }
   }
   if (changed) {
-    contactDisplayNameByUserId.clear();
-    next.forEach((value: string, key: string) => {
-      contactDisplayNameByUserId.set(key, value);
-    });
+    applyCachedContactNames(next);
   }
   setCachedContactRemarks(remarks);
   return changed;
@@ -374,7 +378,8 @@ export function displayConvName(conv: ImConvRow): string {
     if (selfId.length > 0 && conv.peerUserId == selfId) {
       return selfDisplayNameForTitle();
     }
-    const contactName = contactDisplayNameByUserId.get(conv.peerUserId);
+    const index = getCachedContactNames();
+    const contactName = index != null ? index.get(conv.peerUserId) : null;
     if (contactName != null) {
       return contactName;
     }

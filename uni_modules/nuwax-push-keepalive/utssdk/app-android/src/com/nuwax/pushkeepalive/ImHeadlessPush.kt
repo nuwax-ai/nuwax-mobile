@@ -57,7 +57,10 @@ internal object ImHeadlessPush {
             return true
         }
         // 有 Activity 时仍由现有 UTS 前后台逻辑负责；不重复发送 receive 事件。
-        if (UTSAndroid.getUniActivity() != null) return false
+        // 划掉 App 后 uni-app 运行时尚未初始化 currentApp，getUniActivity() 会直接抛
+        // UninitializedPropertyAccessException；这种情况正是无 Activity 的 headless 场景。
+        val hasActivity = runCatching { UTSAndroid.getUniActivity() != null }.getOrDefault(false)
+        if (hasActivity) return false
         if (envelope.optString("content").isBlank()) return false
         if (!notificationsEnabled(context)) {
             Log.i(TAG, "notification skipped: permission disabled key=${key.take(12)}")

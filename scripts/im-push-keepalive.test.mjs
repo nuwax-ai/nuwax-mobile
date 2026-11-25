@@ -10,6 +10,7 @@ const client = read('../utils/im/imPushClient.uts');
 const appManifest = read('../AndroidManifest.xml');
 const runtime = read('../uni_modules/nuwax-push-keepalive/utssdk/app-android/src/com/nuwax/pushkeepalive/PushRuntime.kt');
 const service = read('../uni_modules/nuwax-push-keepalive/utssdk/app-android/src/com/nuwax/pushkeepalive/PushKeepAliveService.kt');
+const headless = read('../uni_modules/nuwax-push-keepalive/utssdk/app-android/src/com/nuwax/pushkeepalive/ImHeadlessPush.kt');
 function evaluate(source, globals) {
   const context = vm.createContext({ console: { log() {}, warn() {} }, ...globals });
   vm.runInContext(stripTypeScriptTypes(source.replace(/^import .*;?$/gm, '').replace(/^export /gm, '')), context);
@@ -47,6 +48,11 @@ test('DCloud receiver stays enabled and its action bridge is installed before Ge
   assert.ok(bind.indexOf('preparePushReceiver()') < bind.indexOf('registerPushListener()'));
   const cid = client.slice(client.indexOf('export function syncImPushClientId'), client.indexOf('/**\n * 确保拿到推送 cid'));
   assert.ok(cid.indexOf('preparePushReceiver()') < cid.indexOf('uni.getPushClientId'));
+});
+
+test('headless delivery treats an uninitialized uni-app Activity as no foreground Activity', () => {
+  assert.match(headless, /runCatching \{ UTSAndroid\.getUniActivity\(\) != null \}\.getOrDefault\(false\)/);
+  assert.doesNotMatch(headless, /if \(UTSAndroid\.getUniActivity\(\) != null\)/);
 });
 
 function clientGate(vendor = 'none') {

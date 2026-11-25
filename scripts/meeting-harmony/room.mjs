@@ -25,7 +25,8 @@ export function createMeetingMedia(post, render) {
     });
     const shareHolder = holder(room);
     const ownsShare = shareHolder === local.identity;
-    if (session.share?.started && !ownsShare) stopShare(session, 'stopped');
+    if (session.share && ownsShare) session.share.owned = true;
+    if (session.share?.owned && !ownsShare) stopShare(session, 'stopped');
     if (room.state === ConnectionState.Disconnected) stopShare(session);
     const shared = remotes.find((participant) => participant.identity === shareHolder);
     const share = shared?.getTrackPublication(Track.Source.ScreenShare);
@@ -43,6 +44,7 @@ export function createMeetingMedia(post, render) {
       raised: local.attributes.handRaised === '1', metadata: room.metadata || '',
       videos: cameras.filter(({ participant }) => participant !== local).map(({ participant }) => participant.identity).join(','),
       shared: !!share?.track && !share.isMuted, sharing: session.share?.published === true,
+      shareId: session.share?.shareId,
       awaitingCapture: !!session.share && !session.share.started && ownsShare,
     });
   }
@@ -109,7 +111,7 @@ export function createMeetingMedia(post, render) {
     session.share = undefined;
     share.track?.stop();
     if (share.published) void session.room.localParticipant.unpublishTrack(share.track).catch(() => {});
-    if (active(session) && error) post({ type: 'shareError', id: session.id, error });
+    if (active(session) && error) post({ type: 'shareError', id: session.id, shareId: share.shareId, error });
   }
 
   // This runs synchronously from the Web button so getDisplayMedia receives user activation.
@@ -165,11 +167,14 @@ export function createMeetingMedia(post, render) {
       return;
     }
     if (command.type === 'prepareShare') {
-      if (!session.share) session.share = { id: session.id, label: command.text, cancel: command.name };
+      if (!session.share) {
+        session.share = { id: session.id, shareId: command.shareId, label: command.text, cancel: command.name };
+      }
       update(session);
       return;
     }
     if (command.type === 'stopShare' || command.type === 'cancelShare') {
+      if (!session.share || command.shareId !== session.share.shareId) return;
       stopShare(session, command.type === 'cancelShare' ? 'cancelled' : '');
       update(session);
       return;
@@ -268,7 +273,7 @@ function mount() {
   const media = createMeetingMedia((event) => window.NuwaxMeeting?.postMessage(JSON.stringify(event)), render);
   confirm.addEventListener('click', () => { void media.startCapture(capture); });
   cancel.addEventListener('click', () => {
-    if (capture) media.dispatch({ type: 'cancelShare', id: capture.id });
+    if (capture) media.dispatch({ type: 'cancelShare', id: capture.id, shareId: capture.shareId });
   });
   window.meetingMedia = media;
   window.addEventListener('pagehide', media.disconnect);

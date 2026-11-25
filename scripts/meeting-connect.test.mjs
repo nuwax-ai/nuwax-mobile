@@ -20,7 +20,8 @@ function forPlatform(raw, platform) {
 
 // 执行业务状态机，原生桥和网络为桩；不调用 HBuilderX/设备或真实接口。
 function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = false, preCode = '0', tokenCode = '0',
-  apiOrigin = 'https://testagent.xspaceagi.com', screenSupported = true } = {}) {
+  apiOrigin = 'https://testagent.xspaceagi.com', screenSupported = true, nativeShareAccepted = true,
+  nativeShareStopping = false, claimResult = async () => ({ code: '0' }) } = {}) {
   const raw = readFileSync(new URL('../utils/meeting/meetingMedia.uts', import.meta.url), 'utf8');
   const source = forPlatform(raw, platform).replace(/^import[\s\S]*?;\s*$/gm, '');
   const timers = new Map(), logs = [], operations = [], presentations = [], navigations = [];
@@ -68,14 +69,19 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     livekitRemoteScreenVisible: () => remoteScreen,
     livekitScreenCaptureSupported: () => screenSupported,
     livekitAwaitingScreenCapture: () => false,
-    livekitPrepareScreenCapture: (label, cancel) => operations.push(label + '/' + cancel),
+    livekitPrepareScreenCapture(label, cancel, url, token) {
+      operations.push(label + '/' + cancel);
+      assert.equal(url, 'https://api.test/rooms/123456789/release');
+      assert.equal(token, 'secret-seat-token');
+      return nativeShareAccepted;
+    },
     livekitIsScreenShareOn: () => false, livekitScreenShareError: () => shareError,
     livekitIsScreenShareStopping: () => {
       if (configThrows) throw new Error('旧基座不能调用新增导出');
-      return false;
+      return nativeShareStopping;
     },
     livekitRequestScreenShare() { if (!configThrows) assert.equal(configured, true); operations.push('share'); },
-    apiImMeetingTakeShareHolder: async () => { claims++; return { code: '0' }; },
+    apiImMeetingTakeShareHolder: async () => { claims++; return claimResult(); },
     livekitDisconnect: () => { connected = false; operations.push('disconnect'); },
     livekitSendMeetingMessage: () => operations.push('chat'),
     livekitSetHandRaised: on => operations.push(on ? 'raise' : 'lower'),
@@ -584,7 +590,7 @@ test('鸿蒙会议媒体仅在测试环境启用，设备开关跟随实际采�
   assert.equal(h.api.meetingMediaState().visualMedia, true);
 });
 
-test('鸿蒙整屏共享先占位，取消系统采集时归还当前席位', async () => {
+test('鸿蒙整屏共享交给原生释放，业务层停止时不重复释放', async () => {
   const h = harness({ platform: 'APP-HARMONY' });
   await h.join(); h.complete();
   assert.equal(await h.api.meetingMediaStartScreenShare('other', '共享整个屏幕', '取消'), false);
@@ -594,9 +600,9 @@ test('鸿蒙整屏共享先占位，取消系统采集时归还当前席位', as
   assert.ok(h.operations.includes('共享整个屏幕/取消'));
   h.media({ error: 'cancelled' }); h.api.meetingMediaReconcile();
   assert.ok(h.operations.includes('stopShare'));
-  assert.equal(h.releases(), 1);
+  assert.equal(h.releases(), 0);
   h.api.meetingMediaReconcile();
-  assert.equal(h.releases(), 1);
+  assert.equal(h.operations.filter(operation => operation === 'stopShare').length, 1);
 });
 
 test('鸿蒙 ArkWeb 无采屏能力时不申请服务端占位', async () => {
@@ -604,4 +610,53 @@ test('鸿蒙 ArkWeb 无采屏能力时不申请服务端占位', async () => {
   await h.join(); h.complete();
   assert.equal(await h.api.meetingMediaStartScreenShare('123456789', '共享整个屏幕', '取消'), false);
   assert.equal(h.claims(), 0);
+});
+
+
+test('鸿蒙原生未接管共享时，业务层归还已申请的席位', async () => {
+  const h = harness({ platform: 'APP-HARMONY', nativeShareAccepted: false });
+  await h.join(); h.complete();
+  assert.equal(await h.api.meetingMediaStartScreenShare('123456789', '共享整个屏幕', '取消'), false);
+  assert.equal(h.claims(), 1);
+  assert.equal(h.releases(), 1);
+});
+
+test('鸿蒙释放尚在途中时不重新申请同席位共享', async () => {
+  const h = harness({ platform: 'APP-HARMONY', nativeShareStopping: true });
+  await h.join(); h.complete();
+  assert.equal(await h.api.meetingMediaStartScreenShare('123456789', '共享整个屏幕', '取消'), false);
+  assert.equal(h.claims(), 0);
+});
+
+test('鸿蒙离会后迟到的共享占用由业务层归还，不唤起采集', async () => {
+  let grant;
+  const h = harness({ platform: 'APP-HARMONY', claimResult: () => new Promise(resolve => { grant = resolve; }) });
+  await h.join(); h.complete();
+  const start = h.api.meetingMediaStartScreenShare('123456789', '共享整个屏幕', '取消');
+  assert.equal(h.claims(), 1);
+  await h.api.meetingMediaDisconnect();
+  assert.equal(h.releases(), 0);
+  grant({ code: '0' });
+  assert.equal(await start, false);
+  assert.equal(h.releases(), 1);
+  assert.equal(h.operations.includes('共享整个屏幕/取消'), false);
+});
+
+test('会议共享请求使用鸿蒙席位，保持 Android 和 iOS 请求形状', async () => {
+  const source = readFileSync(new URL('../servers/imMeeting.uts', import.meta.url), 'utf8');
+  const start = source.indexOf('export async function apiImMeetingTakeShareHolder(');
+  const end = source.indexOf('\n}', start) + 2;
+  for (const platform of ['APP-HARMONY', 'APP-ANDROID', 'APP-IOS']) {
+    let sent;
+    const part = forPlatform(source.slice(start, end), platform).replace('export ', '');
+    const context = vm.createContext({
+      MEETING_RTC_BASE: '/meetings/rtc', enc: encodeURIComponent, imDevicePlatform: () => 'harmonyos',
+      request: async options => { sent = options; },
+    });
+    vm.runInContext(stripTypeScriptTypes(part), context);
+    await context.apiImMeetingTakeShareHolder('123456789');
+    assert.equal(sent.url, '/meetings/rtc/rooms/123456789/share-holder');
+    assert.equal(sent.method, 'POST');
+    assert.equal(sent.data?.platform, platform === 'APP-HARMONY' ? 'harmonyos' : undefined);
+  }
 });

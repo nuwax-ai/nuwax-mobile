@@ -2,6 +2,7 @@ import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit'
 import { webview } from '@kit.ArkWeb'
 import { audio } from '@kit.AudioKit'
 import { util } from '@kit.ArkTS'
+import { http } from '@kit.NetworkKit'
 import { BuilderNode, FrameNode, NodeController, UIContext } from '@kit.ArkUI'
 
 export const meetingAsset = 'nuwax-meeting/media.html'
@@ -18,6 +19,7 @@ class Command {
   text?: string
   name?: string
   danmaku?: boolean
+  shareId?: number
 }
 
 interface MeetingMessage {
@@ -27,6 +29,16 @@ interface MeetingMessage {
   self: boolean
   topic: string
   at: number
+}
+
+interface ShareLease {
+  id: number
+  url: string
+  token: string
+}
+
+interface ShareReleaseResponse {
+  code?: string
 }
 
 interface BrowserEvent {
@@ -43,6 +55,7 @@ interface BrowserEvent {
   shared?: boolean
   sharing?: boolean
   awaitingCapture?: boolean
+  shareId?: number
   error?: string
   message?: MeetingMessage
 }
@@ -64,6 +77,10 @@ export class MeetingStageSession {
   static awaitingCapture: boolean = false
   static shareError: string = ''
   static captureArmed: boolean = false
+  private static shareLease: ShareLease | undefined
+  private static nextShareId: number = 0
+  private static shareStartTimer: number = -1
+  static shareReleaseRunning: boolean = false
   static people: number = 0
   static level: number = 0
   static raised: boolean = false
@@ -120,6 +137,7 @@ export class MeetingStageSession {
   }
 
   static disconnect(): void {
+    MeetingStageSession.releaseShare()
     const command = new Command()
     command.type = 'disconnect'
     command.id = MeetingStageSession.id
@@ -169,24 +187,91 @@ export class MeetingStageSession {
     MeetingStageSession.host?.send(command)
   }
 
-  static prepareShare(label: string, cancel: string): void {
-    if (!MeetingStageSession.isConnected() || !MeetingStageSession.host?.screenSupported) return
+  static prepareShare(label: string, cancel: string, releaseURL: string, seatToken: string): boolean {
+    if (!MeetingStageSession.isConnected() || !MeetingStageSession.host?.screenSupported ||
+        MeetingStageSession.shareReleaseRunning || MeetingStageSession.shareLease) return false
+    const base = 'https://testagent.xspaceagi.com/api/instant-message/meetings/public/rooms/'
+    if (!releaseURL.startsWith(base) || !releaseURL.endsWith('/share-holder/release') || seatToken.length === 0) return false
+    MeetingStageSession.nextShareId += 1
+    const shareId = MeetingStageSession.nextShareId
+    MeetingStageSession.shareLease = { id: shareId, url: releaseURL, token: seatToken }
+    MeetingStageSession.shareError = ''
+    MeetingStageSession.captureArmed = true
     const command = new Command()
     command.type = 'prepareShare'
     command.id = MeetingStageSession.id
+    command.shareId = shareId
     command.text = label
     command.name = cancel
-    MeetingStageSession.shareError = ''
-    MeetingStageSession.captureArmed = true
+    MeetingStageSession.shareStartTimer = setTimeout(() => {
+      MeetingStageSession.shareFailed(shareId, 'screen_capture_timeout')
+    }, 65000)
     MeetingStageSession.host?.send(command)
+    return true
   }
 
   static stopShare(): void {
-    MeetingStageSession.captureArmed = false
+    const lease = MeetingStageSession.shareLease
+    if (!lease) return
     const command = new Command()
     command.type = 'stopShare'
     command.id = MeetingStageSession.id
+    command.shareId = lease.id
     MeetingStageSession.host?.send(command)
+    MeetingStageSession.releaseShare()
+  }
+
+  static shareFailed(id: number, error: string): void {
+    if (MeetingStageSession.shareLease?.id !== id) return
+    MeetingStageSession.shareError = error
+    MeetingStageSession.stopShare()
+  }
+
+  private static clearShareStartTimer(): void {
+    if (MeetingStageSession.shareStartTimer === -1) return
+    clearTimeout(MeetingStageSession.shareStartTimer)
+    MeetingStageSession.shareStartTimer = -1
+  }
+
+  private static releaseShare(): void {
+    MeetingStageSession.clearShareStartTimer()
+    MeetingStageSession.captureArmed = false
+    MeetingStageSession.sharing = false
+    MeetingStageSession.awaitingCapture = false
+    const lease = MeetingStageSession.shareLease
+    if (!lease) return
+    MeetingStageSession.shareLease = undefined
+    MeetingStageSession.shareReleaseRunning = true
+    MeetingStageSession.releaseShareAtServer(lease).finally(() => {
+      MeetingStageSession.shareReleaseRunning = false
+    })
+  }
+
+  private static async releaseShareAtServer(lease: ShareLease): Promise<void> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let request: http.HttpRequest | undefined
+      try {
+        request = http.createHttp()
+        const response = await request.request(lease.url, {
+          method: http.RequestMethod.POST,
+          header: { 'content-type': 'application/json' },
+          extraData: JSON.stringify({ token: lease.token }),
+          connectTimeout: 3000, readTimeout: 3000, expectDataType: http.HttpDataType.STRING,
+        })
+        if (response.responseCode < 500 && response.responseCode !== 429) {
+          if (response.responseCode !== 200 || typeof response.result !== 'string') return
+          const result = JSON.parse(response.result) as ShareReleaseResponse
+          // Releasing a seat that has already been replaced is terminal.
+          if (result.code !== 'IM_30004') return
+        }
+      } catch (_) {
+        // A bounded retry covers a transient connection failure.
+      } finally {
+        try { request?.destroy() } catch (_) {}
+      }
+      if (attempt === 0) await new Promise<void>((resolve) => { setTimeout(resolve, 500) })
+    }
+    console.warn('[MeetingStage] share release did not complete')
   }
 
   static receive(event: BrowserEvent): void {
@@ -196,6 +281,7 @@ export class MeetingStageSession {
         MeetingStageSession.host?.readSpeaker(event.id)
       }
       MeetingStageSession.connection = event.connection ?? ''
+      if (MeetingStageSession.connection === 'disconnected') MeetingStageSession.releaseShare()
       MeetingStageSession.people = event.people ?? 0
       MeetingStageSession.mic = event.mic === true
       MeetingStageSession.camera = event.camera === true
@@ -204,11 +290,13 @@ export class MeetingStageSession {
       MeetingStageSession.metadata = event.metadata ?? ''
       MeetingStageSession.videos = event.videos ?? ''
       MeetingStageSession.shared = event.shared === true
-      MeetingStageSession.sharing = event.sharing === true
-      MeetingStageSession.awaitingCapture = event.awaitingCapture === true
+      const lease = MeetingStageSession.shareLease
+      const currentShare = lease != null && lease.id === event.shareId
+      MeetingStageSession.sharing = currentShare && event.sharing === true
+      MeetingStageSession.awaitingCapture = currentShare && event.awaitingCapture === true
+      if (MeetingStageSession.sharing) MeetingStageSession.clearShareStartTimer()
     } else if (event.type === 'shareError') {
-      MeetingStageSession.captureArmed = false
-      MeetingStageSession.shareError = event.error ?? ''
+      MeetingStageSession.shareFailed(event.shareId ?? 0, event.error ?? '')
     } else if (event.type === 'message' && event.message) {
       if (MeetingStageSession.messages.length >= 100) MeetingStageSession.messages.shift()
       MeetingStageSession.messages.push(event.message)
@@ -315,21 +403,26 @@ export class MeetingStageHost {
       handler.grant({ captureMode: WebCaptureMode.HOME_SCREEN })
     } catch (_) {
       MeetingStageSession.shareError = 'screen_capture_permission'
-      handler.deny()
+      MeetingStageSession.stopShare()
+      try { handler.deny() } catch (_) {}
     }
   }
 
-  send(command: Command): void {
+  async send(command: Command): Promise<void> {
     if (!this.ready) return
     const id = command.id
     const encoded = JSON.stringify(command)
-    this.controller.runJavaScript('window.meetingMedia.dispatch(' + encoded + ')').catch(() => {
-      if (MeetingStageSession.host === this && MeetingStageSession.id === id && command.type === 'connect') {
-        MeetingStageSession.error = 'connect'
-      }
-    })
     // The join credential is consumed once by the local page.
     command.token = undefined
+    try {
+      await this.controller.runJavaScript('window.meetingMedia.dispatch(' + encoded + ')')
+    } catch (_) {
+      if (MeetingStageSession.host !== this || MeetingStageSession.id !== id) return
+      if (command.type === 'connect') MeetingStageSession.error = 'connect'
+      if (command.type === 'prepareShare') {
+        MeetingStageSession.shareFailed(command.shareId ?? 0, 'screen_capture_failed')
+      }
+    }
   }
 
   control(command: Command): void {

@@ -9,6 +9,10 @@ function nativeStage() {
   // and component lifecycle are tested on a device, outside this suite.
   const hostSource = source.split('\n@Builder\n')[0].replace(/^import .*$/gm, '').replace(/^export /gm, '');
   const stages: MockBuilderNode[] = [];
+  const destroy = vi.fn();
+  const request = vi.fn().mockResolvedValue({ responseCode: 200, result: '{"code":"0000"}' });
+  const timers = new Map<number, { callback: () => void; delay: number }>();
+  let nextTimer = 0;
   class MockBuilderNode {
     build = vi.fn();
     frame = {};
@@ -30,9 +34,19 @@ function nativeStage() {
     webview: { WebviewController: MockController },
     wrapBuilder: (builder: unknown) => builder,
     buildMeetingStage: vi.fn(),
+    http: {
+      createHttp: () => ({ request, destroy }),
+      RequestMethod: { POST: 'POST' },
+      HttpDataType: { STRING: 'string' },
+    },
+    setTimeout(callback: () => void, delay: number) {
+      timers.set(++nextTimer, { callback, delay });
+      return nextTimer;
+    },
+    clearTimeout(id: number) { timers.delete(id); },
   });
   const session = vm.runInContext(stripTypeScriptTypes(hostSource) + '\nMeetingStageSession;', context);
-  return { session, stages };
+  return { session, stages, request, destroy, timers };
 }
 
 describe('Harmony meeting native stage', () => {
@@ -86,5 +100,95 @@ describe('Harmony meeting native stage', () => {
     expect(session.releaseView(mount.id)).toBe(true);
     expect(stages[0].dispose).toHaveBeenCalledOnce();
     expect(session.host).toBeUndefined();
+  });
+});
+
+
+const releaseURL = 'https://testagent.xspaceagi.com/api/instant-message/meetings/public/rooms/room-1/share-holder/release';
+
+function connectedStage() {
+  const fixture = nativeStage();
+  const { session } = fixture;
+  const mount = session.attach({});
+  mount.makeNode({});
+  session.host.ready = true;
+  session.host.screenSupported = true;
+  session.connect('wss://room.test', 'seat-token');
+  session.connection = 'connected';
+  session.host.controller.runJavaScript.mockClear();
+  return { ...fixture, mount };
+}
+
+function settle() {
+  return new Promise(resolve => setImmediate(resolve));
+}
+
+describe('Harmony meeting share lease', () => {
+  it('releases the seat on OS capture stop even with all business views detached', async () => {
+    const { session, mount, request, destroy } = connectedStage();
+    expect(session.prepareShare('Share', 'Cancel', releaseURL, 'release-seat-token')).toBe(true);
+    const browser = session.host.controller.runJavaScript;
+    expect(browser.mock.lastCall?.[0]).not.toContain('release-seat-token');
+    session.releaseView(mount.id);
+
+    session.receive({ type: 'shareError', id: session.id, shareId: 1, error: 'stopped' });
+    session.stopShare();
+    expect(request).toHaveBeenCalledOnce();
+    const [url, options] = request.mock.lastCall!;
+    expect(url).toBe(releaseURL);
+    expect(options.method).toBe('POST');
+    expect(JSON.parse(options.extraData)).toEqual({ token: 'release-seat-token' });
+    expect(session.shareReleaseRunning).toBe(true);
+    expect(session.prepareShare('Share', 'Cancel', releaseURL, 'release-seat-token')).toBe(false);
+    await settle();
+    expect(destroy).toHaveBeenCalledOnce();
+    expect(session.shareReleaseRunning).toBe(false);
+  });
+
+  it('does not use production and ignores a stale stop from an earlier share', async () => {
+    const { session, request } = connectedStage();
+    const production = releaseURL.replace('testagent.xspaceagi.com', 'agent.nuwax.com');
+    expect(session.prepareShare('Share', 'Cancel', production, 'token')).toBe(false);
+    expect(session.prepareShare('Share', 'Cancel', releaseURL, 'first')).toBe(true);
+    session.stopShare();
+    await settle();
+    expect(session.prepareShare('Share', 'Cancel', releaseURL, 'second')).toBe(true);
+    session.receive({ type: 'shareError', id: session.id, shareId: 1, error: 'stopped' });
+    expect(request).toHaveBeenCalledOnce();
+    session.disconnect();
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(request.mock.lastCall![1].extraData)).toEqual({ token: 'second' });
+    await settle();
+  });
+
+  it('cancels a pending consent on timeout and retries one transient release failure', async () => {
+    const { session, request, destroy, timers } = connectedStage();
+    request.mockRejectedValueOnce(new Error('timeout'));
+    expect(session.prepareShare('Share', 'Cancel', releaseURL, 'token')).toBe(true);
+    const expiry = [...timers.values()].find(timer => timer.delay === 65000);
+    expect(expiry).toBeDefined();
+    expiry!.callback();
+    await settle();
+    expect(session.shareError).toBe('screen_capture_timeout');
+    expect(session.captureArmed).toBe(false);
+    const retry = [...timers.values()].find(timer => timer.delay === 500);
+    expect(retry).toBeDefined();
+    retry!.callback();
+    await settle();
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(destroy).toHaveBeenCalledTimes(2);
+    expect(session.shareReleaseRunning).toBe(false);
+  });
+
+  it('keeps a published share past the consent deadline and releases it when the connection ends', async () => {
+    const { session, request, timers } = connectedStage();
+    expect(session.prepareShare('Share', 'Cancel', releaseURL, 'token')).toBe(true);
+    session.receive({ type: 'state', id: session.id, connection: 'connected', shareId: 1, sharing: true });
+    expect(session.sharing).toBe(true);
+    expect(timers.size).toBe(0);
+    session.receive({ type: 'state', id: session.id, connection: 'disconnected' });
+    expect(session.sharing).toBe(false);
+    expect(request).toHaveBeenCalledOnce();
+    await settle();
   });
 });

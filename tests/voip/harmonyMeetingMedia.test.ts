@@ -108,7 +108,7 @@ describe('Harmony LiveKit room', () => {
     const { track, stream } = fakeScreen();
     const getDisplayMedia = vi.fn(async () => stream);
     vi.stubGlobal('navigator', { mediaDevices: { getDisplayMedia } });
-    media.dispatch({ id: 1, type: 'prepareShare', text: 'Share the entire screen', name: 'Cancel' });
+    media.dispatch({ id: 1, type: 'prepareShare', shareId: 2, text: 'Share the entire screen', name: 'Cancel' });
     expect(render.mock.lastCall?.[3]).toBeUndefined();
     room.metadata = JSON.stringify({ shareHolder: room.localParticipant.identity });
     room.emit(RoomEvent.RoomMetadataChanged);
@@ -118,12 +118,27 @@ describe('Harmony LiveKit room', () => {
     expect(getDisplayMedia).toHaveBeenCalledWith({ video: true, audio: false });
     await capture;
     expect(room.localParticipant.publishTrack).toHaveBeenCalledWith(track, expect.objectContaining({ source: Track.Source.ScreenShare }));
-    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ sharing: true }));
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ sharing: true, shareId: 2 }));
+    media.dispatch({ id: 1, type: 'stopShare', shareId: 1 });
+    expect(track.stop).not.toHaveBeenCalled();
     room.metadata = JSON.stringify({ shareHolder: 'test:other:ios' });
     room.emit(RoomEvent.RoomMetadataChanged);
     expect(track.stop).toHaveBeenCalledOnce();
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: 'shareError', shareId: 2, error: 'stopped' }));
     expect(room.localParticipant.unpublishTrack).toHaveBeenCalledWith(track);
     expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ sharing: false }));
+  });
+
+  it('dismisses pending confirmation when another participant takes over the share', async () => {
+    const { media, room, render, post } = connection();
+    await waitForOperations();
+    room.metadata = JSON.stringify({ shareHolder: room.localParticipant.identity });
+    media.dispatch({ id: 1, type: 'prepareShare', shareId: 2, text: 'Share', name: 'Cancel' });
+    expect(render.mock.lastCall?.[3]).toBeDefined();
+    room.metadata = JSON.stringify({ shareHolder: 'test:other:android' });
+    room.emit(RoomEvent.RoomMetadataChanged);
+    expect(render.mock.lastCall?.[3]).toBeUndefined();
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: 'shareError', shareId: 2, error: 'stopped' }));
   });
 
   it('discards a late system capture result after cancellation or leaving', async () => {
@@ -133,7 +148,7 @@ describe('Harmony LiveKit room', () => {
     let resolveCapture!: (result: typeof stream) => void;
     vi.stubGlobal('navigator', { mediaDevices: { getDisplayMedia: () => new Promise(resolve => { resolveCapture = resolve; }) } });
     room.metadata = JSON.stringify({ shareHolder: room.localParticipant.identity });
-    media.dispatch({ id: 1, type: 'prepareShare', text: 'Share', name: 'Cancel' });
+    media.dispatch({ id: 1, type: 'prepareShare', shareId: 2, text: 'Share', name: 'Cancel' });
     const capture = media.startCapture(render.mock.lastCall?.[3]);
     media.dispatch({ id: 1, type: 'disconnect' });
     resolveCapture(stream);

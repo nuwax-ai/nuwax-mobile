@@ -101,6 +101,8 @@ let backfillRunning = false;
 let activeBackfillLocalId = "";
 /** 历史列表里正在单独补传的本地会话。同一条不重复开。 */
 let historyBackfillLocalIds: string[] = [];
+/** 本进程里已经 complete 成功的 noteId。避免历史页和补传各收一次尾。 */
+let completedNoteIds: string[] = [];
 /** 正在创建笔记的本地会话。不同会话可以同时创建，同一条不重复创建。 */
 let noteCreateLocalIds: string[] = [];
 /** 完成时创建笔记失败后，自动再补一次。避免和「开始录音」撞在同一次未结束的上传上后再也没人试。 */
@@ -1705,16 +1707,14 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
             await completeRecord(latest);
           } else if (latest != null && !historyNoteStillUploading(latest) && latest.phase != "recording" && latest.phase != "paused") {
             latest.phase = "failed";
-            latest.awaitComplete = false;
             if (latest.error.length == 0) latest.error = "有录音分段上传失败";
             touch(latest);
           }
-        } else if (open.awaitComplete && open.phase != "recording" && open.phase != "paused") {
-          if (allSegmentsUploaded(open)) {
+        } else if (open.phase != "recording" && open.phase != "paused") {
+          if (open.noteId.length > 0 && allSegmentsUploaded(open)) {
             await completeRecord(open);
-          } else {
+          } else if (open.awaitComplete) {
             open.phase = "failed";
-            open.awaitComplete = false;
             if (open.error.length == 0) open.error = "有录音分段上传失败";
             touch(open);
           }
@@ -2000,6 +2000,29 @@ export function backfillVoiceNoteByNoteId(noteId: string): void {
   void pumpQueue(target.localId, false, true);
 }
 
+function noteCompleteDone(noteId: string): boolean {
+  if (noteId.length == 0) return false;
+  for (let i = 0; i < completedNoteIds.length; i++) {
+    if (completedNoteIds[i] == noteId) return true;
+  }
+  return false;
+}
+
+function rememberNoteComplete(noteId: string): void {
+  if (noteCompleteDone(noteId)) return;
+  completedNoteIds.push(noteId);
+}
+
+/** 分段都已上传，这次录音也已结束。这时才应该调用 complete。 */
+function readyToComplete(record: VoiceNoteRecord): boolean {
+  if (record.noteId.length == 0) return false;
+  if (noteCompleteDone(record.noteId)) return false;
+  if (record.phase == "recording" || record.phase == "paused") return false;
+  if (record.phase == "processing" || record.phase == "success" || record.phase == "discarded") return false;
+  if (hasUnstagedOpenFile(record)) return false;
+  return allSegmentsUploaded(record);
+}
+
 async function completeRecord(record: VoiceNoteRecord): Promise<void> {
   if (record.phase == "recording" || record.phase == "paused") {
     return;
@@ -2007,15 +2030,24 @@ async function completeRecord(record: VoiceNoteRecord): Promise<void> {
   if (record.noteId.length == 0) {
     return;
   }
+  if (noteCompleteDone(record.noteId)) {
+    if (record.phase != "processing" && record.phase != "success") {
+      record.phase = "processing";
+      record.awaitComplete = false;
+      record.error = "";
+      touch(record);
+    }
+    return;
+  }
   const total = record.segments.length;
   if (total <= 0 || !allSegmentsUploaded(record)) {
     record.phase = "failed";
     if (total <= 0) {
       record.error = "没有可上传的录音";
+      record.awaitComplete = false;
     } else if (record.error.length == 0) {
       record.error = "有录音分段上传失败";
     }
-    record.awaitComplete = false;
     touch(record);
     return;
   }
@@ -2023,6 +2055,7 @@ async function completeRecord(record: VoiceNoteRecord): Promise<void> {
   touch(record);
   try {
     await apiVoiceNoteComplete(record.noteId, total, true);
+    rememberNoteComplete(record.noteId);
     record.phase = "processing";
     record.awaitComplete = false;
     record.error = "";
@@ -2031,6 +2064,35 @@ async function completeRecord(record: VoiceNoteRecord): Promise<void> {
     record.phase = "failed";
     record.error = `${e}`;
     touch(record);
+  }
+}
+
+/**
+ * 历史里这条还是上传中，但本地已经没有文件。分段此前已经传上去了，这里只补 complete。
+ * 本地还有记录时不在这里收尾，交给补传。正在录音的不收尾。
+ */
+export function orphanUploadNeedsComplete(noteId: string): boolean {
+  if (noteId.length == 0) return false;
+  if (noteCompleteDone(noteId)) return false;
+  const recording = activeRecord();
+  if (recording != null && recording.noteId == noteId) return false;
+  if (findVoiceNoteByNoteId(noteId) != null) return false;
+  return true;
+}
+
+export function completeOrphanUploadingNote(noteId: string, totalSegments: number): void {
+  if (!orphanUploadNeedsComplete(noteId) || totalSegments <= 0) return;
+  void finishOrphanUploadingNote(noteId, totalSegments);
+}
+
+async function finishOrphanUploadingNote(noteId: string, totalSegments: number): Promise<void> {
+  if (noteCompleteDone(noteId)) return;
+  if (findVoiceNoteByNoteId(noteId) != null) return;
+  try {
+    await apiVoiceNoteComplete(noteId, totalSegments, true);
+    rememberNoteComplete(noteId);
+  } catch (_e) {
+    // 下次进入历史再试。服务端仍是上传中。
   }
 }
 
@@ -2133,12 +2195,14 @@ async function runBackfillPass(ids: string[]): Promise<void> {
       }
       if (needsUpload) {
         await pumpQueue(localId, true, false, false);
-      } else if (open.awaitComplete && open.noteId.length > 0 && allSegmentsUploaded(open)) {
-        await completeRecord(open);
       }
-      const latest = findVoiceNoteByLocalId(localId);
-      // 还没有 noteId，或完成接口还没成功，不能删本地文件。历史里还没有这条。
-      if (latest != null && latest.noteId.length > 0 && !latest.awaitComplete && !backfillSkips(latest) && allSegmentsUploaded(latest) && !hasUnstagedOpenFile(latest)) {
+      let latest = findVoiceNoteByLocalId(localId);
+      if (latest != null && readyToComplete(latest)) {
+        await completeRecord(latest);
+        latest = findVoiceNoteByLocalId(localId);
+      }
+      // complete 成功后才删本地文件。分段上传成功但没收尾时，服务端会一直停在上传中。
+      if (latest != null && (latest.phase == "processing" || latest.phase == "success") && !backfillSkips(latest) && allSegmentsUploaded(latest) && !hasUnstagedOpenFile(latest)) {
         deleteVoiceNoteFiles(latest);
         deleteVoiceNote(latest.localId);
       }

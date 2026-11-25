@@ -48,6 +48,11 @@ public class VoiceNoteM4aBridge {
     private let callWatch = CallWatch()
     private let callObserver = CXCallObserver()
     private var terminateObserver: NSObjectProtocol?
+    private var routeObserver: NSObjectProtocol?
+    /// 接通时先准备好下一段。挂断后在后台只调用 record()，避免重新创建录音器被系统拒绝。
+    private var armedRecorder: AVAudioRecorder?
+    private var armedPath = ""
+    private var resumeAttempt = 0
     private static weak var activeBridge: VoiceNoteM4aBridge?
 
     public init() {
@@ -69,6 +74,14 @@ public class VoiceNoteM4aBridge {
         ) { [weak self] notification in
             self?.handleInterruption(notification)
         }
+        routeObserver = center.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: nil
+        ) { [weak self] _ in
+            self?.handleRouteChange()
+        }
+        UIApplication.shared.beginReceivingRemoteControlEvents()
     }
 
     deinit {
@@ -76,6 +89,9 @@ public class VoiceNoteM4aBridge {
             NotificationCenter.default.removeObserver(observer)
         }
         if let observer = terminateObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = routeObserver {
             NotificationCenter.default.removeObserver(observer)
         }
         stopSilence()
@@ -231,6 +247,9 @@ public class VoiceNoteM4aBridge {
             self.interruptEnded = false
             self.keepAliveForInterrupt = false
             self.pendingEvents.removeAll()
+            self.armedRecorder?.stop()
+            self.armedRecorder = nil
+            self.armedPath = ""
             self.stopSilence()
             return self.closeRecorder()
         }
@@ -377,11 +396,49 @@ public class VoiceNoteM4aBridge {
             return
         }
         // 挂断通知本身就是结束。飞书没有系统电话，不能再看 phoneBusy 或 secondaryAudio。
+        NSLog("[voice-note] interruption ended")
         interruptEnded = true
         if !phoneBusy() {
-            resumeRecordingAfterInterrupt()
+            scheduleResumeAttempts()
         }
         pushEvent("ended")
+    }
+
+    /// 已经收到挂断后，路由切回本机时再试一次。接通过程中的路由变化不能当成挂断。
+    private func handleRouteChange() {
+        if Thread.isMainThread {
+            resumeIfRouteFree()
+            return
+        }
+        DispatchQueue.main.sync {
+            self.resumeIfRouteFree()
+        }
+    }
+
+    private func resumeIfRouteFree() {
+        guard interruptHold, interruptEnded, !userPaused, !phoneBusy(), !otherAudioBusy() else {
+            return
+        }
+        resumeRecordingAfterInterrupt()
+    }
+
+    private func scheduleResumeAttempts() {
+        resumeAttempt = 0
+        pumpResumeAttempt()
+    }
+
+    private func pumpResumeAttempt() {
+        guard interruptHold, interruptEnded, !userPaused, !phoneBusy() else {
+            return
+        }
+        resumeRecordingAfterInterrupt()
+        if !interruptHold || resumeAttempt >= 8 {
+            return
+        }
+        resumeAttempt += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.pumpResumeAttempt()
+        }
     }
 
     private func interruptGraceDone() -> Bool {
@@ -467,7 +524,8 @@ public class VoiceNoteM4aBridge {
             let url = silenceFileURL()
             silencePlayer = try? AVAudioPlayer(contentsOf: url)
             silencePlayer?.numberOfLoops = -1
-            silencePlayer?.volume = 0
+            // 音量为 0 时系统不把它当成正在播放，飞书挂断后不会在后台唤醒。波形本身很小，听不到，也不会写进 m4a。
+            silencePlayer?.volume = 1
             silencePlayer?.prepareToPlay()
         }
         _ = silencePlayer?.play()
@@ -505,7 +563,9 @@ public class VoiceNoteM4aBridge {
             holdIsPhone = true
         }
         keepAliveForInterrupt = true
+        armNextRecorder()
         startSilence()
+        NSLog("[voice-note] interruption began")
     }
 
     /// 在挂断回调里直接开下一段。这时页面定时器通常是停的。
@@ -519,6 +579,24 @@ public class VoiceNoteM4aBridge {
         guard !segmentLocalId.isEmpty else {
             return
         }
+        beginWake()
+        guard activateSession() else {
+            keepAliveForInterrupt = true
+            startSilence()
+            return
+        }
+        ignoreBeganUntil = Date().addingTimeInterval(1.5)
+        if let armed = armedRecorder, !armedPath.isEmpty, armed.record() {
+            recorder = armed
+            currentPath = armedPath
+            armedRecorder = nil
+            armedPath = ""
+            finishInterruptResume(currentPath)
+            return
+        }
+        armedRecorder?.stop()
+        armedRecorder = nil
+        armedPath = ""
         if resumeKey.isEmpty {
             let stamp = Int(Date().timeIntervalSince1970 * 1000)
             let indexName = segmentIndexName.isEmpty ? "c\(stamp)" : "\(segmentIndexName)c\(stamp)"
@@ -527,26 +605,58 @@ public class VoiceNoteM4aBridge {
         guard let path = preparePath(resumeKey) else {
             return
         }
-        ignoreBeganUntil = Date().addingTimeInterval(1.5)
-        beginWake()
-        guard activateSession() else {
-            return
-        }
         if openRecorder(path) {
-            resumeKey = ""
-            interruptHold = false
-            holdIsPhone = false
-            interruptEnded = false
-            userPaused = false
-            keepAliveForInterrupt = false
-            suppressBeganUntil = Date().addingTimeInterval(1.2)
-            startSilence()
-            endWake()
-            NSLog("[voice-note] resumed after interruption \(path)")
+            finishInterruptResume(path)
             return
         }
         keepAliveForInterrupt = true
         startSilence()
+    }
+
+    /// 接通后先建好下一段，挂断回调里就不用再创建录音器。
+    private func armNextRecorder() {
+        if armedRecorder != nil {
+            return
+        }
+        guard !segmentLocalId.isEmpty else {
+            return
+        }
+        if resumeKey.isEmpty {
+            let stamp = Int(Date().timeIntervalSince1970 * 1000)
+            let indexName = segmentIndexName.isEmpty ? "c\(stamp)" : "\(segmentIndexName)c\(stamp)"
+            resumeKey = "\(segmentLocalId)|\(indexName)"
+        }
+        guard let path = preparePath(resumeKey) else {
+            return
+        }
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 16000,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 64000
+        ]
+        guard let next = try? AVAudioRecorder(url: URL(fileURLWithPath: path), settings: settings) else {
+            return
+        }
+        if next.prepareToRecord() {
+            armedRecorder = next
+            armedPath = path
+            return
+        }
+        next.stop()
+    }
+
+    private func finishInterruptResume(_ path: String) {
+        resumeKey = ""
+        interruptHold = false
+        holdIsPhone = false
+        interruptEnded = false
+        userPaused = false
+        keepAliveForInterrupt = false
+        suppressBeganUntil = Date().addingTimeInterval(1.2)
+        startSilence()
+        endWake()
+        NSLog("[voice-note] resumed after interruption \(path)")
     }
 
     private func beginWake() {
@@ -574,7 +684,7 @@ public class VoiceNoteM4aBridge {
     }
 
     private func silenceFileURL() -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("voice-note-silence.wav")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("voice-note-keepalive.wav")
         if FileManager.default.fileExists(atPath: url.path) {
             return url
         }
@@ -602,8 +712,9 @@ public class VoiceNoteM4aBridge {
         appendU16(16)
         bytes.append(contentsOf: [0x64, 0x61, 0x74, 0x61])
         appendU32(UInt32(sampleCount * 2))
-        for _ in 0..<sampleCount {
-            appendU16(1)
+        for i in 0..<sampleCount {
+            let sample: Int16 = (i % 2 == 0) ? 24 : -24
+            appendU16(UInt16(bitPattern: sample))
         }
         try? bytes.write(to: url)
         return url

@@ -52,13 +52,21 @@ internal class VoipIncomingNotificationGate {
     private var incomingId: String? = null
     private var presented = false
     private var presentedFirst = false
+    private var replacedAlert = false
 
     fun publish(id: String, incoming: Boolean, uiVisible: Boolean = false): Boolean {
         if (!incoming) { reset(); return true }
         if (id == incomingId && (presented || !uiVisible)) return false
+        replacedAlert = id == incomingId
         if (id != incomingId) presentedFirst = uiVisible
         incomingId = id
         presented = uiVisible
+        return true
+    }
+
+    fun takeReplacedAlert(id: String): Boolean {
+        if (incomingId != id || !replacedAlert) return false
+        replacedAlert = false
         return true
     }
 
@@ -69,5 +77,6 @@ internal class VoipIncomingNotificationGate {
         incomingId = null
         presented = false
         presentedFirst = false
+        replacedAlert = false
     }
 }

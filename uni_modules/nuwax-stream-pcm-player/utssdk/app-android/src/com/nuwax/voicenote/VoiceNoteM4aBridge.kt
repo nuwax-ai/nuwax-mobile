@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.SystemClock
 import java.io.File
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 
 /**
@@ -680,13 +681,27 @@ class VoiceNoteM4aBridge {
         if (!source.isFile || source.length() < 16) {
             return "0:unreadable"
         }
+        // 正常的录音文件 stop() 已经写过 moov，只读头尾确认一下就返回，
+        // 绝不读整文件、更不重写，保证正常文件不会被再封一次。
+        if (fileHasMoov(source)) {
+            File("$path.frames").delete()
+            File("$path.csd").delete()
+            return "1"
+        }
+        // 补封口要把整个文件读进内存。太长的会话直接拒绝，避免 OOM 把进程拖垮
+        // （OOM 是 Error 不是 Exception，下面的 catch 抓不住，会一路冒到引擎里变成裸 "0"）。
+        if (source.length() > MAX_SEAL_BYTES) {
+            return "0:toolarge"
+        }
         val bytes = try {
             source.readBytes()
-        } catch (_e: Exception) {
+        } catch (_e: Throwable) {
             return "0:unreadable"
         }
+        // 头尾没扫到 moov，再按完整 box 链兜一次底。
         if (mp4HasMoov(bytes) || mp4ContainsMoov(bytes)) {
             File("$path.frames").delete()
+            File("$path.csd").delete()
             return "1"
         }
         val payload = mp4MdatPayload(bytes) ?: return "0:layout"
@@ -696,6 +711,19 @@ class VoiceNoteM4aBridge {
         val sizes = readFrameSizes("$path.frames")
         if (sizes.isEmpty()) {
             return "0:nosizes"
+        }
+        // 帧日志每秒都 fsync，mdat 却是 MediaMuxer 内部缓冲、被 kill 时通常只剩一个前缀。
+        // 残片不到预期的一半，说明音频基本没落盘，补出来只会是一段没有声音的 m4a。
+        // 这种情况直接判失败，交给引擎重试/丢弃，绝不能当成补封口成功上传。
+        var expected = 0
+        for (size in sizes) {
+            expected += size
+        }
+        if (expected <= 0) {
+            return "0:nosizes"
+        }
+        if (payload.size * 2 < expected) {
+            return "0:partial"
         }
         val csd = readCsd("$path.csd")
         val tmp = File("$path.sealed")
@@ -750,7 +778,7 @@ class VoiceNoteM4aBridge {
         }
         val sealed = try {
             tmp.readBytes()
-        } catch (_e: Exception) {
+        } catch (_e: Throwable) {
             tmp.delete()
             return "0:verify"
         }
@@ -818,6 +846,60 @@ class VoiceNoteM4aBridge {
             return IntArray(0)
         }
         return sizes.copyOf(kept)
+    }
+
+    /**
+     * 只读头尾判断 m4a 是否已经写过 moov，避免为了确认封口把整个文件读进内存。
+     * MediaMuxer 的 moov 落在文件末尾；faststart 的落在开头。两段都扫，覆盖正常录音文件。
+     */
+    private fun fileHasMoov(file: File): Boolean {
+        val size = file.length()
+        if (size < 16) {
+            return false
+        }
+        val raf = try {
+            RandomAccessFile(file, "r")
+        } catch (_e: Throwable) {
+            return false
+        }
+        try {
+            val headLen = if (size < 65536L) size.toInt() else 65536
+            val head = ByteArray(headLen)
+            raf.seek(0)
+            val headGot = readFully(raf, head, headLen)
+            if (headGot > 0 && mp4WindowHasMoov(head, 0, headGot)) {
+                return true
+            }
+            val tailLen = if (size > 4194304L) 4194304 else size.toInt()
+            val tail = ByteArray(tailLen)
+            raf.seek(size - tailLen)
+            val tailGot = readFully(raf, tail, tailLen)
+            return tailGot > 0 && mp4WindowHasMoov(tail, 0, tailGot)
+        } catch (_e: Throwable) {
+            return false
+        } finally {
+            try {
+                raf.close()
+            } catch (_e: Throwable) {
+            }
+        }
+    }
+
+    /** 尽量读满 length 字节，返回实际读到的数量。 */
+    private fun readFully(raf: RandomAccessFile, buffer: ByteArray, length: Int): Int {
+        var got = 0
+        while (got < length) {
+            val n = try {
+                raf.read(buffer, got, length - got)
+            } catch (_e: Throwable) {
+                break
+            }
+            if (n <= 0) {
+                break
+            }
+            got += n
+        }
+        return got
     }
 
     private fun mp4HasMoov(bytes: ByteArray): Boolean {
@@ -939,6 +1021,8 @@ class VoiceNoteM4aBridge {
 
     companion object {
         private const val SAMPLE_RATE = 16000
+        /** 补封口整文件读进内存的上限。超过就不补，避免 OOM。 */
+        private const val MAX_SEAL_BYTES = 256L * 1024L * 1024L
 
         @Volatile
         private var active: VoiceNoteM4aBridge? = null

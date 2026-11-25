@@ -95,7 +95,7 @@ export class MeetingStageSession {
   private static shareLease: ShareLease | undefined
   private static nextShareId: number = 0
   private static shareStartTimer: number = -1
-  static shareReleaseRunning: boolean = false
+  private static shareRelease: Promise<void> | undefined
   static people: number = 0
   static level: number = 0
   static raised: boolean = false
@@ -247,9 +247,10 @@ export class MeetingStageSession {
     const owner = MeetingStageSession.backgroundOwner
     if (owner.length === 0) return
     MeetingStageSession.backgroundOwner = ''
-    // A detached ArkWeb session may still need to send the final leave before the process is suspended.
+    // A detached meeting still needs time to send its leave and return screen-share ownership.
     const afterLeave = leaving ?? Promise.resolve(true)
-    afterLeave.then(() => EntryVoipBackgroundTask.release(owner)).catch((error: BusinessError) => {
+    const shareRelease = MeetingStageSession.shareRelease ?? Promise.resolve()
+    afterLeave.then(() => shareRelease).finally(() => EntryVoipBackgroundTask.release(owner)).catch((error: BusinessError) => {
       console.warn('[MeetingStage] background task release failed code=' + error.code)
     })
   }
@@ -279,7 +280,7 @@ export class MeetingStageSession {
 
   static prepareShare(label: string, cancel: string, releaseURL: string, seatToken: string): boolean {
     if (!MeetingStageSession.isConnected() || !MeetingStageSession.host?.screenSupported ||
-        MeetingStageSession.shareReleaseRunning || MeetingStageSession.shareLease) return false
+        MeetingStageSession.shareRelease || MeetingStageSession.shareLease) return false
     const base = 'https://testagent.xspaceagi.com/api/instant-message/meetings/public/rooms/'
     if (!releaseURL.startsWith(base) || !releaseURL.endsWith('/share-holder/release') || seatToken.length === 0) return false
     MeetingStageSession.nextShareId += 1
@@ -323,6 +324,10 @@ export class MeetingStageSession {
     MeetingStageSession.shareStartTimer = -1
   }
 
+  static isShareReleaseRunning(): boolean {
+    return MeetingStageSession.shareRelease !== undefined
+  }
+
   private static releaseShare(): void {
     MeetingStageSession.clearShareStartTimer()
     MeetingStageSession.captureArmed = false
@@ -332,9 +337,8 @@ export class MeetingStageSession {
     const lease = MeetingStageSession.shareLease
     if (!lease) return
     MeetingStageSession.shareLease = undefined
-    MeetingStageSession.shareReleaseRunning = true
-    MeetingStageSession.releaseShareAtServer(lease).finally(() => {
-      MeetingStageSession.shareReleaseRunning = false
+    MeetingStageSession.shareRelease = MeetingStageSession.releaseShareAtServer(lease).finally(() => {
+      MeetingStageSession.shareRelease = undefined
     })
   }
 

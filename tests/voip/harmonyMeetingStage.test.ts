@@ -204,11 +204,11 @@ describe('Harmony meeting share lease', () => {
     expect(url).toBe(releaseURL);
     expect(options.method).toBe('POST');
     expect(JSON.parse(options.extraData)).toEqual({ token: 'release-seat-token' });
-    expect(session.shareReleaseRunning).toBe(true);
+    expect(session.isShareReleaseRunning()).toBe(true);
     expect(session.prepareShare('Share', 'Cancel', releaseURL, 'release-seat-token')).toBe(false);
     await settle();
     expect(destroy).toHaveBeenCalledOnce();
-    expect(session.shareReleaseRunning).toBe(false);
+    expect(session.isShareReleaseRunning()).toBe(false);
   });
 
   it('does not use production and ignores a stale stop from an earlier share', async () => {
@@ -243,7 +243,7 @@ describe('Harmony meeting share lease', () => {
     await settle();
     expect(request).toHaveBeenCalledTimes(2);
     expect(destroy).toHaveBeenCalledTimes(2);
-    expect(session.shareReleaseRunning).toBe(false);
+    expect(session.isShareReleaseRunning()).toBe(false);
   });
 
   it('keeps a published share past the consent deadline and releases it when the connection ends', async () => {
@@ -292,6 +292,31 @@ describe('Harmony meeting background lifecycle', () => {
     expect(task.release).not.toHaveBeenCalled();
     session.host.postMessage(JSON.stringify({ type: 'leaveComplete', id, left: true }));
     await leaving;
+    await settle();
+    expect(task.release).toHaveBeenCalledExactlyOnceWith('meeting:' + id);
+  });
+
+  it.each([false, true])('keeps the background owner until the share has been returned (stopped first: %s)', async stoppedFirst => {
+    const { session, task, request, mount } = connectedStage();
+    let finishRelease!: (response: object) => void;
+    request.mockImplementationOnce(() => new Promise(resolve => { finishRelease = resolve; }));
+    const id = session.id;
+    const host = session.host;
+    expect(session.prepareShare('Share', 'Cancel', releaseURL, 'token')).toBe(true);
+    session.receive({ type: 'state', id, connection: 'connected', shareId: 1, sharing: true });
+    expect(task.acquire).toHaveBeenCalledOnce();
+
+    session.releaseView(mount.id);
+    session.setAppForeground(false);
+    if (stoppedFirst) session.stopShare();
+    const leaving = session.disconnect();
+    host.postMessage(JSON.stringify({ type: 'leaveComplete', id, left: true }));
+    expect(await leaving).toBe(true);
+    await settle();
+    expect(request).toHaveBeenCalledOnce();
+    expect(task.release).not.toHaveBeenCalled();
+
+    finishRelease({ responseCode: 200, result: '{"code":"0000"}' });
     await settle();
     expect(task.release).toHaveBeenCalledExactlyOnceWith('meeting:' + id);
   });

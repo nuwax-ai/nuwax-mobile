@@ -60,6 +60,11 @@ class VoiceNoteForegroundService : Service() {
         return START_NOT_STICKY
     }
 
+    override fun onDestroy() {
+        VoiceNoteM4aBridge.stopActive()
+        super.onDestroy()
+    }
+
     override fun onTaskRemoved(rootIntent: Intent?) {
         VoiceNoteM4aBridge.stopActive()
         VoiceNoteExitMark.mark(this)

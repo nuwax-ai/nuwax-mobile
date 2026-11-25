@@ -593,10 +593,13 @@ class VoiceNoteM4aBridge {
         } catch (_e: Exception) {
             return "0:unreadable"
         }
-        if (mp4HasMoov(bytes)) {
+        if (mp4HasMoov(bytes) || mp4EdgeHasMoov(bytes)) {
             return "1"
         }
-        val payload = mp4MdatPayload(bytes) ?: return "0:nomdat"
+        val payload = mp4MdatPayload(bytes) ?: return "0:layout"
+        if (payload.isEmpty()) {
+            return "0:nomdat"
+        }
         val frames = payload.size / AAC_FRAME_BYTES
         if (frames <= 0) {
             return "0:short"
@@ -686,44 +689,77 @@ class VoiceNoteM4aBridge {
         return false
     }
 
+    /** 走完仍没有 mdat 时返回空数组。尺寸读断、还没见到 mdat 时返回 null，不能当成没有音频。 */
     private fun mp4MdatPayload(bytes: ByteArray): ByteArray? {
         var pos = 0
         var steps = 0
+        var broke = false
         while (pos + 8 <= bytes.size && steps < 64) {
             steps += 1
+            val typeM = bytes[pos + 4] == 0x6d.toByte() && bytes[pos + 5] == 0x64.toByte() &&
+                bytes[pos + 6] == 0x61.toByte() && bytes[pos + 7] == 0x74.toByte()
             val size32 = mp4Be32(bytes, pos)
             var header = 8
             var boxSize = size32
             if (size32 == 1) {
-                if (pos + 16 > bytes.size) {
-                    return null
-                }
-                if (mp4Be32(bytes, pos + 8) != 0) {
+                if (pos + 16 > bytes.size || mp4Be32(bytes, pos + 8) != 0) {
+                    if (typeM && pos + header < bytes.size) {
+                        return bytes.copyOfRange(pos + header, bytes.size)
+                    }
                     return null
                 }
                 boxSize = mp4Be32(bytes, pos + 12)
                 header = 16
-            } else if (size32 == 0) {
+            } else if (size32 == 0 || size32 == -1) {
                 boxSize = bytes.size - pos
             }
-            if (boxSize < header) {
-                return null
-            }
-            val end = if (pos + boxSize > bytes.size) bytes.size else pos + boxSize
-            val typeM = bytes[pos + 4] == 0x6d.toByte() && bytes[pos + 5] == 0x64.toByte() &&
-                bytes[pos + 6] == 0x61.toByte() && bytes[pos + 7] == 0x74.toByte()
             if (typeM) {
-                if (end <= pos + header) {
-                    return null
+                val start = pos + header
+                var end = pos + boxSize
+                if (boxSize < header || end > bytes.size) {
+                    end = bytes.size
                 }
-                return bytes.copyOfRange(pos + header, end)
+                if (end <= start) {
+                    return ByteArray(0)
+                }
+                return bytes.copyOfRange(start, end)
             }
-            if (pos + boxSize > bytes.size) {
-                return null
+            if (boxSize < 8 || pos + boxSize > bytes.size) {
+                broke = true
+                break
             }
             pos += boxSize
         }
-        return null
+        if (broke) {
+            return null
+        }
+        return ByteArray(0)
+    }
+
+    /** mdat 长度写过头时，线性扫描到不了末尾的 moov。只看文件头尾，避免把音频字节误认成 moov。 */
+    private fun mp4EdgeHasMoov(bytes: ByteArray): Boolean {
+        if (mp4ScanMoov(bytes, 0, minOf(65536, bytes.size))) {
+            return true
+        }
+        val tail = if (bytes.size > 262144) bytes.size - 262144 else 0
+        return mp4ScanMoov(bytes, tail, bytes.size - tail)
+    }
+
+    private fun mp4ScanMoov(bytes: ByteArray, from: Int, limit: Int): Boolean {
+        var pos = if (from < 0) 0 else from
+        val end = minOf(bytes.size, pos + limit)
+        while (pos + 8 <= end) {
+            val isMoov = bytes[pos + 4] == 0x6d.toByte() && bytes[pos + 5] == 0x6f.toByte() &&
+                bytes[pos + 6] == 0x6f.toByte() && bytes[pos + 7] == 0x76.toByte()
+            if (isMoov) {
+                val size = mp4Be32(bytes, pos)
+                if (size == 0 || (size >= 8 && pos + size <= bytes.size)) {
+                    return true
+                }
+            }
+            pos += 4
+        }
+        return false
     }
 
     private fun mp4BoxSize(bytes: ByteArray, pos: Int): Int? {

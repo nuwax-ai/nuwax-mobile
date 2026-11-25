@@ -610,8 +610,43 @@ async function splitLongHarmonySegment(record: VoiceNoteRecord): Promise<void> {
 /**
  * 杀掉进程后补写 moov。成功返回 "1"。
  * 旧基座没有 seal 方法时返回 "0"，Android、鸿蒙按原文件上传。
- * 新基座封口失败返回 "0:原因"，这次不上传。
+ * 0:nomdat 只表示文件里没有音频数据。盒子尺寸读断返回 0:layout，不当成没音频。
+ * 补封口失败最多 3 次，第 3 次仍失败就删掉这段，不再每次补传都封。
  */
+const maxSealAttempts = 3;
+
+function bumpSegmentSeal(localId: string, segmentIndex: number): number {
+  const record = findVoiceNoteByLocalId(localId);
+  if (record == null) return maxSealAttempts;
+  for (let i = 0; i < record.segments.length; i++) {
+    const row = record.segments[i];
+    if (row.segmentIndex != segmentIndex) continue;
+    const next = row.sealAttempts + 1;
+    row.sealAttempts = next;
+    touch(record);
+    return next;
+  }
+  return maxSealAttempts;
+}
+
+/** 补封口满 3 次仍失败。删掉这段文件；没有别的分段时，连服务端笔记一起结束。 */
+async function dropFailedSeal(localId: string, segmentIndex: number, filePath: string): Promise<void> {
+  if (filePath.length > 0) {
+    await unlinkVoiceFile(filePath);
+  }
+  const left = removeMissingSegment(localId, segmentIndex);
+  const current = left != null ? left : findVoiceNoteByLocalId(localId);
+  if (current != null && current.openSegmentPath == filePath) {
+    current.openSegmentPath = "";
+    current.openSealAttempts = 0;
+    touch(current);
+  }
+  pushVoiceNoteDebug("录音", "补封口已达3次，已删除");
+  if (current != null && current.segments.length <= 0 && current.phase != "recording" && current.phase != "paused") {
+    abandonUnsealableNote(current);
+  }
+}
+
 async function sealUnfinishedM4a(filePath: string): Promise<string> {
   if (filePath.length == 0) return "0";
   try {
@@ -649,13 +684,40 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
   if (isM4aPath(filePath)) {
     let gate = await segmentUploadReady(filePath);
     if (gate == "unsealed") {
+      if (record.openSealAttempts >= maxSealAttempts) {
+        await unlinkVoiceFile(filePath);
+        record.openSegmentPath = "";
+        record.openSealAttempts = 0;
+        touch(record);
+        pushVoiceNoteDebug("录音", "补封口已达3次，已删除");
+        if (record.segments.length <= 0) {
+          abandonUnsealableNote(record);
+        }
+        return -1;
+      }
       const sealResult = await sealUnfinishedM4a(filePath);
       if (sealResult == "1") {
+        record.openSealAttempts = 0;
         gate = await segmentUploadReady(filePath);
+      } else {
+        record.openSealAttempts = record.openSealAttempts + 1;
+        touch(record);
+        pushVoiceNoteDebug("录音", "补封口第" + record.openSealAttempts.toString() + "次未成功");
+        if (record.openSealAttempts >= maxSealAttempts) {
+          await unlinkVoiceFile(filePath);
+          record.openSegmentPath = "";
+          record.openSealAttempts = 0;
+          touch(record);
+          pushVoiceNoteDebug("录音", "补封口已达3次，已删除");
+          if (record.segments.length <= 0) {
+            abandonUnsealableNote(record);
+          }
+          return -1;
+        }
       }
     }
     if (gate == "unsealed") {
-      if (record.segments.length == 0) {
+      if (record.segments.length == 0 && record.error.length == 0) {
         record.error = "录音文件未封口";
       }
       touch(record);
@@ -1553,16 +1615,30 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
       // #ifdef APP
       gate = await segmentUploadReady(missingPath);
       if (gate == "unsealed") {
+        if (pending.sealAttempts >= maxSealAttempts) {
+          await dropFailedSeal(sessionId, pending.segmentIndex, missingPath);
+          continue;
+        }
         sealResult = await sealUnfinishedM4a(missingPath);
         if (sealResult == "1") {
           gate = "ready";
         }
         // #ifdef APP-ANDROID || APP-HARMONY
-        // 划掉任务时 stop() 已经写好可上传的 m4a。补封口认不出 mdat 也不能删文件。
-        if (sealResult == "0" || sealResult == "0:nomdat") {
+        // 旧基座没有补封口，返回的是单独一个 0。划掉任务时 stop() 已经写过 moov，按原文件上传。
+        if (sealResult == "0") {
           gate = "ready";
         }
         // #endif
+        if (gate != "ready") {
+          const tries = bumpSegmentSeal(sessionId, pending.segmentIndex);
+          pushVoiceNoteDebug("录音", "补封口第" + tries.toString() + "次未成功");
+          if (tries >= maxSealAttempts) {
+            await dropFailedSeal(sessionId, pending.segmentIndex, missingPath);
+          } else {
+            skipped.push(pending.segmentIndex);
+          }
+          continue;
+        }
       }
       // #endif
       // #ifndef APP
@@ -1718,6 +1794,7 @@ async function stageOpenFileForUpload(localId: string): Promise<void> {
     }
     kept.durationMs = durationMs;
     kept.uploadStatus = "pending";
+    kept.sealAttempts = record.openSealAttempts;
     record.segments.push(kept);
     record.openSegmentIndex = record.openSegmentIndex + 1;
   }
@@ -2493,6 +2570,29 @@ function findInterruptedVoiceNote(): VoiceNoteRecord | null {
   return null;
 }
 
+/**
+ * 补封口确认文件里没有音频数据。再试也不会封上，停掉重试，并结束服务端这条上传中的笔记。
+ * 不删磁盘文件。Android、鸿蒙不走这里：那边划掉任务时 stop() 已经写过可上传的 m4a。
+ */
+function abandonUnsealableNote(record: VoiceNoteRecord): void {
+  const noteId = record.noteId;
+  record.phase = "discarded";
+  record.awaitComplete = false;
+  record.openSegmentPath = "";
+  record.segmentStartedAt = 0;
+  record.openElapsedMs = 0;
+  record.error = "";
+  touch(record);
+  deleteVoiceNote(record.localId);
+  if (noteId.length > 0) {
+    void deleteNoteQuiet(noteId);
+  }
+  endBackground();
+  stopTicker();
+  releaseRecorderCallbacks();
+  pushVoiceNoteDebug("录音", "没有可封口的音频，已结束这次录音");
+}
+
 /** 直接退出后的这一次按完成结束：留下已落盘分段，等下次点开始录音再补传。面板不再显示继续。 */
 function markInterruptedComplete(record: VoiceNoteRecord): void {
   record.phase = "uploading";
@@ -2576,8 +2676,41 @@ async function sealLeftoverOpenFiles(): Promise<void> {
     if (row.phase == "recording" || row.phase == "paused") continue;
     if (row.openSegmentPath.length == 0) continue;
     const path = row.openSegmentPath;
+    if (row.openSealAttempts >= maxSealAttempts) {
+      await unlinkVoiceFile(path);
+      const full = findVoiceNoteByLocalId(row.localId);
+      if (full != null && full.segments.length <= 0) {
+        abandonUnsealableNote(full);
+      } else if (full != null) {
+        full.openSegmentPath = "";
+        full.openSealAttempts = 0;
+        touch(full);
+      }
+      pushVoiceNoteDebug("录音", "补封口已达3次，已删除");
+      continue;
+    }
     const sealResult = await sealUnfinishedM4a(path);
-    if (sealResult != "1") continue;
+    const currentTry = findVoiceNoteByLocalId(row.localId);
+    if (currentTry == null) continue;
+    if (sealResult != "1") {
+      currentTry.openSealAttempts = currentTry.openSealAttempts + 1;
+      touch(currentTry);
+      pushVoiceNoteDebug("录音", "补封口第" + currentTry.openSealAttempts.toString() + "次未成功");
+      if (currentTry.openSealAttempts >= maxSealAttempts) {
+        await unlinkVoiceFile(path);
+        if (currentTry.segments.length <= 0) {
+          abandonUnsealableNote(currentTry);
+        } else {
+          currentTry.openSegmentPath = "";
+          currentTry.openSealAttempts = 0;
+          touch(currentTry);
+        }
+        pushVoiceNoteDebug("录音", "补封口已达3次，已删除");
+      }
+      continue;
+    }
+    currentTry.openSealAttempts = 0;
+    touch(currentTry);
     const current = findVoiceNoteByLocalId(row.localId);
     if (current == null || current.openSegmentPath != path) continue;
     await closeSegment(current, path);

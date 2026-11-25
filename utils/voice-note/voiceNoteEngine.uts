@@ -2077,6 +2077,73 @@ function newestSegmentPath(record: VoiceNoteRecord): string {
   return "";
 }
 
+/**
+ * 电话打断时先停掉当前文件。iOS 在挂断后对同一个 AVAudioRecorder 再 record()
+ * 会从文件头重写，接通前的音频就没了。这里先 stop() 封口收成一段，挂断后另开文件。
+ */
+async function sealInterruptedIosSegment(record: VoiceNoteRecord): Promise<void> {
+  // #ifdef APP-IOS
+  if (m4aRecorder == null) {
+    return;
+  }
+  recorderBusy = true;
+  let ok = "0";
+  try {
+    ok = await m4aRecorder!.stop();
+  } catch (_e) {
+    ok = "0";
+  }
+  let durationMs = 0;
+  try {
+    durationMs = m4aRecorder!.takeClosedDurationMs();
+  } catch (_e) {
+    durationMs = 0;
+  }
+  recorderBusy = false;
+  if (sessionEnding || queuedIntent == "finish") {
+    queuedIntent = "";
+    stopActiveRecorder("finish");
+    return;
+  }
+  const sealedPath = record.openSegmentPath;
+  currentSegmentPath = "";
+  const latest = noteByLocalId(record.localId);
+  const target = latest != null ? latest : record;
+  if (ok == "1" && sealedPath.length > 0) {
+    if (durationMs > 0) {
+      closedDurationOverride = durationMs;
+    }
+    const closed = await closeSegment(target, sealedPath);
+    if (closed < 0) {
+      const index = target.openSegmentIndex;
+      const segment = new VoiceNoteSegmentRecord();
+      segment.segmentIndex = index;
+      segment.filePath = sealedPath;
+      const keptMs = durationMs > 0 ? durationMs : target.openElapsedMs;
+      segment.durationMs = keptMs > 0 ? keptMs : 0;
+      segment.startedAt = Date.now() - segment.durationMs;
+      segment.uploadStatus = "pending";
+      segment.uploadAttempts = 0;
+      target.segments.push(segment);
+      target.openSegmentIndex = index + 1;
+      target.accumulatedMs = target.accumulatedMs + segment.durationMs;
+      target.openElapsedMs = 0;
+      target.error = "";
+    }
+    target.openSegmentPath = "";
+  }
+  target.phase = "paused";
+  target.awaitComplete = false;
+  target.heldByCall = true;
+  target.segmentStartedAt = 0;
+  touch(target);
+  pushVoiceNoteDebug("录音", ok == "1" ? "通话打断，前一段已保存" : "通话打断，前一段没能封口");
+  if (ok == "1") {
+    void pumpQueue(target.localId, false);
+  }
+  // #endif
+}
+
 async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
   if (sessionEnding) {
     stopActiveRecorder("finish");
@@ -2087,6 +2154,12 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
     pauseAfterRotate = true;
     return;
   }
+  // #ifdef APP-IOS
+  if (pausedByInterruption && m4aRecorder != null && record.openSegmentPath.length > 0) {
+    await sealInterruptedIosSegment(record);
+    return;
+  }
+  // #endif
   if (m4aRecorder != null && record.openSegmentPath.length > 0) {
     recorderBusy = true;
     let paused = "0";
@@ -2218,7 +2291,7 @@ async function resumeInterruptedNote(record: VoiceNoteRecord): Promise<boolean> 
     return false;
     // #endif
 
-    // iOS 电话结束后继续写同一个文件。开新文件会把没封口的这一段丢掉。
+    // 文件还没封口时不要另开。电话打断会先 stop 再清空路径，挂断后走下面的新文件。
     // #ifdef APP-IOS
     return false;
     // #endif

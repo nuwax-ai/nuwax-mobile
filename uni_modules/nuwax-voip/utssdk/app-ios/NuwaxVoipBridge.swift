@@ -39,6 +39,7 @@ import LiveKitClient
     private var mediaId = ""
     private var connected = false, peerReady = false, readySent = false
     private var microphone = true, camera = false, audioActive = false
+    private var ownsCallAudio = false
     private var pushRegistry: PKPushRegistry?
     private var callUUIDs: [String: UUID] = [:]
     private struct PendingPush { let invitation: NuwaxVoipPushInvitation; var declined = false }
@@ -304,8 +305,6 @@ import LiveKitClient
             if #available(iOS 17.4, *) { systemBridge = NuwaxSystemCalls(owner: self) }
             else { systemBridge = NuwaxLegacySystemCalls(owner: self) }
         }
-        AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = false
-        updateAudioEngine()
         if pushRegistry == nil {
             let registry = PKPushRegistry(queue: .main)
             registry.delegate = self
@@ -711,6 +710,7 @@ import LiveKitClient
                 guard !Task.isCancelled, run == self.generation, self.snapshot?["callId"] as? String == id, !self.terminal.contains(id) else { return }
                 let signal = credentials["serverUrl"] as? String ?? ""
                 guard signal.hasPrefix("wss://") || (self.configuration["development"] as? Bool == true && signal.hasPrefix("ws://")) else { throw VoipError.invalid }
+                self.acquireCallAudio()
                 let next = Room(delegate: self); self.room = next
                 try await next.connect(url: credentials["serverUrl"] as? String ?? "", token: credentials["participantToken"] as? String ?? "")
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id, !self.terminal.contains(id) else { await next.disconnect(); return }
@@ -836,13 +836,19 @@ import LiveKitClient
         cancelRemoteLeft(); everHadRemote = false
         let old = room; room = nil; for item in views { item.view?.track = nil }
         audioActive = false; systemPaused = false; audioInterrupted = false
-        try? AudioManager.shared.setEngineAvailability(.none)
+        let hadCallAudio = ownsCallAudio
+        ownsCallAudio = false
+        if hadCallAudio { try? AudioManager.shared.setEngineAvailability(.none) }
         let run = generation
         Task {
             await old?.disconnect()
+            guard hadCallAudio, !self.ownsCallAudio else { return }
             if #unavailable(iOS 17.4), run == self.generation, self.snapshot == nil, self.room == nil {
                 try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
             }
+            // LiveKit's audio engine is shared with meetings in this process.
+            AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = true
+            try? AudioManager.shared.setEngineAvailability(.default)
         }
         if !reason.isEmpty { emit("localEnded", ["reason": reason]) }
         snapshot = nil; connected = false; peerReady = false; readySent = false
@@ -982,6 +988,7 @@ import LiveKitClient
         // the system's responsibility and the media engine waits for didActivate.
         do {
             try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
+            acquireCallAudio()
             trace("system audio session configured")
             return true
         } catch {
@@ -992,11 +999,12 @@ import LiveKitClient
         }
     }
     fileprivate func audioActivated(_ active: Bool) {
+        guard ownsCallAudio else { return }
         let id = snapshot?["callId"] as? String ?? ""
         let outgoing = snapshot?["callerId"] as? String == configuration["userId"] as? String
             && snapshot?["callerDeviceId"] as? String == configuration["deviceId"] as? String
         if active && !NuwaxVoipCallPolicy.mayActivateAudio(state: snapshot?["state"] as? String, outgoing: outgoing, terminal: id.isEmpty || terminal.contains(id)) {
-            audioActive = false; try? AudioManager.shared.setEngineAvailability(.none); return
+            audioActive = false; updateAudioEngine(); return
         }
         audioActive = active
         if active { audioInterrupted = false }
@@ -1048,7 +1056,7 @@ import LiveKitClient
     }
     fileprivate func pauseAudio(_ paused: Bool) { systemPaused = paused; updateAudioEngine() }
     private func handleInterruption(began: Bool, resume: Bool) {
-        guard snapshot != nil else { return }
+        guard ownsCallAudio, snapshot != nil else { return }
         if began { audioInterrupted = true }
         // LCK's didActivate remains the authority on supported OS versions.
         else if resume {
@@ -1057,7 +1065,14 @@ import LiveKitClient
         }
         updateAudioEngine()
     }
+    private func acquireCallAudio() {
+        guard !ownsCallAudio else { return }
+        ownsCallAudio = true
+        AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = systemBridge == nil
+        updateAudioEngine()
+    }
     private func updateAudioEngine() {
+        guard ownsCallAudio else { return }
         let id = snapshot?["callId"] as? String ?? ""
         let outgoing = snapshot?["callerId"] as? String == configuration["userId"] as? String
             && snapshot?["callerDeviceId"] as? String == configuration["deviceId"] as? String

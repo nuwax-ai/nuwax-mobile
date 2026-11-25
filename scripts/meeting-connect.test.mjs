@@ -28,6 +28,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
   const navigationObservers = new Map();
   let now = 10000;
   let nextTimer = 0, connected = false, configured = false, claims = 0;
+  let microphone = false, speaker = true;
   const globals = {
     console: { error: value => logs.push(String(value)) },
     Date: { now: () => now },
@@ -45,6 +46,10 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
       configured = false; // Android 原生 connect 会清理上一场配置。
     },
     livekitIsConnected: () => connected,
+    livekitIsMicEnabled: () => microphone,
+    livekitIsSpeakerEnabled: () => speaker,
+    livekitSetMic: on => operations.push(`mic:${on}`),
+    livekitSetSpeaker: on => operations.push(`speaker:${on}`),
     livekitLastError: () => '', livekitParticipantCount: () => connected ? 1 : 0,
     livekitConfigureBackgroundSession(endpoint, token) {
       assert.equal(connected, true, '不能在原生连接成功前配置后台能力');
@@ -110,6 +115,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
       vm.runInContext('state.connected = false; state.connecting = false; state.errorText = "exception";', context);
     },
     nativeConnected(value) { connected = value; },
+    nativeAudio(mic, output) { microphone = mic; speaker = output; },
     advance(ms = 1000) { now += ms; },
     requestRestore(persistent = false) { restoreRequested = true; persistentRestore = persistent; },
     restoreAcks: () => restoreAcks,
@@ -510,4 +516,22 @@ test('原生页面切换尚未完成：短间隔轮询不能重复压入会议�
   h.advance(250); h.api.meetingMediaReconcile();
   assert.equal(h.navigations.length, 2, '超时仍未显示才重试');
   assert.deepEqual(h.backDeltas, []);
+});
+
+
+test('iOS 会议音频按钮以原生启麦和路由的实际结果为准', async () => {
+  const h = harness();
+  await h.join();
+  h.complete();
+  assert.equal(h.api.meetingMediaState().micOn, false);
+  assert.equal(h.api.meetingMediaState().speakerOn, true);
+  h.api.meetingMediaSetMic(true);
+  h.api.meetingMediaSetSpeaker(false);
+  assert.deepEqual(h.operations.slice(-2), ['mic:true', 'speaker:false']);
+  assert.equal(h.api.meetingMediaState().micOn, false);
+  assert.equal(h.api.meetingMediaState().speakerOn, true);
+  h.nativeAudio(true, false);
+  h.api.meetingMediaReconcile();
+  assert.equal(h.api.meetingMediaState().micOn, true);
+  assert.equal(h.api.meetingMediaState().speakerOn, false);
 });

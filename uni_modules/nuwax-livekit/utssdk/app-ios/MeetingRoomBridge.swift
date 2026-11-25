@@ -38,6 +38,8 @@ public class MeetingRoomBridge: NSObject {
   private static let screenSharePublishProfile = "bounded720p30-3Mbps-single-h264"
 
   private static var room: Room?
+  private static var audioSessionRequirement: SessionRequirementHandle?
+  private static var micChangePending = false
   private static var videoView: VideoView?
   /// 连接状态由业务层轮询（UTS 回调类型跨到 Swift 会变成 UTSCallback，编译不过）
   private static var connectedFlag = false
@@ -94,6 +96,7 @@ public class MeetingRoomBridge: NSObject {
       MeetingRoomBridge.onMain {
         guard MeetingRoomBridge.room === current else { return }
         MeetingRoomBridge.connectedFlag = false
+        MeetingRoomBridge.releaseAudioSession()
         MeetingRoomBridge.stopScreenShare()
         MeetingPictureInPicture.shared.stop()
       }
@@ -190,6 +193,7 @@ public class MeetingRoomBridge: NSObject {
     deviceErrorText = ""
     onMain {
       connectionGeneration += 1
+      micChangePending = false
       let generation = connectionGeneration
       // 上一场没断干净时先收尾（业务层一般会先 disconnect，这里兜底防两个 Room 抢音频会话）
       if let stale = room {
@@ -198,6 +202,7 @@ public class MeetingRoomBridge: NSObject {
       }
       bridgeLog("connect start host=\(URL(string: serverUrl)?.host ?? "?") mic=\(micOn) cam=\(cameraOn)")
       Task { @MainActor in
+        guard generation == connectionGeneration else { return }
         do {
           try activateAudioSession()
           bridgeLog("audio session active cat=\(AVAudioSession.sharedInstance().category.rawValue)")
@@ -235,6 +240,7 @@ public class MeetingRoomBridge: NSObject {
         } catch {
           guard generation == connectionGeneration else { return }
           connectedFlag = false
+          releaseAudioSession()
           lastErrorText = "connect"
           bridgeLog("connect failed: \(error)")
         }
@@ -328,7 +334,8 @@ public class MeetingRoomBridge: NSObject {
       connectedFlag = false
       lastErrorText = ""
       deviceErrorText = ""
-      deactivateAudioSession()
+      micChangePending = false
+      releaseAudioSession()
     }
   }
 
@@ -715,13 +722,17 @@ public class MeetingRoomBridge: NSObject {
     bridgeLog("setMicrophone -> \(enabled)")
     onMain {
       Task { @MainActor in
-        guard let room = room else {
-          bridgeLog("setMicrophone skipped: no room")
+        guard connectedFlag, !micChangePending, let room = room else {
+          bridgeLog("setMicrophone skipped: meeting unavailable or microphone change pending")
           return
         }
+        micChangePending = true
+        defer { if Self.room === room { micChangePending = false } }
         if enabled {
           // ★开采集前显式申请授权：没授权就根本不要进 SDK 的采集路径
-          guard await LiveKitSDK.ensureDeviceAccess(for: [.audio]) else {
+          let allowed = await LiveKitSDK.ensureDeviceAccess(for: [.audio])
+          guard connectedFlag, Self.room === room else { return }
+          guard allowed else {
             deviceErrorText = "mic_denied"
             bridgeLog("setMicrophone skipped: microphone permission denied")
             return
@@ -730,9 +741,11 @@ public class MeetingRoomBridge: NSObject {
         bridgeLog("setMicrophone -> sdk")
         do {
           try await room.localParticipant.setMicrophone(enabled: enabled)
+          guard Self.room === room else { return }
           deviceErrorText = ""
           bridgeLog("setMicrophone ok \(debugSnapshot())")
         } catch {
+          guard Self.room === room else { return }
           deviceErrorText = "set_device"
           bridgeLog("setMicrophone(\(enabled)) failed: \(error)")
         }
@@ -777,14 +790,22 @@ public class MeetingRoomBridge: NSObject {
     }
   }
 
-  /// 扬声器 / 听筒（耳机插入时系统优先级更高）。
+  public static func isMicEnabled() -> Bool {
+    return room?.localParticipant.isMicrophoneEnabled() == true
+  }
+
+  public static func isSpeakerEnabled() -> Bool {
+    return AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .builtInSpeaker }
+  }
+
+  /// Speaker preference controls the session category as well as the immediate route.
   public static func setSpeakerEnabled(_ enabled: Bool) {
     onMain {
-      let session = AVAudioSession.sharedInstance()
+      guard connectedFlag else { return }
+      AudioManager.shared.isSpeakerOutputPreferred = enabled
       do {
-        // overrideOutputAudioPort 要求会话已激活，否则会抛错（也不会崩，但路由不生效）
-        try session.setActive(true)
-        try session.overrideOutputAudioPort(enabled ? .speaker : .none)
+        try AVAudioSession.sharedInstance().overrideOutputAudioPort(enabled ? .speaker : .none)
+        bridgeLog("setSpeaker requested=\(enabled) actual=\(isSpeakerEnabled())")
       } catch {
         bridgeLog("overrideOutputAudioPort(\(enabled)) failed: \(error)")
       }
@@ -1103,14 +1124,16 @@ public class MeetingRoomBridge: NSObject {
   // MARK: - 音频会话
 
   private static func activateAudioSession() throws {
-    let session = AVAudioSession.sharedInstance()
-    try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker])
-    try session.setActive(true)
+    releaseAudioSession()
+    let audio = AudioManager.shared
+    audio.isSpeakerOutputPreferred = true
+    // Keep both routes available even while the room's microphone track is muted.
+    audioSessionRequirement = try audio.audioSession.acquire(requirement: .playbackAndRecording)
   }
 
-  private static func deactivateAudioSession() {
-    let session = AVAudioSession.sharedInstance()
-    try? session.setActive(false, options: [.notifyOthersOnDeactivation])
-    try? session.setCategory(.ambient, mode: .default)
+  private static func releaseAudioSession() {
+    let requirement = audioSessionRequirement
+    audioSessionRequirement = nil
+    try? requirement?.release()
   }
 }

@@ -22,9 +22,11 @@ class MockRoom extends EventEmitter {
   remoteParticipants = new Map();
   localParticipant = {
     name: '本机', identity: 'test:member:harmony', attributes: {}, audioLevel: 0,
+    permissions: { canPublish: true, canPublishSources: [] as number[] },
     isMicrophoneEnabled: false, isCameraEnabled: false,
     getTrackPublication: vi.fn(),
     setMicrophoneEnabled: vi.fn(async (on: boolean) => { this.localParticipant.isMicrophoneEnabled = on; }),
+    setCameraEnabled: vi.fn(async (on: boolean) => { this.localParticipant.isCameraEnabled = on; }),
     setAttributes: vi.fn(async (attributes) => { this.localParticipant.attributes = attributes; }),
     publishData: vi.fn(async (_bytes: Uint8Array, _options: unknown) => {}),
     publishTrack: vi.fn(async () => {}),
@@ -74,6 +76,41 @@ describe('Harmony LiveKit room', () => {
     expect(JSON.parse(new TextDecoder().decode(payload))).toEqual({ text: '你好', name: '本机' });
     expect(options).toEqual({ topic: 'meeting-chat', reliable: true });
     expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: 'message', message: expect.objectContaining({ self: true }) }));
+  });
+
+  it('checks microphone and camera publication rights before opening local tracks', async () => {
+    const { media, room, post } = connection();
+    await waitForOperations();
+    const local = room.localParticipant;
+    local.permissions = { canPublish: true, canPublishSources: [Track.sourceToProto(Track.Source.Camera)] };
+    room.emit(RoomEvent.ParticipantPermissionsChanged);
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ micAllowed: false, cameraAllowed: true }));
+    media.dispatch({ id: 1, type: 'mic', on: true });
+    media.dispatch({ id: 1, type: 'camera', on: true });
+    await waitForOperations();
+    expect(local.setMicrophoneEnabled).not.toHaveBeenCalled();
+    expect(local.setCameraEnabled).toHaveBeenCalledWith(true, { facingMode: 'user' });
+
+    local.permissions.canPublishSources.push(Track.sourceToProto(Track.Source.Microphone));
+    room.emit(RoomEvent.ParticipantPermissionsChanged);
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ micAllowed: true, cameraAllowed: true }));
+    media.dispatch({ id: 1, type: 'mic', on: true });
+    await waitForOperations();
+    expect(local.setMicrophoneEnabled).toHaveBeenCalledWith(true);
+  });
+
+  it('switches facing mode on the published local camera without recreating the room', async () => {
+    const { media, room } = connection();
+    await waitForOperations();
+    const videoTrack = {
+      mediaStreamTrack: { getSettings: () => ({ facingMode: 'user' }) },
+      restartTrack: vi.fn(async (_options: object) => {}),
+    };
+    room.localParticipant.getTrackPublication.mockReturnValue({ videoTrack });
+    media.dispatch({ id: 1, type: 'flip' });
+    await waitForOperations();
+    expect(videoTrack.restartTrack).toHaveBeenCalledExactlyOnceWith({ facingMode: 'environment' });
+    expect(room.connect).toHaveBeenCalledOnce();
   });
 
   it('receives the current holder screen independently of the remote camera and plays remote audio', async () => {

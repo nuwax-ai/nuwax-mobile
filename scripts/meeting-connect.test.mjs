@@ -21,7 +21,8 @@ function forPlatform(raw, platform) {
 // 执行业务状态机，原生桥和网络为桩；不调用 HBuilderX/设备或真实接口。
 function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = false, preCode = '0', tokenCode = '0',
   apiOrigin = 'https://testagent.xspaceagi.com', screenSupported = true, nativeShareAccepted = true,
-  nativeShareStopping = false, claimResult = async () => ({ code: '0' }) } = {}) {
+  nativeShareStopping = false, claimResult = async () => ({ code: '0' }),
+  preData = { active: true } } = {}) {
   const raw = readFileSync(new URL('../utils/meeting/meetingMedia.uts', import.meta.url), 'utf8');
   const source = forPlatform(raw, platform).replace(/^import[\s\S]*?;\s*$/gm, '');
   const timers = new Map(), logs = [], operations = [], presentations = [], navigations = [];
@@ -40,7 +41,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     Date: { now: () => now },
     JSON: { parseObject: JSON.parse, parse: JSON.parse, stringify: JSON.stringify },
     SUCCESS_CODE: '0', eventBus: { emit() {} },
-    apiImMeetingPublicRoomSafe: async () => ({ code: preCode, data: { active: true } }),
+    apiImMeetingPublicRoomSafe: async () => ({ code: preCode, data: preData }),
     apiImMeetingIssueToken: async () => ({ code: tokenCode, data: { wsUrl: 'wss://rtc.test', token: 'secret-seat-token' } }),
     apiResCode: response => response.code,
     apiResData: response => response.data,
@@ -692,4 +693,37 @@ test('鸿蒙单聊来电优先，通知返回请求不会在挂断后跳到旧�
   h.voipActive(false);
   h.api.meetingMediaReconcile();
   assert.deepEqual(h.navigations, []);
+});
+
+
+test('鸿蒙提前入会时媒体舞台已挂载，收到进行中详情时不重建', async () => {
+  const page = readFileSync(new URL('../subpackages/pages/im-meeting/im-meeting-room.uvue', import.meta.url), 'utf8');
+  const markup = page.match(/<native-view v-if="mediaSupported && meetingStageEnabled"[^>]+@init="handleHarmonyStageInit"/s);
+  assert.ok(markup);
+  const stageStart = page.indexOf('const meetingStageEnabled = computed(');
+  assert.notEqual(stageStart, -1);
+  const stage = page.slice(stageStart, page.indexOf(';', stageStart) + 1);
+  const context = vm.createContext({
+    computed: get => get, roomRaw: { value: '123456789' }, status: { value: 0 },
+    mediaConnecting: { value: false }, mediaConnected: { value: false },
+  });
+  vm.runInContext(stripTypeScriptTypes(stage) + '\nglobalThis.stage = meetingStageEnabled;', context);
+  assert.equal(context.stage(), true);
+  const h = harness({ platform: 'APP-HARMONY', preData: { active: false, status: 0, allowEarlyJoin: true } });
+  await h.join();
+  assert.deepEqual(h.operations, ['connect']);
+  h.complete();
+  context.mediaConnected.value = h.api.meetingMediaState().connected;
+  context.status.value = 1;
+  assert.equal(context.stage(), true);
+  context.status.value = 2;
+  context.mediaConnected.value = false;
+  assert.equal(context.stage(), false);
+});
+
+test('鸿蒙未开放提前入会时，预检会阻止媒体连接', async () => {
+  const h = harness({ platform: 'APP-HARMONY', preData: { active: false, status: 0, allowEarlyJoin: false } });
+  assert.equal(await h.join(), false);
+  assert.equal(h.api.meetingMediaState().errorText, 'notStarted');
+  assert.deepEqual(h.operations, []);
 });

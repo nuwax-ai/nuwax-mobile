@@ -14,6 +14,10 @@ function nativeStage() {
     release: vi.fn(async (_owner: string) => {}),
     acceptsNotification: vi.fn((_want: unknown) => false),
   };
+  const permissions = {
+    checkAccessTokenSync: vi.fn((_token: number, _permission: string) => -1),
+    requestPermissionsFromUser: vi.fn(async (_context: unknown, _names: string[]) => ({ authResults: [0] })),
+  };
   const destroy = vi.fn();
   const request = vi.fn().mockResolvedValue({ responseCode: 200, result: '{"code":"0000"}' });
   const timers = new Map<number, { callback: () => void; delay: number }>();
@@ -40,6 +44,8 @@ function nativeStage() {
     wrapBuilder: (builder: unknown) => builder,
     buildMeetingStage: vi.fn(),
     EntryVoipBackgroundTask: task,
+    abilityAccessCtrl: { createAtManager: () => permissions },
+    ProtectedResourceType: { AUDIO_CAPTURE: 'audio', VIDEO_CAPTURE: 'video' },
     console: { info: vi.fn(), warn: vi.fn() },
     http: {
       createHttp: () => ({ request, destroy }),
@@ -53,7 +59,7 @@ function nativeStage() {
     clearTimeout(id: number) { timers.delete(id); },
   });
   const session = vm.runInContext(stripTypeScriptTypes(hostSource) + '\nMeetingStageSession;', context);
-  return { session, stages, request, destroy, timers, task };
+  return { session, stages, request, destroy, timers, task, permissions };
 }
 
 describe('Harmony meeting native stage', () => {
@@ -117,7 +123,7 @@ const releaseURL = 'https://testagent.xspaceagi.com/api/instant-message/meetings
 function connectedStage() {
   const fixture = nativeStage();
   const { session } = fixture;
-  const mount = session.attach({}, 'Picture in picture');
+  const mount = session.attach({ applicationInfo: { accessTokenId: 43 } }, 'Picture in picture');
   mount.makeNode({});
   session.host.ready = true;
   session.host.screenSupported = true;
@@ -250,4 +256,28 @@ it('queues only a valid task notification while connected and consumes the retur
   expect(session.consumeRestoreRequest()).toBe(false);
   session.handleBackgroundWant({});
   expect(session.consumeRestoreRequest()).toBe(false);
+});
+
+
+it('requests OS permissions only for media the participant can publish in the foreground', async () => {
+  const { session, permissions } = connectedStage();
+  const id = session.id;
+  session.receive({ type: 'state', id, connection: 'connected', micAllowed: false, cameraAllowed: true });
+  session.control('mic', true);
+  await settle();
+  expect(permissions.requestPermissionsFromUser).not.toHaveBeenCalled();
+  expect(session.controlError).toBe('mic');
+
+  session.setAppForeground(false);
+  session.control('camera', true);
+  await settle();
+  expect(permissions.requestPermissionsFromUser).not.toHaveBeenCalled();
+
+  session.setAppForeground(true);
+  session.control('camera', true);
+  await settle();
+  expect(permissions.requestPermissionsFromUser).toHaveBeenCalledWith(expect.anything(), ['ohos.permission.CAMERA']);
+  permissions.checkAccessTokenSync.mockReturnValue(0);
+  expect(session.host.captureResourceAllowed('audio')).toBe(false);
+  expect(session.host.captureResourceAllowed('video')).toBe(true);
 });

@@ -51,6 +51,8 @@ interface BrowserEvent {
   mic?: boolean
   remoteAudio?: boolean
   camera?: boolean
+  micAllowed?: boolean
+  cameraAllowed?: boolean
   level?: number
   raised?: boolean
   metadata?: string
@@ -73,6 +75,8 @@ export class MeetingStageSession {
   static error: string = ''
   static controlError: string = ''
   static mic: boolean = false
+  static micAllowed: boolean = false
+  static cameraAllowed: boolean = false
   private static remoteAudio: boolean = false
   private static backgroundOwner: string = ''
   private static backgroundRetryAt: number = 0
@@ -158,6 +162,8 @@ export class MeetingStageSession {
     MeetingStageSession.error = ''
     MeetingStageSession.controlError = ''
     MeetingStageSession.mic = false
+    MeetingStageSession.micAllowed = false
+    MeetingStageSession.cameraAllowed = false
     MeetingStageSession.remoteAudio = false
     MeetingStageSession.backgroundRetryAt = 0
     MeetingStageSession.restoreRequested = false
@@ -237,6 +243,10 @@ export class MeetingStageSession {
     EntryVoipBackgroundTask.release(owner).catch((error: BusinessError) => {
       console.warn('[MeetingStage] background task release failed code=' + error.code)
     })
+  }
+
+  static isAppForeground(): boolean {
+    return MeetingStageSession.foreground
   }
 
   static control(type: string, on: boolean = false): void {
@@ -357,6 +367,8 @@ export class MeetingStageSession {
       MeetingStageSession.mic = event.mic === true
       MeetingStageSession.remoteAudio = event.remoteAudio === true
       MeetingStageSession.camera = event.camera === true
+      MeetingStageSession.micAllowed = event.micAllowed === true
+      MeetingStageSession.cameraAllowed = event.cameraAllowed === true
       MeetingStageSession.level = event.level ?? 0
       MeetingStageSession.raised = event.raised === true
       MeetingStageSession.metadata = event.metadata ?? ''
@@ -523,6 +535,8 @@ export class MeetingStageHost {
         return
       }
       if (command.on && (command.type === 'mic' || command.type === 'camera')) {
+        const allowed = command.type === 'mic' ? MeetingStageSession.micAllowed : MeetingStageSession.cameraAllowed
+        if (!allowed || !MeetingStageSession.isAppForeground()) throw new Error('media permission')
         const permission: Permissions = command.type === 'mic' ? 'ohos.permission.MICROPHONE' : 'ohos.permission.CAMERA'
         const manager = abilityAccessCtrl.createAtManager()
         if (manager.checkAccessTokenSync(this.context.applicationInfo.accessTokenId, permission) !== 0) {
@@ -530,7 +544,7 @@ export class MeetingStageHost {
           if (result.authResults[0] !== 0) throw new Error('permission')
         }
       }
-      if (MeetingStageSession.host === this && MeetingStageSession.id === command.id) this.send(command)
+      if (MeetingStageSession.host === this && MeetingStageSession.id === command.id) await this.send(command)
     }).catch(() => {
       if (MeetingStageSession.id === command.id) MeetingStageSession.controlError = command.type
     })
@@ -551,8 +565,10 @@ export class MeetingStageHost {
     if (MeetingStageSession.host !== this || !MeetingStageSession.isConnected()) return false
     const manager = abilityAccessCtrl.createAtManager()
     const token = this.context.applicationInfo.accessTokenId
-    if (resource === ProtectedResourceType.AUDIO_CAPTURE) return manager.checkAccessTokenSync(token, 'ohos.permission.MICROPHONE') === 0
-    if (resource === ProtectedResourceType.VIDEO_CAPTURE) return manager.checkAccessTokenSync(token, 'ohos.permission.CAMERA') === 0
+    if (resource === ProtectedResourceType.AUDIO_CAPTURE) return MeetingStageSession.micAllowed &&
+      manager.checkAccessTokenSync(token, 'ohos.permission.MICROPHONE') === 0
+    if (resource === ProtectedResourceType.VIDEO_CAPTURE) return MeetingStageSession.cameraAllowed &&
+      manager.checkAccessTokenSync(token, 'ohos.permission.CAMERA') === 0
     return false
   }
 }

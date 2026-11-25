@@ -14,6 +14,12 @@ export function createMeetingMedia(post, render) {
     try { return JSON.parse(room.metadata || '{}').shareHolder; } catch { return ''; }
   }
 
+  function canPublish(participant, source) {
+    const permissions = participant.permissions;
+    return !!permissions?.canPublish && (permissions.canPublishSources.length === 0 ||
+      permissions.canPublishSources.includes(Track.sourceToProto(source)));
+  }
+
   function update(session) {
     if (!active(session)) return;
     const { room } = session;
@@ -42,6 +48,8 @@ export function createMeetingMedia(post, render) {
       people: room.state === ConnectionState.Disconnected ? 0 : 1 + remotes.length,
       mic: local.isMicrophoneEnabled, camera: local.isCameraEnabled, level: local.audioLevel,
       remoteAudio: audioPublications.some((publication) => publication.track && !publication.isMuted),
+      micAllowed: canPublish(local, Track.Source.Microphone),
+      cameraAllowed: canPublish(local, Track.Source.Camera),
       raised: local.attributes.handRaised === '1', metadata: room.metadata || '',
       videos: cameras.filter(({ participant }) => participant !== local).map(({ participant }) => participant.identity).join(','),
       shared: !!share?.track && !share.isMuted, sharing: session.share?.published === true,
@@ -81,6 +89,7 @@ export function createMeetingMedia(post, render) {
       RoomEvent.TrackSubscribed, RoomEvent.TrackUnsubscribed, RoomEvent.TrackMuted, RoomEvent.TrackUnmuted,
       RoomEvent.LocalTrackPublished, RoomEvent.LocalTrackUnpublished, RoomEvent.ActiveSpeakersChanged,
       RoomEvent.RoomMetadataChanged, RoomEvent.ParticipantAttributesChanged, RoomEvent.ParticipantNameChanged,
+      RoomEvent.ParticipantPermissionsChanged,
     ]) room.on(event, refresh);
     room.on(RoomEvent.DataReceived, (bytes, participant, _kind, topic) => {
       if ((topic !== chatTopic && topic !== danmakuTopic) || bytes.length > 2048) return;
@@ -184,9 +193,16 @@ export function createMeetingMedia(post, render) {
       if (!active(session) || session.room.state !== ConnectionState.Connected) return;
       const local = session.room.localParticipant;
       switch (command.type) {
-        case 'mic': await local.setMicrophoneEnabled(command.on); break;
-        case 'camera': await local.setCameraEnabled(command.on, { facingMode: 'user' }); break;
+        case 'mic':
+          if (command.on && !canPublish(local, Track.Source.Microphone)) throw new Error('microphone publication denied');
+          await local.setMicrophoneEnabled(command.on);
+          break;
+        case 'camera':
+          if (command.on && !canPublish(local, Track.Source.Camera)) throw new Error('camera publication denied');
+          await local.setCameraEnabled(command.on, { facingMode: 'user' });
+          break;
         case 'flip': {
+          if (!canPublish(local, Track.Source.Camera)) throw new Error('camera publication denied');
           const track = local.getTrackPublication(Track.Source.Camera)?.videoTrack;
           if (track) {
             const facingMode = track.mediaStreamTrack.getSettings().facingMode;

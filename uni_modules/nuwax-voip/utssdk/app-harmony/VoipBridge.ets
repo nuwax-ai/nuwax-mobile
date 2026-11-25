@@ -155,6 +155,12 @@ export class VoipBridge {
       if (command.op === 'reset') { VoipBridge.reset(); return }
       if (command.op === 'initialize') { VoipBridge.initialize(JSON.parse(raw) as Configuration); return }
       if (command.scope !== VoipBridge.configuration?.scope) return
+      if (command.op === 'meetingInviteHandled') {
+        if (command.msgId && VoipBridge.configuration?.apiBaseUrl === VoipBridge.nativeVoiceTestOrigin) {
+          VoipBridge.markMeetingInviteHandled(command.msgId)
+        }
+        return
+      }
       if (['action', 'microphone', 'camera', 'speaker', 'audioRoute', 'switchCamera'].includes(command.op) && command.callId !== VoipBridge.current?.callId) return
       if (command.op === 'invitation' && VoipBridge.business()) { VoipBridge.request(`/api/instant-message/messages/${command.msgId}?convId=${command.convId}`, '', true).then(message => VoipBridge.receiveInvitation(message)).catch(() => VoipBridge.emit('error', 'CALL_INVITATION_FAILED')); return }
       if (command.op === 'watch' && command.snapshot) VoipBridge.adopt(command.snapshot)
@@ -447,10 +453,7 @@ export class VoipBridge {
     if (type === 'meeting:invite-handled') {
       const msgId = `${payload.msgId ?? ''}`
       if (msgId && `${payload.userId ?? ''}` === VoipBridge.configuration?.userId) {
-        VoipBridge.rememberCallId(VoipBridge.handledMeetingMessages, msgId)
-        const pending = VoipBridge.pendingIncoming
-        if (pending?.invite.scene === 'meeting' && pending.invite.msgId === msgId) VoipBridge.dismissPendingIncoming()
-        VoipBridge.queue = VoipBridge.queue.filter(item => item.type !== 'meetingInvite' || item.msgId !== msgId)
+        VoipBridge.markMeetingInviteHandled(msgId)
       }
       return
     }
@@ -828,7 +831,13 @@ export class VoipBridge {
     }
     VoipBridge.clearPendingIncoming()
   }
-  private static completeMeetingInvitation(pending: PendingIncoming, action: string): void {
+  private static markMeetingInviteHandled(msgId: string): void {
+    VoipBridge.rememberCallId(VoipBridge.handledMeetingMessages, msgId)
+    const pending = VoipBridge.pendingIncoming
+    if (pending?.invite.scene === 'meeting' && pending.invite.msgId === msgId) VoipBridge.dismissPendingIncoming()
+    VoipBridge.queue = VoipBridge.queue.filter(item => item.type !== 'meetingInvite' || item.msgId !== msgId)
+  }
+  private static reportMeetingInvitation(pending: PendingIncoming, action: string): void {
     const meeting = pending.meeting, config = VoipBridge.configuration
     if (VoipBridge.pendingIncoming !== pending || !meeting || !config) return
     const event: CallEvent = {
@@ -837,8 +846,7 @@ export class VoipBridge {
       roomName: meeting.roomName, title: meeting.title, passcode: action === 'accept' ? meeting.passcode : '',
       mediaType: pending.answerMediaType, handoffExpiresAt: action === 'accept' ? Date.now() + 60_000 : undefined,
     }
-    VoipBridge.rememberCallId(VoipBridge.handledMeetingMessages, meeting.msgId)
-    VoipBridge.dismissPendingIncoming()
+    if (action !== 'presented') VoipBridge.markMeetingInviteHandled(meeting.msgId)
     VoipBridge.queue.push(event)
     if (VoipBridge.queue.length > 256) VoipBridge.queue.shift()
     const context = VoipBridge.context
@@ -875,7 +883,7 @@ export class VoipBridge {
       timer: setTimeout(() => {
         const live = VoipBridge.pendingIncoming
         if (!live || live.nativeId !== id) return
-        if (live.meeting) VoipBridge.completeMeetingInvitation(live, 'timeout')
+        if (live.meeting) VoipBridge.reportMeetingInvitation(live, 'timeout')
         else VoipBridge.dismissPendingIncoming()
       }, invite.expiresAt - Date.now()) }
     VoipBridge.pendingIncoming = pending
@@ -918,7 +926,7 @@ export class VoipBridge {
       VoipBridge.traceIncoming('verified', invite.callId)
       if (resolved.meeting) {
         pending.meeting = resolved.meeting
-        if (pending.action) VoipBridge.completeMeetingInvitation(pending, pending.action)
+        VoipBridge.reportMeetingInvitation(pending, pending.action || 'presented')
         return
       }
       const call = resolved.call
@@ -950,13 +958,13 @@ export class VoipBridge {
       VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_ANSWERED, info.callId)
       if (pending) {
         pending.action = 'accept'; pending.answerMediaType = media
-        if (pending.meeting) VoipBridge.completeMeetingInvitation(pending, 'accept')
+        if (pending.meeting) VoipBridge.reportMeetingInvitation(pending, 'accept')
       }
       else VoipBridge.action('accept', media, true)
     } else if (event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_REJECT || event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_HANGUP) {
       if (pending) {
         pending.action = 'reject'
-        if (pending.meeting) VoipBridge.completeMeetingInvitation(pending, 'reject')
+        if (pending.meeting) VoipBridge.reportMeetingInvitation(pending, 'reject')
       }
       else VoipBridge.action(event === voipCall.VoipCallUiEvent.VOIP_CALL_EVENT_REJECT ? 'reject' : 'end')
     } else if (pending?.invite.scene === 'meeting') return

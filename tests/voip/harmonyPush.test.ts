@@ -378,6 +378,9 @@ describe('Harmony system call cold start', () => {
     await VoipBridge.incoming(meetingPush());
     expect(VoipBridge.meetingInviteState(msgId)).toBe('pending');
     expect(VoipBridge.meetingInviteState('different-message')).toBe('');
+    expect(VoipBridge.queue).toContainEqual(expect.objectContaining({
+      type: 'meetingInvite', action: 'presented', inviteId: 'qa-meeting', msgId, passcode: '',
+    }));
     VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'answer-voice' } as any);
     expect(VoipBridge.meetingInviteState(msgId)).toBe('handled');
     VoipBridge.reset();
@@ -409,6 +412,33 @@ describe('Harmony system call cold start', () => {
     await VoipBridge.incoming({ ...meetingPush(), callId: 'repeat-system-id' });
 
     expect(kits.report).toHaveBeenCalledOnce();
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
+    expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([]);
+  });
+
+  it('ignores a late push after the invite was handled in the local foreground banner', async () => {
+    VoipBridge.initialize(meetingConfig);
+    const handled = { op: 'meetingInviteHandled', msgId };
+    VoipBridge.execute(JSON.stringify({ ...handled, scope: 'old-account-scope' }));
+    expect(VoipBridge.meetingInviteState(msgId)).toBe('');
+
+    VoipBridge.execute(JSON.stringify({ ...handled, scope: meetingConfig.scope }));
+    expect(VoipBridge.meetingInviteState(msgId)).toBe('handled');
+    await VoipBridge.incoming(meetingPush());
+    expect(kits.report).not.toHaveBeenCalled();
+    expect(VoipBridge.request).not.toHaveBeenCalled();
+  });
+
+  it('closes the late system card when the foreground banner is handled during its presentation', async () => {
+    VoipBridge.initialize(meetingConfig);
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(meetingMessage() as any);
+    let finishReport!: (value: number) => void;
+    kits.report.mockReturnValueOnce(new Promise(resolve => { finishReport = resolve; }));
+    const push = VoipBridge.incoming(meetingPush());
+    await vi.waitFor(() => expect(kits.report).toHaveBeenCalledOnce());
+    VoipBridge.execute(JSON.stringify({ op: 'meetingInviteHandled', scope: meetingConfig.scope, msgId }));
+    finishReport(0);
+    await push;
     expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
     expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([]);
   });

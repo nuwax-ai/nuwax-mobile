@@ -3,6 +3,12 @@ import { callFailure, callErrorTranslationKey, isIncomingPresentationError } fro
 import { ref } from "vue";
 import { CallStateStore, CallSnapshot, parseCallSnapshot } from "./callState";
 import { VoipHistoryRecord, parseVoipHistory } from "./callHistory";
+// #ifdef APP-ANDROID || APP-IOS
+import { voipChatEndTranslationKey } from "./callHistory";
+// #endif
+// #ifdef APP-ANDROID
+import { VoipChatTerminal, addVoipChatTerminal, readVoipChatTerminals } from "./callHistory";
+// #endif
 import { apiCallCapabilities, apiCreateCall, apiCallSnapshot, voipSessionConfig, readVoipDevSession, setVoipDevSession, cancelCreatedVoipCall } from "@/servers/voip";
 import { apiImWhoami } from "@/servers/im";
 import { apiImMeetingInviteHandled } from "@/servers/imMeeting";
@@ -35,6 +41,13 @@ export const voipNativeIncomingUI = ref<boolean>(false);
 export const voipAudioRoutes = ref<UTSJSONObject[]>([]);
 export const voipAudioRoute = ref<string>("");
 export const voipHistory = ref<VoipHistoryRecord[]>([]);
+// #ifdef APP-ANDROID || APP-IOS
+const chatHistoryImStamp = ref<string>("");
+// #endif
+// #ifdef APP-ANDROID
+const chatTerminals = ref<VoipChatTerminal[]>([]);
+let chatHistoryStorageKey = "";
+// #endif
 /** Registration/sender declaration only; never evidence that a device received a VoIP push. */
 export const voipPushRegistration = ref<UTSJSONObject>({ provider: "", state: "unknown", serverReady: false } as UTSJSONObject);
 const store = new CallStateStore();
@@ -78,6 +91,33 @@ function send(command: UTSJSONObject): void {
 }
 
 export function getVoipSnapshot(): CallSnapshot | null { return store.current; }
+export function getVoipChatEndKey(convId: string, callId: string): string {
+  // #ifdef APP-ANDROID || APP-IOS
+  const stamp = chatHistoryImStamp.value;
+  if (stamp.length == 0 || stamp != getImSessionStamp()) return "";
+  // #endif
+  // #ifdef APP-ANDROID
+  const row = chatTerminals.value.find((entry: VoipChatTerminal): boolean => entry.convId == convId && entry.callId == callId);
+  if (row != null) return voipChatEndTranslationKey(row.reason);
+  // #endif
+  // #ifdef APP-IOS
+  const row = voipHistory.value.find((entry: VoipHistoryRecord): boolean => entry.convId == convId && entry.callId == callId && entry.endedAt > 0);
+  if (row != null) return voipChatEndTranslationKey(row.reason);
+  // #endif
+  return "";
+}
+
+// #ifdef APP-ANDROID
+function rememberVoipChatTerminal(call: CallSnapshot, reason: string): void {
+  if (chatHistoryStorageKey.length == 0 || chatHistoryImStamp.value != getImSessionStamp()) return;
+  const records = addVoipChatTerminal(chatTerminals.value, call.callId, call.convId, reason);
+  if (records == null) return;
+  chatTerminals.value = records;
+  try { uni.setStorageSync(chatHistoryStorageKey, JSON.stringify(records)); }
+  catch (_e) { /* Keep the observation visible for this app session. */ }
+}
+// #endif
+
 export function getVoipPhase(): string { return store.phase(userId); }
 export function getVoipConnectedAt(): number { return store.activeStartedAt; }
 export function isVoipBusy(): boolean { return store.isBusy() || creating; }
@@ -150,7 +190,12 @@ function consumeNative(): void {
               if (firstSnapshot) pendingIncomingPageId = next.callId;
             } else if (next.state == "ringing" && !voipNativeIncomingUI.value && !isAppInBackground()) openVoipPage();
           }
-        } else { voipNativeIncomingUI.value = false; resetCallControls(); releaseVoipAudio(); }
+        } else {
+          // #ifdef APP-ANDROID
+          rememberVoipChatTerminal(next, next.reason);
+          // #endif
+          voipNativeIncomingUI.value = false; resetCallControls(); releaseVoipAudio();
+        }
         if (next.calleeId == userId && next.acceptedDeviceId.length > 0 && next.acceptedDeviceId != deviceId) {
           store.endLocal("answeredElsewhere", Date.now()); releaseVoipAudio();
         }
@@ -185,7 +230,12 @@ function consumeNative(): void {
       } else if (type == "localEnded") {
         traceCall("native call ended");
         if (store.current != null && `${event["callId"] ?? ""}` != store.current?.callId) continue;
-        store.endLocal(`${event["reason"] ?? "failed"}`, Date.now());
+        const reason = `${event["reason"] ?? "failed"}`;
+        // #ifdef APP-ANDROID
+        const call = store.current;
+        if (call != null && call.state != "ended") rememberVoipChatTerminal(call, reason);
+        // #endif
+        store.endLocal(reason, Date.now());
         resetCallControls();
         releaseVoipAudio();
       } else if (type == "openPage") {
@@ -248,6 +298,13 @@ export function clearVoipSession(): void {
   voipError.value = ""; voipRevision.value += 1;
   voipNativeIncomingUI.value = false;
   resetCallControls(); voipHistory.value = [];
+  // #ifdef APP-ANDROID || APP-IOS
+  chatHistoryImStamp.value = "";
+  // #endif
+  // #ifdef APP-ANDROID
+  chatHistoryStorageKey = "";
+  chatTerminals.value = [];
+  // #endif
   resetPushRegistration();
   releaseVoipAudio();
 }
@@ -280,6 +337,9 @@ export async function bootstrapVoip(): Promise<void> {
   if (timer != 0) { clearInterval(timer); timer = 0; }
   const sameIdentity = userId == uid && deviceId == `${config["deviceId"]}` && sessionApiBase == `${config["apiBaseUrl"]}`;
   if (!sameIdentity) {
+    // #ifdef APP-ANDROID || APP-IOS
+    chatHistoryImStamp.value = "";
+    // #endif
     if (userId.length > 0) clearMeetingInviteNavigation();
     store.reset(); pendingIncomingPageId = ""; resetCallControls(); voipHistory.value = []; releaseVoipAudio();
   }
@@ -310,9 +370,26 @@ export async function bootstrapVoip(): Promise<void> {
   } catch (error) {
     // 初始化失败不能留下“已经初始化”的会话戳，否则下次回前台也不会重试。
     sessionStamp = "";
+    // #ifdef APP-ANDROID || APP-IOS
+    chatHistoryImStamp.value = "";
+    // #endif
     voipError.value = "CALL_SYSTEM_UNAVAILABLE";
     throw error;
   }
+  // #ifdef APP-ANDROID || APP-IOS
+  const historyStamp = dev == null && `${config["accessToken"] ?? ""}`.length > 0 ? stamp : "";
+  // #endif
+  // #ifdef APP-ANDROID
+  // Android reports the terminal event but has no native history store. Keep only the status for the chat row.
+  const historyKey = historyStamp.length > 0 ? `NUWAX_VOIP_CHAT_V1:${encodeURIComponent(sessionApiBase)}:${encodeURIComponent(uid)}` : "";
+  if (chatHistoryStorageKey != historyKey) {
+    chatHistoryStorageKey = historyKey;
+    chatTerminals.value = historyKey.length > 0 ? readVoipChatTerminals(historyKey) : [];
+  }
+  // #endif
+  // #ifdef APP-ANDROID || APP-IOS
+  chatHistoryImStamp.value = historyStamp;
+  // #endif
   timer = setInterval((): void => { consumeNative(); }, 100);
 }
 
@@ -388,16 +465,25 @@ export async function answerVoipCall(mediaType: string): Promise<void> {
 }
 
 /** Ordinary app-push adapter (including iOS 15); a push only initiates an authoritative query. */
-export async function handleVoipInvitation(callId: string, clicked: boolean, convId: string = "", msgId: string = ""): Promise<void> {
+export async function handleVoipInvitation(callId: string, clicked: boolean, convId: string = "", msgId: string = "",
+    expiresAt: number = 0, calleeId: string = ""): Promise<void> {
   if ((callId.length == 0 && (convId.length == 0 || msgId.length == 0)) || !hasAppPrivacyConsent() || (!isVoipBusinessEnabled() && !isVoipPlatformAccepted() && readVoipDevSession() == null)) return;
+  if (!Number.isInteger(expiresAt) || (expiresAt != 0 && expiresAt <= Date.now())) return;
+  const stamp = getImSessionStamp();
+  const serial = bootstrapSerial;
   try {
     await bootstrapVoip(); const epoch = store.epoch;
+    if (stamp != getImSessionStamp() || serial != bootstrapSerial || nativeScope.length == 0 ||
+        (calleeId.length > 0 && calleeId != userId) ||
+        (expiresAt > 0 && expiresAt <= Date.now())) return;
     if (readVoipDevSession() == null) {
-      send({ op: "invitation", convId, msgId } as UTSJSONObject);
+      if (convId.length == 0 || msgId.length == 0) return;
+      send({ op: "invitation", callId, convId, msgId, expiresAt } as UTSJSONObject);
       return;
     }
     const raw = await apiCallSnapshot(callId);
-    if (epoch != store.epoch || nativeScope.length == 0) return;
+    if (stamp != getImSessionStamp() || serial != bootstrapSerial || epoch != store.epoch ||
+        (expiresAt > 0 && expiresAt <= Date.now())) return;
     const snapshot = parseCallSnapshot(raw);
     if (snapshot.state == "ended" || (snapshot.state == "ringing" && snapshot.expiresAt <= Date.now())) return;
     send({ op: "watch", snapshot: raw } as UTSJSONObject);

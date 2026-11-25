@@ -8,58 +8,56 @@ import XCTest
         XCTFail("Expected push processing stage was not reached")
     }
 
-    func testPushKitReturnsAfterSystemReportWhileNetworkIsStillBlocked() async throws {
-        var report: CheckedContinuation<Void, Never>?, network: CheckedContinuation<Void, Never>?
-        var returned = false, released = 0
+    func testPushKitStartsSystemReportInlineAndCompletesBeforeNetworkReturns() async {
+        var report: NuwaxVoipPushWork.ReportCompletion?
+        var network: CheckedContinuation<Void, Never>?
+        var completed = false, released = 0
         let work = NuwaxVoipPushWork(finished: { released += 1 })
-        let delivery = Task { @MainActor in
-            try await work.reportThenValidate(report: { await withCheckedContinuation { report = $0 } },
-                validate: { await withCheckedContinuation { network = $0 } })
-            returned = true
-        }
-        await until { report != nil }
-        XCTAssertFalse(returned); XCTAssertNil(network)
-        report?.resume()
-        await until { returned && network != nil }
+        work.reportThenValidate(report: { report = $0 },
+            validate: { await withCheckedContinuation { network = $0 } },
+            completion: { _ in completed = true })
+        XCTAssertNotNil(report, "CallKit reporting must begin before the delegate returns")
+        XCTAssertFalse(completed); XCTAssertNil(network)
+        report?(.success(()))
+        XCTAssertTrue(completed)
+        await until { network != nil }
         XCTAssertEqual(released, 0) // HTTP keeps its own lease, not the PushKit callback.
         network?.resume()
-        try await delivery.value
         await until { released == 1 }
     }
 
     func testReportFailureDoesNotVerifyOrLeakBackgroundTime() async {
         var verified = false, released = 0
+        var failure: URLError.Code?
         let work = NuwaxVoipPushWork(finished: { released += 1 })
-        do {
-            try await work.reportThenValidate(report: { throw URLError(.cancelled) }, validate: { verified = true })
-            XCTFail("System report failure was swallowed")
-        } catch { }
+        work.reportThenValidate(report: { $0(.failure(URLError(.cancelled))) }, validate: { verified = true },
+            completion: { if case .failure(let error) = $0 { failure = (error as? URLError)?.code } })
         work.cancel(); work.cancel()
-        XCTAssertFalse(verified); XCTAssertEqual(released, 1)
+        await Task.yield()
+        XCTAssertFalse(verified); XCTAssertEqual(released, 1); XCTAssertEqual(failure, .cancelled)
     }
 
-    func testExpiryDuringReportClosesLeaseAndCannotStartLateVerification() async throws {
-        var report: CheckedContinuation<Void, Never>?, verified = false, released = 0
+    func testExpiryDuringReportClosesLeaseAndCannotStartLateVerification() async {
+        var report: NuwaxVoipPushWork.ReportCompletion?
+        var verified = false, completed = false, released = 0
         let work = NuwaxVoipPushWork(finished: { released += 1 })
-        let delivery = Task { @MainActor in
-            try await work.reportThenValidate(report: { await withCheckedContinuation { report = $0 } },
-                validate: { verified = true })
-        }
-        await until { report != nil }
+        work.reportThenValidate(report: { report = $0 }, validate: { verified = true },
+            completion: { _ in completed = true })
         work.cancel()
         XCTAssertEqual(released, 1)
-        report?.resume(); try await delivery.value
-        XCTAssertFalse(verified); XCTAssertEqual(released, 1)
+        report?(.success(()))
+        await Task.yield()
+        XCTAssertTrue(completed); XCTAssertFalse(verified); XCTAssertEqual(released, 1)
     }
 
-    func testLogoutOrExpiryCancelsHttpAndReleasesExactlyOnce() async throws {
+    func testLogoutOrExpiryCancelsHttpAndReleasesExactlyOnce() async {
         var network: CheckedContinuation<Void, Never>?, adopted = false, released = 0, finished = false
         let work = NuwaxVoipPushWork(finished: { released += 1 })
-        try await work.reportThenValidate(report: {}, validate: {
+        work.reportThenValidate(report: { $0(.success(())) }, validate: {
             await withCheckedContinuation { network = $0 }
             if !Task.isCancelled { adopted = true }
             finished = true
-        })
+        }, completion: { _ in })
         await until { network != nil }
         work.cancel(); work.cancel()
         XCTAssertEqual(released, 1)
@@ -67,14 +65,15 @@ import XCTest
         XCTAssertFalse(adopted); XCTAssertEqual(released, 1)
     }
 
-    func testCancellingAnOldDeliveryDoesNotCancelAnotherPush() async throws {
+    func testCancellingAnOldDeliveryDoesNotCancelAnotherPush() async {
         var oldNetwork: CheckedContinuation<Void, Never>?, received = false, oldReleased = 0, newReleased = 0
         let old = NuwaxVoipPushWork(finished: { oldReleased += 1 })
         let next = NuwaxVoipPushWork(finished: { newReleased += 1 })
-        try await old.reportThenValidate(report: {}, validate: { await withCheckedContinuation { oldNetwork = $0 } })
+        old.reportThenValidate(report: { $0(.success(())) },
+            validate: { await withCheckedContinuation { oldNetwork = $0 } }, completion: { _ in })
         await until { oldNetwork != nil }
         old.cancel()
-        try await next.reportThenValidate(report: {}, validate: { received = true })
+        next.reportThenValidate(report: { $0(.success(())) }, validate: { received = true }, completion: { _ in })
         await until { received && newReleased == 1 }
         oldNetwork?.resume(); await Task.yield()
         XCTAssertEqual(oldReleased, 1); XCTAssertEqual(newReleased, 1)

@@ -185,10 +185,15 @@ import LiveKitClient
         case "invitation":
             if business, let conv = command["convId"] as? String, let msg = command["msgId"] as? String {
                 guard [conv, msg].allSatisfy({ $0.range(of: "^[A-Za-z0-9_-]{1,128}\\z", options: .regularExpression) != nil }) else { return }
+                let expiresAt = (command["expiresAt"] as? NSNumber)?.doubleValue ?? 0
+                guard expiresAt == 0 || (expiresAt.isFinite && expiresAt > Date().timeIntervalSince1970 * 1000) else { return }
                 let run = generation
                 Task {
                     guard run == self.generation else { return }
-                    if let message = try? await self.request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true), run == self.generation { await self.receiveInvitation(message) }
+                    guard let message = try? await self.request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true),
+                          run == self.generation, self.wireString(message["convId"]) == conv,
+                          self.wireString(message["msgId"]) == msg else { return }
+                    await self.receiveInvitation(message, notificationCallID: commandId, notificationExpiry: expiresAt)
                 }
             }
         case "watch":
@@ -251,6 +256,7 @@ import LiveKitClient
         }
         trace("initialize accepted")
         let same = configuration["userId"] as? String == user && configuration["apiBaseUrl"] as? String == base && configuration["deviceId"] as? String == config["deviceId"] as? String
+        let reuseTransport = pushRegistration != nil && NuwaxVoipClientPolicy.sharesTransport(configuration, config)
         if !same && !configuration.isEmpty { reset() }
         let savedRegistration = same ? configuration["apnsRegistration"] : nil
         let savedRoutePaused = same ? configuration["pushRoutePaused"] : nil
@@ -263,8 +269,6 @@ import LiveKitClient
         if configuration["apnsRegistration"] == nil { configuration["apnsRegistration"] = savedRegistration }
         if configuration["pushRoutePaused"] == nil { configuration["pushRoutePaused"] = savedRoutePaused }
         if configuration["pushRouteRevoked"] == nil { configuration["pushRouteRevoked"] = savedRouteRevoked }
-        // Refresh the transport when access credentials refresh; retain the exact registration identity.
-        pushRegistration?.stop(revoke: false); pushRegistration = nil
         if let mapping = config["systemUUIDs"] as? [String: String] { for (key, value) in mapping { if let id = UUID(uuidString: value) { callUUIDs[key] = id } } }
         terminalOrder = NuwaxVoipCallPolicy.terminalHistory((config["terminalCallIds"] as? [String] ?? []) + terminalOrder)
         terminal = Set(terminalOrder)
@@ -290,6 +294,35 @@ import LiveKitClient
             })
         } else { systemDiagnostics?.report() }
         #endif
+        // The UI bootstrap attaches a new scope after native cold-start restore.
+        // Keep the already-authenticated connection for the same credentials.
+        if reuseTransport { pushRegistration?.replayState() }
+        else { configurePushRegistration() }
+        persist()
+        UserDefaults.standard.set(true, forKey: "nuwax-voip-install-session")
+        if systemBridge == nil {
+            if #available(iOS 17.4, *) { systemBridge = NuwaxSystemCalls(owner: self) }
+            else { systemBridge = NuwaxLegacySystemCalls(owner: self) }
+        }
+        AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = false
+        updateAudioEngine()
+        if pushRegistry == nil {
+            let registry = PKPushRegistry(queue: .main)
+            registry.delegate = self
+            pushRegistry = registry
+            registry.desiredPushTypes = [.voIP]
+        }
+        if (!reuseTransport || getuiBindingTask == nil), let registry = pushRegistry,
+           let token = registry.pushToken(for: .voIP) { updatePushToken(token, registry: registry) }
+        if !reuseTransport { startStream() }
+        if let value = snapshot {
+            emitSnapshot(value)
+            if connected { emit("connected") }; if peerReady { emit("peerMediaReady") }
+        }
+    }
+
+    private func configurePushRegistration() {
+        pushRegistration?.stop(revoke: false)
         let run = generation, settings = configuration, provider = pushProvider
         let restored = (settings["apnsRegistration"] as? [String: Any]).flatMap { NuwaxVoipApnsDevice(stored: $0) }
         let transport: NuwaxVoipApnsRegistration.Transport = { [weak self] body in
@@ -310,26 +343,6 @@ import LiveKitClient
             self.trace("PushKit registration state=\(state) senderReady=\(ready)")
             self.emit("pushRegistration", ["provider": provider, "state": state, "nativePush": ready])
         })
-        persist()
-        UserDefaults.standard.set(true, forKey: "nuwax-voip-install-session")
-        if systemBridge == nil {
-            if #available(iOS 17.4, *) { systemBridge = NuwaxSystemCalls(owner: self) }
-            else { systemBridge = NuwaxLegacySystemCalls(owner: self) }
-        }
-        AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = false
-        updateAudioEngine()
-        if pushRegistry == nil {
-            let registry = PKPushRegistry(queue: .main)
-            registry.delegate = self
-            pushRegistry = registry
-            registry.desiredPushTypes = [.voIP]
-        }
-        if let registry = pushRegistry, let token = registry.pushToken(for: .voIP) { updatePushToken(token, registry: registry) }
-        startStream()
-        if let value = snapshot {
-            emitSnapshot(value)
-            if connected { emit("connected") }; if peerReady { emit("peerMediaReady") }
-        }
     }
     private func request(_ path: String, body: [String: Any]? = nil, absolute: Bool = false, captured: [String: Any]? = nil) async throws -> [String: Any] {
         let run = generation; let config = captured ?? configuration
@@ -450,9 +463,15 @@ import LiveKitClient
             }
         }
     }
-    private func receiveInvitation(_ message: [String: Any]) async {
+    private func receiveInvitation(_ message: [String: Any], notificationCallID: String = "", notificationExpiry: Double = 0) async {
         trace("control invitation received")
-        guard let next = await businessInvitation(message), let id = next["callId"] as? String, !terminal.contains(id), snapshot?["callId"] as? String != id else { return }
+        guard var next = await businessInvitation(message), let id = next["callId"] as? String,
+              notificationCallID.isEmpty || notificationCallID == id,
+              !terminal.contains(id), snapshot?["callId"] as? String != id,
+              let messageExpiry = next["expiresAt"] as? Double,
+              let expiry = NuwaxVoipCallPolicy.incomingExpiry(messageExpiry: messageExpiry, notificationExpiry: notificationExpiry,
+                                                             now: Date().timeIntervalSince1970 * 1000) else { return }
+        next["expiresAt"] = expiry
         adoptBusinessInvitation(next)
     }
     private func businessInvitation(_ message: [String: Any]) async -> [String: Any]? {
@@ -494,25 +513,42 @@ import LiveKitClient
             }
             return
         }
+        let isAnswer = type == "voip:answered"
+        guard isAnswer || ["voip:cancel", "voip:timeout", "voip:decline"].contains(type) else { return }
+        trace("control signal received type=\(type)")
         let id = wireString(payload["callId"])
         let conv = wireString(payload["convId"])
+        let msg = wireString(payload["msgId"])
         guard !conv.isEmpty else { return }
+        let user = configuration["userId"] as? String
+        let answeredByCurrentUser = wireString(payload["userId"]) == user
         if let call = snapshot, wireString(call["convId"]) == conv,
-           NuwaxVoipCallPolicy.matches(signalID: id, messageID: wireString(payload["msgId"]), callID: wireString(call["callId"]), callMessageID: wireString(call["msgId"])) {
-            if type == "voip:answered" {
-                if call["calleeId"] as? String == configuration["userId"] as? String && wireString(call["acceptedDeviceId"]).isEmpty { finish("answeredElsewhere", notifyRemote: false) }
-                else if call["callerId"] as? String == configuration["userId"] as? String && call["state"] as? String == "ringing" { project("connecting") }
-            } else if let reason = NuwaxVoipCallPolicy.signalEndReason(type: type, state: wireString(call["state"])) { finish(reason, notifyRemote: false) }
+           NuwaxVoipCallPolicy.matches(signalID: id, messageID: msg, callID: wireString(call["callId"]), callMessageID: wireString(call["msgId"])) {
+            let state = wireString(call["state"])
+            trace("control signal matched snapshot type=\(type) state=\(state)")
+            if isAnswer {
+                if call["calleeId"] as? String == user, answeredByCurrentUser, state == "ringing", wireString(call["acceptedDeviceId"]).isEmpty {
+                    finish("answeredElsewhere", notifyRemote: false)
+                } else if call["callerId"] as? String == user, state == "ringing" {
+                    project("connecting")
+                }
+            } else if let reason = NuwaxVoipCallPolicy.signalEndReason(type: type, state: state) { finish(reason, notifyRemote: false) }
             return
         }
-        // Terminal-before-invitation ordering, including another device's answer.
-        // An unrelated conversation may never tombstone the current call.
-        guard !id.isEmpty, snapshot?["callId"] as? String != id,
-              ["voip:cancel", "voip:timeout", "voip:decline"].contains(type) || (type == "voip:answered" && wireString(payload["userId"]) == configuration["userId"] as? String) else { return }
-        rememberTerminal(id)
-        for (key, pending) in pendingPushes where pending.invitation.callId == id {
+        guard snapshot?["callId"] as? String != id, !isAnswer || answeredByCurrentUser else { return }
+        let matchingPushes = pendingPushes.filter { _, pending in
+            pending.invitation.matchesCallSignal(callID: id, conversationID: conv, messageID: msg)
+        }
+        for (key, pending) in matchingPushes {
+            trace("control signal matched pending push type=\(type)")
+            rememberTerminal(pending.invitation.callId)
             removePendingPush(key)
             systemBridge?.end(uuid: key)
+        }
+        if matchingPushes.isEmpty {
+            trace("control signal unmatched type=\(type)")
+            // A signal can precede the invitation. Do not mark a known UUID from a different conversation as ended.
+            if !id.isEmpty && !pendingPushes.values.contains(where: { $0.invitation.callId == id }) { rememberTerminal(id) }
         }
     }
     private func project(_ state: String, media: String? = nil) {
@@ -1215,17 +1251,22 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         guard type == .voIP else { return }
         updatePushToken(Data(), registry: registry)
     }
-    public func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType) async {
-        guard type == .voIP else { return }
-        await receiveVoipPush(payload, mustReport: true)
+    public func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload,
+                             for type: PKPushType, completion: @escaping @Sendable () -> Void) {
+        guard type == .voIP else { completion(); return }
+        // The registry delivers on .main. CallKit on older iOS requires the
+        // report to start on this callback's run loop, before a Swift task hop.
+        receiveVoipPush(payload, mustReport: true, completion: completion)
     }
     #if compiler(>=6.3)
     @available(iOS 26.4, *)
     public func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingVoIPPushWith payload: PKPushPayload, metadata: PKVoIPPushMetadata) async {
-        await receiveVoipPush(payload, mustReport: metadata.mustReport)
+        await withCheckedContinuation { continuation in
+            receiveVoipPush(payload, mustReport: metadata.mustReport) { continuation.resume() }
+        }
     }
     #endif
-    private func receiveVoipPush(_ payload: PKPushPayload, mustReport: Bool) async {
+    private func receiveVoipPush(_ payload: PKPushPayload, mustReport: Bool, completion: @escaping @Sendable () -> Void) {
         restore()
         let run = generation
         let route = requiredPushRegistration
@@ -1234,6 +1275,7 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
             pushBusinessEnvironment: configuration["pushBusinessEnvironment"] as? String)
         if invitation == nil && !mustReport {
             trace("PushKit ignored invitation outside current registration")
+            completion()
             return
         }
         let systemUUID = invitation.map { uuid($0.callId) } ?? UUID()
@@ -1271,29 +1313,34 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
                 self.removePendingPush(systemUUID); system.end(uuid: systemUUID)
             }
         }
-        // PushKit requires the system call to be reported before network validation.
-        do {
-            try await work.reportThenValidate(report: {
-                try await system.reportIncoming(invitation?.report(labels: self.configuration["labels"] as? [String: Any] ?? [:]) ?? ["displayName": "Nuwax", "mediaType": "audio"], uuid: systemUUID, requiredByPushKit: mustReport)
-            }, validate: { [weak self] in
-                guard let self, run == self.generation, let invitation, !self.configuration.isEmpty else { system.end(uuid: systemUUID); return }
-                await self.validatePush(invitation, systemUUID: systemUUID, system: system, run: run, duplicate: duplicate, route: route)
-            })
-            trace("PushKit report completed systemUUID=\(systemUUID.uuidString)")
-            if pushProvider == "unipush", invitation != nil {
-                let raw = payload.dictionaryPayload
-                Task { @MainActor in NuwaxVoipGetui.recordReceipt(raw) }
-            }
-        } catch {
-            system.end(uuid: systemUUID)
-            if run == generation {
-                removePendingPush(systemUUID)
-                if let invitation {
-                    rememberTerminal(invitation.callId)
-                    if snapshot == nil { emit("error", ["code": NuwaxVoipIncomingFailure(error).code]) }
+        let report = invitation?.report(labels: configuration["labels"] as? [String: Any] ?? [:])
+            ?? ["displayName": "Nuwax", "mediaType": "audio"]
+        work.reportThenValidate(report: { finished in
+            system.reportIncoming(report, uuid: systemUUID, requiredByPushKit: mustReport, completion: finished)
+        }, validate: { [weak self] in
+            guard let self, run == self.generation, let invitation, !self.configuration.isEmpty else { system.end(uuid: systemUUID); return }
+            await self.validatePush(invitation, systemUUID: systemUUID, system: system, run: run, duplicate: duplicate, route: route)
+        }, completion: { [weak self] result in
+            defer { completion() }
+            guard let self else { return }
+            switch result {
+            case .success:
+                self.trace("PushKit report completed systemUUID=\(systemUUID.uuidString)")
+                if self.pushProvider == "unipush", invitation != nil {
+                    let raw = payload.dictionaryPayload
+                    Task { @MainActor in NuwaxVoipGetui.recordReceipt(raw) }
+                }
+            case .failure(let error):
+                system.end(uuid: systemUUID)
+                if run == self.generation {
+                    self.removePendingPush(systemUUID)
+                    if let invitation {
+                        self.rememberTerminal(invitation.callId)
+                        if self.snapshot == nil { self.emit("error", ["code": NuwaxVoipIncomingFailure(error).code]) }
+                    }
                 }
             }
-        }
+        })
     }
     private func validatePush(_ invitation: NuwaxVoipPushInvitation, systemUUID: UUID, system: NuwaxSystemCalling, run: Int, duplicate: Bool, route: String?) async {
         // The online path may have independently validated this same call while
@@ -1373,7 +1420,8 @@ private final class WeakVideoView {
 private enum VoipError: Error { case invalid }
 
 @MainActor private protocol NuwaxSystemCalling: AnyObject {
-    func reportIncoming(_ payload: [AnyHashable: Any], uuid: UUID, requiredByPushKit: Bool) async throws
+    func reportIncoming(_ payload: [AnyHashable: Any], uuid: UUID, requiredByPushKit: Bool,
+                        completion: @escaping NuwaxVoipPushWork.ReportCompletion)
     func register(_ snapshot: [String: Any], uuid: UUID, incoming: Bool)
     func isPresented(uuid: UUID) -> Bool
     func requestAnswer(uuid: UUID, mediaType: String)
@@ -1411,34 +1459,53 @@ private enum VoipError: Error { case invalid }
         provider.setDelegate(self, queue: nil)
     }
 
-    func reportIncoming(_ payload: [AnyHashable: Any], uuid: UUID, requiredByPushKit: Bool = false) async throws {
-        if registry.isReported(uuid) {
+    func reportIncoming(_ payload: [AnyHashable: Any], uuid: UUID, requiredByPushKit: Bool,
+                        completion: @escaping NuwaxVoipPushWork.ReportCompletion) {
+        if !requiredByPushKit && registry.isReported(uuid) {
             if registry.hasEnded(uuid) { end(uuid: uuid) }
             else { owner?.systemIncomingReady(uuid) }
+            completion(.success(()))
             return
         }
-        let generation = registry.beginIncomingReport(uuid, requiredByPushKit: requiredByPushKit)
-        guard generation != nil || (requiredByPushKit && registry.hasEnded(uuid)) else { return }
+        guard let run = registry.beginIncomingReport(uuid, requiredByPushKit: requiredByPushKit) else {
+            completion(.success(()))
+            return
+        }
         let update = CXCallUpdate()
         update.remoteHandle = CXHandle(type: .generic, value: payload["handle"] as? String ?? payload["callId"] as? String ?? uuid.uuidString)
         update.localizedCallerName = payload["displayName"] as? String ?? "Nuwax"
         update.hasVideo = payload["mediaType"] as? String == "video"
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            provider.reportNewIncomingCall(with: uuid, update: update) { error in
-                if let error { continuation.resume(throwing: error) }
-                else { continuation.resume() }
+        provider.reportNewIncomingCall(with: uuid, update: update) { error in
+            Task { @MainActor in
+                if let error, !self.isDuplicateReport(error, uuid: uuid, requiredByPushKit: requiredByPushKit) {
+                    self.registry.registrationFailed(uuid, generation: run)
+                    completion(.failure(error))
+                    return
+                }
+                guard run == self.registry.generation, self.owner?.ownsSystemManager(self) == true else {
+                    self.provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+                    completion(.success(()))
+                    return
+                }
+                self.registry.registrationReported(uuid, generation: run)
+                if self.registry.hasEnded(uuid) { self.end(uuid: uuid) }
+                else { self.owner?.systemIncomingReady(uuid) }
+                completion(.success(()))
             }
         }
-        registry.registrationReported(uuid, generation: generation ?? registry.generation)
-        if registry.hasEnded(uuid) { end(uuid: uuid) }
-        else { owner?.systemIncomingReady(uuid) }
+    }
+
+    private func isDuplicateReport(_ error: Error, uuid: UUID, requiredByPushKit: Bool) -> Bool {
+        requiredByPushKit && NuwaxVoipCallPolicy.isDuplicateIncomingReport(error) &&
+            (registry.isReported(uuid) || controller.callObserver.calls.contains { $0.uuid == uuid && !$0.hasEnded })
     }
 
     func register(_ snapshot: [String: Any], uuid: UUID, incoming: Bool) {
         if incoming {
-            Task {
-                do { try await reportIncoming(snapshot, uuid: uuid) }
-                catch { if owner?.ownsSystemUUID(uuid) == true { owner?.systemIncomingFailed(uuid, error: error) } }
+            reportIncoming(snapshot, uuid: uuid, requiredByPushKit: false) { [weak self] result in
+                if case .failure(let error) = result, self?.owner?.ownsSystemUUID(uuid) == true {
+                    self?.owner?.systemIncomingFailed(uuid, error: error)
+                }
             }
             return
         }
@@ -1597,7 +1664,19 @@ private enum VoipError: Error { case invalid }
             includesConversationInRecents: false, supportsVideo: true, supportedHandleTypes: [.generic]))
         super.init(); manager.delegate = self
     }
-    func reportIncoming(_ payload: [AnyHashable: Any], uuid: UUID, requiredByPushKit: Bool = false) async throws {
+    func reportIncoming(_ payload: [AnyHashable: Any], uuid: UUID, requiredByPushKit: Bool,
+                        completion: @escaping NuwaxVoipPushWork.ReportCompletion) {
+        Task { @MainActor in
+            do {
+                try await reportIncoming(payload, uuid: uuid, requiredByPushKit: requiredByPushKit)
+                completion(.success(()))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+    }
+
+    private func reportIncoming(_ payload: [AnyHashable: Any], uuid: UUID, requiredByPushKit: Bool = false) async throws {
         if !requiredByPushKit && registry.isReported(uuid) {
             if registry.hasEnded(uuid) { end(uuid: uuid) }
             else { owner?.systemIncomingReady(uuid) }

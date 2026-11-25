@@ -21,6 +21,7 @@ describe('VoIP feature integration boundary', () => {
       '@/features/voip/integration',
       '@/features/voip/audioFocus',
       '@/features/voip/components/chat-actions.uvue',
+      '@/features/voip/components/incoming-call-setup-hint.uvue',
       '@/features/voip/components/return-to-call.uvue',
     ]);
     const hosts = ['App.uvue', ...['pages', 'components', 'utils', 'hooks'].flatMap(sourceFiles)];

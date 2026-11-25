@@ -16,6 +16,14 @@ final class CallPolicyTests: XCTestCase {
         XCTAssertEqual(NuwaxVoipCallPolicy.ringDeadline(sendTime: 1_000_000, acknowledgedAt: 120_500), 180_500)
         XCTAssertLessThan(NuwaxVoipCallPolicy.ringDeadline(sendTime: 1000, acknowledgedAt: 120_500), 120_500)
     }
+    func testOrdinaryNotificationCannotExtendTheMessageDeadlineOrRestoreAnExpiredInvite() {
+        XCTAssertEqual(NuwaxVoipCallPolicy.incomingExpiry(messageExpiry: 60_000, notificationExpiry: 0, now: 10_000), 60_000)
+        XCTAssertEqual(NuwaxVoipCallPolicy.incomingExpiry(messageExpiry: 60_000, notificationExpiry: 30_000, now: 10_000), 30_000)
+        XCTAssertEqual(NuwaxVoipCallPolicy.incomingExpiry(messageExpiry: 60_000, notificationExpiry: 70_000, now: 10_000), 60_000)
+        XCTAssertNil(NuwaxVoipCallPolicy.incomingExpiry(messageExpiry: 60_000, notificationExpiry: 30_000, now: 30_000))
+        XCTAssertNil(NuwaxVoipCallPolicy.incomingExpiry(messageExpiry: 60_000, notificationExpiry: .infinity, now: 10_000))
+        XCTAssertNil(NuwaxVoipCallPolicy.incomingExpiry(messageExpiry: 60_000, notificationExpiry: -1, now: 10_000))
+    }
     func testActiveHangupDoesNotBecomeLegacyCancel() {
         XCTAssertNil(NuwaxVoipCallPolicy.businessEndAction(caller: true, state: "active", reason: "ended"))
         XCTAssertEqual(NuwaxVoipCallPolicy.businessEndAction(caller: true, state: "connecting", reason: "cancelled"), "ended")

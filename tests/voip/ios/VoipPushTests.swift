@@ -62,6 +62,17 @@ final class VoipPushTests: XCTestCase {
         wrong["body"] = ["callId": "call-123", "mediaType": "video"]
         XCTAssertFalse(invitation.matches(wrong, now: now))
     }
+    func testPendingCallSignalCanMatchByMessageWhenTheCallIdIsOmitted() throws {
+        let invitation = try XCTUnwrap(parse(payload))
+        let conversationID = try XCTUnwrap(invitation.convId)
+        let messageID = try XCTUnwrap(invitation.msgId)
+        XCTAssertTrue(invitation.matchesCallSignal(callID: "call-123", conversationID: conversationID, messageID: messageID))
+        XCTAssertTrue(invitation.matchesCallSignal(callID: "", conversationID: conversationID, messageID: messageID))
+        XCTAssertFalse(invitation.matchesCallSignal(callID: "", conversationID: conversationID, messageID: "123"))
+        XCTAssertFalse(invitation.matchesCallSignal(callID: "", conversationID: "123", messageID: messageID))
+        XCTAssertFalse(invitation.matchesCallSignal(callID: "call-123", conversationID: "123", messageID: messageID))
+        XCTAssertFalse(invitation.matchesCallSignal(callID: "another-call", conversationID: conversationID, messageID: messageID))
+    }
     func testNoLateMessageOrDeadlineExtension() throws {
         let invitation = try XCTUnwrap(parse(payload))
         XCTAssertFalse(invitation.matches(message, now: now + 45_000))

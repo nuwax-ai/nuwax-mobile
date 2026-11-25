@@ -38,6 +38,13 @@
 
 本地离线 Android 打包脚本也把业务 Activity 的 Window 背景改为纯色；Android 12+ 只使用系统的启动图标，低版本继续使用 Launcher 启动背景。业务 Activity 不再使用带 Logo 的背景。
 
+iOS 使用系统 `LaunchScreen`（App 启动瞬间由系统直接渲染，不经过 JS），源文件在 [nativeResources/ios/launchscreen/](../../nativeResources/ios/launchscreen/)：白底 + 居中品牌 Logo，没有任何背景图依赖方向。两条 iOS 打包路径共用这份源：
+
+- **云打包（正式包）**：[manifest.json](../../manifest.json) `app-ios.distribute.splashScreens.storyboard` 指向 `NuwaxLaunchScreen.zip`。zip 由 [scripts/gen-ios-launchscreen-zip.sh](../../scripts/gen-ios-launchscreen-zip.sh) 生成（zip 根目录只有 `.storyboard` 与 `dc_launchscreen_icon@2x/@3x.png`，无子目录——HBuilderX 的硬要求）。改 Logo 后必须重跑该脚本并提交 zip。
+- **本地离线基座**：[scripts/voip-native/device/prepare-ios.py](../../scripts/voip-native/device/prepare-ios.py) 在复制 SDK Demo 后覆盖其示例 `LaunchScreen.storyboard`，并把 `UILaunchStoryboardName` 固定为 `LaunchScreen`。仅改业务代码不会更新启动屏，需要重打 iOS 基座。
+
+uni-app x 的 iOS 不支持 `splashScreens` 多密度启动图（那是老 uni-app 的 Android 方案），只支持自定义 storyboard。业务页面同样不再补画启动 Logo。
+
 需要基于最新资源重新生成一次基座；清理旧原生构建缓存，避免残留旧模块。可检查最终 APK Manifest：不应再包含 `com.nuwax.launchsplash.LaunchSplashInitializer`。本轮没有启动 HBuilderX 编译或云打包。
 
 ## 新基座验收

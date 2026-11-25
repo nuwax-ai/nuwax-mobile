@@ -7,6 +7,7 @@ object VoipCallPolicyTest {
         standaloneQaCannotRestoreProductionIdentity()
         releaseOriginRequiresAnExplicitMatchingHttpsPin()
         incomingSoundHonorsSilenceAndExplicitChoices()
+        presentedNotificationRingsOnlyWhenAllowedAndTheServiceIsNotRinging()
         unlockedBackgroundUiOpensForAudioAndVideo()
         notificationAnswerPreservesTheInvitationMedia()
         duplicatedInvitationsCannotRestartOrStopTheRingingNotification()
@@ -14,7 +15,7 @@ object VoipCallPolicyTest {
         endingOrAnsweringReleasesTheIncomingNotificationSlot()
         ringTimeStartsAfterInvitationAcknowledgement(); activeHangupDoesNotSendLegacyCancel()
         reconnectMustNotLookLikeRemoteHangup(); authFailuresAreSeparateFromNotificationFailures()
-        println("16 Kotlin call policy cases passed")
+        println("17 Kotlin call policy cases passed")
     }
     private fun ringTimeStartsAfterInvitationAcknowledgement() {
         check(VoipCallPolicy.ringDeadline(120000, 120500) == 180000L)
@@ -57,6 +58,13 @@ object VoipCallPolicyTest {
         check(sound(true, "custom", true) == "custom")
         check(sound(true, null, false) == null)
         check(sound(true, null, true) == null)
+    }
+    private fun presentedNotificationRingsOnlyWhenAllowedAndTheServiceIsNotRinging() {
+        check(VoipCallPolicy.notificationRings(incoming = true, presentedSoundAllowed = null, serviceRings = false))
+        check(!VoipCallPolicy.notificationRings(incoming = true, presentedSoundAllowed = true, serviceRings = true))
+        check(VoipCallPolicy.notificationRings(incoming = true, presentedSoundAllowed = true, serviceRings = false))
+        check(!VoipCallPolicy.notificationRings(incoming = true, presentedSoundAllowed = false, serviceRings = false))
+        check(!VoipCallPolicy.notificationRings(incoming = false, presentedSoundAllowed = null, serviceRings = false))
     }
     private fun duplicatedInvitationsCannotRestartOrStopTheRingingNotification() {
         val gate = VoipIncomingNotificationGate()

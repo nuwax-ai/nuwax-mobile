@@ -77,6 +77,12 @@ struct NuwaxVoipPushInvitation {
         scene == "meeting" ? matchesMeeting(message, now: now) : matchesCall(message, now: now)
     }
 
+    func matchesCallSignal(callID: String, conversationID: String, messageID: String) -> Bool {
+        scene == "call" && convId == conversationID && NuwaxVoipCallPolicy.matches(
+            signalID: callID, messageID: messageID, callID: callId, callMessageID: msgId ?? ""
+        )
+    }
+
     private func matchesCall(_ message: [String: Any], now: Double) -> Bool {
         guard let body = message["body"] as? [String: Any], body["callId"] as? String == callId,
               body["mediaType"] as? String == mediaType, message["msgType"] as? String == "voip",

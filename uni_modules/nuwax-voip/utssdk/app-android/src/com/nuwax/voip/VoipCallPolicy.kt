@@ -2,6 +2,9 @@ package com.nuwax.voip
 
 /** Business policy, independent from Telecom/media, and executable on the JVM. */
 internal object VoipCallPolicy {
+    fun notificationRings(incoming: Boolean, presentedSoundAllowed: Boolean?, serviceRings: Boolean): Boolean =
+        incoming && presentedSoundAllowed != false && !serviceRings
+
     const val PREPARE_TIMEOUT_MS = 30000L
     const val REMOTE_LEFT_GRACE_MS = 3000L
     fun ringDeadline(sendTime: Long, acknowledgedAt: Long): Long =

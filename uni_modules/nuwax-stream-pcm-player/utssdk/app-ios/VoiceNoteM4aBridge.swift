@@ -27,6 +27,11 @@ public class VoiceNoteM4aBridge {
     /// 用户自己点的暂停。这种停止不能当成电话打断，否则挂断后又会自动录。
     private var userPaused = false
     private var resumeNotBefore = Date()
+    /// 飞书、微信语音不是系统电话。停掉录音器后进程会被挂起，挂断通知要等回到前台。
+    /// 这段时间用静音播放留在后台，挂断后才能马上开下一段。
+    private var keepAliveForInterrupt = false
+    private var silencePlayer: AVAudioPlayer?
+    private var silenceTimer: Timer?
     /// 不设置 delegate 时 calls 一直是空的，系统电话会被当成已经挂断。
     private let callWatch = CallWatch()
     private let callObserver = CXCallObserver()
@@ -61,6 +66,7 @@ public class VoiceNoteM4aBridge {
         if let observer = terminateObserver {
             NotificationCenter.default.removeObserver(observer)
         }
+        stopSilence()
         if VoiceNoteM4aBridge.activeBridge === self {
             VoiceNoteM4aBridge.activeBridge = nil
         }
@@ -199,7 +205,19 @@ public class VoiceNoteM4aBridge {
         return onMain {
             self.userPaused = false
             self.interruptHold = false
+            self.keepAliveForInterrupt = false
             self.pendingEvents.removeAll()
+            self.stopSilence()
+            return self.closeRecorder()
+        }
+    }
+
+    /// 电话或第三方语音打断。封上当前文件，但不要退出后台，挂断后还要接着录。
+    public func sealForInterruption() -> String {
+        return onMain {
+            self.userPaused = false
+            self.keepAliveForInterrupt = true
+            self.startSilence()
             return self.closeRecorder()
         }
     }
@@ -229,6 +247,8 @@ public class VoiceNoteM4aBridge {
                 if let recorder = self.recorder, !recorder.isRecording {
                     self.interruptBeganAt = Date()
                     self.interruptHold = true
+                    self.keepAliveForInterrupt = true
+                    self.startSilence()
                     self.pushEvent("began")
                     NSLog("[voice-note] m4a recorder stopped without interruption")
                 }
@@ -291,12 +311,20 @@ public class VoiceNoteM4aBridge {
                     self.interruptBeganAt = Date()
                 }
                 self.interruptHold = true
+                self.keepAliveForInterrupt = true
+                self.startSilence()
                 self.pushEvent("began")
             }
             return
         }
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, self.interruptHold, self.interruptGraceDone(), !self.sessionBusy() else {
+            guard let self = self else {
+                return
+            }
+            if self.keepAliveForInterrupt {
+                self.silencePlayer?.play()
+            }
+            guard self.interruptHold, self.interruptGraceDone(), !self.sessionBusy() else {
                 return
             }
             self.pushEvent("ended")
@@ -362,12 +390,99 @@ public class VoiceNoteM4aBridge {
     }
 
     private func openRecorder(_ path: String) -> Bool {
+        let holding = keepAliveForInterrupt
+        stopSilencePlayback()
         closeRecorder()
         if writeRecorder(path, bitRate: 64000) {
+            keepAliveForInterrupt = false
             return true
         }
         try? FileManager.default.removeItem(atPath: path)
-        return writeRecorder(path, bitRate: 0)
+        if writeRecorder(path, bitRate: 0) {
+            keepAliveForInterrupt = false
+            return true
+        }
+        if holding {
+            keepAliveForInterrupt = true
+            startSilence()
+        }
+        return false
+    }
+
+    /// 静音循环只用来让系统把进程留在后台。样本几乎为零，听不到。
+    private func startSilence() {
+        if silencePlayer == nil {
+            let url = silenceFileURL()
+            silencePlayer = try? AVAudioPlayer(contentsOf: url)
+            silencePlayer?.numberOfLoops = -1
+            silencePlayer?.volume = 0.01
+            silencePlayer?.prepareToPlay()
+        }
+        _ = silencePlayer?.play()
+        if silenceTimer == nil {
+            let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+                self?.pokeSilence()
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            silenceTimer = timer
+        }
+    }
+
+    private func pokeSilence() {
+        guard keepAliveForInterrupt else {
+            stopSilence()
+            return
+        }
+        if silencePlayer?.isPlaying != true && !sessionBusy() {
+            _ = silencePlayer?.play()
+        }
+    }
+
+    private func stopSilencePlayback() {
+        silencePlayer?.stop()
+    }
+
+    private func stopSilence() {
+        silenceTimer?.invalidate()
+        silenceTimer = nil
+        silencePlayer?.stop()
+        silencePlayer = nil
+    }
+
+    private func silenceFileURL() -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("voice-note-silence.wav")
+        if FileManager.default.fileExists(atPath: url.path) {
+            return url
+        }
+        let sampleRate = 8000
+        let sampleCount = 4000
+        var bytes = Data(capacity: 44 + sampleCount * 2)
+        func appendU32(_ value: UInt32) {
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) { bytes.append(contentsOf: $0) }
+        }
+        func appendU16(_ value: UInt16) {
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) { bytes.append(contentsOf: $0) }
+        }
+        bytes.append(contentsOf: [0x52, 0x49, 0x46, 0x46])
+        appendU32(UInt32(36 + sampleCount * 2))
+        bytes.append(contentsOf: [0x57, 0x41, 0x56, 0x45])
+        bytes.append(contentsOf: [0x66, 0x6d, 0x74, 0x20])
+        appendU32(16)
+        appendU16(1)
+        appendU16(1)
+        appendU32(UInt32(sampleRate))
+        appendU32(UInt32(sampleRate * 2))
+        appendU16(2)
+        appendU16(16)
+        bytes.append(contentsOf: [0x64, 0x61, 0x74, 0x61])
+        appendU32(UInt32(sampleCount * 2))
+        for _ in 0..<sampleCount {
+            appendU16(1)
+        }
+        try? bytes.write(to: url)
+        return url
     }
 
     /// bitRate 为 0 时不写码率，避开部分系统因码率拒绝 prepareToRecord。

@@ -14,6 +14,28 @@ enum NuwaxVoipClientPolicy {
         guard let pinnedOrigin else { return true }
         return !pinnedOrigin.isEmpty && origin == pinnedOrigin
     }
+
+    static func avatarURL(_ value: Any?) -> String? {
+        guard let url = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty else { return nil }
+        return url
+    }
+
+    static func backfillCallerAvatar(_ call: [String: Any], callID: String, callerID: String,
+                                     contacts: [[String: Any]]) -> [String: Any]? {
+        guard call["callId"] as? String == callID, call["callerId"] as? String == callerID,
+              call["state"] as? String != "ended", avatarURL(call["callerAvatar"]) == nil,
+              let version = call["version"] as? Int,
+              let contact = contacts.first(where: {
+                  String(describing: $0["userId"] ?? "") == callerID &&
+                      $0["subjectType"] as? Int == 1 && $0["status"] as? Int == 1
+              }),
+              let avatar = avatarURL(contact["avatar"]) else { return nil }
+        var updated = call
+        updated["callerAvatar"] = avatar
+        updated["version"] = version + 1
+        return updated
+    }
+
     static func permissionPlan(microphone: NuwaxVoipPermission, camera: NuwaxVoipPermission, video: Bool, foreground: Bool) -> NuwaxVoipPermissionPlan {
         let required = video ? [microphone, camera] : [microphone]
         if required.contains(.denied) { return .settings }

@@ -1181,6 +1181,8 @@ object VoipBridge {
         return channel.takeIf { audio.ringerMode == AudioManager.RINGER_MODE_NORMAL && audio.getStreamVolume(AudioManager.STREAM_RING) > 0 }
     }
 
+    internal fun takeReplacedIncomingAlert(callId: String) = incomingNotifications.takeReplacedAlert(callId)
+
     internal fun notification(ctx: Context, useServiceRingtone: Boolean = false): Notification {
         ensureNotificationChannels(ctx)
         val s = current ?: JSONObject()
@@ -1205,12 +1207,12 @@ object VoipBridge {
             else NotificationCompat.CallStyle.forOngoingCall(person, intent(if (s.optString("state") == "ringing") "cancel" else "end"))
         val channel = when {
             alert -> VoipNotificationChannels.INCOMING
-            presented -> VoipNotificationChannels.presentedIncoming(ctx)
+            presented && !ringsInService -> VoipNotificationChannels.presentedIncoming(ctx)
             else -> VoipNotificationChannels.ONGOING
         }
         val priority = when {
             alert -> NotificationCompat.PRIORITY_MAX
-            presented -> NotificationCompat.PRIORITY_DEFAULT
+            presented && !ringsInService -> NotificationCompat.PRIORITY_DEFAULT
             else -> NotificationCompat.PRIORITY_LOW
         }
         val builder = NotificationCompat.Builder(ctx, channel)
@@ -1254,8 +1256,14 @@ class VoipCallService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (!VoipBridge.hasSystemCall()) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return START_NOT_STICKY }
-        if (VoipBridge.uiSnapshot(intent?.getStringExtra("callId") ?: "") == null) return START_NOT_STICKY
+        val callId = intent?.getStringExtra("callId") ?: ""
+        if (VoipBridge.uiSnapshot(callId) == null) return START_NOT_STICKY
         val channel = VoipBridge.presentedRingtoneChannel(this)
+        // Updating an insistent notification can leave its SystemUI ringtone running.
+        // Remove that alert before posting the silent foreground notification.
+        if (channel != null && VoipBridge.takeReplacedIncomingAlert(callId)) {
+            getSystemService(NotificationManager::class.java).cancel(9090)
+        }
         publishForeground(useServiceRingtone = channel != null)
         if (channel == null) stopRinging()
         else if (!startRinging(channel)) publishForeground(useServiceRingtone = false)

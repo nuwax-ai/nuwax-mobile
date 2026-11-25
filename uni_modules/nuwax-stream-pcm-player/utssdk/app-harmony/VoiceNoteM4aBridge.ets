@@ -138,6 +138,46 @@ export class VoiceNoteM4aBridge {
     return elapsed
   }
 
+  /** 当前段里还能听的时长。通话静音会在封口时剪掉，这段时间不计入。 */
+  private audibleElapsedMs(): number {
+    let elapsed = this.mediaElapsedMs()
+    let dropped = 0
+    const marks = this.silenceMarks
+    let i = 0
+    while (i + 1 < marks.length) {
+      const start = marks[i]
+      const end = marks[i + 1]
+      if (end > start) {
+        dropped = dropped + (end - start)
+      }
+      i = i + 2
+    }
+    if (this.silenceOpen && marks.length % 2 == 1) {
+      const start = marks[marks.length - 1]
+      if (elapsed > start) {
+        dropped = dropped + (elapsed - start)
+      }
+    }
+    let audible = elapsed - dropped
+    if (audible < 0) {
+      audible = 0
+    }
+    return audible
+  }
+
+  /**
+   * 面板计时用。第一段 1 表示正在通话静音，0 表示正常写；第二段是当前文件可听毫秒。
+   * 文件没打开时第二段为 -1，界面继续用自己的时钟。
+   */
+  displayClock(): string {
+    this.noteCallSilence()
+    if (!this.fileOpen || this.segmentStartedAt <= 0) {
+      return '0\t-1'
+    }
+    const hold = this.silenceOpen ? '1' : '0'
+    return hold + '\t' + this.audibleElapsedMs()
+  }
+
   /** 只是来电响铃时，系统可能把录音器按住。拉回来继续写，不进入暂停。 */
   private keepRecordingThroughRing(): void {
     if (this.ringResumeBusy || !this.fileOpen || this.callConnected()) {

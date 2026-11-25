@@ -826,11 +826,14 @@ function sealUnsealedM4a(path: string): string {
     return '0:unreadable'
   }
   const view = payloadView(source)
-  if (findTopBox(view, source.length, BOX_MOOV) != null) {
+  if (findTopBox(view, source.length, BOX_MOOV) != null || edgeHasMoov(view, source.length)) {
     return '1'
   }
   const payload = mdatPayload(view, source.length)
   if (payload == null) {
+    return '0:layout'
+  }
+  if (payload.length < 2) {
     return '0:nomdat'
   }
   const frames = Math.floor(payload.length / 512)
@@ -876,9 +879,11 @@ function sealUnsealedM4a(path: string): string {
   return '1'
 }
 
+/** 走完没有 mdat 时返回空数组。尺寸读断时返回 null，不能当成没有音频。 */
 function mdatPayload(view: DataView, fileLength: number): Uint8Array | null {
   let offset = 0
   let steps = 0
+  let broke = false
   while (offset + 8 <= fileLength && steps < 64) {
     steps = steps + 1
     const size32 = view.getUint32(offset)
@@ -886,36 +891,63 @@ function mdatPayload(view: DataView, fileLength: number): Uint8Array | null {
     let header = 8
     let size = size32
     if (size32 == 1) {
-      if (offset + 16 > fileLength) {
-        return null
-      }
-      if (view.getUint32(offset + 8) != 0) {
+      if (offset + 16 > fileLength || view.getUint32(offset + 8) != 0) {
+        if (type == BOX_MDAT && offset + header < fileLength) {
+          return copySpan(view, offset + header, fileLength - offset - header)
+        }
         return null
       }
       size = view.getUint32(offset + 12)
       header = 16
-    } else if (size32 == 0) {
+    } else if (size32 == 0 || size32 == 0xffffffff) {
       size = fileLength - offset
     }
-    if (size < header) {
-      return null
-    }
-    let end = offset + size
-    if (end > fileLength) {
-      end = fileLength
-    }
     if (type == BOX_MDAT) {
+      let end = offset + size
+      if (size < header || end > fileLength) {
+        end = fileLength
+      }
       if (end <= offset + header) {
-        return null
+        return new Uint8Array(0)
       }
       return copySpan(view, offset + header, end - offset - header)
     }
-    if (offset + size > fileLength) {
-      return null
+    if (size < header || offset + size > fileLength) {
+      broke = true
+      break
     }
     offset = offset + size
   }
-  return null
+  if (broke) {
+    return null
+  }
+  return new Uint8Array(0)
+}
+
+function edgeHasMoov(view: DataView, fileLength: number): boolean {
+  if (scanMoov(view, fileLength, 0, 65536)) {
+    return true
+  }
+  const tail = fileLength > 262144 ? fileLength - 262144 : 0
+  return scanMoov(view, fileLength, tail, fileLength - tail)
+}
+
+function scanMoov(view: DataView, fileLength: number, from: number, limit: number): boolean {
+  let pos = from < 0 ? 0 : from
+  let end = pos + limit
+  if (end > fileLength) {
+    end = fileLength
+  }
+  while (pos + 8 <= end) {
+    if (view.getUint32(pos + 4) == BOX_MOOV) {
+      const size = view.getUint32(pos)
+      if (size == 0 || (size >= 8 && pos + size <= fileLength)) {
+        return true
+      }
+    }
+    pos = pos + 4
+  }
+  return false
 }
 
 function topBoxBytes(view: DataView, fileLength: number, type: number): Uint8Array | null {

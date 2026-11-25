@@ -44,10 +44,15 @@ public enum VoiceNoteM4aSeal {
             NSLog("[voice-note] m4a seal unreadable \(path)")
             return "0"
         }
-        if topLevelHasMoov(data) {
+        if topLevelHasMoov(data) || edgeHasMoov(data) {
             return "1"
         }
-        guard let payload = mdatPayload(data), payload.count >= minFrameBytes else {
+        guard let payload = mdatPayload(data) else {
+            lastDetail = "layout"
+            NSLog("[voice-note] m4a seal layout \(path)")
+            return "0"
+        }
+        guard payload.count >= minFrameBytes else {
             lastDetail = "nomdat"
             NSLog("[voice-note] m4a seal no mdat \(path)")
             return "0"
@@ -319,38 +324,74 @@ public enum VoiceNoteM4aSeal {
         return false
     }
 
-    /// mdat 的 size 在 stop() 之前经常是 0，表示一直写到文件末尾。
+    /// 文件头尾有没有 moov。mdat 的长度写过头时，线性扫描到不了末尾的 moov，不能因此当成没封口。
+    private static func edgeHasMoov(_ data: Data) -> Bool {
+        if scanMoov(data, from: 0, limit: 65536) {
+            return true
+        }
+        let tail = data.count > 262144 ? data.count - 262144 : 0
+        return scanMoov(data, from: tail, limit: data.count - tail)
+    }
+
+    private static func scanMoov(_ data: Data, from: Int, limit: Int) -> Bool {
+        var pos = from
+        if pos < 0 {
+            pos = 0
+        }
+        let end = min(data.count, pos + limit)
+        while pos + 8 <= end {
+            if data[pos + 4] == 0x6d && data[pos + 5] == 0x6f && data[pos + 6] == 0x6f && data[pos + 7] == 0x76 {
+                let size = readU32(data, pos)
+                if size == 0 || (size >= 8 && pos + Int(size) <= data.count) {
+                    return true
+                }
+            }
+            pos += 4
+        }
+        return false
+    }
+
+    /// 走完盒子仍没有 mdat 时返回空数据，调用方记 nomdat。
+    /// 尺寸读断、还没走到 mdat 时返回 nil，调用方记 layout，不能当成没有音频。
+    /// mdat 的 size 在 stop() 之前经常是 0 或比文件大，音频算到文件末尾。
     private static func mdatPayload(_ data: Data) -> Data? {
         var pos = 0
         var steps = 0
         var payload = Data()
+        var broke = false
         while pos + 8 <= data.count && steps < 64 {
             steps += 1
             let isMdat = data[pos + 4] == 0x6d && data[pos + 5] == 0x64 && data[pos + 6] == 0x61 && data[pos + 7] == 0x74
             let size32 = readU32(data, pos)
-            if size32 == 0 {
+            if size32 == 0 || size32 == 0xffffffff {
                 if isMdat && pos + 8 < data.count {
                     payload.append(data.subdata(in: (pos + 8)..<data.count))
+                } else if !isMdat {
+                    broke = true
                 }
                 break
             }
             guard let boxSize = boxByteSize(data, pos) else {
-                return payload.isEmpty ? nil : payload
+                if isMdat && pos + 8 < data.count {
+                    payload.append(data.subdata(in: (pos + 8)..<data.count))
+                } else {
+                    broke = true
+                }
+                break
             }
             let end = min(pos + boxSize, data.count)
             if isMdat && pos + 8 < end {
                 payload.append(data.subdata(in: (pos + 8)..<end))
+                break
             }
-            if boxSize < 8 {
-                return payload.isEmpty ? nil : payload
-            }
-            if pos + boxSize > data.count {
+            if boxSize < 8 || pos + boxSize > data.count {
+                broke = true
                 break
             }
             pos += boxSize
         }
         if payload.isEmpty {
-            return nil
+            return broke ? nil : Data()
         }
         return payload
     }

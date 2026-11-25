@@ -7,6 +7,7 @@
 import AVFoundation
 import CallKit
 import Foundation
+import UIKit
 
 /// 只要被设成 delegate，CXCallObserver.calls 才会更新。
 private final class CallWatch: NSObject, CXCallObserverDelegate {
@@ -29,10 +30,21 @@ public class VoiceNoteM4aBridge {
     /// 不设置 delegate 时 calls 一直是空的，系统电话会被当成已经挂断。
     private let callWatch = CallWatch()
     private let callObserver = CXCallObserver()
+    private var terminateObserver: NSObjectProtocol?
+    private static weak var activeBridge: VoiceNoteM4aBridge?
 
     public init() {
+        VoiceNoteM4aBridge.activeBridge = self
         callObserver.setDelegate(callWatch, queue: .main)
         let center = NotificationCenter.default
+        // 录音中划掉进程时，JS 的 onExit 经常来不及把 stop() 跑完。这里在进程退出前同步封口。
+        terminateObserver = center.addObserver(
+            forName: UIApplication.willTerminateNotification,
+            object: nil,
+            queue: nil
+        ) { _ in
+            VoiceNoteM4aBridge.stopForTermination()
+        }
         interruptObserver = center.addObserver(
             forName: AVAudioSession.interruptionNotification,
             object: AVAudioSession.sharedInstance(),
@@ -45,6 +57,27 @@ public class VoiceNoteM4aBridge {
     deinit {
         if let observer = interruptObserver {
             NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = terminateObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        if VoiceNoteM4aBridge.activeBridge === self {
+            VoiceNoteM4aBridge.activeBridge = nil
+        }
+    }
+
+    /// 进程被划掉时同步 stop()，把 moov 写进正在录的 m4a。必须在主线程，且不能再派发一次主线程。
+    private static func stopForTermination() {
+        guard let bridge = activeBridge else {
+            return
+        }
+        let finish = {
+            _ = bridge.closeRecorder()
+        }
+        if Thread.isMainThread {
+            finish()
+        } else {
+            DispatchQueue.main.sync(execute: finish)
         }
     }
 

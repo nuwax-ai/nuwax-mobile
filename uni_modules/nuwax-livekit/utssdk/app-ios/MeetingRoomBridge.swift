@@ -346,8 +346,9 @@ public class MeetingRoomBridge: NSObject {
           let text = object["text"] as? String else { return }
     let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !cleanText.isEmpty else { return }
+    // 不按字数裁剪：智能体入会会发 markdown 正文，120 字只是老口径
     let item: [String: Any] = [
-      "text": String(cleanText.prefix(120)),
+      "text": cleanText,
       "name": (object["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? participant?.name ?? "参会人",
       "identity": participant?.identity?.stringValue ?? "",
       "self": false,
@@ -363,7 +364,7 @@ public class MeetingRoomBridge: NSObject {
   public static func sendMeetingMessage(_ text: String, _ displayName: String, _ danmaku: Bool) {
     guard connectedFlag, let current = room else { return }
     let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !cleanText.isEmpty, cleanText.count <= 120 else { return }
+    guard !cleanText.isEmpty else { return }
     let topic = danmaku ? "danmaku" : "meeting-chat"
     let payloadObject: [String: String] = ["text": cleanText, "name": displayName]
     guard let payload = try? JSONSerialization.data(withJSONObject: payloadObject) else { return }
@@ -835,6 +836,18 @@ public class MeetingRoomBridge: NSObject {
   public static func localAudioLevel() -> NSNumber {
     guard let room = room else { return 0 }
     return room.localParticipant.isSpeaking ? 1 : 0
+  }
+
+  /// 当前正在说话的远端成员 identity（空串 = 没有人在说）。
+  /// 给「演讲者」布局选大图用；Swift 侧没有 `audioLevel`，只按 `isSpeaking` 取第一个。
+  public static func remoteSpeakingIdentity() -> String {
+    guard let current = room else { return "" }
+    for (_, p) in current.remoteParticipants {
+      if p.isSpeaking {
+        return p.identity?.stringValue ?? ""
+      }
+    }
+    return ""
   }
 
   public static func participantCount() -> NSNumber {

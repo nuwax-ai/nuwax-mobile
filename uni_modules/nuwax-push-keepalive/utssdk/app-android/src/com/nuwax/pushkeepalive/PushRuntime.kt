@@ -16,7 +16,6 @@ import java.lang.reflect.Method
  */
 object PushRuntime {
     private const val TAG = "NuwaxPushKeepAlive"
-    private const val IM_TAG = "NuwaxImPush"
     private const val VOIP_TAG = "NuwaxVoip"
     private const val INDEX = "uts.sdk.modules.DCloudUniPush.IndexKt"
     private const val HOLDER = "uts.sdk.modules.DCloudUniPush.PushActionHolder"
@@ -54,7 +53,6 @@ object PushRuntime {
                 { value -> forward(delegateOptions, "getOnReceiveClientId", value) },
                 { value ->
                     val raw = value as? String
-                    Log.i(IM_TAG, "native transmission received")
                     main.post {
                         if (raw == null ||
                             !routeVoip(app, raw, "transmission") &&
@@ -64,7 +62,6 @@ object PushRuntime {
                     }
                 },
                 { value ->
-                    Log.i(TAG, "sdk online=${value == true}")
                     forward(delegateOptions, "getOnReceiveOnlineState", value)
                 },
                 { value -> forward(delegateOptions, "getOnReceiveCommandResult", value) },
@@ -77,7 +74,6 @@ object PushRuntime {
             val action = Class.forName(ACTION).getConstructor(optionsClass).newInstance(options)
             setPushAction(action)
             installedAction = action
-            Log.i(TAG, "DCloud push action bridge installed")
             true
         } catch (error: Throwable) {
             // 增强失败不能阻断 DCloud 原推送初始化，更不能影响登录和 WebSocket。

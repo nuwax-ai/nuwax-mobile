@@ -38,12 +38,10 @@ internal object ImHeadlessPush {
         val user = session.getString("user", "").orEmpty()
         val environment = session.getString("environment", "").orEmpty()
         if (!session.getBoolean("enabled", false) || user.isEmpty() || environment.isEmpty()) {
-            Log.i(TAG, "ordinary receive ignored: no enabled session")
             return true
         }
         val pushedEnvironment = field(envelope, "pushEnvironment")
         if (pushedEnvironment.isNotEmpty() && pushedEnvironment != environment) {
-            Log.i(TAG, "ordinary receive ignored: environment mismatch")
             return true
         }
         val businessId = field(envelope, "msgId")
@@ -55,7 +53,6 @@ internal object ImHeadlessPush {
         val now = System.currentTimeMillis()
         val previous = receipts.getLong(key, 0L)
         if (previous > 0 && now - previous in 0L until TTL) {
-            Log.i(TAG, "ordinary receive duplicate key=${key.take(12)}")
             return true
         }
         // 有 Activity 时仍由现有 UTS 前后台逻辑负责；不重复发送 receive 事件。
@@ -65,7 +62,6 @@ internal object ImHeadlessPush {
         if (hasActivity) return false
         if (envelope.optString("content").isBlank()) return false
         if (!notificationsEnabled(context)) {
-            Log.i(TAG, "notification skipped: permission disabled key=${key.take(12)}")
             return true
         }
         return try {
@@ -89,7 +85,6 @@ internal object ImHeadlessPush {
             val edit = receipts.edit().clear()
             retained.forEach { edit.putLong(it.first, it.second) }
             edit.putLong(key, now).commit()
-            Log.i(TAG, "notification submitted key=${key.take(12)}")
             true
         } catch (error: Exception) {
             Log.w(TAG, "notification failed key=${key.take(12)} type=${error.javaClass.simpleName}")
@@ -116,8 +111,6 @@ internal object ImHeadlessPush {
             val helper = invokeStaticOrCompanion(BADGE_HELPER, "getInstance")
                 ?: error("DCloud BadgeHelper unavailable")
             invokeMember(helper, "sendBadgeNumber", context, count, options)
-        }.onSuccess {
-            Log.i(TAG, "badge submitted count=$count")
         }.onFailure { error ->
             // 角标失败不能回退成第二条通知；通知本身已经成功提交。
             Log.w(TAG, "badge failed count=$count type=${error.javaClass.simpleName}")

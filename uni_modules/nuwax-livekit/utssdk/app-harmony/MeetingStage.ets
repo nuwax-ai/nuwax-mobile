@@ -2,6 +2,7 @@ import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit'
 import { webview } from '@kit.ArkWeb'
 import { audio } from '@kit.AudioKit'
 import { util } from '@kit.ArkTS'
+import { BuilderNode, FrameNode, NodeController, UIContext } from '@kit.ArkUI'
 
 export const meetingAsset = 'nuwax-meeting/media.html'
 // The reserved HTTPS origin provides a secure context for WebRTC capture.
@@ -48,6 +49,8 @@ interface BrowserEvent {
 
 export class MeetingStageSession {
   static host: MeetingStageHost | undefined
+  private static mount: MeetingStageMount | undefined
+  private static nextMountId: number = 0
   static pending: Command | undefined
   static id: number = 0
   static connection: string = ''
@@ -67,6 +70,34 @@ export class MeetingStageSession {
   static metadata: string = ''
   static videos: string = ''
   static messages: MeetingMessage[] = []
+
+  static attach(context: common.UIAbilityContext): MeetingStageMount {
+    MeetingStageSession.mount?.detach()
+    const host = MeetingStageSession.host ?? new MeetingStageHost(context)
+    MeetingStageSession.host = host
+    MeetingStageSession.nextMountId += 1
+    const mount = new MeetingStageMount(MeetingStageSession.nextMountId, host)
+    MeetingStageSession.mount = mount
+    return mount
+  }
+
+  static releaseView(id: number): boolean {
+    const mount = MeetingStageSession.mount
+    if (!mount) return true
+    if (mount.id !== id) return false
+    MeetingStageSession.mount = undefined
+    mount.detach()
+    MeetingStageSession.releaseIdleHost()
+    return true
+  }
+
+  static releaseIdleHost(): void {
+    if (MeetingStageSession.mount || MeetingStageSession.isConnected() ||
+        MeetingStageSession.connection === 'connecting') return
+    const host = MeetingStageSession.host
+    MeetingStageSession.host = undefined
+    host?.dispose()
+  }
 
   static connect(url: string, token: string): void {
     MeetingStageSession.disconnect()
@@ -193,10 +224,32 @@ export class MeetingStageHost {
   ready: boolean = false
   screenSupported: boolean = false
   private context: common.UIAbilityContext
+  private stage: BuilderNode<[MeetingStageHost]> | undefined
   private tasks: Promise<void> = Promise.resolve()
 
   constructor(context: common.UIAbilityContext) {
     this.context = context
+  }
+
+  frame(context: UIContext): FrameNode | null {
+    if (!this.stage) {
+      const stage = new BuilderNode<[MeetingStageHost]>(context)
+      this.stage = stage
+      stage.build(wrapBuilder<[MeetingStageHost]>(buildMeetingStage), this)
+    }
+    return this.stage.getFrameNode()
+  }
+
+  keepActive(): void {
+    if (this.ready) {
+      try { this.controller.onActive() } catch (_) {}
+    }
+  }
+
+  dispose(): void {
+    this.ready = false
+    this.stage?.dispose()
+    this.stage = undefined
   }
 
   postMessage(raw: string): void {
@@ -322,6 +375,38 @@ export class MeetingStageHost {
   }
 }
 
+export class MeetingStageMount extends NodeController {
+  readonly id: number
+  private host: MeetingStageHost
+  private attached: boolean = true
+
+  constructor(id: number, host: MeetingStageHost) {
+    super()
+    this.id = id
+    this.host = host
+  }
+
+  makeNode(context: UIContext): FrameNode | null {
+    return this.attached ? this.host.frame(context) : null
+  }
+
+  aboutToAppear(): void {
+    if (this.attached) this.host.keepActive()
+  }
+
+  detach(): void {
+    this.attached = false
+    try { this.rebuild() } catch (_) {}
+    // Keep the Web page and room alive when the in-app meeting view is popped.
+    this.host.keepActive()
+  }
+}
+
+@Builder
+export function buildMeetingMount(mount: MeetingStageMount) {
+  NodeContainer(mount).width('100%').height('100%')
+}
+
 @Component
 struct MeetingStageWeb {
   host: MeetingStageHost
@@ -352,6 +437,6 @@ struct MeetingStageWeb {
 }
 
 @Builder
-export function buildMeetingStage(host: MeetingStageHost) {
+function buildMeetingStage(host: MeetingStageHost) {
   MeetingStageWeb({ host: host })
 }

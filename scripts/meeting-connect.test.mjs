@@ -376,6 +376,43 @@ test('实际页面聊天、举手和共享入口先校准连接，返回不再�
   assert.equal(h.api.meetingMediaIsMinimized(), true);
 });
 
+test('鸿蒙会议连接后返回最小化，点击入口复用当前房间', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  const resume = '/subpackages/pages/im-meeting/im-meeting-room?room=123456789';
+  h.api.meetingMediaSetResumeURL(resume);
+  h.routes(['pages/tab-shell/tab-shell', 'subpackages/pages/im-meeting/im-meeting-room']);
+  await h.join(); h.complete();
+  const ref = value => ({ value });
+  const context = vm.createContext({
+    ...h.api, sheet: ref(''), status: ref(1), mediaConnected: ref(true), mediaConnecting: ref(false),
+    meetingClosing: false, preserveMeetingOnUnmount: false,
+    syncConnectionBeforeAction() {},
+  });
+  vm.runInContext(stripTypeScriptTypes(pageFunctions(['minimizeMeetingPage', 'handleBack'], 'APP-HARMONY')), context);
+  context.handleBack();
+  assert.deepEqual(h.backDeltas, [1]);
+  assert.equal(h.api.meetingMediaIsMinimized(), true);
+  h.api.meetingMediaResume();
+  assert.deepEqual(h.navigations, [resume]);
+  await h.join();
+  assert.deepEqual(h.operations, ['connect']);
+});
+
+test('鸿蒙连接途中返回取消入会，避免恢复一个尚未建立的会话', () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  const ref = value => ({ value });
+  const context = vm.createContext({
+    ...h.api, sheet: ref(''), status: ref(1), mediaConnected: ref(false), mediaConnecting: ref(true),
+    meetingClosing: false,
+    syncConnectionBeforeAction() {},
+    minimizeMeetingPage: () => assert.fail('入会尚未完成'),
+  });
+  vm.runInContext(stripTypeScriptTypes(pageFunctions(['handleBack'], 'APP-HARMONY')), context);
+  context.handleBack();
+  assert.deepEqual(h.backDeltas, [1]);
+  assert.equal(context.meetingClosing, true);
+});
+
 test('通知返回会议：页面未就绪或导航失败时保留请求，成功后不重复打开', async () => {
   const h = harness();
   await h.join(); h.complete();

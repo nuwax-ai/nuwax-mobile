@@ -6,7 +6,7 @@
     :show-header="false"
     :body-scroll="false"
     :mask-click="true"
-    @afterleave="resetForm"
+    @afterleave="onSheetLeave"
   >
     <view class="todo-create">
       <view class="todo-create__header">
@@ -34,16 +34,29 @@
           placeholder-style="color: #c9cdd4; font-size: 15px;"
         />
 
-        <view class="todo-create__label-row">
+        <view class="todo-create__label-row todo-create__label-row--spaced">
           <text class="todo-create__label todo-create__label--inline">{{ t("Mobile.Discover.todoAssignee") }}</text>
-          <text class="todo-create__hint">{{ t("Mobile.Discover.todoAssigneeHint") }}</text>
+          <text v-if="showAssigneeHint" class="todo-create__hint">{{ t("Mobile.Discover.todoAssigneeHint") }}</text>
         </view>
-        <view class="todo-create__assignee-wrap">
-          <view class="todo-create__assignee">
-            <view class="todo-create__avatar">
-              <svg-icon name="icon-User" size="14" unit="px" color="#ffffff" />
+        <view class="todo-create__assignee-wrap" @click="openAssignees">
+          <view v-for="(person, personIndex) in assignees" :key="personIndex" class="todo-create__assignee">
+            <image
+              v-if="person.avatar.length > 0"
+              class="todo-create__avatar"
+              :src="person.avatar"
+              mode="aspectFill"
+              @error="clearAssigneeAvatar(personIndex)"
+            />
+            <view v-else class="todo-create__avatar" :style="assigneeAvatarStyle(person.name)">
+              <text class="todo-create__avatar-text">{{ assigneeLetters(person.name) }}</text>
             </view>
-            <text class="todo-create__assignee-name">{{ t("Mobile.Discover.todoAssigneeMe") }}</text>
+            <text class="todo-create__assignee-name">{{ person.name }}</text>
+            <view class="todo-create__assignee-remove" @click.stop="removeAssigneeAt(personIndex)">
+              <text class="todo-create__assignee-remove-text">×</text>
+            </view>
+          </view>
+          <view v-if="assignees.length == 0" class="todo-create__assignee todo-create__assignee--empty">
+            <text class="todo-create__assignee-name todo-create__assignee-name--empty">{{ t("Mobile.Discover.todoAssigneeAdd") }}</text>
           </view>
         </view>
 
@@ -57,7 +70,7 @@
           </view>
         </picker>
 
-        <view class="todo-create__label-row">
+        <view class="todo-create__label-row todo-create__label-row--spaced">
           <text class="todo-create__label todo-create__label--inline">{{ t("Mobile.Discover.todoPriority") }}</text>
           <text class="todo-create__hint">{{ t("Mobile.Discover.todoPriorityHint") }}</text>
         </view>
@@ -179,6 +192,13 @@
 <script setup lang="uts">
   import { computed, nextTick, ref, type ComponentPublicInstance } from "vue";
   import { emptyI18nParams, t as translateFn } from "@/utils/i18n";
+  import { avatarGradient } from "@/pages/message/components/im-row-helpers.uts";
+  import { apiUserInfo } from "@/servers/account";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import { getCachedMyInfo } from "@/utils/im/myInfoCache";
+  import { getMyUserIdSync } from "@/utils/imNoticeBar";
+  import { TodoAssignee, getTodoAssignees, getTodoCompleteMode, setTodoAssignees, setTodoCompleteMode } from "../todo-assignee-draft.uts";
 
   const emit = defineEmits<{
     submit: [content: string];
@@ -197,6 +217,12 @@
   }
 
   const popupRef = ref<any | null>(null);
+  const assignees = ref<TodoAssignee[]>([]);
+  /** 去负责人页时先关掉弹层。这次关闭不重置表单，返回后再打开。 */
+  let awaitingAssigneeReturn = false;
+  let assigneeLeaveToken = 0;
+  let handledAssigneeLeave = 0;
+  let seedToken = 0;
   /** 按窗口高度写死，避免百分比在 page-container 里失效后把页面撑高。 */
   const sheetHeight = ref<string>("92%");
   const scrollStyle = ref<string>("");
@@ -215,6 +241,11 @@
   const requireSubmit = ref<boolean>(false);
   const extraFields = ref<TodoExtraField[]>([]);
   let extraFieldSeq = 0;
+
+  const showAssigneeHint = computed((): boolean => {
+    const list = assignees.value;
+    return list.length == 1 && list[0].self;
+  });
 
   const pickerDate = computed((): string => {
     if (dueDate.value.length > 0) {
@@ -262,6 +293,14 @@
     proxy.$callMethod(methodName);
   }
 
+  function onSheetLeave(): void {
+    if (handledAssigneeLeave != assigneeLeaveToken) {
+      handledAssigneeLeave = assigneeLeaveToken;
+      return;
+    }
+    resetForm();
+  }
+
   function resetForm(): void {
     content.value = "";
     dueDate.value = "";
@@ -276,6 +315,141 @@
     requireSubmit.value = false;
     extraFields.value = [];
     fieldScrollTop.value = 0;
+    seedToken++;
+    assignees.value = [];
+    setTodoAssignees([]);
+    setTodoCompleteMode("single");
+  }
+
+  function readProfileText(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const text = `${raw}`.trim();
+    if (text == "null" || text == "undefined") {
+      return "";
+    }
+    return text;
+  }
+
+  function assigneeLetters(name: string): string {
+    let cleaned = "";
+    for (let i = 0; i < name.length; i++) {
+      const ch = name.charAt(i);
+      if (ch != " " && ch != "\t" && ch != "　") {
+        cleaned += ch;
+      }
+    }
+    if (cleaned.length == 0) {
+      return "#";
+    }
+    let hasCjk = false;
+    for (let i = 0; i < cleaned.length; i++) {
+      const code = cleaned.charCodeAt(i);
+      if (code != null && code > 0x2e80) {
+        hasCjk = true;
+        break;
+      }
+    }
+    if (hasCjk && cleaned.length >= 2) {
+      return cleaned.substring(cleaned.length - 2);
+    }
+    return cleaned.charAt(0);
+  }
+
+  function assigneeAvatarStyle(name: string): string {
+    return "background-image: " + avatarGradient(name) + ";";
+  }
+
+  function copyAssignees(list: TodoAssignee[]): TodoAssignee[] {
+    const next: TodoAssignee[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const item = new TodoAssignee();
+      item.userId = list[i].userId;
+      item.name = list[i].name;
+      item.avatar = list[i].avatar;
+      item.self = list[i].self;
+      next.push(item);
+    }
+    return next;
+  }
+
+  function applyAssignees(list: TodoAssignee[]): void {
+    const next = copyAssignees(list);
+    assignees.value = next;
+    setTodoAssignees(next);
+  }
+
+  /** 默认责任人是当前用户。昵称未返回前先用「我」，返回后只刷新本人那一行。 */
+  async function seedSelf(): Promise<void> {
+    const token = ++seedToken;
+    const cached = getCachedMyInfo();
+    const item = new TodoAssignee();
+    item.self = true;
+    item.userId = getMyUserIdSync();
+    if (cached != null) {
+      if (item.userId.length == 0) {
+        item.userId = cached.userId;
+      }
+      item.name = cached.displayName.length > 0 ? cached.displayName : t("Mobile.Discover.todoAssigneeMe");
+      item.avatar = cached.avatar;
+    } else {
+      item.name = t("Mobile.Discover.todoAssigneeMe");
+    }
+    if (token != seedToken) {
+      return;
+    }
+    applyAssignees([item]);
+    try {
+      const res = await apiUserInfo();
+      if (token != seedToken || apiResCode(res) != SUCCESS_CODE) {
+        return;
+      }
+      const raw = apiResData<any>(res);
+      let profile: UTSJSONObject | null = null;
+      if (raw != null) {
+        const encoded = JSON.stringify(raw);
+        if (encoded != null && encoded.length > 0 && encoded.charAt(0) == "{") {
+          profile = JSON.parse(encoded) as UTSJSONObject | null;
+        }
+      }
+      if (profile == null || token != seedToken) {
+        return;
+      }
+      const nick = readProfileText(profile, "nickName");
+      const userName = readProfileText(profile, "userName");
+      const avatar = readProfileText(profile, "avatar");
+      const profileId = readProfileText(profile, "id");
+      const current = assignees.value;
+      const next: TodoAssignee[] = [];
+      for (let i = 0; i < current.length; i++) {
+        const row = new TodoAssignee();
+        row.userId = current[i].userId;
+        row.name = current[i].name;
+        row.avatar = current[i].avatar;
+        row.self = current[i].self;
+        if (row.self) {
+          if (row.userId.length == 0) {
+            const syncId = getMyUserIdSync();
+            row.userId = syncId.length > 0 ? syncId : profileId;
+          }
+          const display = nick.length > 0 ? nick : userName;
+          if (display.length > 0) {
+            row.name = display;
+          }
+          if (avatar.length > 0) {
+            row.avatar = avatar;
+          }
+        }
+        next.push(row);
+      }
+      if (token == seedToken) {
+        applyAssignees(next);
+      }
+    } catch (_e) {
+      return;
+    }
   }
 
   /** 新字段画出来后再滚到底，避免被底部按钮挡住。每次加大数值，重复添加也会再次滚动。 */
@@ -312,9 +486,13 @@
 
   /** 打开新建待办弹层，并清空上一次填写。 */
   function open(): void {
+    awaitingAssigneeReturn = false;
+    assigneeLeaveToken = 0;
+    handledAssigneeLeave = 0;
     resetForm();
     measureSheet();
     callPopupMethod("open");
+    seedSelf();
   }
 
   function close(): void {
@@ -327,6 +505,57 @@
 
   function setCompleteMode(value: string): void {
     completeMode.value = value;
+    setTodoCompleteMode(value);
+  }
+
+  function removeAssigneeAt(index: number): void {
+    const next: TodoAssignee[] = [];
+    const current = assignees.value;
+    for (let i = 0; i < current.length; i++) {
+      if (i != index) {
+        next.push(current[i]);
+      }
+    }
+    applyAssignees(next);
+  }
+
+  function clearAssigneeAvatar(index: number): void {
+    const next: TodoAssignee[] = [];
+    const current = assignees.value;
+    for (let i = 0; i < current.length; i++) {
+      const item = new TodoAssignee();
+      item.userId = current[i].userId;
+      item.name = current[i].name;
+      item.avatar = i == index ? "" : current[i].avatar;
+      item.self = current[i].self;
+      next.push(item);
+    }
+    applyAssignees(next);
+  }
+
+  function openAssignees(): void {
+    setTodoCompleteMode(completeMode.value);
+    setTodoAssignees(assignees.value);
+    uni.hideKeyboard();
+    awaitingAssigneeReturn = true;
+    assigneeLeaveToken++;
+    callPopupMethod("close");
+    uni.navigateTo({ url: "/pages/todo/todo-assignees" });
+  }
+
+  /** 从负责人页返回后，把页面上的人选和完成模式写回，并重新打开新建待办。 */
+  function resumeAfterAssignees(): void {
+    if (!awaitingAssigneeReturn) {
+      return;
+    }
+    awaitingAssigneeReturn = false;
+    assignees.value = getTodoAssignees();
+    const nextMode = getTodoCompleteMode();
+    if (nextMode == "single" || nextMode == "ratio" || nextMode == "all") {
+      completeMode.value = nextMode;
+    }
+    measureSheet();
+    callPopupMethod("open");
   }
 
   function setRemind(value: string): void {
@@ -368,6 +597,7 @@
   defineExpose({
     open: open as any,
     close: close as any,
+    resumeAfterAssignees: resumeAfterAssignees as any,
   });
 </script>
 
@@ -378,6 +608,7 @@
     flex-direction: column;
     background-color: #ffffff;
     overflow: hidden;
+    position: relative;
   }
 
   .todo-create__header {
@@ -419,6 +650,10 @@
     margin-top: 18px;
   }
 
+  .todo-create__label-row--spaced {
+    margin-bottom: 8px;
+  }
+
   .todo-create__label {
     margin-top: 18px;
     margin-bottom: 8px;
@@ -451,11 +686,14 @@
   .todo-create__assignee-wrap {
     display: flex;
     flex-direction: row;
+    flex-wrap: wrap;
   }
 
   .todo-create__assignee {
     height: 36px;
-    padding: 0 12px 0 4px;
+    margin-right: 8px;
+    margin-bottom: 0;
+    padding: 0 6px 0 4px;
     border-width: 1px;
     border-style: solid;
     border-color: #e5e6eb;
@@ -463,6 +701,11 @@
     display: flex;
     flex-direction: row;
     align-items: center;
+  }
+
+  .todo-create__assignee--empty {
+    padding: 0 12px;
+    border-style: dashed;
   }
 
   .todo-create__avatar {
@@ -473,12 +716,38 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    overflow: hidden;
+  }
+
+  .todo-create__avatar-text {
+    font-size: 10px;
+    color: #ffffff;
   }
 
   .todo-create__assignee-name {
     margin-left: 6px;
     font-size: 14px;
     color: #1f2329;
+  }
+
+  .todo-create__assignee-name--empty {
+    margin-left: 0;
+    color: #86909c;
+  }
+
+  .todo-create__assignee-remove {
+    width: 20px;
+    height: 20px;
+    margin-left: 2px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .todo-create__assignee-remove-text {
+    font-size: 16px;
+    color: #86909c;
+    line-height: 16px;
   }
 
   .todo-create__date {

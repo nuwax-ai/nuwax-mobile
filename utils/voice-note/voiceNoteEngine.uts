@@ -11,7 +11,6 @@ import {
   removeVoiceNote,
   saveBackfillGate,
   upsertVoiceNote,
-  VoiceNoteBackfillGate,
   VoiceNoteRecord,
   VoiceNoteSegmentRecord,
 } from "@/utils/voice-note/voiceNoteStore.uts";
@@ -104,6 +103,8 @@ let activeBackfillLocalId = "";
 let historyBackfillLocalIds: string[] = [];
 /** 正在创建笔记的本地会话。不同会话可以同时创建，同一条不重复创建。 */
 let noteCreateLocalIds: string[] = [];
+/** 完成时创建笔记失败后，自动再补一次。避免和「开始录音」撞在同一次未结束的上传上后再也没人试。 */
+let noteCreateRetryLocalId = "";
 /** 这一次录音已经申请过后台录音。前台、后台、继续录音都不再重复申请。 */
 let backgroundOn = false;
 
@@ -945,7 +946,10 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     record.phase = "uploading";
     record.awaitComplete = true;
     record.segmentStartedAt = 0;
-    record.openSegmentPath = "";
+    // 没收到分段就清掉路径的话，文件还在磁盘上，补传却找不到它。
+    if (closedIndex >= 0) {
+      record.openSegmentPath = "";
+    }
     touch(record);
     endBackground();
     stopTicker();
@@ -1114,9 +1118,6 @@ function writeSegmentUpload(
 
 /** 刚落下的一段在同一次上传里连续失败时，最多再试到 3 次，然后留给以后的补传。 */
 const maxSegmentUploadAttempts = 3;
-
-/** 两次补传开始时间至少间隔 2 分钟。不满就跳过这次。 */
-const backfillGapMs = 120000;
 
 /**
  * 补传只处理还没上传成功的分段。
@@ -1708,16 +1709,27 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
         const again = uploadRerunLocalId;
         uploadRerunLocalId = "";
         void pumpQueue(again, false);
+      } else {
+        retryMissingServerNote(localId);
       }
     }
   }
 }
 
-/** 补传总开关。正在补传，或距上次开始不满 2 分钟，这一轮都不开。 */
-function backfillBlocked(gate: VoiceNoteBackfillGate): boolean {
-  if (gate.catchingUp) return true;
-  if (gate.backfillStartedAt <= 0) return false;
-  return Date.now() - gate.backfillStartedAt < backfillGapMs;
+/**
+ * 点完成时还没有 noteId，创建失败就停在本地。
+ * 这里只自动再试一次，避免没网时连环重试。之后靠下次点开始录音再补。
+ */
+function retryMissingServerNote(localId: string): void {
+  if (backfillRunning || uploadRunning) return;
+  const latest = findVoiceNoteByLocalId(localId);
+  if (latest == null || !noteStillNeedsServerId(latest)) {
+    if (noteCreateRetryLocalId == localId) noteCreateRetryLocalId = "";
+    return;
+  }
+  if (noteCreateRetryLocalId == localId) return;
+  noteCreateRetryLocalId = localId;
+  void pumpQueue(localId, true, false, true);
 }
 
 function markBackfillRunning(running: boolean): void {
@@ -1727,7 +1739,7 @@ function markBackfillRunning(running: boolean): void {
   saveBackfillGate(gate);
 }
 
-/** 进程已不在补传。清掉上次异常退出留下的正在补传标记，保留开始时间。 */
+/** 进程已不在补传。清掉上次异常退出留下的正在补传标记。 */
 function clearStaleBackfillRunning(): void {
   if (backfillRunning) return;
   markBackfillRunning(false);
@@ -1916,6 +1928,35 @@ function backfillSkips(record: VoiceNoteRecord): boolean {
   return false;
 }
 
+/** 已经点过完成，但创建笔记失败，本地还有音频。历史列表要等 noteId 和上传。 */
+function noteStillNeedsServerId(record: VoiceNoteRecord): boolean {
+  if (record.noteId.length > 0) return false;
+  if (record.localId.length == 0) return false;
+  if (record.phase == "recording" || record.phase == "paused" || record.phase == "discarded" || record.phase == "success") {
+    return false;
+  }
+  if (hasUnstagedOpenFile(record)) return true;
+  for (let i = 0; i < record.segments.length; i++) {
+    if (segmentCanUpload(record.segments[i])) return true;
+  }
+  return false;
+}
+
+/** 没有 noteId 的已结束录音。正在上传的那一轮跳过名单不挡这些，否则断网那条不会补传。 */
+function missingServerNoteIds(): string[] {
+  const panel = panelVoiceNote();
+  const panelId = panel != null ? panel.localId : "";
+  const rows = loadVoiceNotes();
+  const ids: string[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (panelId.length > 0 && row.localId == panelId) continue;
+    if (!noteStillNeedsServerId(row)) continue;
+    ids.push(row.localId);
+  }
+  return ids;
+}
+
 /** 补传这一轮：还有分段没传完的，以及分段已全部上传、可以移出列表的。正在录、已暂停、面板上这一次不放进来。 */
 function backfillPassLocalIds(): string[] {
   const panel = panelVoiceNote();
@@ -1970,7 +2011,8 @@ async function runBackfillPass(ids: string[]): Promise<void> {
         await completeRecord(open);
       }
       const latest = findVoiceNoteByLocalId(localId);
-      if (latest != null && !backfillSkips(latest) && allSegmentsUploaded(latest)) {
+      // 还没有 noteId，或完成接口还没成功，不能删本地文件。历史里还没有这条。
+      if (latest != null && latest.noteId.length > 0 && !latest.awaitComplete && !backfillSkips(latest) && allSegmentsUploaded(latest) && !hasUnstagedOpenFile(latest)) {
         deleteVoiceNoteFiles(latest);
         deleteVoiceNote(latest.localId);
       }
@@ -1983,19 +2025,22 @@ async function runBackfillPass(ids: string[]): Promise<void> {
 }
 
 /**
- * 只在点击开始录音后调用。上一轮还没结束，或距上次开始不满 2 分钟，都跳过。
+ * 只在点击开始录音后调用。本进程这一轮还在补传就直接返回。
  * 只补还有分段没上传成功的会话。传完就从补传列表去掉，不再查转写，也不为转写或文档失败重试。
  */
 function startBackfill(): void {
   if (backfillRunning) return;
   clearStaleBackfillRunning();
-  const gate = loadBackfillGate();
-  if (backfillBlocked(gate)) return;
   const ids = backfillPassLocalIds();
+  const missing = missingServerNoteIds();
+  for (let i = 0; i < missing.length; i++) {
+    let seen = false;
+    for (let j = 0; j < ids.length; j++) {
+      if (ids[j] == missing[i]) seen = true;
+    }
+    if (!seen) ids.push(missing[i]);
+  }
   if (ids.length == 0) return;
-  gate.catchingUp = true;
-  gate.backfillStartedAt = Date.now();
-  saveBackfillGate(gate);
   backfillRunning = true;
   void runBackfillPass(ids);
 }

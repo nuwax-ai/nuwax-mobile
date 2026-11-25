@@ -702,6 +702,41 @@ export class VoipBridge {
     call.expiresAt = invite.expiresAt
     return call
   }
+  private static async loadIncomingAvatar(avatar: string): Promise<image.PixelMap | null> {
+    if (!avatar.startsWith('https://')) return null
+    const request = http.createHttp()
+    try {
+      const response = await request.request(avatar, {
+        method: http.RequestMethod.GET, expectDataType: http.HttpDataType.ARRAY_BUFFER,
+        connectTimeout: 1200, readTimeout: 1200, maxLimit: 2 * 1024 * 1024,
+      })
+      if (response.responseCode !== 200 || !(response.result instanceof ArrayBuffer)) return null
+      const source = image.createImageSource(response.result)
+      try {
+        return await source.createPixelMap({ desiredSize: { width: 96, height: 96 },
+          desiredPixelFormat: image.PixelMapFormat.RGBA_8888 })
+      } finally { await source.release().catch(() => {}) }
+    } finally { request.destroy() }
+  }
+  private static incomingAvatar(verification: Promise<CallData | null>, pending: PendingIncoming): Promise<image.PixelMap | null> {
+    const budget = Math.min(1800, pending.invite.expiresAt - Date.now() - 250)
+    if (budget <= 0) return Promise.resolve(null)
+    // Keep the Huawei reporting deadline independent of the profile or IM server response.
+    return new Promise<image.PixelMap | null>(resolve => {
+      let timedOut = false
+      const timer = setTimeout(() => { timedOut = true; resolve(null) }, budget)
+      verification.then(call => {
+        if (timedOut || VoipBridge.pendingIncoming !== pending) return null
+        return VoipBridge.loadIncomingAvatar(call?.callerAvatar ?? '')
+      }).catch((): image.PixelMap | null => null).then(picture => {
+        clearTimeout(timer)
+        if (timedOut || VoipBridge.pendingIncoming !== pending) {
+          picture?.release().catch(() => {})
+          resolve(null)
+        } else resolve(picture)
+      })
+    })
+  }
   static clearPendingIncoming(): void {
     const pending = VoipBridge.pendingIncoming
     if (pending) clearTimeout(pending.timer)
@@ -743,7 +778,10 @@ export class VoipBridge {
     VoipBridge.pendingIncoming = pending
     VoipBridge.traceIncoming(verifiedCall ? 'onlineInvitation' : 'received', invite.callId)
     try {
-      const picture = await image.createPixelMap(new Uint8Array([61, 89, 139, 255]).buffer, { size: { width: 1, height: 1 }, pixelFormat: image.PixelMapFormat.RGBA_8888 })
+      const verification = verifiedCall ? Promise.resolve<CallData | null>(verifiedCall) :
+        VoipBridge.resolvePushInvitation(pending).catch((): CallData | null => null)
+      const avatar = await VoipBridge.incomingAvatar(verification, pending)
+      const picture = avatar ?? await image.createPixelMap(new Uint8Array([61, 89, 139, 255]).buffer, { size: { width: 1, height: 1 }, pixelFormat: image.PixelMapFormat.RGBA_8888 })
       try {
         if (VoipBridge.pendingIncoming !== pending) {
           if (!verifiedCall) await voipCall.reportIncomingCallError(id, voipCall.VoipCallFailureCause.OTHER)
@@ -766,7 +804,8 @@ export class VoipBridge {
       VoipBridge.nativeId = id
       VoipBridge.rememberCallId(VoipBridge.reportedInvitations, invite.callId)
       VoipBridge.traceIncoming('systemRinging', invite.callId)
-      const call = verifiedCall ?? await VoipBridge.resolvePushInvitation(pending)
+      VoipBridge.traceIncoming(avatar ? 'systemAvatar=profile' : 'systemAvatar=fallback', invite.callId)
+      const call = await verification
       if (VoipBridge.pendingIncoming !== pending) return
       if (!call || invite.expiresAt <= Date.now() || VoipBridge.terminal.has(invite.callId)) {
         VoipBridge.dismissPendingIncoming()

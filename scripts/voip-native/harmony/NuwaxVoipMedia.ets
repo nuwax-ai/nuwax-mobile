@@ -196,10 +196,11 @@ struct NuwaxVoipMedia {
       if (!this.showVideo()) {
         Stack() {
           Stack() {
-            Text(this.peerName().slice(0, 1)).fontSize(44).fontWeight(FontWeight.Medium).fontColor('#F0F5F2')
             if (this.avatar.startsWith('https://') && !this.avatarFailed) {
               Image(this.avatar).width('100%').height('100%').objectFit(ImageFit.Cover)
                 .onError(() => { this.avatarFailed = true })
+            } else {
+              Text(this.peerName().slice(0, 1)).fontSize(44).fontWeight(FontWeight.Medium).fontColor('#F0F5F2')
             }
           }.width(104).height(104).backgroundColor('#71867C').borderRadius(24).clip(true)
         }.width(116).height(116).border({ width: 1, color: '#1AFFFFFF', radius: 30 }).margin({ bottom: 25 })
@@ -290,8 +291,14 @@ struct NuwaxVoipMedia {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
+      Column()
+        .width('100%').height('100%')
+        .linearGradient({ direction: GradientDirection.Bottom, colors: [['#46534F', 0], ['#202827', 1]] })
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+        .hitTestBehavior(HitTestMode.None)
       Web({ src: $rawfile('voip/media.html'), controller: this.web })
         .width('100%').height('100%').opacity(this.showVideo() ? 1 : 0)
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
         .javaScriptAccess(true).fileAccess(true).domStorageAccess(false).mediaPlayGestureAccess(false)
         .javaScriptProxy({ object: this.proxy, name: 'NuwaxVoip', methodList: ['postMessage'], controller: this.web })
         .onLoadIntercept(event => { return !event.data.getRequestUrl().startsWith('resource://') && !event.data.getRequestUrl().startsWith('file://') })
@@ -312,7 +319,7 @@ struct NuwaxVoipMedia {
       if (this.showVideo()) {
         Column().width('100%').height(320).linearGradient({
           direction: GradientDirection.Bottom, colors: [[Color.Transparent, 0], ['#D9000000', 1]]
-        }).hitTestBehavior(HitTestMode.None)
+        }).expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM]).hitTestBehavior(HitTestMode.None)
       }
       Column() {
         this.header()
@@ -320,6 +327,6 @@ struct NuwaxVoipMedia {
         Blank()
         this.callDock()
       }.width('100%').height('100%')
-    }.width('100%').height('100%').linearGradient({ direction: GradientDirection.Bottom, colors: [['#46534F', 0], ['#202827', 1]] })
+    }.width('100%').height('100%')
   }
 }

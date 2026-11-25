@@ -4,7 +4,7 @@ const token = vi.hoisted(() => ({ get: vi.fn() }));
 const transport = vi.hoisted(() => ({ request: vi.fn(), destroy: vi.fn() }));
 const kits = vi.hoisted(() => ({
   receive: vi.fn(), loadAsset: vi.fn(), report: vi.fn(), reportError: vi.fn(), reportState: vi.fn(),
-  onCall: vi.fn(), createPicture: vi.fn(), createCallId: vi.fn(),
+  onCall: vi.fn(), createPicture: vi.fn(), createImageSource: vi.fn(), createCallId: vi.fn(),
 }));
 vi.mock('BuildProfile', () => ({ default: { DEBUG: true } }));
 vi.mock('@kit.AbilityKit', () => ({ bundleManager: {
@@ -13,7 +13,7 @@ vi.mock('@kit.AbilityKit', () => ({ bundleManager: {
 } }));
 vi.mock('@kit.NetworkKit', () => ({ http: {
   createHttp: () => ({ request: transport.request, destroy: transport.destroy }),
-  HttpDataType: { STRING: 0 }, RequestMethod: { GET: 'GET', POST: 'POST' },
+  HttpDataType: { STRING: 0, ARRAY_BUFFER: 1 }, RequestMethod: { GET: 'GET', POST: 'POST' },
 } }));
 vi.mock('@kit.ArkTS', () => ({ util: { generateRandomUUID: kits.createCallId, TextEncoder: class {
   encodeInto(value: string) { return new TextEncoder().encode(value); }
@@ -38,7 +38,9 @@ vi.mock('@kit.CallServiceKit', () => ({ voipCall: {
     VOIP_CALL_EVENT_REJECT: 'reject', VOIP_CALL_EVENT_HANGUP: 'hangup' },
 } }));
 vi.mock('@kit.BackgroundTasksKit', () => ({ backgroundTaskManager: {} }));
-vi.mock('@kit.ImageKit', () => ({ image: { createPixelMap: kits.createPicture, PixelMapFormat: { RGBA_8888: 0 } } }));
+vi.mock('@kit.ImageKit', () => ({ image: {
+  createPixelMap: kits.createPicture, createImageSource: kits.createImageSource, PixelMapFormat: { RGBA_8888: 0 },
+} }));
 vi.mock('@kit.AudioKit', () => ({ audio: {} }));
 vi.mock('@kit.ArkWeb', () => ({ webview: {} }));
 
@@ -66,6 +68,7 @@ beforeEach(() => {
   kits.reportError.mockReset().mockResolvedValue(undefined);
   kits.reportState.mockReset().mockResolvedValue(undefined);
   kits.createPicture.mockReset().mockResolvedValue({ release: vi.fn() });
+  kits.createImageSource.mockReset();
   kits.createCallId.mockReset().mockReturnValue('local-system-call');
   vi.spyOn(VoipBridge, 'startStream').mockImplementation(() => {});
   vi.spyOn(VoipBridge, 'finish').mockImplementation(() => {});
@@ -125,8 +128,9 @@ describe('Harmony system call cold start', () => {
     expect(VoipBridge.current?.callId).toBe(callId);
   });
 
-  it('reports the system call before IM validation and processes an early locked-screen voice answer once', async () => {
+  it('reports the system call when IM validation is slow and processes an early locked-screen voice answer once', async () => {
     setup();
+    vi.useFakeTimers();
     let resolveMessage!: (value: any) => void;
     vi.mocked(VoipBridge.request).mockReturnValueOnce(new Promise(resolve => { resolveMessage = resolve; }))
       .mockResolvedValueOnce(detail as any);
@@ -134,9 +138,8 @@ describe('Harmony system call cold start', () => {
     const media = vi.spyOn(VoipBridge, 'startMedia').mockImplementation(() => {});
 
     const pending = VoipBridge.incoming(push());
-    await vi.waitFor(() => expect(VoipBridge.request).toHaveBeenCalledExactlyOnceWith(
-      `/api/instant-message/messages/${msgId}?convId=${convId}`, '', true));
-    expect(kits.report.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(VoipBridge.request).mock.invocationCallOrder[0]);
+    expect(VoipBridge.request).toHaveBeenCalledExactlyOnceWith(`/api/instant-message/messages/${msgId}?convId=${convId}`, '', true);
+    await vi.advanceTimersByTimeAsync(1800);
     await VoipBridge.incoming(push());
     await VoipBridge.incoming(push({}, 'duplicate-system-call'));
     await VoipBridge.receiveInvitation(message() as any);
@@ -160,6 +163,52 @@ describe('Harmony system call cold start', () => {
     VoipBridge.mediaEvent(JSON.stringify({ type: 'peerMediaReady', callId }));
     expect(kits.reportState).toHaveBeenLastCalledWith(systemId, 'active', 'voice');
     expect(VoipBridge.current?.state).toBe('active');
+  });
+
+  it('reports the verified caller profile without using an avatar from the push payload', async () => {
+    setup();
+    const avatar = 'https://cdn.example/caller.png';
+    const body = new ArrayBuffer(64);
+    const picture = { release: vi.fn() };
+    const source = { createPixelMap: vi.fn().mockResolvedValue(picture), release: vi.fn().mockResolvedValue(undefined) };
+    kits.createImageSource.mockReturnValue(source);
+    transport.request.mockResolvedValue({ responseCode: 200, result: body });
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce({ ...detail, peerAvatar: avatar } as any);
+
+    await VoipBridge.incoming(push({ callerAvatar: 'https://unverified.example/other.png' }));
+
+    expect(transport.request).toHaveBeenCalledExactlyOnceWith(avatar, expect.objectContaining({ method: 'GET' }));
+    expect(transport.request.mock.calls[0][1]).not.toHaveProperty('header');
+    expect(kits.createImageSource).toHaveBeenCalledWith(body);
+    expect(source.createPixelMap).toHaveBeenCalledWith(expect.objectContaining({ desiredSize: { width: 96, height: 96 } }));
+    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ callId: systemId, userProfile: picture }));
+    expect(kits.createPicture).not.toHaveBeenCalled();
+    expect(source.release).toHaveBeenCalledOnce();
+    expect(picture.release).toHaveBeenCalledOnce();
+  });
+
+  it('rings on time when decoding is slow and releases the late avatar', async () => {
+    setup();
+    vi.useFakeTimers();
+    const picture = { release: vi.fn().mockResolvedValue(undefined) };
+    let decoded!: (value: typeof picture) => void;
+    const decode = new Promise(resolve => { decoded = resolve; });
+    const fallback = { release: vi.fn() };
+    kits.createPicture.mockResolvedValue(fallback);
+    kits.createImageSource.mockReturnValue({ createPixelMap: () => decode, release: vi.fn().mockResolvedValue(undefined) });
+    transport.request.mockResolvedValue({ responseCode: 200, result: new ArrayBuffer(64) });
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any)
+      .mockResolvedValueOnce({ ...detail, peerAvatar: 'https://cdn.example/caller.png' } as any);
+
+    const pending = VoipBridge.incoming(push());
+    await vi.advanceTimersByTimeAsync(1800);
+    await pending;
+    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ userProfile: fallback }));
+    expect(VoipBridge.current?.callId).toBe(callId);
+
+    decoded(picture);
+    await vi.waitFor(() => expect(picture.release).toHaveBeenCalledOnce());
+    expect(kits.report).toHaveBeenCalledOnce();
   });
 
   it('reports a verified WS invitation in the background and rejects a later push as already presented', async () => {
@@ -190,10 +239,12 @@ describe('Harmony system call cold start', () => {
 
   it.each(['cancel', 'answered', 'account switch'])('drops validation after %s while ringing', async reason => {
     setup();
+    vi.useFakeTimers();
     let resolveMessage!: (value: any) => void;
     vi.mocked(VoipBridge.request).mockReturnValueOnce(new Promise(resolve => { resolveMessage = resolve; }));
     const pending = VoipBridge.incoming(push());
-    await vi.waitFor(() => expect(VoipBridge.nativeId).toBe(systemId));
+    await vi.advanceTimersByTimeAsync(1800);
+    expect(VoipBridge.nativeId).toBe(systemId);
     if (reason === 'account switch') VoipBridge.initialize({ ...config, userId: 'charlie' });
     else VoipBridge.receiveSignal({ eventType: `voip:${reason}`, payload: { convId, msgId, userId: 'alice' } } as any);
     resolveMessage(message()); await pending;
@@ -233,7 +284,8 @@ describe('Harmony system call cold start', () => {
     VoipBridge.reset();
     finishReport(0); await pending;
     expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
-    expect(VoipBridge.request).not.toHaveBeenCalled();
+    expect(VoipBridge.request).toHaveBeenCalledOnce();
+    expect(VoipBridge.current).toBeNull();
   });
 });
 

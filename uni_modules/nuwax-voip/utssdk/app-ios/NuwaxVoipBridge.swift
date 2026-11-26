@@ -41,6 +41,7 @@ import LiveKitClient
     private var microphone = true, camera = false, audioActive = false
     private var ownsCallAudio = false
     private var audioRouteChosen = false
+    private var defaultAudioRoutePending = false
     private var visibleCallPageID: String?
     private var pushRegistry: PKPushRegistry?
     private var callUUIDs: [String: UUID] = [:]
@@ -326,6 +327,7 @@ import LiveKitClient
         if !reuseTransport { startStream() }
         if let value = snapshot {
             emitSnapshot(value)
+            if defaultAudioRoutePending { emit("audioRoutePending", ["enabled": true]) }
             if connected { emit("connected") }; if peerReady { emit("peerMediaReady") }
         }
     }
@@ -655,7 +657,7 @@ import LiveKitClient
         let ranks = ["ringing", "connecting", "active", "ended"]
         guard let rank = ranks.firstIndex(of: state), (value["version"] as? Int ?? 0) > 0 else { return }
         if let previous = snapshot, previous["callId"] as? String == id, let oldRank = ranks.firstIndex(of: previous["state"] as? String ?? ""), rank < oldRank { return }
-        if snapshot?["callId"] as? String != id { microphone = true; camera = value["mediaType"] as? String == "video"; systemPaused = false; audioInterrupted = false; audioRouteChosen = false }
+        if snapshot?["callId"] as? String != id { microphone = true; camera = value["mediaType"] as? String == "video"; systemPaused = false; audioInterrupted = false; audioRouteChosen = false; defaultAudioRoutePending = false }
         snapshot = value; observeHistory(value); emitSnapshot(value)
         updateProximity()
         if state == "ended" { finish(); return }
@@ -713,6 +715,9 @@ import LiveKitClient
         mediaId = id; connected = false; peerReady = false; readySent = false
         cancelRemoteLeft(); everHadRemote = false
         let run = generation
+        let defaultRoutePending = value["mediaType"] as? String == "audio" && !audioRouteChosen
+        defaultAudioRoutePending = defaultRoutePending
+        if defaultRoutePending { emit("audioRoutePending", ["enabled": true]) }
         mediaTask = Task { @MainActor in
             do {
                 if value["mediaType"] as? String != "video" { self.camera = false }
@@ -752,6 +757,16 @@ import LiveKitClient
                     do { try AVAudioSession.sharedInstance().overrideOutputAudioPort(.none) }
                     catch { self.trace("default earpiece route unavailable") }
                     self.emitAudioRoutes()
+                }
+                if defaultRoutePending {
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 300_000_000)
+                        guard run == self.generation, self.snapshot?["callId"] as? String == id,
+                              self.room === next, !self.terminal.contains(id) else { return }
+                        self.emitAudioRoutes()
+                        self.defaultAudioRoutePending = false
+                        self.emit("audioRoutePending", ["enabled": false])
+                    }
                 }
                 try await next.localParticipant.setMicrophone(enabled: self.microphone)
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id else { await next.disconnect(); return }
@@ -855,7 +870,7 @@ import LiveKitClient
         reconnectTask?.cancel(); reconnectTask = nil; reconnectWindow.cancel()
         cancelRemoteLeft(); everHadRemote = false
         let old = room; room = nil; for item in views { item.view?.track = nil }
-        audioActive = false; systemPaused = false; audioInterrupted = false
+        audioActive = false; systemPaused = false; audioInterrupted = false; defaultAudioRoutePending = false
         let hadCallAudio = ownsCallAudio
         ownsCallAudio = false
         if hadCallAudio { try? AudioManager.shared.setEngineAvailability(.none) }

@@ -857,8 +857,9 @@ function writeFileBytes(path: string, raw: ArrayBuffer): boolean {
 }
 
 /**
- * 64kbps、16kHz、单声道 AAC-LC，每帧 512 字节、1024 个采样。
- * 进程被杀掉时 AVRecorder.stop() 没写 moov，这里按固定帧长补上。
+ * 进程被杀掉时 AVRecorder.stop() 没写 moov。
+ * 当前 MediaKit 没有音频编码器输出回调，也没有解码器，录的时候拿不到每帧长度。
+ * AVRecorder 按 64000bps、16kHz、1024 采样写出的就是固定 512 字节一帧，这里按这个长度原样拷贝。
  */
 function sealUnsealedM4a(path: string): string {
   const source = readFileBytes(path)
@@ -968,7 +969,7 @@ function edgeHasMoov(view: DataView, fileLength: number): boolean {
   if (scanMoov(view, fileLength, 0, 65536)) {
     return true
   }
-  const tail = fileLength > 262144 ? fileLength - 262144 : 0
+  const tail = fileLength > 4194304 ? fileLength - 4194304 : 0
   return scanMoov(view, fileLength, tail, fileLength - tail)
 }
 
@@ -978,10 +979,12 @@ function scanMoov(view: DataView, fileLength: number, from: number, limit: numbe
   if (end > fileLength) {
     end = fileLength
   }
-  while (pos + 8 <= end) {
+  while (pos + 20 <= end) {
     if (view.getUint32(pos + 4) == BOX_MOOV) {
       const size = view.getUint32(pos)
-      if (size == 0 || (size >= 8 && pos + size <= fileLength)) {
+      const header = size == 1 ? 16 : 8
+      const typeAt = pos + header + 4
+      if (typeAt + 4 <= fileLength && view.getUint32(typeAt) == BOX_MVHD) {
         return true
       }
     }

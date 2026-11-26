@@ -1,13 +1,6 @@
 <template>
   <view class="vh-page">
-    <safety-zone />
-    <view class="vh-nav">
-      <view class="vh-nav__side" @click="handleBack">
-        <svg-icon name="icon-a-Chevronleft" size="22" unit="px" color="#1a1a1a" />
-      </view>
-      <text class="vh-nav__title">历史记录</text>
-      <view class="vh-nav__side"></view>
-    </view>
+    <custom-nav-bar title="历史记录" showBack hasSafetyZone interceptBack backgroundColor="#f4f5f7" @back="handleBack" />
     <scroll-view
       class="vh-list"
       scroll-y="true"
@@ -53,6 +46,9 @@
       <view v-if="records.length > 0" class="vh-footer">
         <text class="vh-footer__text">{{ footerText }}</text>
       </view>
+      <view v-else-if="listLoaded" class="vh-empty">
+        <empty-state text="暂无历史记录" />
+      </view>
     </scroll-view>
     <uni-modal-popup
       ref="audioSheetRef"
@@ -96,8 +92,9 @@
  */
 import { type ComponentPublicInstance } from "vue";
 import { apiVoiceNoteAudioFiles, apiVoiceNoteDelete, apiVoiceNoteDetail, apiVoiceNoteList, apiVoiceNoteReprocess } from "@/servers/voiceNote.uts";
-import { backfillVoiceNoteByNoteId, deleteCachedVoiceNoteFiles } from "@/utils/voice-note/voiceNoteEngine.uts";
+import { backfillVoiceNoteByNoteId, completeOrphanUploadingNote, deleteCachedVoiceNoteFiles, orphanUploadNeedsComplete, startBackfill } from "@/utils/voice-note/voiceNoteEngine.uts";
 import { loadRecordingNoteId } from "@/utils/voice-note/voiceNoteStore.uts";
+import EmptyState from "@/components/empty-state/empty-state.uvue";
 import UniModalPopup from "@/components/uni-modal-popup/uni-modal-popup.uvue";
 import SpinLoading from "@/subpackages/components/spin-loading/spin-loading.uvue";
 // #ifdef APP
@@ -137,6 +134,8 @@ type VoiceAudioFileItem = {
 const records = ref<VoiceRecordHistoryItem[]>([]);
 /** 请求进行中，避免下拉和上拉叠在一起 */
 const loading = ref<boolean>(false);
+/** 至少完成过一次列表请求。首屏请求回来前不显示空态，避免进页先闪「暂无历史记录」。 */
+const listLoaded = ref<boolean>(false);
 /** 打开文档的全屏 loading。只挡住文档请求本身，不和行内转圈共用。 */
 const actionLocked = ref<boolean>(false);
 /** 正在删除的 noteId。每条各自转圈，互不影响。 */
@@ -421,12 +420,61 @@ function applyStatus(item: VoiceRecordHistoryItem, status: string): void {
   item.detail = statusLabel(status) + " · " + item.segmentCount.toString() + " 段";
 }
 
+function readAudioFiles(data: UTSJSONObject | null): VoiceAudioFileItem[] {
+  const result: VoiceAudioFileItem[] = [];
+  if (data == null) return result;
+  const raw = data["items"];
+  if (raw == null) return result;
+  const rows = raw as UTSJSONObject[];
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const urlRaw = row["audioUrl"];
+    const url = urlRaw != null ? `${urlRaw}` : "";
+    if (url.length == 0 || url == "null") continue;
+    let segmentIndex = i;
+    const indexRaw = row["segmentIndex"];
+    if (indexRaw != null) {
+      const parsed = parseFloat(`${indexRaw}`);
+      if (!isNaN(parsed)) segmentIndex = Math.floor(parsed);
+    }
+    let durationMs = 0;
+    const durationRaw = row["durationMs"];
+    if (durationRaw != null) {
+      const parsedDuration = parseFloat(`${durationRaw}`);
+      if (!isNaN(parsedDuration)) durationMs = parsedDuration;
+    }
+    const file: VoiceAudioFileItem = {
+      segmentIndex: segmentIndex,
+      duration: formatDuration(durationMs),
+      audioUrl: url,
+    };
+    result.push(file);
+  }
+  return result;
+}
+
+/** 本地文件已经没了时，用列表或音频列表上的分段数补一次 complete。 */
+async function completeHistoryUpload(item: VoiceRecordHistoryItem): Promise<void> {
+  if (!orphanUploadNeedsComplete(item.id)) return;
+  let total = item.segmentCount;
+  if (total <= 0) {
+    try {
+      const data = await apiVoiceNoteAudioFiles(item.id, 1, 50);
+      total = readAudioFiles(data).length;
+    } catch (_e) {
+      total = 0;
+    }
+  }
+  completeOrphanUploadingNote(item.id, total);
+}
+
 /** 只处理这一页已经查出来、状态是上传中的记录。未加载的页不补。 */
 function backfillUploadingHistory(items: VoiceRecordHistoryItem[]): void {
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     if (item.status != "UPLOADING") continue;
     backfillVoiceNoteByNoteId(item.id);
+    void completeHistoryUpload(item);
   }
 }
 
@@ -476,6 +524,7 @@ async function loadRecords(reset: boolean): Promise<void> {
   } finally {
     loading.value = false;
     refreshing.value = false;
+    listLoaded.value = true;
   }
 }
 
@@ -551,39 +600,6 @@ function openDetail(item: VoiceRecordHistoryItem): void {
   }
   // 返回动画未结束时再进详情会报 navigateTo locked，并留下未处理的拒绝。
   navigateToPageOnce("/subpackages/pages/voice-record-detail/voice-record-detail?noteId=" + encodeURIComponent(item.id));
-}
-
-function readAudioFiles(data: UTSJSONObject | null): VoiceAudioFileItem[] {
-  const result: VoiceAudioFileItem[] = [];
-  if (data == null) return result;
-  const raw = data["items"];
-  if (raw == null) return result;
-  const rows = raw as UTSJSONObject[];
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const urlRaw = row["audioUrl"];
-    const url = urlRaw != null ? `${urlRaw}` : "";
-    if (url.length == 0 || url == "null") continue;
-    let segmentIndex = i;
-    const indexRaw = row["segmentIndex"];
-    if (indexRaw != null) {
-      const parsed = parseFloat(`${indexRaw}`);
-      if (!isNaN(parsed)) segmentIndex = Math.floor(parsed);
-    }
-    let durationMs = 0;
-    const durationRaw = row["durationMs"];
-    if (durationRaw != null) {
-      const parsedDuration = parseFloat(`${durationRaw}`);
-      if (!isNaN(parsedDuration)) durationMs = parsedDuration;
-    }
-    const file: VoiceAudioFileItem = {
-      segmentIndex: segmentIndex,
-      duration: formatDuration(durationMs),
-      audioUrl: url,
-    };
-    result.push(file);
-  }
-  return result;
 }
 
 /** 拉第一页音频列表，最多 50 条，在弹窗里展示。 */
@@ -684,9 +700,10 @@ function handleDelete(item: VoiceRecordHistoryItem): void {
   });
 }
 
-/** 每次进入页面都从第一页重拉，保证状态和刚处理完的结果一致。 */
+/** 每次进入页面都从第一页重拉，并补一轮本地未传完的录音。已在补传中则不再开一轮。 */
 onShow(() => {
   void loadRecords(true);
+  startBackfill();
 });
 </script>
 
@@ -694,28 +711,6 @@ onShow(() => {
 .vh-page {
   flex: 1;
   background-color: #f4f5f7;
-}
-
-.vh-nav {
-  height: 88rpx;
-  flex-direction: row;
-  align-items: center;
-  padding: 0 8rpx;
-}
-
-.vh-nav__side {
-  width: 88rpx;
-  height: 88rpx;
-  justify-content: center;
-  padding-left: 16rpx;
-}
-
-.vh-nav__title {
-  flex: 1;
-  text-align: center;
-  font-size: 34rpx;
-  font-weight: 600;
-  color: #1a1a1a;
 }
 
 .vh-list {
@@ -780,6 +775,11 @@ onShow(() => {
 
 .vh-card__btn-text--plain {
   margin-left: 0;
+}
+
+.vh-empty {
+  padding-top: 80rpx;
+  align-items: center;
 }
 
 .vh-footer {

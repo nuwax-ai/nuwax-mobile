@@ -9,6 +9,7 @@ help:
 	@echo "自定义基座 · 只生成包 → unpackage/debug/"
 	@echo "  make base-android         # android_debug.apk"
 	@echo "  make base-ios-device       # iOS_debug.ipa（真机）"
+	@echo "  make ios-tester            # 生成可独立安装的 iOS 测试环境 IPA"
 	@echo "  make base-ios-simulator   # Pandora_simulator_debug.app（模拟器）"
 	@echo "  make base-all             # 上述三份（仅出包，不生成资源、不上 S3）"
 	@echo "  make base-ship            # 一键：appResource → 出包 → 上传 S3"
@@ -40,6 +41,13 @@ base-android:
 # 发给测试同学：流程化打接近发行性能的完整 APK（非上架证书）
 android-tester:
 	@bash "$(ROOT)scripts/android-esp/build_tester_release_apk.sh"
+
+# 合入带 VoIP 的分支后，由该分支的 iOS tester 规则构建完整 App。
+ifeq ($(wildcard $(ROOT)scripts/voip-native/package-business-qa-ios.sh),)
+.PHONY: ios-tester
+ios-tester:
+	@HX_CLI="$(HX_CLI)" bash "$(ROOT)scripts/ios-tester/build.sh"
+endif
 
 # 应用市场正式包：生产配置、正式证书、APK+AAB，并执行签名/版本验收
 android-release:

@@ -13,7 +13,10 @@ import android.media.MediaMuxer
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.SystemClock
+import android.util.Log
 import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 
 /**
@@ -38,6 +41,9 @@ class VoiceNoteM4aBridge {
     private var segmentSamples: Long = 0
     private var lastClosedDurationMs: Int = 0
     private var currentPath: String = ""
+    private var frameLog: FileOutputStream? = null
+    private var frameLogPath: String = ""
+    private var framesSinceSync: Int = 0
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
     private var interruptHold: Boolean = false
@@ -445,6 +451,7 @@ class VoiceNoteM4aBridge {
         muxerStarted = false
         segmentSamples = 0
         currentPath = path
+        openFrameLog(path)
         return true
     }
 
@@ -490,6 +497,7 @@ class VoiceNoteM4aBridge {
                 output.limit(info.offset + info.size)
                 try {
                     muxer?.writeSampleData(trackIndex, output, info)
+                    noteFrameSize(info.size)
                 } catch (_e: Exception) {
                 }
             }
@@ -508,6 +516,29 @@ class VoiceNoteM4aBridge {
         trackIndex = current.addTrack(format)
         current.start()
         muxerStarted = true
+        rememberCsd(format)
+    }
+
+    /** 编码器自己的 AudioSpecificConfig。补封口必须用这份，写死的参数解出来是静音。 */
+    private fun rememberCsd(format: MediaFormat) {
+        if (!format.containsKey("csd-0")) {
+            return
+        }
+        val buf = format.getByteBuffer("csd-0") ?: return
+        val dup = buf.duplicate()
+        dup.position(0)
+        if (dup.remaining() <= 0) {
+            return
+        }
+        val bytes = ByteArray(dup.remaining())
+        dup.get(bytes)
+        if (currentPath.isEmpty()) {
+            return
+        }
+        try {
+            File("$currentPath.csd").writeBytes(bytes)
+        } catch (_e: Exception) {
+        }
     }
 
     private fun closeEncoder() {
@@ -531,9 +562,11 @@ class VoiceNoteM4aBridge {
             }
             lastClosedDurationMs = (segmentSamples * 1000L / SAMPLE_RATE).toInt()
         }
+        var sealedByStop = false
         try {
             if (muxerStarted) {
                 muxer?.stop()
+                sealedByStop = true
             }
         } catch (_e: Exception) {
         }
@@ -555,6 +588,67 @@ class VoiceNoteM4aBridge {
         muxerStarted = false
         segmentSamples = 0
         currentPath = ""
+        closeFrameLog(sealedByStop)
+    }
+
+    /** 每帧长度另写一份。进程被杀掉时 mdat 里没有长度表，靠这份把每一帧原样封回去。 */
+    private fun openFrameLog(path: String) {
+        closeFrameLog(false)
+        val logPath = "$path.frames"
+        frameLogPath = logPath
+        framesSinceSync = 0
+        frameLog = try {
+            File(logPath).delete()
+            FileOutputStream(logPath, false)
+        } catch (_e: Exception) {
+            null
+        }
+    }
+
+    private fun noteFrameSize(size: Int) {
+        val out = frameLog ?: return
+        if (size <= 0) {
+            return
+        }
+        try {
+            out.write(
+                byteArrayOf(
+                    (size ushr 24).toByte(),
+                    (size ushr 16).toByte(),
+                    (size ushr 8).toByte(),
+                    size.toByte(),
+                ),
+            )
+            framesSinceSync += 1
+            if (framesSinceSync >= 8) {
+                out.fd.sync()
+                framesSinceSync = 0
+            }
+        } catch (_e: Exception) {
+        }
+    }
+
+    private fun closeFrameLog(delete: Boolean) {
+        val out = frameLog
+        val path = frameLogPath
+        frameLog = null
+        frameLogPath = ""
+        framesSinceSync = 0
+        if (out != null) {
+            try {
+                out.fd.sync()
+            } catch (_e: Exception) {
+            }
+            try {
+                out.close()
+            } catch (_e: Exception) {
+            }
+        }
+        if (delete && path.isNotEmpty()) {
+            File(path).delete()
+            val stem = if (path.endsWith(".frames")) path.removeSuffix(".frames") else path
+            File("$stem.csd").delete()
+        }
     }
 
     private fun preparePath(context: Context, localId: String, indexName: String): String? {
@@ -580,30 +674,75 @@ class VoiceNoteM4aBridge {
 
     /**
      * 进程被杀掉时 MediaMuxer.stop() 没跑到，m4a 只有 ftyp 和 mdat。
-     * 64kbps、16kHz、单声道 AAC-LC 每帧 512 字节。补上 moov 后再替换原文件。
-     * 已经有 moov 的文件原样返回成功。
+     * 已经有 moov 的文件原样返回，不再按固定帧长重写。
+     * 没有 moov 时用录制时记下的每帧长度补封口。
      */
     fun sealFile(path: String): String {
         val source = File(path)
         if (!source.isFile || source.length() < 16) {
             return "0:unreadable"
         }
+        // 正常的录音文件 stop() 已经写过 moov，只读头尾确认一下就返回，
+        // 绝不读整文件、更不重写，保证正常文件不会被再封一次。
+        if (fileHasMoov(source)) {
+            File("$path.frames").delete()
+            File("$path.csd").delete()
+            return "1"
+        }
+        // 补封口要把整个文件读进内存。太长的会话直接拒绝，避免 OOM 把进程拖垮
+        // （OOM 是 Error 不是 Exception，下面的 catch 抓不住，会一路冒到引擎里变成裸 "0"）。
+        if (source.length() > MAX_SEAL_BYTES) {
+            return "0:toolarge"
+        }
         val bytes = try {
             source.readBytes()
-        } catch (_e: Exception) {
+        } catch (_e: Throwable) {
             return "0:unreadable"
         }
-        if (mp4HasMoov(bytes) || mp4EdgeHasMoov(bytes)) {
+        // 头尾没扫到 moov，再按完整 box 链兜一次底。
+        if (mp4HasMoov(bytes) || mp4ContainsMoov(bytes)) {
+            File("$path.frames").delete()
+            File("$path.csd").delete()
             return "1"
         }
         val payload = mp4MdatPayload(bytes) ?: return "0:layout"
         if (payload.isEmpty()) {
             return "0:nomdat"
         }
-        val frames = payload.size / AAC_FRAME_BYTES
-        if (frames <= 0) {
-            return "0:short"
+        val sizes = readFrameSizes("$path.frames")
+        if (sizes.isEmpty()) {
+            return "0:nosizes"
         }
+        // 帧日志每秒都 fsync，mdat 却是 MediaMuxer 内部缓冲、被 kill 时通常只剩一个前缀。
+        // 残片不到预期的一半，说明音频基本没落盘，补出来只会是一段没有声音的 m4a。
+        // 这种情况直接判失败，交给引擎重试/丢弃，绝不能当成补封口成功上传。
+        var expected = 0
+        var maxFrame = 0
+        var minFrame = Int.MAX_VALUE
+        for (size in sizes) {
+            expected += size
+            if (size > maxFrame) maxFrame = size
+            if (size < minFrame) minFrame = size
+        }
+        if (expected <= 0) {
+            return "0:nosizes"
+        }
+        val avgFrame = expected / sizes.size
+        // 诊断：帧长正常（几百字节）说明采到了声音，静音输出就是封口写错；
+        // 帧长极小（几字节）说明采集阶段本来就是静音，问题不在封口。
+        Log.i(
+            "NuwaxVoiceNote",
+            "seal expected=$expected payload=${payload.size} frames=${sizes.size} min=$minFrame max=$maxFrame avg=$avgFrame",
+        )
+        if (payload.size * 2 < expected) {
+            return "0:partial"
+        }
+        // 被 kill 时 MediaMuxer 的 mdat 头会被这里多算 8 字节（16 字节头按 8 字节头解），
+        // 取出的 payload 开头就多出 8 字节，后面每一帧都错位、解出来整段静音（但有 moov、有档长）。
+        // 帧长已经对齐到 mdat 尾部，把多出来的这点从开头剔掉即可。
+        val lead = payload.size - expected
+        val base = if (lead in 1..16) lead else 0
+        val csd = readCsd("$path.csd")
         val tmp = File("$path.sealed")
         if (tmp.exists()) {
             tmp.delete()
@@ -613,22 +752,35 @@ class VoiceNoteM4aBridge {
         format.setInteger(MediaFormat.KEY_BIT_RATE, 64000)
         format.setInteger(MediaFormat.KEY_SAMPLE_RATE, SAMPLE_RATE)
         format.setInteger(MediaFormat.KEY_CHANNEL_COUNT, 1)
-        format.setByteBuffer("csd-0", ByteBuffer.wrap(byteArrayOf(0x14, 0x08)))
+        format.setByteBuffer("csd-0", ByteBuffer.wrap(csd))
         val muxer = try {
             MediaMuxer(tmp.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         } catch (_e: Exception) {
             return "0:create"
         }
+        var framesWritten = 0
         try {
             val track = muxer.addTrack(format)
             muxer.start()
             val info = MediaCodec.BufferInfo()
+            var offset = 0
             var index = 0
-            while (index < frames) {
-                val packet = ByteBuffer.wrap(payload, index * AAC_FRAME_BYTES, AAC_FRAME_BYTES)
-                info.set(0, AAC_FRAME_BYTES, index * 1024L * 1000000L / SAMPLE_RATE, 0)
+            while (index < sizes.size) {
+                val size = sizes[index]
+                if (size <= 0 || base + offset + size > payload.size) {
+                    break
+                }
+                val packet = ByteBuffer.allocateDirect(size)
+                packet.put(payload, base + offset, size)
+                packet.flip()
+                info.set(0, size, index * 1024L * 1000000L / SAMPLE_RATE, 0)
                 muxer.writeSampleData(track, packet, info)
+                offset += size
                 index += 1
+            }
+            framesWritten = index
+            if (index <= 0) {
+                throw IllegalStateException("no frame")
             }
             muxer.stop()
         } catch (_e: Exception) {
@@ -645,11 +797,11 @@ class VoiceNoteM4aBridge {
         }
         val sealed = try {
             tmp.readBytes()
-        } catch (_e: Exception) {
+        } catch (_e: Throwable) {
             tmp.delete()
             return "0:verify"
         }
-        if (!mp4HasMoov(sealed)) {
+        if (!mp4HasMoov(sealed) && !mp4ContainsMoov(sealed)) {
             tmp.delete()
             return "0:verify"
         }
@@ -667,7 +819,115 @@ class VoiceNoteM4aBridge {
             return "0:replace"
         }
         backup.delete()
-        return "1"
+        File("$path.frames").delete()
+        File("$path.csd").delete()
+        var csdHex = ""
+        for (b in csd) {
+            csdHex += "%02x".format(b.toInt() and 0xff)
+        }
+        val realMin = if (minFrame == Int.MAX_VALUE) 0 else minFrame
+        val stats = "n=" + sizes.size + ",w=" + framesWritten + ",min=" + realMin +
+            ",max=" + maxFrame + ",avg=" + avgFrame + ",tot=" + expected +
+            ",pay=" + payload.size + ",lead=" + lead + ",base=" + base + ",csd=" + csdHex
+        Log.i("NuwaxVoiceNote", "seal ok " + stats)
+        return "1|" + stats
+    }
+
+    private fun readCsd(path: String): ByteArray {
+        val file = File(path)
+        if (!file.isFile || file.length() <= 0L || file.length() > 64L) {
+            return byteArrayOf(0x14, 0x08)
+        }
+        return try {
+            file.readBytes()
+        } catch (_e: Exception) {
+            byteArrayOf(0x14, 0x08)
+        }
+    }
+
+    private fun readFrameSizes(path: String): IntArray {
+        val file = File(path)
+        if (!file.isFile || file.length() < 4) {
+            return IntArray(0)
+        }
+        val raw = try {
+            file.readBytes()
+        } catch (_e: Exception) {
+            return IntArray(0)
+        }
+        val count = raw.size / 4
+        val sizes = IntArray(count)
+        var kept = 0
+        while (kept < count) {
+            val pos = kept * 4
+            val size = ((raw[pos].toInt() and 0xff) shl 24) or
+                ((raw[pos + 1].toInt() and 0xff) shl 16) or
+                ((raw[pos + 2].toInt() and 0xff) shl 8) or
+                (raw[pos + 3].toInt() and 0xff)
+            if (size <= 0 || size > 8192) {
+                break
+            }
+            sizes[kept] = size
+            kept += 1
+        }
+        if (kept <= 0) {
+            return IntArray(0)
+        }
+        return sizes.copyOf(kept)
+    }
+
+    /**
+     * 只读头尾判断 m4a 是否已经写过 moov，避免为了确认封口把整个文件读进内存。
+     * MediaMuxer 的 moov 落在文件末尾；faststart 的落在开头。两段都扫，覆盖正常录音文件。
+     */
+    private fun fileHasMoov(file: File): Boolean {
+        val size = file.length()
+        if (size < 16) {
+            return false
+        }
+        val raf = try {
+            RandomAccessFile(file, "r")
+        } catch (_e: Throwable) {
+            return false
+        }
+        try {
+            val headLen = if (size < 65536L) size.toInt() else 65536
+            val head = ByteArray(headLen)
+            raf.seek(0)
+            val headGot = readFully(raf, head, headLen)
+            if (headGot > 0 && mp4WindowHasMoov(head, 0, headGot)) {
+                return true
+            }
+            val tailLen = if (size > 4194304L) 4194304 else size.toInt()
+            val tail = ByteArray(tailLen)
+            raf.seek(size - tailLen)
+            val tailGot = readFully(raf, tail, tailLen)
+            return tailGot > 0 && mp4WindowHasMoov(tail, 0, tailGot)
+        } catch (_e: Throwable) {
+            return false
+        } finally {
+            try {
+                raf.close()
+            } catch (_e: Throwable) {
+            }
+        }
+    }
+
+    /** 尽量读满 length 字节，返回实际读到的数量。 */
+    private fun readFully(raf: RandomAccessFile, buffer: ByteArray, length: Int): Int {
+        var got = 0
+        while (got < length) {
+            val n = try {
+                raf.read(buffer, got, length - got)
+            } catch (_e: Throwable) {
+                break
+            }
+            if (n <= 0) {
+                break
+            }
+            got += n
+        }
+        return got
     }
 
     private fun mp4HasMoov(bytes: ByteArray): Boolean {
@@ -702,14 +962,15 @@ class VoiceNoteM4aBridge {
             var header = 8
             var boxSize = size32
             if (size32 == 1) {
-                if (pos + 16 > bytes.size || mp4Be32(bytes, pos + 8) != 0) {
-                    if (typeM && pos + header < bytes.size) {
-                        return bytes.copyOfRange(pos + header, bytes.size)
-                    }
+                // 64 位（large size）头固定 16 字节。被 kill 时 MediaMuxer 还没回填 64 位长度，
+                // 高 32 位是占位值；如果据此退回 8 字节头，样本会整体后移 8 字节、解出来整段静音。
+                if (pos + 16 > bytes.size) {
                     return null
                 }
-                boxSize = mp4Be32(bytes, pos + 12)
                 header = 16
+                val high = mp4Be32(bytes, pos + 8)
+                val low = mp4Be32(bytes, pos + 12)
+                boxSize = if (high == 0 && low >= 16 && pos + low <= bytes.size) low else bytes.size - pos
             } else if (size32 == 0 || size32 == -1) {
                 boxSize = bytes.size - pos
             }
@@ -736,24 +997,28 @@ class VoiceNoteM4aBridge {
         return ByteArray(0)
     }
 
-    /** mdat 长度写过头时，线性扫描到不了末尾的 moov。只看文件头尾，避免把音频字节误认成 moov。 */
-    private fun mp4EdgeHasMoov(bytes: ByteArray): Boolean {
-        if (mp4ScanMoov(bytes, 0, minOf(65536, bytes.size))) {
+    /** mdat 长度写成 0 时，顺序扫描到不了末尾的 moov。只在头尾找带 mvhd 的 moov，避免把音频字节误认成索引。 */
+    private fun mp4ContainsMoov(bytes: ByteArray): Boolean {
+        if (mp4WindowHasMoov(bytes, 0, minOf(65536, bytes.size))) {
             return true
         }
-        val tail = if (bytes.size > 262144) bytes.size - 262144 else 0
-        return mp4ScanMoov(bytes, tail, bytes.size - tail)
+        val tail = if (bytes.size > 4 * 1024 * 1024) bytes.size - 4 * 1024 * 1024 else 0
+        return mp4WindowHasMoov(bytes, tail, bytes.size)
     }
 
-    private fun mp4ScanMoov(bytes: ByteArray, from: Int, limit: Int): Boolean {
+    private fun mp4WindowHasMoov(bytes: ByteArray, from: Int, endAt: Int): Boolean {
         var pos = if (from < 0) 0 else from
-        val end = minOf(bytes.size, pos + limit)
-        while (pos + 8 <= end) {
+        val end = if (endAt > bytes.size) bytes.size else endAt
+        while (pos + 20 <= end) {
             val isMoov = bytes[pos + 4] == 0x6d.toByte() && bytes[pos + 5] == 0x6f.toByte() &&
                 bytes[pos + 6] == 0x6f.toByte() && bytes[pos + 7] == 0x76.toByte()
             if (isMoov) {
-                val size = mp4Be32(bytes, pos)
-                if (size == 0 || (size >= 8 && pos + size <= bytes.size)) {
+                val header = if (mp4Be32(bytes, pos) == 1) 16 else 8
+                val typeAt = pos + header + 4
+                val isMvhd = typeAt + 4 <= bytes.size &&
+                    bytes[typeAt] == 0x6d.toByte() && bytes[typeAt + 1] == 0x76.toByte() &&
+                    bytes[typeAt + 2] == 0x68.toByte() && bytes[typeAt + 3] == 0x64.toByte()
+                if (isMvhd) {
                     return true
                 }
             }
@@ -785,7 +1050,8 @@ class VoiceNoteM4aBridge {
 
     companion object {
         private const val SAMPLE_RATE = 16000
-        private const val AAC_FRAME_BYTES = 512
+        /** 补封口整文件读进内存的上限。超过就不补，避免 OOM。 */
+        private const val MAX_SEAL_BYTES = 256L * 1024L * 1024L
 
         @Volatile
         private var active: VoiceNoteM4aBridge? = null

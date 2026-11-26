@@ -4,6 +4,14 @@ enum NuwaxVoipPermission: String { case authorized, notDetermined, denied }
 enum NuwaxVoipPermissionPlan: Equatable { case ready, request, foreground, settings }
 
 enum NuwaxVoipClientPolicy {
+    static func pushProvider(info: [String: Any]) -> String {
+        if let provider = info["NuwaxVoipPushProvider"] as? String { return provider }
+        // Cloud hosts can include the UniPush SDK configuration without the custom provider key.
+        guard let getui = info["getui"] as? [String: Any],
+              ["appid", "appKey", "appSecret"].allSatisfy({ (getui[$0] as? String)?.isEmpty == false }) else { return "" }
+        return "unipush"
+    }
+
     /// Cloud packages do not inject build-specific plist metadata. The embedded
     /// provisioning profile supplies the APNs environment; App Store installs
     /// have no embedded profile and use production. An unreadable profile fails closed.

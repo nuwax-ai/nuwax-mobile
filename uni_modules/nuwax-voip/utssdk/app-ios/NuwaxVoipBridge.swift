@@ -60,7 +60,7 @@ import LiveKitClient
     private var pushRegistration: NuwaxVoipApnsRegistration?
     private var getuiBindingTask: Task<Void, Never>?
     private var getuiBinding: (token: Data, cid: String)?
-    private var pushProvider: String { Bundle.main.object(forInfoDictionaryKey: "NuwaxVoipPushProvider") as? String ?? "" }
+    private var pushProvider: String { NuwaxVoipClientPolicy.pushProvider(info: Bundle.main.infoDictionary ?? [:]) }
     private var systemBridge: NuwaxSystemCalling?
     #if DEBUG
     private var systemDiagnostics: NuwaxVoipSystemDiagnostics?

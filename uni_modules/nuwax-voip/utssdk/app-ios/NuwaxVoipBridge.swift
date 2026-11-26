@@ -321,7 +321,8 @@ import LiveKitClient
         if !reuseTransport { startStream() }
         if let value = snapshot {
             emitSnapshot(value)
-            if defaultAudioRoutePending { emit("audioRoutePending", ["enabled": true]) }
+            emit("audioRoutePending", ["enabled": defaultAudioRoutePending])
+            emitAudioRoutes()
             if connected { emit("connected") }; if peerReady { emit("peerMediaReady") }
             emit("remoteVideo", ["enabled": remoteVideo])
             emit("cameraSwitching", ["enabled": switchingCameraTrack != nil])
@@ -730,9 +731,9 @@ import LiveKitClient
         mediaId = id; connected = false; peerReady = false; readySent = false
         cancelRemoteLeft(); everHadRemote = false
         let run = generation
-        let defaultRoutePending = value["mediaType"] as? String == "audio" && !audioRouteChosen
-        defaultAudioRoutePending = defaultRoutePending
-        if defaultRoutePending { emit("audioRoutePending", ["enabled": true]) }
+        let preferSpeaker = value["mediaType"] as? String == "video"
+        defaultAudioRoutePending = !audioRouteChosen
+        if defaultAudioRoutePending { emit("audioRoutePending", ["enabled": true]) }
         mediaTask = Task { @MainActor in
             do {
                 if value["mediaType"] as? String != "video" { self.camera = false }
@@ -741,10 +742,8 @@ import LiveKitClient
                 guard !Task.isCancelled, run == self.generation, self.snapshot?["callId"] as? String == id, !self.terminal.contains(id) else { return }
                 let signal = credentials["serverUrl"] as? String ?? ""
                 guard signal.hasPrefix("wss://") || (self.configuration["development"] as? Bool == true && signal.hasPrefix("ws://")) else { throw VoipError.invalid }
-                if value["mediaType"] as? String == "audio" && !self.audioRouteChosen {
-                    AudioManager.shared.isSpeakerOutputPreferred = false
-                }
                 self.acquireCallAudio()
+                if !self.audioRouteChosen { AudioManager.shared.isSpeakerOutputPreferred = preferSpeaker }
                 let next = Room(delegate: self); self.room = next
                 try await next.connect(url: credentials["serverUrl"] as? String ?? "", token: credentials["participantToken"] as? String ?? "")
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id, !self.terminal.contains(id) else { await next.disconnect(); return }
@@ -768,24 +767,21 @@ import LiveKitClient
                     self.audioActive = true; self.updateAudioEngine()
                 }
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id else { await next.disconnect(); return }
-                if value["mediaType"] as? String == "audio" && !self.audioRouteChosen {
-                    // Clear any inherited speaker override without selecting the built-in mic over a headset.
-                    do { try AVAudioSession.sharedInstance().overrideOutputAudioPort(.none) }
-                    catch { self.trace("default earpiece route unavailable") }
-                    self.emitAudioRoutes()
-                }
-                if defaultRoutePending {
+                self.applyDefaultAudioRoute(preferSpeaker: preferSpeaker)
+                try await next.localParticipant.setMicrophone(enabled: self.microphone)
+                guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id else { await next.disconnect(); return }
+                if self.defaultAudioRoutePending {
                     Task { @MainActor in
                         try? await Task.sleep(nanoseconds: 300_000_000)
                         guard run == self.generation, self.snapshot?["callId"] as? String == id,
                               self.room === next, !self.terminal.contains(id) else { return }
+                        // Starting media can change the route after the system activates the audio session.
+                        self.applyDefaultAudioRoute(preferSpeaker: preferSpeaker)
                         self.emitAudioRoutes()
                         self.defaultAudioRoutePending = false
                         self.emit("audioRoutePending", ["enabled": false])
                     }
                 }
-                try await next.localParticipant.setMicrophone(enabled: self.microphone)
-                guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id else { await next.disconnect(); return }
                 if self.camera && UIApplication.shared.applicationState == .active { try await next.localParticipant.setCamera(enabled: true) }
                 if UIApplication.shared.applicationState != .active { try? await next.localParticipant.setCamera(enabled: false) }
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id else { await next.disconnect(); return }
@@ -1221,6 +1217,21 @@ import LiveKitClient
         }
         emit("audioInterrupted", ["enabled": systemPaused || audioInterrupted || !audioActive])
         updateProximity()
+    }
+    private func applyDefaultAudioRoute(preferSpeaker: Bool) {
+        guard audioActive, !audioRouteChosen else { return }
+        let session = AVAudioSession.sharedInstance()
+        let route = session.currentRoute
+        let otherBuiltInPort: AVAudioSession.Port = preferSpeaker ? .builtInReceiver : .builtInSpeaker
+        // Only switch between built-in outputs. Leave a routed headset with the system.
+        guard !route.outputs.isEmpty, route.outputs.allSatisfy({ $0.portType == otherBuiltInPort }),
+              route.inputs.allSatisfy({ $0.portType == .builtInMic }) else { return }
+        do {
+            if !preferSpeaker && session.categoryOptions.contains(.defaultToSpeaker) {
+                try configureCallAudioSession()
+            }
+            try session.overrideOutputAudioPort(preferSpeaker ? .speaker : .none)
+        } catch { trace("default audio route unavailable") }
     }
     private func selectAudioRoute(_ route: String) {
         audioRouteChosen = true

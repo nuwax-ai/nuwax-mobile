@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { stripTypeScriptTypes } from 'node:module';
+import vm from 'node:vm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const kits = vi.hoisted(() => ({
@@ -37,6 +40,33 @@ vi.mock('libnuwax_harmony_rtc.so', () => ({ default: { start: () => 1, stop: vi.
 
 import { HarmonyNativeVoice } from '../../scripts/voip-native/harmony-voice-qa/HarmonyNativeVoice.ets';
 import { EntryVoipBackgroundTask } from '../../uni_modules/nuwax-livekit/utssdk/app-harmony/EntryVoipBackgroundTask.ets';
+
+it('does not hold a late proximity lock after leaving the call screen', async () => {
+  const raw = readFileSync(new URL('../../scripts/voip-native/harmony/NuwaxVoipMedia.ets', import.meta.url), 'utf8');
+  const source = raw.slice(raw.indexOf('class CallProximityLock'), raw.indexOf('class MediaProxy'));
+  let grant!: (value: object) => void;
+  const create = vi.fn(() => new Promise<object>(resolve => { grant = resolve; }));
+  const Lock = vm.runInNewContext(stripTypeScriptTypes(source) + '\nCallProximityLock;', {
+    runningLock: { RunningLockType: { PROXIMITY_SCREEN_CONTROL: 2 }, isSupported: () => true, create },
+  });
+  const proximity = new Lock();
+  const hold = vi.fn();
+  const unhold = vi.fn();
+  const isHolding = vi.fn(() => false);
+  proximity.update(true);
+  proximity.update(true);
+  expect(create).toHaveBeenCalledOnce();
+  proximity.update(false);
+  grant({ hold, unhold, isHolding });
+  await new Promise(resolve => setImmediate(resolve));
+  expect(hold).not.toHaveBeenCalled();
+
+  proximity.update(true);
+  expect(hold).toHaveBeenCalledExactlyOnceWith(-1);
+  isHolding.mockReturnValue(true);
+  proximity.update(false);
+  expect(unhold).toHaveBeenCalledOnce();
+});
 
 function audioResource() {
   return { start: vi.fn(async () => {}), stop: vi.fn(async () => {}), release: vi.fn(async () => {}), on: vi.fn() };

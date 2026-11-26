@@ -17,10 +17,12 @@ export default class NuwaxVoipMediaAbility extends UIAbility {
   }
   onBackground(): void {
     VoipBridge.mediaForeground = false
+    VoipBridge.listeners.forEach(callback => callback())
     VoipBridge.media(JSON.stringify({ op: 'background', hidden: true }))
   }
   onForeground(): void {
     VoipBridge.mediaForeground = true
+    VoipBridge.listeners.forEach(callback => callback())
     VoipBridge.media(JSON.stringify({ op: 'background', hidden: false }))
     VoipBridge.resumeSystemVideoAnswer()
   }

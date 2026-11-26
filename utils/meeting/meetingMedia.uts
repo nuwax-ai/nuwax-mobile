@@ -31,6 +31,7 @@ import {
   switchCamera as livekitSwitchCamera,
   sendMeetingMessage as livekitSendMeetingMessage,
   drainMeetingMessages as livekitDrainMeetingMessages,
+  remoteSpeakingIdentity as livekitRemoteSpeakingIdentity,
   requestScreenShare as livekitRequestScreenShare,
   stopScreenShare as livekitStopScreenShare,
   isScreenShareOn as livekitIsScreenShareOn,
@@ -41,6 +42,10 @@ import {
   setMeetingPresentation as livekitSetMeetingPresentation,
   consumeMeetingRestoreRequest as livekitConsumeMeetingRestoreRequest,
 } from "@/uni_modules/nuwax-livekit";
+// #endif
+
+// #ifdef APP-IOS
+import { isMicEnabled as livekitIsMicEnabled, isSpeakerEnabled as livekitIsSpeakerEnabled } from "@/uni_modules/nuwax-livekit";
 // #endif
 
 // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
@@ -464,10 +469,21 @@ export function meetingMediaPlatform(): string {
   platform = "ios";
   // #endif
   // #ifdef APP-HARMONY
-  platform = "harmony";
+  platform = "harmonyos";
   // #endif
   return platform;
 }
+
+// #ifdef APP-IOS
+function refreshNativeAudioState(): boolean {
+  const mic = livekitIsMicEnabled();
+  const speaker = livekitIsSpeakerEnabled();
+  const audioChanged = state.micOn != mic || state.speakerOn != speaker;
+  state.micOn = mic;
+  state.speakerOn = speaker;
+  return audioChanged;
+}
+// #endif
 
 export function meetingMediaState(): MeetingMediaState {
   const copy = new MeetingMediaState();
@@ -476,6 +492,14 @@ export function meetingMediaState(): MeetingMediaState {
   copy.micOn = state.micOn;
   copy.cameraOn = state.cameraOn;
   copy.speakerOn = state.speakerOn;
+  // #ifdef APP-IOS
+  if (state.connected) {
+    try {
+      copy.micOn = livekitIsMicEnabled();
+      copy.speakerOn = livekitIsSpeakerEnabled();
+    } catch (_e) {}
+  }
+  // #endif
   copy.peopleCount = state.peopleCount;
   copy.plannedDurationSec = state.plannedDurationSec;
   copy.meetingStartedAtMs = state.meetingStartedAtMs;
@@ -729,6 +753,8 @@ export function meetingMediaSetMic(on: boolean): void {
     console.error(`[Meeting] setMic throw: ${_e}`);
   }
   console.error(`[Meeting] setMic ${on} <- native`);
+  // #endif
+  // #ifndef APP-IOS || APP-HARMONY
   state.micOn = on;
   changed();
   // #endif
@@ -772,6 +798,8 @@ export function meetingMediaSetSpeaker(on: boolean): void {
     livekitSetSpeaker(on);
   } catch (_e) {
   }
+  // #endif
+  // #ifndef APP-IOS || APP-HARMONY
   state.speakerOn = on;
   changed();
   // #endif
@@ -874,6 +902,23 @@ export function meetingMediaSetHandRaised(on: boolean): void {
   // #endif
 }
 
+/**
+ * 当前正在说话的远端成员 identity（空串 = 没有人在说）。
+ * 给「演讲者」布局挑大图用：页面在演讲者布局下按秒轮询。
+ */
+export function meetingMediaRemoteSpeakingIdentity(): string {
+  if (!state.connected) {
+    return "";
+  }
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
+  try {
+    return livekitRemoteSpeakingIdentity();
+  } catch (_e) {
+  }
+  // #endif
+  return "";
+}
+
 /** 查询本端举手状态；用于跨端变更后的轮询校准。 */
 export function meetingMediaLocalHandRaised(): boolean {
   if (!state.connected) {
@@ -888,9 +933,10 @@ export function meetingMediaLocalHandRaised(): boolean {
   return false;
 }
 
-/** Send a reliable PC-compatible chat/danmaku packet in the active room. */
+/** Send a reliable PC-compatible chat/danmaku packet in the active room.
+ *  ★不限长度：120 字是历史口径、并非服务端限制；硬上限只有 LiveKit 数据包大小。 */
 export function meetingMediaSendMessage(text: string, displayName: string, asDanmaku: boolean): void {
-  if (!state.connected || text.trim().length == 0 || text.trim().length > 120) return;
+  if (!state.connected || text.trim().length == 0) return;
   // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   try { livekitSendMeetingMessage(text.trim(), displayName, asDanmaku); } catch (_e) {}
   // #endif
@@ -904,23 +950,54 @@ export function meetingMediaDrainMessages(): string {
   return "[]";
 }
 
+/** 屏幕上一次「抢共享占位」失败的原因（空 = 成功 / 还没试过）。页面据此给出准确提示。 */
+let lastShareStartError = "";
+
+/** 读一次最近一次启动共享失败的原因：`busy` / `platform` / `disconnected` / `http:IM_xxx` / `threw`。 */
+export function meetingMediaScreenShareStartError(): string {
+  return lastShareStartError;
+}
+
 /** Acquire server ownership before prompting the platform screen-capture consent UI. */
 export async function meetingMediaStartScreenShare(room: string, label: string = "", cancelLabel: string = ""): Promise<boolean> {
-  if (!state.connected || activeRoom != room) return false;
+  lastShareStartError = "";
+  if (!state.connected) {
+    lastShareStartError = "disconnected";
+    return false;
+  }
   // #ifndef APP-HARMONY
-  if (meetingMediaPlatform() != "android" && meetingMediaPlatform() != "ios") return false;
+  if (meetingMediaPlatform() != "android" && meetingMediaPlatform() != "ios") {
+    lastShareStartError = "platform";
+    return false;
+  }
   // #endif
   // #ifdef APP-HARMONY
-  if (!livekitScreenCaptureSupported() || label.length == 0 || cancelLabel.length == 0) return false;
+  if (activeRoom != room) {
+    lastShareStartError = "disconnected";
+    return false;
+  }
+  if (!livekitScreenCaptureSupported() || label.length == 0 || cancelLabel.length == 0) {
+    lastShareStartError = "platform";
+    return false;
+  }
+  if (livekitIsScreenShareStopping()) {
+    lastShareStartError = "busy";
+    return false;
+  }
   // #endif
   // 后台整屏共享是新增能力；旧基座仍走原有 requestScreenShare，不能禁用已验证的应用内共享。
-  if (shareRequested || shareRequestInFlight || shareStopping) return false;
-  // #ifdef APP-HARMONY
-  if (livekitIsScreenShareStopping()) return false;
-  // #endif
+  if (shareRequested || shareRequestInFlight || shareStopping) {
+    lastShareStartError = "busy";
+    return false;
+  }
   // #ifdef APP-ANDROID || APP-IOS
   if (backgroundSessionReady) {
-    try { if (livekitIsScreenShareStopping()) return false; } catch (_e) {}
+    try {
+      if (livekitIsScreenShareStopping()) {
+        lastShareStartError = "busy";
+        return false;
+      }
+    } catch (_e) {}
   }
   // #endif
   shareRequestInFlight = true;
@@ -931,9 +1008,10 @@ export async function meetingMediaStartScreenShare(room: string, label: string =
   shareRequested = true;
   shareAttemptStartedAt = Date.now();
   try {
-    const response = await apiImMeetingTakeShareHolder(room);
+    const response = await apiImMeetingTakeShareHolder(room, meetingMediaPlatform());
     if (generation != connectGeneration || activeRoom != room || attempt != shareGeneration) {
       // 申请占位过程中退出，迟到的成功结果也要归还原席位。
+      lastShareStartError = "left";
       if (apiResCode(response) == SUCCESS_CODE && seatToken.length > 0) {
         // #ifdef APP-HARMONY
         try { await apiImMeetingGuestReleaseShareHolder(room, seatToken); } catch (_error) {}
@@ -946,7 +1024,9 @@ export async function meetingMediaStartScreenShare(room: string, label: string =
     }
     if (apiResCode(response) != SUCCESS_CODE) {
       // 共享失败定位口：服务端拒绝（限流/权限）与端上授权失败要能分开
-      console.error(`[Meeting] takeShareHolder failed code=${apiResCode(response)}`);
+      const failCode = apiResCode(response);
+      lastShareStartError = `http:${failCode}`;
+      console.error(`[Meeting] takeShareHolder failed code=${failCode} platform=${meetingMediaPlatform()}`);
       shareRequested = false;
       return false;
     }
@@ -958,6 +1038,7 @@ export async function meetingMediaStartScreenShare(room: string, label: string =
     // #ifdef APP-HARMONY
     shareNativeRequested = livekitPrepareScreenCapture(label, cancelLabel, meetingShareReleaseEndpoint(room), seatToken);
     if (!shareNativeRequested) {
+      lastShareStartError = "platform";
       shareRequested = false;
       try { await apiImMeetingGuestReleaseShareHolder(room, seatToken); } catch (_error) {}
       return false;
@@ -965,6 +1046,7 @@ export async function meetingMediaStartScreenShare(room: string, label: string =
     // #endif
     return true;
   } catch (_e) {
+    lastShareStartError = "threw";
     if (generation == connectGeneration) {
       shareRequested = false;
       if (seatToken.length > 0) {
@@ -1032,6 +1114,9 @@ export function meetingMediaReconcile(expectedRoom: string = ""): void {
       configureConnectedBackgroundSession();
       restored = true;
     }
+    // #ifdef APP-IOS
+    try { if (refreshNativeAudioState()) restored = true; } catch (_e) {}
+    // #endif
     const on = livekitIsScreenShareOn();
     const error = livekitScreenShareError();
     if (on) shareObservedOn = true;

@@ -35,7 +35,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
   const navigationObservers = new Map();
   let now = 10000;
   let nextTimer = 0, connected = false, configured = false, claims = 0;
-  let microphone = false, remoteScreen = false, shareError = '', releases = 0;
+  let microphone = false, speaker = true, remoteScreen = false, shareError = '', releases = 0;
   const globals = {
     console: { error: value => logs.push(String(value)) },
     Date: { now: () => now },
@@ -53,6 +53,8 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
       configured = false; // Android 原生 connect 会清理上一场配置。
     },
     livekitIsConnected: () => connected,
+    livekitIsMicEnabled: () => microphone,
+    livekitIsSpeakerEnabled: () => speaker,
     livekitLastError: () => '', livekitParticipantCount: () => connected ? 1 : 0,
     livekitConfigureBackgroundSession(endpoint, token) {
       assert.equal(connected, true, '不能在原生连接成功前配置后台能力');
@@ -66,10 +68,10 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     livekitMicEnabled: () => microphone,
     livekitCameraEnabled: () => false,
     livekitSpeakerEnabled: () => true,
-    livekitSetMic: on => operations.push(on ? 'unmute' : 'mute'),
+    livekitSetMic: on => operations.push(platform === 'APP-HARMONY' ? (on ? 'unmute' : 'mute') : `mic:${on}`),
     livekitSetCamera: on => operations.push(on ? 'cameraOn' : 'cameraOff'),
     livekitSwitchCamera: () => operations.push('flipCamera'),
-    livekitSetSpeaker: on => operations.push(on ? 'speaker' : 'earpiece'),
+    livekitSetSpeaker: on => operations.push(platform === 'APP-HARMONY' ? (on ? 'speaker' : 'earpiece') : `speaker:${on}`),
     livekitRemoteVideoIdentities: () => '',
     livekitRemoteScreenVisible: () => remoteScreen,
     livekitScreenCaptureSupported: () => screenSupported,
@@ -140,6 +142,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
       vm.runInContext('state.connected = false; state.connecting = false; state.errorText = "exception";', context);
     },
     nativeConnected(value) { connected = value; },
+    nativeAudio(mic, output) { microphone = mic; speaker = output; },
     advance(ms = 1000) { now += ms; },
     requestRestore(persistent = false) { restoreRequested = true; persistentRestore = persistent; },
     restoreAcks: () => restoreAcks,
@@ -654,18 +657,18 @@ test('会议共享请求使用鸿蒙席位，保持 Android 和 iOS 请求形状
   const source = readFileSync(new URL('../servers/imMeeting.uts', import.meta.url), 'utf8');
   const start = source.indexOf('export async function apiImMeetingTakeShareHolder(');
   const end = source.indexOf('\n}', start) + 2;
-  for (const platform of ['APP-HARMONY', 'APP-ANDROID', 'APP-IOS']) {
+  for (const platform of ['harmonyos', 'android', 'ios']) {
     let sent;
-    const part = forPlatform(source.slice(start, end), platform).replace('export ', '');
+    const part = source.slice(start, end).replace('export ', '');
     const context = vm.createContext({
-      MEETING_RTC_BASE: '/meetings/rtc', enc: encodeURIComponent, imDevicePlatform: () => 'harmonyos',
+      MEETING_RTC_BASE: '/meetings/rtc', enc: encodeURIComponent,
       request: async options => { sent = options; },
     });
     vm.runInContext(stripTypeScriptTypes(part), context);
-    await context.apiImMeetingTakeShareHolder('123456789');
+    await context.apiImMeetingTakeShareHolder('123456789', platform);
     assert.equal(sent.url, '/meetings/rtc/rooms/123456789/share-holder');
     assert.equal(sent.method, 'POST');
-    assert.equal(sent.data?.platform, platform === 'APP-HARMONY' ? 'harmonyos' : undefined);
+    assert.equal(sent.data?.platform, platform);
   }
 });
 
@@ -828,4 +831,21 @@ test('鸿蒙切换会场后丢弃在途成员头像结果', async () => {
   resolved('file://sandbox/photo.png');
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(current.avatar, '');
+});
+
+test('iOS 会议音频按钮以原生启麦和路由的实际结果为准', async () => {
+  const h = harness();
+  await h.join();
+  h.complete();
+  assert.equal(h.api.meetingMediaState().micOn, false);
+  assert.equal(h.api.meetingMediaState().speakerOn, true);
+  h.api.meetingMediaSetMic(true);
+  h.api.meetingMediaSetSpeaker(false);
+  assert.deepEqual(h.operations.slice(-2), ['mic:true', 'speaker:false']);
+  assert.equal(h.api.meetingMediaState().micOn, false);
+  assert.equal(h.api.meetingMediaState().speakerOn, true);
+  h.nativeAudio(true, false);
+  h.api.meetingMediaReconcile();
+  assert.equal(h.api.meetingMediaState().micOn, true);
+  assert.equal(h.api.meetingMediaState().speakerOn, false);
 });

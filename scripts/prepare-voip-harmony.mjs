@@ -63,6 +63,7 @@ if (!config.module.abilities.some(value => value.name === 'NuwaxVoipMediaAbility
   launchType: 'singleton', backgroundModes: ['voip'], label: '$string:voip_call_label',
 });
 const callAbility = config.module.abilities.find(value => value.name === 'NuwaxVoipMediaAbility');
+callAbility.orientation = 'portrait';
 callAbility.startWindowIcon = main.startWindowIcon;
 callAbility.startWindowBackground = main.startWindowBackground;
 const permissions = JSON5.parse(await readFile(`${root}/uni_modules/nuwax-voip/utssdk/app-harmony/module.json5`, 'utf8')).module.requestPermissions;

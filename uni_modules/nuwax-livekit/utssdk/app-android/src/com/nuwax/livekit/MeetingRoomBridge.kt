@@ -165,7 +165,8 @@ class MeetingRoomBridge(context: Context) {
     try {
       val payload = JSONObject(String(event.data, Charsets.UTF_8))
       val text = payload.optString("text", "").trim()
-      if (text.isEmpty() || text.length > 120) return
+      // 不按字数裁剪：智能体入会会发 markdown 正文，120 字只是老口径
+      if (text.isEmpty()) return
       val item = JSONObject()
       item.put("text", text)
       item.put("name", payload.optString("name", event.participant?.name ?: ""))
@@ -188,7 +189,7 @@ class MeetingRoomBridge(context: Context) {
     val r = room ?: return
     val s = scope ?: return
     val cleanText = text.trim()
-    if (!connectedFlag || cleanText.isEmpty() || cleanText.length > 120) return
+    if (!connectedFlag || cleanText.isEmpty()) return
     val topic = if (danmaku) "danmaku" else "meeting-chat"
     val payload = JSONObject().put("text", cleanText).put("name", displayName).toString().toByteArray(Charsets.UTF_8)
     s.launch {
@@ -507,6 +508,30 @@ class MeetingRoomBridge(context: Context) {
       return 0
     }
     return r.remoteParticipants.values.count { !isEgressParticipant(it) } + 1
+  }
+
+  /**
+   * 当前正在说话的远端成员 identity（空串 = 没有人在说）。
+   * 给「演讲者」布局选大图用：由页面在演讲者布局下轮询（SDK 的 speaking 事件流暂未接）。
+   * ★多个在说时取音量最大的一个；只认 isSpeaking，避免底噪把画面拽走。
+   */
+  fun remoteSpeakingIdentity(): String {
+    val r = room ?: return ""
+    return try {
+      var best = ""
+      var bestLevel = 0.0
+      for (p in r.remoteParticipants.values) {
+        if (!p.isSpeaking) continue
+        val level = p.audioLevel.toDouble()
+        if (level >= bestLevel) {
+          best = p.identity?.value ?: ""
+          bestLevel = level
+        }
+      }
+      best
+    } catch (_: Throwable) {
+      ""
+    }
   }
 
   /** 房间 metadata：服务端更新后 LiveKit 会同步到 Room，本端由页面轮询读取。 */

@@ -84,8 +84,11 @@ export default class EntryAbility extends UniEntryAbility {
     expect(source.match(/VoipBridge\.bindPush\(this\)/g)).toHaveLength(1);
     const { abilities, requestPermissions } = JSON.parse(project.read(moduleFile)).module;
     expect(abilities[0].skills).toEqual([{ actions: ['action.system.home'] }, { actions: [listener] }]);
-    expect(abilities[1]).toMatchObject({ name: 'NuwaxVoipMediaAbility', backgroundModes: ['voip'], exported: false });
+    expect(abilities[1]).toMatchObject({
+      name: 'NuwaxVoipMediaAbility', orientation: 'portrait', backgroundModes: ['voip'], exported: false,
+    });
     expect(requestPermissions.map((permission: { name: string }) => permission.name)).toContain('ohos.permission.MICROPHONE');
+    expect(requestPermissions.map((permission: { name: string }) => permission.name)).toContain('ohos.permission.RUNNING_LOCK');
     expect(JSON.parse(project.read(`${entry}/resources/base/profile/main_pages.json`)).src)
       .toEqual(['pages/Index', 'pages/NuwaxVoipMedia']);
     const media = `${entry}/resources/rawfile/voip`;

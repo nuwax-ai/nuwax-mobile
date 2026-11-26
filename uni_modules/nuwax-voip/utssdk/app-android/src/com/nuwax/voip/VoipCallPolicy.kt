@@ -72,6 +72,7 @@ internal class VoipIncomingNotificationGate {
 
     fun wasPresented(id: String) = incomingId == id && presented
     fun wasPresentedFirst(id: String) = incomingId == id && presentedFirst
+    fun hasUnpresentedAlert(id: String) = incomingId == id && !presented
 
     fun reset() {
         incomingId = null

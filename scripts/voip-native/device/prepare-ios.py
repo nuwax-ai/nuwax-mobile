@@ -162,7 +162,9 @@ for p in sorted((RES/'uni_modules').iterdir()):
  # a newer private native implementation when rebuilding the offline host.
  for swift in (ROOT/'uni_modules'/p.name/'utssdk/app-ios').glob('*.swift'):
   shutil.copy2(swift,dest/swift.name)
- settings={'PRODUCT_BUNDLE_IDENTIFIER':('com.nuwax.app.module.' if BUSINESS else 'com.nuwax.test.')+module,'GENERATE_INFOPLIST_FILE':'YES','DEFINES_MODULE':'YES'}
+ # PRODUCT_NAME must be explicit: newer Xcode no longer falls back to $(TARGET_NAME)
+ # for framework targets, which produced '.framework' and a duplicate-output error.
+ settings={'PRODUCT_BUNDLE_IDENTIFIER':('com.nuwax.app.module.' if BUSINESS else 'com.nuwax.test.')+module,'PRODUCT_NAME':module,'GENERATE_INFOPLIST_FILE':'YES','DEFINES_MODULE':'YES'}
  deps=[{'framework':str(libs[n]),'embed':False} for n in ['DCloudUTSFoundation','DCloudUniappRuntime','DCloudUTSExtAPI']]
  if BUSINESS:
   config_file=ROOT/'uni_modules'/p.name/'utssdk/app-ios/config.json'

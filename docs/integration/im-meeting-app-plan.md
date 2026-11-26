@@ -226,7 +226,8 @@ preparing/connecting → 失败/取消 → 释放资源 → ended
 - `RoomMetadataChanged`：读取 `muteAll`、`danmaku`、主持信息等；入会时也先读取快照。
 - 权限变更、TrackPublished/Unpublished/Muted、成员增减和说话人事件：更新对应成员与轨道。
 - 举手：participant attributes `handRaised='1'`，放下用空字符串。
-- 聊天 topic `meeting-chat`，弹幕 topic `danmaku`；可靠发送 UTF-8 JSON `{text,name}`，文字上限与 PC 的 120 保持一致；本地发送成功后补一次本地展示，避免 SDK 不回传自己的消息。
+- 聊天 topic `meeting-chat`，弹幕 topic `danmaku`；可靠发送 UTF-8 JSON `{text,name}`；本地发送成功后补一次本地展示，避免 SDK 不回传自己的消息。
+- 文字长度：120 字是早期端上自设口径（PC 也各自截），**不是服务端限制**；现已取消端上字数限制（页面输入、UTS 适配层、Android/iOS 原生桥都不再裁剪），真正的硬上限只有 LiveKit 单个数据包大小。正文按 markdown 渲染（智能体入会后会发 markdown）；PC 端 `livekitRoom.ts` 仍在发送/接收时 `slice(0, 120)`，跨端对齐需同步放开。
 - 会中聊天当前为房内实时数据，不承诺离线补拉、历史持久化和会后可读；如需保存应增加服务端能力。
 - 邀请链接优先 `shareSlug`，保留旧会议号链接兼容；slug 是分享定位信息，不是主持人凭据。
 

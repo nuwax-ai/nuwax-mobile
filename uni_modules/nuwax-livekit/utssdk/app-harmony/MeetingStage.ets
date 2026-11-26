@@ -56,6 +56,7 @@ interface BrowserEvent {
   cameraAllowed?: boolean
   level?: number
   raised?: boolean
+  remoteSpeaker?: string
   metadata?: string
   videos?: string
   shared?: boolean
@@ -65,6 +66,8 @@ interface BrowserEvent {
   shareId?: number
   error?: string
   message?: MeetingMessage
+  identity?: string
+  thumbnail?: boolean
 }
 
 export class MeetingStageSession {
@@ -99,12 +102,26 @@ export class MeetingStageSession {
   static people: number = 0
   static level: number = 0
   static raised: boolean = false
+  static remoteSpeaker: string = ''
   static metadata: string = ''
   static videos: string = ''
   static messages: MeetingMessage[] = []
+  private static stageTap: string = ''
+
+  static setStagePresentation(mountId: number, presentation: string): void {
+    if (MeetingStageSession.mount?.id === mountId) MeetingStageSession.host?.setStagePresentation(presentation)
+  }
+
+  static consumeStageTap(mountId: number): string {
+    if (MeetingStageSession.mount?.id !== mountId) return ''
+    const tap = MeetingStageSession.stageTap
+    MeetingStageSession.stageTap = ''
+    return tap
+  }
 
   static attach(context: common.UIAbilityContext, pipLabel: string): MeetingStageMount {
     MeetingStageSession.mount?.detach()
+    MeetingStageSession.stageTap = ''
     const host = MeetingStageSession.host ?? new MeetingStageHost(context)
     MeetingStageSession.host = host
     host.setPictureInPictureLabel(pipLabel)
@@ -182,9 +199,11 @@ export class MeetingStageSession {
     MeetingStageSession.people = 0
     MeetingStageSession.level = 0
     MeetingStageSession.raised = false
+    MeetingStageSession.remoteSpeaker = ''
     MeetingStageSession.metadata = ''
     MeetingStageSession.videos = ''
     MeetingStageSession.messages = []
+    MeetingStageSession.stageTap = ''
     return leaving ?? Promise.resolve(true)
   }
 
@@ -384,6 +403,7 @@ export class MeetingStageSession {
       MeetingStageSession.cameraAllowed = event.cameraAllowed === true
       MeetingStageSession.level = event.level ?? 0
       MeetingStageSession.raised = event.raised === true
+      MeetingStageSession.remoteSpeaker = event.remoteSpeaker ?? ''
       MeetingStageSession.metadata = event.metadata ?? ''
       MeetingStageSession.videos = event.videos ?? ''
       MeetingStageSession.shared = event.shared === true
@@ -399,6 +419,8 @@ export class MeetingStageSession {
     } else if (event.type === 'message' && event.message) {
       if (MeetingStageSession.messages.length >= 100) MeetingStageSession.messages.shift()
       MeetingStageSession.messages.push(event.message)
+    } else if (event.type === 'stageTap' && event.identity && MeetingStageSession.mount) {
+      MeetingStageSession.stageTap = JSON.stringify(event)
     } else if (event.type === 'error') {
       if (event.error === 'connect') MeetingStageSession.error = event.error
       else MeetingStageSession.controlError = event.error ?? ''
@@ -413,6 +435,7 @@ export class MeetingStageHost {
   private context: common.UIAbilityContext
   private stage: BuilderNode<[MeetingStageHost]> | undefined
   private pipLabel: string = ''
+  private stagePresentation: string = ''
   leaving: Promise<boolean> | undefined
   private leavingId: number = -1
   private leaveTimer: number = -1
@@ -441,6 +464,14 @@ export class MeetingStageHost {
   setPictureInPictureLabel(label: string): void {
     this.pipLabel = label
     if (this.ready) this.controller.runJavaScript('window.meetingMedia.setPictureInPictureLabel(' + JSON.stringify(label) + ')').catch(() => {})
+  }
+
+  setStagePresentation(presentation: string): void {
+    this.stagePresentation = presentation
+    if (this.ready && presentation.length > 0) {
+      this.controller.runJavaScript('window.meetingMedia.setStagePresentation(' +
+        JSON.stringify(presentation) + ')').catch(() => {})
+    }
   }
 
   closePictureInPicture(): void {
@@ -501,6 +532,7 @@ export class MeetingStageHost {
       this.screenSupported = result === '2'
       if (this.ready) {
         this.setPictureInPictureLabel(this.pipLabel)
+        this.setStagePresentation(this.stagePresentation)
         MeetingStageSession.flush()
       } else MeetingStageSession.error = 'connect'
     }).catch(() => {

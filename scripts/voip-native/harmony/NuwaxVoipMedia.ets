@@ -1,6 +1,36 @@
 import { webview } from '@kit.ArkWeb'
 import { abilityAccessCtrl } from '@kit.AbilityKit'
+import { audio } from '@kit.AudioKit'
+import { runningLock } from '@kit.BasicServicesKit'
 import { VoipBridge } from '@uni_modules/nuwax-voip'
+
+class CallProximityLock {
+  private lock: runningLock.RunningLock | undefined
+  private wanted: boolean = false
+  private pending: boolean = false
+  private supported: boolean = true
+
+  update(wanted: boolean): void {
+    this.wanted = wanted
+    try {
+      const lock = this.lock
+      if (lock) {
+        if (wanted && !lock.isHolding()) lock.hold(-1)
+        else if (!wanted && lock.isHolding()) lock.unhold()
+        return
+      }
+      if (!wanted || this.pending || !this.supported) return
+      const kind = runningLock.RunningLockType.PROXIMITY_SCREEN_CONTROL
+      this.supported = runningLock.isSupported(kind)
+      if (!this.supported) return
+      this.pending = true
+      runningLock.create('NuwaxVoipEarpiece', kind).then(created => {
+        this.lock = created
+        this.update(this.wanted)
+      }).catch(() => { this.supported = false }).finally(() => { this.pending = false })
+    } catch (_) {}
+  }
+}
 
 class MediaProxy { postMessage(raw: string): void { VoipBridge.mediaEvent(raw) } }
 
@@ -44,6 +74,7 @@ struct NuwaxVoipMedia {
   private closeTimer = -1
   private visible = false
   private displayedCallId = ''
+  private proximity: CallProximityLock = new CallProximityLock()
   @State private lastPeer: string = ''
   @State private lastVideo: boolean = false
   @State private avatar: string = ''
@@ -61,7 +92,10 @@ struct NuwaxVoipMedia {
   onPageShow(): void {
     this.visible = true
     this.refreshCall()
-    if (this.timer < 0) this.timer = setInterval(() => { this.revision++ }, 1000)
+    if (this.timer < 0) this.timer = setInterval(() => {
+      this.revision++
+      this.updateProximity()
+    }, 1000)
   }
 
   onPageHide(): void {
@@ -69,6 +103,7 @@ struct NuwaxVoipMedia {
     if (this.timer >= 0) clearInterval(this.timer)
     this.timer = -1
     this.cancelClose()
+    this.proximity.update(false)
   }
 
   aboutToDisappear(): void {
@@ -100,7 +135,24 @@ struct NuwaxVoipMedia {
         if (this.visible && !VoipBridge.current) this.minimize()
       }, 3000)
     }
+    this.updateProximity()
     this.revision++
+  }
+
+  private updateProximity(): void {
+    const call = VoipBridge.current
+    let receiver = false
+    if (this.visible && VoipBridge.mediaForeground && VoipBridge.connected &&
+        call?.state === 'active' && call.mediaType === 'audio') {
+      try {
+        const routing = audio.getAudioManager().getRoutingManager()
+        const devices = routing.getPreferredOutputDeviceForRendererInfoSync({
+          usage: audio.StreamUsage.STREAM_USAGE_VOICE_COMMUNICATION, rendererFlags: 0,
+        })
+        receiver = devices[0]?.deviceType === audio.DeviceType.EARPIECE
+      } catch (_) {}
+    }
+    this.proximity.update(receiver)
   }
 
   private label(key: string): string {
@@ -163,6 +215,7 @@ struct NuwaxVoipMedia {
     this.cancelClose()
     if (!VoipBridge.current) this.displayedCallId = ''
     VoipBridge.emit('minimize')
+    this.proximity.update(false)
     const context = VoipBridge.mediaContext
     if (context) context.startAbility({
       bundleName: context.abilityInfo.bundleName,

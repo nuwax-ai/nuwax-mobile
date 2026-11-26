@@ -651,7 +651,7 @@ nuwax-livekit.connect(serverUrl, token, room, displayName, micOn, cameraOn)
 | 接收与卡片渲染 | ✅ 已有 | `pages/message/components/chat-view.uvue`（解析 + 点击入会） |
 | 实时弹窗 + 加入/忽略 | ✅ 已有（App 启动全局监听） | `utils/im/imCallSession.uts` |
 | 通话页面与状态 | ✅ 已有 | `subpackages/pages/im-call/im-call*`、`utils/im/imCallSession.uts` |
-| 创建会议选人 | ⚠️ 选人已实现，但发的是**纯文本** | `im-meeting-create.uvue:sendInvitesToContacts` |
+| 创建会议选人 | ✅ 已改发 `meeting_invite`（卡片 + 前台邀请条/响铃）；原纯文本实现作废 | `im-meeting-create.uvue:sendInvitesToContacts` |
 | 预约会议邀请 | ⚠️ 同样发纯文本 | `im-meeting-schedule.uvue` |
 | 会中「添加成员」 | ❌ 无入口 | `im-meeting-room.uvue` members 面板 |
 | 邀请携带密码 | ❌ 发送接口无 `passcode` 参数 | `servers/imCall.uts` |

@@ -4,6 +4,7 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const chatTopic = 'meeting-chat';
 const danmakuTopic = 'danmaku';
+const maxChatPacketBytes = 15 * 1024;
 setLogLevel(LogLevel.silent);
 
 export function createMeetingMedia(post, render) {
@@ -60,6 +61,7 @@ export function createMeetingMedia(post, render) {
       micAllowed: canPublish(local, Track.Source.Microphone),
       cameraAllowed: canPublish(local, Track.Source.Camera),
       raised: local.attributes.handRaised === '1', metadata: room.metadata || '',
+      remoteSpeaker: room.activeSpeakers.find(participant => participant !== local)?.identity || '',
       videos: cameras.filter(({ participant }) => participant !== local).map(({ participant }) => participant.identity).join(','),
       shared: !!share?.track && !share.isMuted, sharing: session.share?.published === true,
       shareId: session.share?.shareId,
@@ -70,7 +72,7 @@ export function createMeetingMedia(post, render) {
   function message(session, data, participant, topic, self = false) {
     if (!active(session) || !participant || (topic !== chatTopic && topic !== danmakuTopic)) return;
     const text = typeof data?.text === 'string' ? data.text.trim() : '';
-    if (!text || text.length > 120) return;
+    if (!text) return;
     const name = typeof data.name === 'string' ? data.name.trim().slice(0, 120) : '';
     post({ type: 'message', id: session.id, message: {
       text, name: participant.name || name, identity: participant.identity, self, topic, at: Date.now(),
@@ -101,7 +103,7 @@ export function createMeetingMedia(post, render) {
       RoomEvent.ParticipantPermissionsChanged,
     ]) room.on(event, refresh);
     room.on(RoomEvent.DataReceived, (bytes, participant, _kind, topic) => {
-      if ((topic !== chatTopic && topic !== danmakuTopic) || bytes.length > 2048) return;
+      if ((topic !== chatTopic && topic !== danmakuTopic) || bytes.length > maxChatPacketBytes) return;
       let data;
       try { data = JSON.parse(decoder.decode(bytes)); } catch { return; }
       message(session, data, participant, topic);
@@ -177,7 +179,9 @@ export function createMeetingMedia(post, render) {
       request.published = true;
     } catch (error) {
       if (session.share === request) {
-        stopShare(session, error?.name === 'NotAllowedError' ? 'cancelled' : 'screen_capture_failed');
+        const captureError = request.track ? 'screen_share_publish' :
+          error?.name === 'NotAllowedError' ? 'cancelled' : 'screen_capture_failed';
+        stopShare(session, captureError);
       }
     } finally {
       pendingDisplayConsent = undefined;
@@ -242,10 +246,12 @@ export function createMeetingMedia(post, render) {
         case 'hand': await local.setAttributes({ handRaised: command.on ? '1' : '' }); break;
         case 'message': {
           const text = command.text.trim();
-          if (!text || text.length > 120) return;
+          if (!text) return;
           const topic = command.danmaku ? danmakuTopic : chatTopic;
           const data = { text, name: command.name.slice(0, 120) };
-          await local.publishData(encoder.encode(JSON.stringify(data)), { reliable: true, topic });
+          const packet = encoder.encode(JSON.stringify(data));
+          if (packet.length > maxChatPacketBytes) throw new Error('meeting chat packet too large');
+          await local.publishData(packet, { reliable: true, topic });
           message(session, data, local, topic, true);
           break;
         }
@@ -263,7 +269,11 @@ export function createMeetingMedia(post, render) {
     if (current) post({ type: 'error', id: current.id, error: 'pictureInPicture' });
   }
 
-  return { dispatch, disconnect, startCapture, pictureInPictureFailed };
+  function stageTap(identity, thumbnail) {
+    if (current) post({ type: 'stageTap', id: current.id, identity, thumbnail });
+  }
+
+  return { dispatch, disconnect, startCapture, pictureInPictureFailed, stageTap };
 }
 
 export function createMeetingPictureInPicture(page, button, onError) {
@@ -314,19 +324,48 @@ export function createMeetingPictureInPicture(page, button, onError) {
   return { update, refresh };
 }
 
+export function meetingStageLayout(presentation, cameras, shared, fullscreen) {
+  const mode = presentation.mode || 'grid';
+  const members = new Map((presentation.members || []).map(member => [member.identity, member.name]));
+  for (const { participant } of cameras) {
+    if (!members.has(participant.identity)) members.set(participant.identity, participant.name || participant.identity);
+  }
+  if (shared && !members.has(shared.participant.identity)) {
+    members.set(shared.participant.identity, shared.participant.name || shared.participant.identity);
+  }
+  const main = members.has(presentation.main) ? presentation.main :
+    shared?.participant.identity || members.keys().next().value;
+  const gridMode = mode === 'grid' && !presentation.focused;
+  const sharedVisible = !!shared && (fullscreen || gridMode || (!presentation.focused && shared.participant.identity === main));
+  const primaryShare = sharedVisible && !gridMode;
+  const tiles = gridMode ? (presentation.grid?.length ? presentation.grid : [...members.keys()]) : [main];
+  const visible = fullscreen || primaryShare ? [] : tiles.filter(identity => members.has(identity));
+  const thumbs = !fullscreen && (mode === 'topThumbs' || mode === 'sideThumbs');
+  return { mode, members, main, visible, thumbs, sharedVisible };
+}
+
 function mount() {
   const stage = document.querySelector('#stage');
   const grid = document.querySelector('#cameras');
   const share = document.querySelector('#share');
+  const thumbs = document.querySelector('#thumbs');
   const confirm = document.querySelector('#start-capture');
   const cancel = document.querySelector('#cancel-capture');
   const actions = document.querySelector('#capture-actions');
   const pipButton = document.querySelector('#meeting-pip');
   const tracks = new Map();
+  const placeholders = new Map();
   let fullscreen = false;
   let capture;
+  let presentation = {};
+  let cameras = [];
+  let shared;
+  let thumbSnapshot = '';
 
-  function render(cameras, shared, audio, request) {
+  function render(nextCameras, nextShared, audio, request) {
+    cameras = nextCameras;
+    shared = nextShared;
+    if (!shared) fullscreen = false;
     capture = request;
     actions.hidden = !request;
     confirm.textContent = request?.label || '';
@@ -353,7 +392,10 @@ function mount() {
         if (participant && track.source === Track.Source.Camera) media.muted = true;
         const element = participant ? document.createElement('figure') : media;
         const caption = participant ? document.createElement('figcaption') : undefined;
-        if (caption) element.append(media, caption);
+        if (caption) {
+          element.append(media, caption);
+          if (container === grid) element.addEventListener('click', () => mediaRoom.stageTap(participant.identity, false));
+        }
         track.attach(media);
         container.append(element);
         tracks.set(track, { media, element, caption });
@@ -363,33 +405,94 @@ function mount() {
     }
     cameras.forEach(({ participant, track }) => attach(track, grid, participant));
     if (shared) attach(shared.track, share, shared.participant);
-    else fullscreen = false;
     audio.forEach((track) => attach(track, stage, undefined));
-    share.hidden = !shared;
-    stage.classList.toggle('shared', !!shared);
+    renderLayout();
+  }
+
+  function renderLayout() {
+    const layout = meetingStageLayout(presentation, cameras, shared, fullscreen);
+    const activeKeys = layout.visible;
+    const cameraKeys = new Set();
+    for (const { participant, track } of cameras) {
+      const node = tracks.get(track);
+      const order = activeKeys.indexOf(participant.identity);
+      cameraKeys.add(participant.identity);
+      node.element.hidden = order < 0;
+      node.element.style.order = order;
+    }
+    for (const [identity, card] of placeholders) {
+      if (!activeKeys.includes(identity) || cameraKeys.has(identity)) {
+        card.remove();
+        placeholders.delete(identity);
+      }
+    }
+    for (const [order, identity] of activeKeys.entries()) {
+      if (cameraKeys.has(identity)) continue;
+      const name = layout.members.get(identity) || identity;
+      let card = placeholders.get(identity);
+      if (!card) {
+        card = document.createElement('figure');
+        card.className = 'placeholder';
+        card.append(document.createElement('span'), document.createElement('figcaption'));
+        card.addEventListener('click', () => mediaRoom.stageTap(identity, false));
+        grid.append(card);
+        placeholders.set(identity, card);
+      }
+      card.firstElementChild.textContent = [...name][0] || '?';
+      card.lastElementChild.textContent = name;
+      card.style.order = order;
+    }
+    const nextThumbSnapshot = layout.thumbs ? JSON.stringify([layout.main, [...layout.members]]) : '';
+    if (nextThumbSnapshot !== thumbSnapshot) {
+      thumbSnapshot = nextThumbSnapshot;
+      thumbs.replaceChildren();
+      if (layout.thumbs) {
+        for (const [identity, name] of layout.members) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.textContent = [...(name || identity)][0] || '?';
+          button.setAttribute('aria-label', name || identity);
+          button.setAttribute('aria-pressed', identity === layout.main ? 'true' : 'false');
+          button.addEventListener('click', () => mediaRoom.stageTap(identity, true));
+          thumbs.append(button);
+        }
+      }
+    }
+    thumbs.hidden = !layout.thumbs;
+    grid.hidden = activeKeys.length === 0;
+    const columns = activeKeys.length <= 1 ? 1 : Math.min(3, presentation.columns || 2);
+    grid.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
+    stage.dataset.layout = layout.mode;
+    share.hidden = !layout.sharedVisible;
+    stage.classList.toggle('shared', layout.sharedVisible);
     stage.classList.toggle('fullscreen', fullscreen);
-    const remoteCameras = cameras.filter(({ track }) => !track.isLocal);
-    const localCameras = cameras.filter(({ track }) => track.isLocal);
-    pip.update([...(shared ? [shared] : []), ...remoteCameras, ...localCameras]
+    const visibleCameras = cameras.filter(({ participant }) => activeKeys.includes(participant.identity));
+    const remoteCameras = visibleCameras.filter(({ track }) => !track.isLocal);
+    const localCameras = visibleCameras.filter(({ track }) => track.isLocal);
+    pip.update([...(layout.sharedVisible ? [shared] : []), ...remoteCameras, ...localCameras]
       .map(({ track }) => tracks.get(track).media));
   }
 
   share.addEventListener('click', () => {
     fullscreen = !fullscreen;
-    stage.classList.toggle('fullscreen', fullscreen);
+    renderLayout();
   });
-  const media = createMeetingMedia((event) => window.NuwaxMeeting?.postMessage(JSON.stringify(event)), render);
-  const pip = createMeetingPictureInPicture(document, pipButton, media.pictureInPictureFailed);
+  const mediaRoom = createMeetingMedia((event) => window.NuwaxMeeting?.postMessage(JSON.stringify(event)), render);
+  const pip = createMeetingPictureInPicture(document, pipButton, mediaRoom.pictureInPictureFailed);
   function setPictureInPictureLabel(label) {
     pipButton.textContent = label;
     pip.refresh();
   }
-  confirm.addEventListener('click', () => { void media.startCapture(capture); });
+  function setStagePresentation(raw) {
+    presentation = JSON.parse(raw);
+    renderLayout();
+  }
+  confirm.addEventListener('click', () => { void mediaRoom.startCapture(capture); });
   cancel.addEventListener('click', () => {
-    if (capture) media.dispatch({ type: 'cancelShare', id: capture.id, shareId: capture.shareId });
+    if (capture) mediaRoom.dispatch({ type: 'cancelShare', id: capture.id, shareId: capture.shareId });
   });
-  window.meetingMedia = { ...media, setPictureInPictureLabel };
-  window.addEventListener('pagehide', media.disconnect);
+  window.meetingMedia = { ...mediaRoom, setPictureInPictureLabel, setStagePresentation };
+  window.addEventListener('pagehide', mediaRoom.disconnect);
 }
 
 if (typeof document !== 'undefined') mount();

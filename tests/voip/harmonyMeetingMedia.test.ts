@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RoomEvent, Track } from 'livekit-client';
-import { createMeetingMedia, createMeetingPictureInPicture } from '../../scripts/meeting-harmony/room.mjs';
+import { createMeetingMedia, createMeetingPictureInPicture, meetingStageLayout } from '../../scripts/meeting-harmony/room.mjs';
 
 const rooms = vi.hoisted(() => [] as MockRoom[]);
 vi.mock('livekit-client', async (importOriginal) => {
@@ -19,6 +19,7 @@ vi.mock('livekit-client', async (importOriginal) => {
 class MockRoom extends EventEmitter {
   state = 'disconnected';
   metadata = '';
+  activeSpeakers: { identity: string }[] = [];
   remoteParticipants = new Map();
   localParticipant = {
     name: '本机', identity: 'test:member:harmony', attributes: {}, audioLevel: 0,
@@ -61,6 +62,43 @@ afterEach(() => {
 });
 
 describe('Harmony LiveKit room', () => {
+  it('uses the shared page and focus selection across ArkWeb camera and screen tracks', () => {
+    const members = [{ identity: 'a', name: 'Alice' }, { identity: 'b', name: 'Bob' }, { identity: 'c', name: 'Carol' }];
+    const cameras = [{ participant: members[0] }];
+    const shared = { participant: members[1] };
+    expect(meetingStageLayout({ mode: 'grid', members, grid: ['c', 'a'] }, cameras, shared, false))
+      .toMatchObject({ visible: ['c', 'a'], thumbs: false, sharedVisible: true });
+    expect(meetingStageLayout({ mode: 'grid', members, main: 'a', focused: true }, cameras, shared, false))
+      .toMatchObject({ visible: ['a'], thumbs: false, sharedVisible: false });
+    for (const mode of ['topThumbs', 'sideThumbs']) {
+      expect(meetingStageLayout({ mode, members, main: 'b' }, cameras, shared, false))
+        .toMatchObject({ visible: [], thumbs: true, sharedVisible: true });
+    }
+    expect(meetingStageLayout({ mode: 'speaker', members, main: 'c' }, cameras, shared, false))
+      .toMatchObject({ visible: ['c'], thumbs: false, sharedVisible: false });
+  });
+
+  it('forwards a remote speaker and long Markdown chat without a legacy character cap', async () => {
+    const { media, room, post } = connection();
+    await waitForOperations();
+    const speaker = { identity: 'test:other:ios', name: 'Alice' };
+    room.activeSpeakers = [room.localParticipant, speaker];
+    room.emit(RoomEvent.ActiveSpeakersChanged);
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ remoteSpeaker: speaker.identity }));
+    const text = '## 会议内容\n' + '详细内容。'.repeat(230);
+    media.dispatch({ id: 1, type: 'message', text, name: '本机', danmaku: false });
+    await waitForOperations();
+    expect(room.localParticipant.publishData).toHaveBeenCalledOnce();
+    room.emit(RoomEvent.DataReceived, new TextEncoder().encode(JSON.stringify({ text })),
+      speaker, undefined, 'meeting-chat');
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({
+      message: expect.objectContaining({ identity: speaker.identity, text }),
+    }));
+    media.dispatch({ id: 1, type: 'message', text: '字'.repeat(16_000), name: '本机', danmaku: false });
+    await waitForOperations();
+    expect(room.localParticipant.publishData).toHaveBeenCalledOnce();
+  });
+
   it('joins with the supplied token and shares the existing device, hand and chat protocol', async () => {
     const { media, room, post } = connection();
     await waitForOperations();

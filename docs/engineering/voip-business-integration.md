@@ -8,7 +8,9 @@
 
 使用完整“女娲Nuwax”App：同意隐私政策 → 登录测试环境 → 消息 → 真人联系人单聊 → 加号 → 语音/视频通话。安装身份仍为 `com.nuwax.app` / `__UNI__8BF05E4`。无需测试页面、Alice/Bob 身份或本地开发呼叫服务。真实 App 忽略专用测试宿主留下的开发身份。
 
-当前仅在 **HBuilderX development 运行模式、测试地址 `https://testagent.xspaceagi.com`、Android/iOS** 开放入口。`isVoipPlatformAccepted()` 仍为 false；生产发行和鸿蒙入口未开放，不表示三端验收完成。能力由单聊详情及联系人 `subjectType=1` 判断；未知主体、群聊和智能体暂不开放。同账号的两台设备不作为主被叫，能力查询和创建均拦截呼叫自己。此判断是客户端联调范围，不代替后端能力声明。
+2026-11-26 起，Android/iOS 的普通云发行包和原测试包统一走新版单聊通话，使用当前配置的 HTTPS 服务地址；云发行默认正式域名 `https://agent.nuwax.com`，切换测试域名后仍使用相同通话页面。Android 本地 tester 仍可通过原生固定域名限制测试包；iOS 独立 tester 仍固定测试环境。鸿蒙入口不在本次变更范围。`isVoipPlatformAccepted()` 仍为 false，它不表示设备矩阵已验收。能力由单聊详情及联系人 `subjectType=1` 判断；未知主体、群聊和智能体暂不开放。同账号的两台设备不作为主被叫，能力查询和创建均拦截呼叫自己。此判断不代替后端能力声明。
+
+云发行需要以实际 APK/IPA 核对原生模块、来电界面与推送配置。iOS 插件声明 UniPush 和后台模式；APNs 环境由嵌入的签名 profile 读取，App Store 无 profile 时使用 production，不能根据 API 域名推断。IPA 出包后仍需核对 `aps-environment` 与 profile 的实际签名一致、VoIP 铃声和启动 hook 已打入，并在测试及正式服务分别验证前台、锁屏、进程回收接听。Android vivo 专用 receiver 当前由本地离线脚本注入，普通云包不包含相同的专用适配；其他云包原生通道与机型行为也必须实机验证。不要将业务入口统一视作厂商离线来电已对齐。
 
 ## 协议与代码归属
 

@@ -252,7 +252,7 @@ import LiveKitClient
     private func initialize(_ config: [String: Any]) {
         trace("initialize requested")
         #if !DEBUG
-        guard config["development"] as? Bool != true, config["businessEnabled"] as? Bool != true || config["qaAccepted"] as? Bool == true else { return }
+        guard config["development"] as? Bool != true else { return }
         #endif
         guard config["development"] as? Bool == true || config["qaAccepted"] as? Bool == true || config["businessEnabled"] as? Bool == true,
               let base = config["apiBaseUrl"] as? String, let url = URL(string: base), url.host != nil,
@@ -1287,7 +1287,11 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
     private func registerPushDevice(_ data: Data, cid: String?) {
         let config = configuration
         // The signed host owns APNs environment. Never infer it from DEBUG or the API domain.
-        let environment = Bundle.main.object(forInfoDictionaryKey: "NuwaxVoipAPNSEnvironment") as? String ?? ""
+        let profileURL = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision")
+        let profile = profileURL.flatMap { try? Data(contentsOf: $0) }
+        let environment = profileURL != nil && profile == nil ? "" :
+            (NuwaxVoipClientPolicy.pushEnvironment(profile: profile,
+                explicit: Bundle.main.object(forInfoDictionaryKey: "NuwaxVoipAPNSEnvironment") as? String) ?? "")
         let bundle = Bundle.main.bundleIdentifier ?? "", device = config["deviceId"] as? String ?? ""
         guard let candidate = NuwaxVoipApnsDevice(token: data, bundleId: bundle, environment: environment,
                                                  deviceId: device, cid: cid), candidate.provider == pushProvider else {

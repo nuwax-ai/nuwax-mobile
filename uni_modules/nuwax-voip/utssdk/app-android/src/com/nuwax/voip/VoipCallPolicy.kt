@@ -25,8 +25,12 @@ internal object VoipCallPolicy {
         else previousSound
 
     fun originAllowed(fixedOrigin: String?, origin: String): Boolean = fixedOrigin.isNullOrEmpty() || fixedOrigin == origin
-    fun releaseOriginAllowed(fixedOrigin: String?, origin: String): Boolean =
-        !fixedOrigin.isNullOrEmpty() && origin == fixedOrigin && origin.startsWith("https://")
+    fun releaseOriginAllowed(fixedOrigin: String?, origin: String): Boolean {
+        val uri = runCatching { java.net.URI(origin) }.getOrNull() ?: return false
+        return uri.scheme == "https" && !uri.host.isNullOrEmpty() && uri.userInfo == null &&
+            uri.rawQuery == null && uri.rawFragment == null && uri.rawPath.isNullOrEmpty() &&
+            (fixedOrigin.isNullOrEmpty() || fixedOrigin == origin)
+    }
 
     fun shouldOpenBackgroundCallUi(locked: Boolean, mediaType: String): Boolean =
         mediaType == "audio" || (!locked && mediaType == "video")

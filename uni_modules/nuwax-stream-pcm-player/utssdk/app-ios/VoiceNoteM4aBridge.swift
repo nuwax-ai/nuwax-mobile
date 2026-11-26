@@ -53,6 +53,18 @@ public class VoiceNoteM4aBridge {
     private var backgroundedWhileRecording = false
     /// 最近一次看到其他 App 还在出声的时间。后台打断靠它确认通话真的结束，避免刚挂断就又去抢会话。
     private var otherAudioSeenAt = Date.distantPast
+    /// 飞书、微信的来电通知。这时麦克风未必被拿走，先观察，占稳了再暂停。
+    private var thirdPartySuspect = false
+    /// 开始观察第三方来电的时间。前 0.8 秒不探麦克风，避免系统电话的通话列表还没更新就被探开。
+    private var suspectStartedAt = Date.distantPast
+    /// 麦克风连续被第三方占住的起点。没接听的铃声通常占不住这么久。
+    private var micOccupiedSince: Date?
+    /// 第三方通话里，其他 App 连续不再出声的起点。稳定后再尝试续录。
+    private var micFreeSince: Date?
+    /// 已经看到过通话出声、收到挂断或路由切回。没有这个标记时不尝试开麦，避免通话静音间隙把录音打开。
+    private var micProbeArmed = false
+    /// 飞书占麦和挂断都靠它观察。系统电话不走这个定时器。
+    private var watchTimer: Timer?
     private var resignObserver: NSObjectProtocol?
     private var activeObserver: NSObjectProtocol?
     private var backgroundObserver: NSObjectProtocol?
@@ -137,6 +149,7 @@ public class VoiceNoteM4aBridge {
             NotificationCenter.default.removeObserver(observer)
         }
         stopSilence()
+        watchTimer?.invalidate()
         if VoiceNoteM4aBridge.activeBridge === self {
             VoiceNoteM4aBridge.activeBridge = nil
         }
@@ -192,8 +205,8 @@ public class VoiceNoteM4aBridge {
 
     private func startSegmentOnMain(_ segmentKey: String) -> String {
         lastError = ""
-        // 飞书还没挂断时不能开下一段。只等挂断通知，避免前台刚暂停又马上继续计时。
-        if phoneBusy() || (interruptHold && !interruptEnded) {
+        // 系统电话没挂断、或飞书还占着麦克风时，不能开下一段。
+        if phoneBusy() || (interruptHold && !holdIsPhone) || (interruptHold && !interruptEnded) {
             lastError = "音频仍被占用"
             return ""
         }
@@ -300,6 +313,7 @@ public class VoiceNoteM4aBridge {
             self.armedRecorder = nil
             self.armedPath = ""
             self.resignedDuringHold = false
+            self.clearThirdPartyWatch()
             self.stopSilence()
             return self.closeRecorder()
         }
@@ -361,33 +375,41 @@ public class VoiceNoteM4aBridge {
                 self.backgroundedWhileRecording = false
             }
             // 电话进来时经常没有 interruption 通知，录音器已经被系统停掉。页面仍在计时。
+            // 只有系统电话在这里立刻暂停。飞书来电先观察麦克风，占稳了再暂停。
             let ready = Date() >= self.ignoreBeganUntil || self.sessionBusy()
             if !self.userPaused && !self.interruptHold && !self.currentPath.isEmpty && ready {
                 if let recorder = self.recorder, !recorder.isRecording {
-                    self.interruptBeganAt = Date()
-                    self.sealActiveFileForInterrupt()
-                    self.pushEvent("began")
-                    self.logState("m4a recorder stopped without interruption")
+                    if self.phoneBusy() {
+                        self.interruptBeganAt = Date()
+                        self.sealActiveFileForInterrupt()
+                        self.pushEvent("began")
+                        self.logState("m4a recorder stopped without interruption")
+                    } else {
+                        self.noteThirdPartySuspect()
+                    }
                 }
             }
             if self.interruptHold && self.phoneBusy() {
                 self.holdIsPhone = true
             }
-            // 只有系统电话才在通话列表变空时补一次结束。飞书、微信要等真正的挂断通知，否则页面计时会在通话中恢复。
+            // 只有系统电话才在通话列表变空时补一次结束。飞书不走这里。
             if self.interruptHold && self.holdIsPhone && self.interruptGraceDone() && !self.phoneBusy() {
                 self.interruptEnded = true
                 self.resumeRecordingAfterInterrupt()
                 self.pushEvent("ended")
             }
-            // 后台打断经常收不到 ended，回到前台后按挂断处理，让下面的恢复流程去探麦克风。
-            self.adoptBackgroundHoldEndIfReady()
-            // 挂断通知已经到了，但当时在后台没能开录。回到前台再试一次。通话未结束不能试。
-            if self.interruptHold && self.interruptEnded && self.returnedToForeground() && !self.phoneBusy() {
-                // 后台打断还要确认其他音频确实安静下来，避免通话间隙又把会话抢走。
-                if !self.holdInBackground || !self.otherAppPlaying() {
-                    self.resumeRecordingAfterInterrupt()
-                    self.pushEvent("ended")
+            if self.holdIsPhone {
+                // 后台打断经常收不到 ended，回到前台后按挂断处理，让下面的恢复流程去探麦克风。
+                self.adoptBackgroundHoldEndIfReady()
+                // 挂断通知已经到了，但当时在后台没能开录。回到前台再试一次。通话未结束不能试。
+                if self.interruptHold && self.interruptEnded && self.returnedToForeground() && !self.phoneBusy() {
+                    if !self.holdInBackground || !self.otherAppPlaying() {
+                        self.resumeRecordingAfterInterrupt()
+                        self.pushEvent("ended")
+                    }
                 }
+            } else {
+                self.watchThirdPartyAudio()
             }
             if self.pendingEvents.isEmpty {
                 return ""
@@ -450,8 +472,12 @@ public class VoiceNoteM4aBridge {
     private func noteBecameActive() {
         onMainVoid {
             self.logState("became active")
-            self.adoptBackgroundHoldEndIfReady()
-            self.resumeAfterReturning()
+            if self.holdIsPhone {
+                self.adoptBackgroundHoldEndIfReady()
+                self.resumeAfterReturning()
+                return
+            }
+            self.watchThirdPartyAudio()
         }
     }
 
@@ -542,26 +568,51 @@ public class VoiceNoteM4aBridge {
                 logState("interruption began ignored: session idle")
                 return
             }
-            if !interruptHold {
-                interruptBeganAt = Date()
+            if phoneBusy() {
+                if !interruptHold {
+                    interruptBeganAt = Date()
+                }
+                // 系统电话立刻停。只 pause 的话，通话期间文件时间轴还在长。
+                sealActiveFileForInterrupt()
+                pushEvent("began")
+                return
             }
-            // 立刻 stop。只 pause 的话，飞书占用期间文件时间轴还在长，中间会变成无法播放的一段。
-            sealActiveFileForInterrupt()
-            pushEvent("began")
+            // 飞书来电先不暂停。麦克风被连续占住后，下面的观察才会停计时和波浪。
+            if interruptHold {
+                micFreeSince = nil
+                return
+            }
+            noteThirdPartySuspect()
             return
         }
         silencePlayer?.play()
         logState("interruption ended notification")
-        guard interruptHold else {
+        if phoneBusy() || holdIsPhone {
+            guard interruptHold else {
+                return
+            }
+            NSLog("[voice-note] interruption ended")
+            interruptEnded = true
+            if !phoneBusy() {
+                scheduleResumeAttempts()
+            }
+            pushEvent("ended")
             return
         }
-        // 挂断通知本身就是结束。飞书没有系统电话，不能再看 phoneBusy 或 secondaryAudio。
+        if !interruptHold {
+            // 铃声结束，麦克风没有被占住。继续原来的文件，页面不进入暂停。
+            if continueCurrentRecorder() {
+                clearThirdPartyWatch()
+            }
+            return
+        }
         NSLog("[voice-note] interruption ended")
         interruptEnded = true
-        if !phoneBusy() {
-            scheduleResumeAttempts()
+        micProbeArmed = true
+        if !otherAppPlaying() {
+            micFreeSince = Date().addingTimeInterval(-1.2)
         }
-        pushEvent("ended")
+        watchThirdPartyAudio()
     }
 
     /// 已经收到挂断后，路由切回本机时再试一次。接通过程中的路由变化不能当成挂断。
@@ -576,6 +627,13 @@ public class VoiceNoteM4aBridge {
     }
 
     private func resumeIfRouteFree() {
+        if !holdIsPhone && !phoneBusy() {
+            if interruptHold && !otherAppPlaying() {
+                micProbeArmed = true
+            }
+            watchThirdPartyAudio()
+            return
+        }
         adoptBackgroundHoldEndIfReady()
         guard interruptHold, interruptEnded, !userPaused, !phoneBusy(), !otherAudioBusy() else {
             return
@@ -712,19 +770,158 @@ public class VoiceNoteM4aBridge {
         if otherAppPlaying() {
             otherAudioSeenAt = Date()
         }
-        // 后台打断收不到 ended 时，回到前台靠这里补一次结束。
-        adoptBackgroundHoldEndIfReady()
+        if !holdIsPhone && !phoneBusy() {
+            watchThirdPartyAudio()
+        } else {
+            // 系统电话：后台打断收不到 ended 时，回到前台靠这里补一次结束。
+            adoptBackgroundHoldEndIfReady()
+        }
         if silencePlayer?.isPlaying != true && !phoneBusy() {
             _ = silencePlayer?.play()
         }
-        // 只有挂断之后才试。通话过程中不能把计时和波浪又打开。
-        guard interruptHold, interruptEnded, !userPaused, !phoneBusy() else {
+        // 系统电话只有挂断之后才试。飞书由上面的麦克风观察决定，不在这里重试。
+        guard holdIsPhone, interruptHold, interruptEnded, !userPaused, !phoneBusy() else {
             return
         }
         let holding = interruptHold
         resumeRecordingAfterInterrupt()
         if holding && !interruptHold {
             pushEvent("ended")
+        }
+    }
+
+    /// 飞书、微信来电。先不暂停，等麦克风真的被占住。
+    private func noteThirdPartySuspect() {
+        if userPaused || interruptHold || phoneBusy() || currentPath.isEmpty {
+            return
+        }
+        if !thirdPartySuspect {
+            thirdPartySuspect = true
+            suspectStartedAt = Date()
+            micOccupiedSince = nil
+            logState("third-party audio, waiting until microphone is held")
+        }
+        beginWake()
+        startWatchTimer()
+    }
+
+    /// 麦克风还在自己手里时接着写原文件。已经封口的文件不会走到这里。
+    private func continueCurrentRecorder() -> Bool {
+        guard let recorder = recorder, !currentPath.isEmpty else {
+            return false
+        }
+        if recorder.isRecording {
+            return true
+        }
+        guard activateSession() else {
+            return false
+        }
+        return recorder.record()
+    }
+
+    /// 激活自己的录音会话失败，说明麦克风被其他 App 占着。
+    private func microphoneAvailable() -> Bool {
+        let session = AVAudioSession.sharedInstance()
+        if !session.isInputAvailable {
+            return false
+        }
+        return activateSession()
+    }
+
+    private func startWatchTimer() {
+        if watchTimer != nil {
+            return
+        }
+        let timer = Timer(timeInterval: 0.4, repeats: true) { [weak self] _ in
+            self?.watchThirdPartyAudio()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchTimer = timer
+    }
+
+    private func clearThirdPartyWatch() {
+        thirdPartySuspect = false
+        micOccupiedSince = nil
+        micFreeSince = nil
+        micProbeArmed = false
+        watchTimer?.invalidate()
+        watchTimer = nil
+    }
+
+    /// 飞书占麦后暂停，挂断后前台和后台都续。系统电话不进这里。
+    private func watchThirdPartyAudio() {
+        if userPaused || holdIsPhone {
+            if holdIsPhone {
+                watchTimer?.invalidate()
+                watchTimer = nil
+            }
+            return
+        }
+        if phoneBusy() {
+            if !interruptHold && !currentPath.isEmpty && recorder?.isRecording != true {
+                thirdPartySuspect = false
+                micOccupiedSince = nil
+                interruptBeganAt = Date()
+                sealActiveFileForInterrupt()
+                pushEvent("began")
+                logState("phone appeared while watching third-party audio")
+            }
+            return
+        }
+        if !interruptHold {
+            guard thirdPartySuspect else {
+                if watchTimer != nil && micFreeSince == nil {
+                    clearThirdPartyWatch()
+                }
+                return
+            }
+            if recorder?.isRecording == true {
+                clearThirdPartyWatch()
+                return
+            }
+            // 给系统电话留出进入通话列表的时间，这段时间不抢会话。
+            if Date().timeIntervalSince(suspectStartedAt) < 0.8 {
+                return
+            }
+            if microphoneAvailable() && continueCurrentRecorder() {
+                clearThirdPartyWatch()
+                logState("microphone still ours, keep recording")
+                return
+            }
+            if micOccupiedSince == nil {
+                micOccupiedSince = Date()
+            }
+            if Date().timeIntervalSince(micOccupiedSince!) >= 1.0 {
+                thirdPartySuspect = false
+                micOccupiedSince = nil
+                interruptBeganAt = Date()
+                sealActiveFileForInterrupt()
+                pushEvent("began")
+                logState("microphone held, pause")
+            }
+            return
+        }
+        if otherAppPlaying() {
+            micFreeSince = nil
+            micProbeArmed = true
+            return
+        }
+        if !micProbeArmed {
+            return
+        }
+        if micFreeSince == nil {
+            micFreeSince = Date()
+            return
+        }
+        if Date().timeIntervalSince(micFreeSince!) < 1.2 {
+            return
+        }
+        micProbeArmed = false
+        micFreeSince = nil
+        resumeRecordingAfterInterrupt()
+        if interruptHold {
+            keepAliveForInterrupt = true
+            startSilence()
         }
     }
 
@@ -750,6 +947,9 @@ public class VoiceNoteM4aBridge {
         keepAliveForInterrupt = true
         armNextRecorder()
         startSilence()
+        if !holdIsPhone {
+            startWatchTimer()
+        }
         NSLog("[voice-note] interruption began")
         logState("sealed for interruption")
     }
@@ -863,6 +1063,7 @@ public class VoiceNoteM4aBridge {
         backgroundedWhileRecording = false
         userPaused = false
         keepAliveForInterrupt = false
+        clearThirdPartyWatch()
         suppressBeganUntil = Date().addingTimeInterval(1.2)
         startSilence()
         armNextRecorderLater()

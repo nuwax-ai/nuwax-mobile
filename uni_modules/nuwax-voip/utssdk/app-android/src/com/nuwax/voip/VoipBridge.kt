@@ -867,15 +867,43 @@ object VoipBridge {
     private fun requestBackgroundCallUi(id: String) {
         val ctx = context ?: return
         val call = current ?: return
-        if (!business() || call.optString("callId") != id || !isRingingIncoming(call) ||
-            call.optLong("expiresAt") <= System.currentTimeMillis() || callUiVisible(id) || incomingUiWait != null) return
+        if (!business()) { trace("background call activity skipped: not a business call"); return }
+        if (call.optString("callId") != id) { trace("background call activity skipped: call changed"); return }
+        if (!isRingingIncoming(call)) { trace("background call activity skipped: not an incoming ringing call"); return }
+        if (call.optLong("expiresAt") <= System.currentTimeMillis()) { trace("background call activity skipped: invitation expired"); return }
+        if (callUiVisible(id)) { trace("background call activity skipped: call UI already visible"); return }
+        if (incomingUiWait != null) { trace("background call activity skipped: request pending"); return }
         val locked = ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked
-        if (!VoipCallPolicy.shouldOpenBackgroundCallUi(locked, call.optString("mediaType")) || !Settings.canDrawOverlays(ctx)) return
+        if (!VoipCallPolicy.shouldOpenBackgroundCallUi(locked, call.optString("mediaType"))) {
+            trace("background call activity skipped: screen and media policy")
+            return
+        }
+        if (!Settings.canDrawOverlays(ctx)) {
+            trace("background call activity skipped: overlay unavailable")
+            return
+        }
         val manager = ctx.getSystemService(NotificationManager::class.java)
-        if (runCatching { ensureNotificationChannels(ctx) }.isFailure) return
-        val channel = VoipNotificationChannels.incoming(manager) ?: return
-        if (!manager.areNotificationsEnabled() || channel.importance < NotificationManager.IMPORTANCE_HIGH ||
-            manager.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) return
+        if (runCatching { ensureNotificationChannels(ctx) }.isFailure) {
+            trace("background call activity skipped: notification channel setup failed")
+            return
+        }
+        val channel = VoipNotificationChannels.incoming(manager)
+        if (channel == null) {
+            trace("background call activity skipped: notification channel missing")
+            return
+        }
+        if (!manager.areNotificationsEnabled()) {
+            trace("background call activity skipped: notifications disabled")
+            return
+        }
+        if (channel.importance < NotificationManager.IMPORTANCE_HIGH) {
+            trace("background call activity skipped: notification channel importance below high")
+            return
+        }
+        if (manager.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) {
+            trace("background call activity skipped: interruption filter active or unknown")
+            return
+        }
         trace(if (locked) "locked call activity requested" else "unlocked incoming call activity requested")
         requestIncomingCallUi(id)
     }
@@ -934,7 +962,10 @@ object VoipBridge {
             }
             incomingUiWait = null
             val call = current
-            if (call?.optString("callId") == id && isRingingIncoming(call) && hasSystemCall()) publishCall()
+            if (call?.optString("callId") == id && isRingingIncoming(call) && hasSystemCall()) {
+                trace(if (callUiVisible(id)) "incoming call UI visible after activity request" else "incoming call UI not visible after activity request")
+                publishCall()
+            }
         }
     }
 

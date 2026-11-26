@@ -220,11 +220,13 @@ internal class VoipNativeCallView(
         } else {
             val muted = !value.optBoolean("microphone")
             val loudspeaker = value.optBoolean("speaker")
+            val routePending = value.optBoolean("defaultAudioRoutePending")
             val mic = if (hasVideo) videoMicrophone else microphone
             val route = if (hasVideo) videoSpeaker else speaker
             val end = if (hasVideo) videoHangup else hangup
             mic.update(if (muted) "unmute" else "mute", if (muted) "microphone_off" else "microphone", selected = muted)
-            route.update(if (loudspeaker) "earpiece" else "speaker", selected = loudspeaker)
+            route.update(if (routePending) "connecting" else if (loudspeaker) "earpiece" else "speaker", selected = !routePending && loudspeaker)
+            route.isEnabled = !routePending
             end.update("hangup", color = DANGER)
             if (hasVideo) {
                 camera.update(if (cameraOn) "cameraOff" else "cameraOn", if (cameraOn) "video" else "video_off", selected = !cameraOn)

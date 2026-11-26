@@ -50,7 +50,7 @@ vi.mock('../../features/voip/audioFocus.uts', () => ({ claimVoipAudio: fake.clai
 vi.mock('../../utils/voice/stopAllSpeechPlayback.uts', () => ({ stopAllSpeechPlayback: vi.fn() }));
 vi.mock('../../utils/i18n.uts', () => ({ t: (key: string) => key }));
 
-import { bootstrapVoip, clearVoipSession, getVoipSnapshot, handleVoipInvitation, startVoipCall, answerVoipCall, endVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioRoutePending, voipAudioInterrupted, voipPermissionPending, voipPushRegistration, setVoipBackground } from '../../features/voip/callManager.uts';
+import { bootstrapVoip, clearVoipSession, getVoipSnapshot, handleVoipInvitation, startVoipCall, answerVoipCall, endVoipCall, restoreVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioRoutePending, voipAudioInterrupted, voipPermissionPending, voipPushRegistration, voipRemoteVideo, voipCameraSwitching, setVoipBackground } from '../../features/voip/callManager.uts';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -286,6 +286,21 @@ describe('incoming actions and event isolation', () => {
     expect(fake.commands.at(-1)).toMatchObject({ op: 'action', action: 'end', callId: 'accepted' });
   });
 
+  it('reopens a minimized call without creating another call and ignores a late tap after hangup', async () => {
+    await incoming();
+    event({ type: 'snapshot', snapshot: { ...getVoipSnapshot(), version: 2, state: 'active', acceptedDeviceId: 'a1' } });
+    await vi.advanceTimersByTimeAsync(100);
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    const sent = fake.commands.length;
+    restoreVoipCall();
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+    expect(fake.commands).toHaveLength(sent);
+    event({ type: 'localEnded', callId: 'incoming', reason: 'ended' });
+    await vi.advanceTimersByTimeAsync(100);
+    restoreVoipCall();
+    expect(navigate).toHaveBeenCalledOnce();
+  });
+
   it('leaves background calls and native-only incoming activities to the system', async () => {
     await bootstrapVoip();
     const navigate = vi.spyOn(uni, 'navigateTo');
@@ -403,6 +418,30 @@ describe('incoming actions and event isolation', () => {
     event({ type: 'localEnded', callId: 'incoming', reason: 'ended' });
     await vi.advanceTimersByTimeAsync(100);
     expect(voipAudioRoutePending.value).toBe(false);
+  });
+
+  it('hides remote video on mute, restores it on unmute, and discards ended-call video state', async () => {
+    await incoming();
+    event({ type: 'snapshot', snapshot: { ...getVoipSnapshot(), version: 2, state: 'active', mediaType: 'video', acceptedDeviceId: 'a1' } });
+    event({ type: 'remoteVideo', callId: 'incoming', enabled: true });
+    event({ type: 'cameraSwitching', callId: 'incoming', enabled: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipRemoteVideo.value).toBe(true);
+    expect(voipCameraSwitching.value).toBe(true);
+    event({ type: 'remoteVideo', callId: 'incoming', enabled: false });
+    event({ type: 'cameraSwitching', callId: 'incoming', enabled: false });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipRemoteVideo.value).toBe(false);
+    expect(voipCameraSwitching.value).toBe(false);
+    event({ type: 'remoteVideo', callId: 'incoming', enabled: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipRemoteVideo.value).toBe(true);
+    event({ type: 'cameraSwitching', callId: 'incoming', enabled: true });
+    event({ type: 'localEnded', callId: 'incoming', reason: 'ended' });
+    event({ type: 'remoteVideo', callId: 'incoming', enabled: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipRemoteVideo.value).toBe(false);
+    expect(voipCameraSwitching.value).toBe(false);
   });
 });
 

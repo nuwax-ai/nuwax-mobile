@@ -201,11 +201,12 @@ internal class VoipNativeCallView(
             else -> VoipBridge.label("connecting")
         }
         val showVideo = !meeting && !ringing && hasVideo
+        val showRemoteVideo = showVideo && value.optBoolean("remoteVideo")
         val cameraOn = value.optBoolean("camera")
-        updateIdentity(showVideo, active && !reconnecting)
-        remote.visibility = if (showVideo) VISIBLE else INVISIBLE
+        updateIdentity(showRemoteVideo, active && !reconnecting)
+        remote.visibility = if (showRemoteVideo) VISIBLE else INVISIBLE
         local.visibility = if (showVideo && cameraOn) VISIBLE else INVISIBLE
-        shade.visibility = if (showVideo) VISIBLE else GONE
+        shade.visibility = if (showRemoteVideo) VISIBLE else GONE
         ringActions.visibility = if (ringing) VISIBLE else GONE
         audioActions.visibility = if (!ringing && !hasVideo) VISIBLE else GONE
         videoActions.visibility = if (showVideo) VISIBLE else GONE
@@ -231,6 +232,7 @@ internal class VoipNativeCallView(
             if (hasVideo) {
                 camera.update(if (cameraOn) "cameraOff" else "cameraOn", if (cameraOn) "video" else "video_off", selected = !cameraOn)
                 switchCamera.update("switchCamera")
+                switchCamera.isEnabled = cameraOn && !value.optBoolean("cameraSwitching")
             }
         }
     }

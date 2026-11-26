@@ -39,6 +39,8 @@ import LiveKitClient
     private var mediaId = ""
     private var connected = false, peerReady = false, readySent = false
     private var microphone = true, camera = false, audioActive = false
+    private var remoteVideo = false
+    private var switchingCameraTrack: LocalVideoTrack?
     private var ownsCallAudio = false
     private var audioRouteChosen = false
     private var defaultAudioRoutePending = false
@@ -228,8 +230,10 @@ import LiveKitClient
         case "speaker":
             selectAudioRoute(command["enabled"] as? Bool == true ? "speaker" : "earpiece")
         case "switchCamera":
-            Task { guard self.snapshot?["callId"] as? String == commandId else { return }; if let track = self.room?.localParticipant.videoTracks.first?.track as? LocalVideoTrack,
-                      let capturer = track.capturer as? CameraCapturer { _ = try? await capturer.switchCameraPosition() } }
+            Task {
+                guard self.snapshot?["callId"] as? String == commandId else { return }
+                await self.switchCamera()
+            }
         case "callPageVisibility":
             if command["visible"] as? Bool == true, commandId == snapshot?["callId"] as? String {
                 visibleCallPageID = commandId
@@ -247,6 +251,7 @@ import LiveKitClient
                 if run != self.generation || self.snapshot?["callId"] as? String != id || self.room !== target || UIApplication.shared.applicationState != .active {
                     try? await target?.localParticipant.setCamera(enabled: false)
                 }
+                if self.room === target { self.refreshViews() }
             }
         default: break
         }
@@ -329,6 +334,8 @@ import LiveKitClient
             emitSnapshot(value)
             if defaultAudioRoutePending { emit("audioRoutePending", ["enabled": true]) }
             if connected { emit("connected") }; if peerReady { emit("peerMediaReady") }
+            emit("remoteVideo", ["enabled": remoteVideo])
+            emit("cameraSwitching", ["enabled": switchingCameraTrack != nil])
         }
     }
 
@@ -844,15 +851,52 @@ import LiveKitClient
         guard run == generation, snapshot?["callId"] as? String == id, room === target else { return }
         camera = enabled; refreshViews(); emit("camera", ["enabled": enabled])
     }
-    private func refreshViews() {
-        views.removeAll { $0.view == nil }
-        for item in views {
-            let track = item.local ? room?.localParticipant.videoTracks.first?.track : room?.remoteParticipants.values.first?.videoTracks.first?.track
-            item.view?.track = track as? VideoTrack
+
+    private func switchCamera() async {
+        guard camera, switchingCameraTrack == nil, UIApplication.shared.applicationState == .active,
+              let target = room, target.localParticipant.isCameraEnabled(),
+              let track = target.localParticipant.firstCameraVideoTrack as? LocalVideoTrack,
+              let capturer = track.capturer as? CameraCapturer else { return }
+        switchingCameraTrack = track
+        emit("cameraSwitching", ["enabled": true])
+        defer {
+            if switchingCameraTrack === track {
+                switchingCameraTrack = nil
+                emit("cameraSwitching", ["enabled": false])
+            }
+        }
+        do {
+            let switched = try await capturer.switchCameraPosition()
+            if !switched && room === target && camera && target.localParticipant.isCameraEnabled() {
+                emit("error", ["code": "CALL_MEDIA_FAILED"])
+            }
+        } catch {
+            if room === target && camera && target.localParticipant.isCameraEnabled() {
+                emit("error", ["code": "CALL_MEDIA_FAILED"])
+            }
         }
     }
+
+    private func refreshViews() {
+        let localTrack = camera && UIApplication.shared.applicationState == .active && room?.localParticipant.isCameraEnabled() == true
+            ? room?.localParticipant.firstCameraVideoTrack : nil
+        let peer = room?.remoteParticipants.values.first
+        let remoteTrack = peer?.isCameraEnabled() == true ? peer?.firstCameraVideoTrack : nil
+        let remoteVideoOn = remoteTrack != nil
+        if remoteVideo != remoteVideoOn {
+            remoteVideo = remoteVideoOn
+            emit("remoteVideo", ["enabled": remoteVideoOn])
+        }
+        views.removeAll { $0.view == nil }
+        for item in views {
+            let track = item.local ? localTrack : remoteTrack
+            item.view?.isHidden = track == nil
+            item.view?.track = track
+        }
+    }
+
     private func releaseMedia() async {
-        let old = room; room = nil; for view in views { view.view?.track = nil }
+        let old = room; room = nil; switchingCameraTrack = nil; refreshViews()
         connected = false; peerReady = false; await old?.disconnect()
     }
     fileprivate func finish(_ reason: String = "", notifyRemote: Bool = true) {
@@ -869,7 +913,7 @@ import LiveKitClient
         mediaTask?.cancel(); mediaTask = nil; mediaId = ""
         reconnectTask?.cancel(); reconnectTask = nil; reconnectWindow.cancel()
         cancelRemoteLeft(); everHadRemote = false
-        let old = room; room = nil; for item in views { item.view?.track = nil }
+        let old = room; room = nil; switchingCameraTrack = nil; refreshViews()
         audioActive = false; systemPaused = false; audioInterrupted = false; defaultAudioRoutePending = false
         let hadCallAudio = ownsCallAudio
         ownsCallAudio = false
@@ -1228,11 +1272,24 @@ extension NuwaxVoipBridge: RoomDelegate {
         }
     }
     public nonisolated func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
-        DispatchQueue.main.async { self.observeRemotePresence(room) }
+        DispatchQueue.main.async {
+            if self.room === room { self.refreshViews() }
+            self.observeRemotePresence(room)
+        }
     }
     public nonisolated func room(_ room: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {
         DispatchQueue.main.async { guard self.room === room else { return }; self.refreshViews()
             if publication.track is AudioTrack { self.peerReady = true; self.emit("peerMediaReady"); self.maybeReady() } }
+    }
+    public nonisolated func room(_ room: Room, participant: RemoteParticipant, didUnsubscribeTrack publication: RemoteTrackPublication) {
+        DispatchQueue.main.async { if self.room === room { self.refreshViews() } }
+    }
+    public nonisolated func room(_ room: Room, participant: RemoteParticipant, didUnpublishTrack publication: RemoteTrackPublication) {
+        DispatchQueue.main.async { if self.room === room { self.refreshViews() } }
+    }
+    public nonisolated func room(_ room: Room, participant: Participant, trackPublication: TrackPublication, didUpdateIsMuted isMuted: Bool) {
+        guard trackPublication.source == .camera else { return }
+        DispatchQueue.main.async { if self.room === room { self.refreshViews() } }
     }
     public nonisolated func room(_ room: Room, didStartReconnectWithMode reconnectMode: ReconnectMode) {
         DispatchQueue.main.async { self.beginReconnect(room); self.observeRemotePresence(room) }
@@ -1241,6 +1298,7 @@ extension NuwaxVoipBridge: RoomDelegate {
         DispatchQueue.main.async { if self.room === room {
             self.reconnectTask?.cancel(); self.reconnectTask = nil; self.reconnectWindow.cancel()
             self.emit("connected"); self.announceMediaReady()
+            self.refreshViews()
             self.observeRemotePresence(room)
         } }
     }

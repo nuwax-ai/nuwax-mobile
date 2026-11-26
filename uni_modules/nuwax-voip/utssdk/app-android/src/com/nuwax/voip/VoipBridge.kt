@@ -41,6 +41,7 @@ import io.livekit.android.audio.NoAudioHandler
 import io.livekit.android.events.collect
 import io.livekit.android.events.RoomEvent
 import io.livekit.android.room.Room
+import io.livekit.android.room.track.CameraPosition
 import io.livekit.android.room.track.Track
 import io.livekit.android.room.track.VideoTrack
 import io.livekit.android.room.track.LocalVideoTrack
@@ -103,6 +104,8 @@ object VoipBridge {
     private var readySent = false
     private var microphone = true
     private var camera = false
+    private var remoteVideo = false
+    private var switchingCameraTrack: LocalVideoTrack? = null
     private var hidden = false
     private var nativeUiId = ""
     private var appCallUiId = ""
@@ -316,6 +319,7 @@ object VoipBridge {
         if (value.optString("callId") != id || value.optString("state") == "ended") return null
         return JSONObject(value.toString()).put("incoming", value.optString("calleeId") == config.optString("userId"))
             .put("microphone", microphone).put("camera", camera).put("speaker", speaker)
+            .put("remoteVideo", remoteVideo).put("cameraSwitching", switchingCameraTrack != null)
             .put("defaultAudioRoutePending", defaultAudioRoutePending)
             .put("mediaReady", connected && peerReady).put("reconnecting", reconnecting)
     }
@@ -330,6 +334,7 @@ object VoipBridge {
             try {
                 if (room != null) VoipCallService.enableCapture(camera && cameraVisible())
                 room?.localParticipant?.setCameraEnabled(camera && cameraVisible())
+                refreshViews()
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { if (current?.optString("callId") == id) emit("error", "code", "CALL_NATIVE_FAILED") }
         }
@@ -348,7 +353,7 @@ object VoipBridge {
                 if (command.optString("op") == "initialize") { initialize(command); return@launch }
                 if (command.optString("op") == "reset") { reset(); return@launch }
                 if (command.optString("scope") != config.optString("scope")) return@launch
-                if (command.optString("op") in listOf("action", "microphone", "camera", "speaker", "audioRoute", "switchCamera") &&
+                if (command.optString("op") in listOf("action", "microphone", "camera", "speaker", "audioRoute", "switchCamera", "restoreCall") &&
                     command.optString("callId") != current?.optString("callId")) return@launch
                 when (command.optString("op")) {
                     "developmentListener" -> {
@@ -359,18 +364,29 @@ object VoipBridge {
                     }
                     "reset" -> reset()
                     "watch" -> adopt(command.getJSONObject("snapshot"))
+                    "restoreCall" -> {
+                        val id = command.optString("callId")
+                        val call = uiSnapshot(id) ?: return@launch
+                        if (isRingingIncoming(call) && call.optLong("expiresAt") <= System.currentTimeMillis()) return@launch
+                        try {
+                            ctx.startActivity(VoipIncomingActivity.intent(ctx, id))
+                        } catch (_: RuntimeException) {
+                            emit("openPage")
+                        }
+                    }
                     "invitation" -> if (business()) receiveInvitation(api("/api/instant-message/messages/" + Uri.encode(command.getString("msgId")) + "?convId=" + Uri.encode(command.getString("convId")), absolute = true))
                     "action" -> act(command.optString("action"), command.optString("answerMediaType", "audio"))
                     "microphone" -> setMicrophone(command.optBoolean("enabled"))
                     "camera" -> setCamera(command.optBoolean("enabled"))
                     "speaker" -> setSpeaker(command.optBoolean("enabled"))
-                    "switchCamera" -> (room?.localParticipant?.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack)?.switchCamera()
+                    "switchCamera" -> switchCamera()
                     "background" -> {
                         hidden = command.optBoolean("hidden")
                         updateProximity()
                         if (!hidden && appCallUiId.isNotEmpty()) updatePresentedIncoming(appCallUiId)
                         room?.localParticipant?.setCameraEnabled(camera && cameraVisible())
                         if (room != null) VoipCallService.enableCapture(camera && cameraVisible())
+                        refreshViews()
                         if (!hidden && activity.get()?.intent?.getBooleanExtra("nuwaxVoip", false) == true) {
                             activity.get()?.intent?.removeExtra("nuwaxVoip"); emit("openPage")
                         }
@@ -418,7 +434,13 @@ object VoipBridge {
             calls!!.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE or CallsManager.CAPABILITY_SUPPORTS_VIDEO_CALLING)
         }
         startStream()
-        current?.let { emitSnapshot(it); if (connected) emit("connected"); if (peerReady) emit("peerMediaReady") }
+        current?.let {
+            emitSnapshot(it)
+            if (connected) emit("connected")
+            if (peerReady) emit("peerMediaReady")
+            emit("remoteVideo", "enabled", remoteVideo)
+            emit("cameraSwitching", "enabled", switchingCameraTrack != null)
+        }
     }
 
     private fun emit(type: String, key: String = "", value: Any = "") {
@@ -1078,7 +1100,8 @@ object VoipBridge {
                                 if (event.track.kind == Track.Kind.AUDIO) { peerReady = true; emit("peerMediaReady"); maybeReady() }
                                 refreshViews()
                             }
-                            is RoomEvent.TrackUnsubscribed -> refreshViews()
+                            is RoomEvent.TrackUnsubscribed, is RoomEvent.TrackUnpublished,
+                            is RoomEvent.TrackMuted, is RoomEvent.TrackUnmuted -> refreshViews()
                             is RoomEvent.ParticipantConnected -> { everHadRemote = true; observeRemotePresence(next, id, run); announceMediaReady() }
                             is RoomEvent.DataReceived -> {
                                 if (event.participant != null && event.topic == "nuwax.voip.media-ready.v1" && event.data.size <= 256) {
@@ -1089,8 +1112,8 @@ object VoipBridge {
                                 }
                             }
                             is RoomEvent.Reconnecting -> { reconnecting = true; emit("reconnecting"); observeRemotePresence(next, id, run) }
-                            is RoomEvent.Reconnected -> { reconnecting = false; emit("connected"); observeRemotePresence(next, id, run); announceMediaReady() }
-                            is RoomEvent.ParticipantDisconnected -> observeRemotePresence(next, id, run)
+                            is RoomEvent.Reconnected -> { reconnecting = false; emit("connected"); refreshViews(); observeRemotePresence(next, id, run); announceMediaReady() }
+                            is RoomEvent.ParticipantDisconnected -> { refreshViews(); observeRemotePresence(next, id, run) }
                             is RoomEvent.Disconnected -> if (!terminal.contains(id)) { finish("disconnected") }
                             else -> {}
                         }
@@ -1161,6 +1184,35 @@ object VoipBridge {
         target?.localParticipant?.setCameraEnabled(enabled && cameraVisible())
         if (run == generation && current?.optString("callId") == id && room === target) { refreshViews(); emit("camera", "enabled", enabled) }
     }
+
+    private suspend fun switchCamera() {
+        if (!camera || !cameraVisible() || switchingCameraTrack != null) return
+        val target = room ?: return
+        val publication = target.localParticipant.getTrackPublication(Track.Source.CAMERA) ?: return
+        val track = publication.track as? LocalVideoTrack ?: return
+        if (publication.muted) return
+        val next = if (track.options.position == CameraPosition.FRONT) CameraPosition.BACK else CameraPosition.FRONT
+        switchingCameraTrack = track
+        emit("cameraSwitching", "enabled", true)
+        try {
+            track.switchCamera(position = next)
+            // LiveKit updates the track options after the new camera starts sending frames.
+            val switched = withTimeoutOrNull(5000) {
+                while (room === target && camera && cameraVisible() && !publication.muted && track.options.position != next) {
+                    delay(50)
+                }
+                track.options.position == next
+            }
+            if (switched != true && room === target && camera && cameraVisible() && !publication.muted) {
+                emit("error", "code", "CALL_MEDIA_FAILED")
+            }
+        } finally {
+            if (switchingCameraTrack === track) {
+                switchingCameraTrack = null
+                emit("cameraSwitching", "enabled", false)
+            }
+        }
+    }
     private suspend fun setSpeaker(enabled: Boolean) {
         setAudioRoute(if (enabled) "speaker" else "earpiece")
     }
@@ -1207,17 +1259,44 @@ object VoipBridge {
     }
     private fun refreshViews() {
         val r = room ?: return
+        val localTrack = if (camera && cameraVisible()) {
+            r.localParticipant.getTrackPublication(Track.Source.CAMERA)?.takeUnless { it.muted }?.track as? VideoTrack
+        } else null
+        val remoteTrack = r.remoteParticipants.values.firstNotNullOfOrNull { participant ->
+            participant.getTrackPublication(Track.Source.CAMERA)?.takeUnless { it.muted }?.track as? VideoTrack
+        }
+        val remoteVideoOn = remoteTrack != null
+        if (remoteVideo != remoteVideoOn) {
+            remoteVideo = remoteVideoOn
+            emit("remoteVideo", "enabled", remoteVideoOn)
+        }
         for ((host, kind) in views) {
-            val renderer = renderers.getOrPut(host) { TextureViewRenderer(host.context).also { r.initVideoRenderer(it); host.addView(it, FrameLayout.LayoutParams(-1, -1)) } }
-            val track = if (kind == "local") r.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? VideoTrack
-                else r.remoteParticipants.values.firstNotNullOfOrNull { it.getTrackPublication(Track.Source.CAMERA)?.track as? VideoTrack }
-            if (bindings[host] !== track) { bindings.remove(host)?.removeRenderer(renderer); track?.addRenderer(renderer); if (track != null) bindings[host] = track }
+            val track = if (kind == "local") localTrack else remoteTrack
+            if (track == null) {
+                renderers.remove(host)?.let { renderer ->
+                    bindings.remove(host)?.removeRenderer(renderer)
+                    host.removeView(renderer)
+                    renderer.release()
+                }
+                continue
+            }
+            val renderer = renderers.getOrPut(host) {
+                TextureViewRenderer(host.context).also { r.initVideoRenderer(it); host.addView(it, FrameLayout.LayoutParams(-1, -1)) }
+            }
+            if (bindings[host] !== track) {
+                bindings.remove(host)?.removeRenderer(renderer)
+                renderer.clearImage()
+                track.addRenderer(renderer)
+                bindings[host] = track
+            }
         }
     }
     private fun releaseMedia() {
         remoteLeftJob?.cancel(); remoteLeftJob = null; everHadRemote = false
         reconnecting = false
         val old = room; room = null
+        remoteVideo = false
+        switchingCameraTrack = null
         for ((host, renderer) in renderers) { bindings[host]?.removeRenderer(renderer); renderer.release(); host.removeAllViews() }
         renderers.clear(); bindings.clear(); old?.release(); connected = false; peerReady = false; reconnecting = false
     }

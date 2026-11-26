@@ -32,8 +32,8 @@ internal object VoipCallPolicy {
             (fixedOrigin.isNullOrEmpty() || fixedOrigin == origin)
     }
 
-    fun shouldOpenBackgroundCallUi(locked: Boolean, mediaType: String): Boolean =
-        mediaType == "audio" || (!locked && mediaType == "video")
+    fun shouldOpenBackgroundCallUi(mediaType: String): Boolean =
+        mediaType == "audio" || mediaType == "video"
 
     fun answerMediaType(invited: String, requested: String?): String =
         if (invited == "video" && (requested == null || requested == "video")) "video" else "audio"

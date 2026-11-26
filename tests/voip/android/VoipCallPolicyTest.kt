@@ -8,7 +8,7 @@ object VoipCallPolicyTest {
         releaseOriginAllowsHttpsAndHonorsAnOptionalPin()
         incomingSoundHonorsSilenceAndExplicitChoices()
         presentedNotificationRingsOnlyWhenAllowedAndTheServiceIsNotRinging()
-        unlockedBackgroundUiOpensForAudioAndVideo()
+        backgroundUiSupportsAudioAndVideo()
         notificationAnswerPreservesTheInvitationMedia()
         duplicatedInvitationsCannotRestartOrStopTheRingingNotification()
         showingTheCallUiReplacesTheAlertWithoutRearmingIt()
@@ -73,12 +73,10 @@ object VoipCallPolicyTest {
         check(gate.publish("call-b", true))
         check(!gate.publish("call-b", true))
     }
-    private fun unlockedBackgroundUiOpensForAudioAndVideo() {
-        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = "audio"))
-        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = "video"))
-        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = ""))
-        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, mediaType = "audio"))
-        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, mediaType = "video"))
+    private fun backgroundUiSupportsAudioAndVideo() {
+        check(VoipCallPolicy.shouldOpenBackgroundCallUi("audio"))
+        check(VoipCallPolicy.shouldOpenBackgroundCallUi("video"))
+        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(""))
     }
     private fun notificationAnswerPreservesTheInvitationMedia() {
         check(VoipCallPolicy.answerMediaType(invited = "video", requested = null) == "video")

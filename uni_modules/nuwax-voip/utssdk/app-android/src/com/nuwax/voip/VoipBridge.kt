@@ -898,9 +898,9 @@ object VoipBridge {
         if (call.optLong("expiresAt") <= System.currentTimeMillis()) { trace("background call activity skipped: invitation expired"); return }
         if (callUiVisible(id)) { trace("background call activity skipped: call UI already visible"); return }
         if (incomingUiWait != null) { trace("background call activity skipped: request pending"); return }
-        val locked = ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked
-        if (!VoipCallPolicy.shouldOpenBackgroundCallUi(locked, call.optString("mediaType"))) {
-            trace("background call activity skipped: screen and media policy")
+        // The ringing screen can show either media type over keyguard. The activity handles unlock on answer.
+        if (!VoipCallPolicy.shouldOpenBackgroundCallUi(call.optString("mediaType"))) {
+            trace("background call activity skipped: unsupported media type")
             return
         }
         if (!Settings.canDrawOverlays(ctx)) {
@@ -929,6 +929,7 @@ object VoipBridge {
             trace("background call activity skipped: interruption filter active or unknown")
             return
         }
+        val locked = ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked
         trace(if (locked) "locked call activity requested" else "unlocked incoming call activity requested")
         requestIncomingCallUi(id)
     }

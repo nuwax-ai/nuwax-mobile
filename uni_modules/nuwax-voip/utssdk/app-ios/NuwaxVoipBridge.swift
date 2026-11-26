@@ -40,6 +40,7 @@ import LiveKitClient
     private var connected = false, peerReady = false, readySent = false
     private var microphone = true, camera = false, audioActive = false
     private var ownsCallAudio = false
+    private var audioRouteChosen = false
     private var visibleCallPageID: String?
     private var pushRegistry: PKPushRegistry?
     private var callUUIDs: [String: UUID] = [:]
@@ -654,7 +655,7 @@ import LiveKitClient
         let ranks = ["ringing", "connecting", "active", "ended"]
         guard let rank = ranks.firstIndex(of: state), (value["version"] as? Int ?? 0) > 0 else { return }
         if let previous = snapshot, previous["callId"] as? String == id, let oldRank = ranks.firstIndex(of: previous["state"] as? String ?? ""), rank < oldRank { return }
-        if snapshot?["callId"] as? String != id { microphone = true; camera = value["mediaType"] as? String == "video"; systemPaused = false; audioInterrupted = false }
+        if snapshot?["callId"] as? String != id { microphone = true; camera = value["mediaType"] as? String == "video"; systemPaused = false; audioInterrupted = false; audioRouteChosen = false }
         snapshot = value; observeHistory(value); emitSnapshot(value)
         updateProximity()
         if state == "ended" { finish(); return }
@@ -720,6 +721,9 @@ import LiveKitClient
                 guard !Task.isCancelled, run == self.generation, self.snapshot?["callId"] as? String == id, !self.terminal.contains(id) else { return }
                 let signal = credentials["serverUrl"] as? String ?? ""
                 guard signal.hasPrefix("wss://") || (self.configuration["development"] as? Bool == true && signal.hasPrefix("ws://")) else { throw VoipError.invalid }
+                if value["mediaType"] as? String == "audio" && !self.audioRouteChosen {
+                    AudioManager.shared.isSpeakerOutputPreferred = false
+                }
                 self.acquireCallAudio()
                 let next = Room(delegate: self); self.room = next
                 try await next.connect(url: credentials["serverUrl"] as? String ?? "", token: credentials["participantToken"] as? String ?? "")
@@ -743,6 +747,12 @@ import LiveKitClient
                     self.audioActive = true; self.updateAudioEngine()
                 }
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id else { await next.disconnect(); return }
+                if value["mediaType"] as? String == "audio" && !self.audioRouteChosen {
+                    // Clear any inherited speaker override without selecting the built-in mic over a headset.
+                    do { try AVAudioSession.sharedInstance().overrideOutputAudioPort(.none) }
+                    catch { self.trace("default earpiece route unavailable") }
+                    self.emitAudioRoutes()
+                }
                 try await next.localParticipant.setMicrophone(enabled: self.microphone)
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id else { await next.disconnect(); return }
                 if self.camera && UIApplication.shared.applicationState == .active { try await next.localParticipant.setCamera(enabled: true) }
@@ -1096,6 +1106,7 @@ import LiveKitClient
         updateProximity()
     }
     private func selectAudioRoute(_ route: String) {
+        audioRouteChosen = true
         let session = AVAudioSession.sharedInstance()
         do {
             if route == "speaker" || route == "earpiece" {

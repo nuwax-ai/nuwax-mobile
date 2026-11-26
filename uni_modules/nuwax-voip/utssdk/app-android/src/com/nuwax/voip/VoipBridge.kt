@@ -111,6 +111,7 @@ object VoipBridge {
     private var incomingAvatar: Bitmap? = null
     private var speaker = false
     private var onEarpiece = false
+    private var audioRouteChosen = false
     private var proximityLock: PowerManager.WakeLock? = null
     private val terminal = LinkedHashSet<String>()
     private val incomingNotifications = VoipIncomingNotificationGate()
@@ -753,7 +754,7 @@ object VoipBridge {
         if (old?.optString("callId") == id && snapshot.optLong("version") <= old.optLong("version")) return
         if (snapshot.optString("state") == "ringing" && snapshot.optLong("expiresAt") <= System.currentTimeMillis()) return
         val first = old == null || old.optString("callId") != id
-        if (first) { microphone = true; camera = snapshot.optString("mediaType") == "video"; speaker = false; onEarpiece = false }
+        if (first) { microphone = true; camera = snapshot.optString("mediaType") == "video"; speaker = false; onEarpiece = false; audioRouteChosen = false }
         current = snapshot; emitSnapshot(snapshot)
         updateProximity()
         if (snapshot.optString("state") == "ended") { finish(); return }
@@ -1040,6 +1041,9 @@ object VoipBridge {
                 }
                 val result = if (snapshot.optString("calleeId") == config.optString("userId")) c.answer(if (camera) CallAttributesCompat.CALL_TYPE_VIDEO_CALL else CallAttributesCompat.CALL_TYPE_AUDIO_CALL) else c.setActive()
                 check(result is CallControlResult.Success)
+                if (snapshot.optString("mediaType") == "audio") {
+                    launch { selectDefaultAudioRoute(c, id, run) }
+                }
                 val credentials = if (business()) businessCredentials(snapshot) else api("/$id/credentials", JSONObject())
                 val signal = credentials.getString("serverUrl")
                 check(signal.startsWith("wss://") || (config.optBoolean("development") && signal.startsWith("ws://")))
@@ -1142,11 +1146,25 @@ object VoipBridge {
         setAudioRoute(if (enabled) "speaker" else "earpiece")
     }
     private suspend fun setAudioRoute(route: String) {
+        audioRouteChosen = true
         val c = control ?: return
         val endpoints = withTimeoutOrNull(1000) { c.availableEndpoints.first() } ?: return
         val type = when (route) { "speaker" -> CallEndpointCompat.TYPE_SPEAKER; "earpiece" -> CallEndpointCompat.TYPE_EARPIECE; "bluetooth" -> CallEndpointCompat.TYPE_BLUETOOTH; "wired" -> CallEndpointCompat.TYPE_WIRED_HEADSET; else -> return }
         val endpoint = endpoints.firstOrNull { it.type == type }
         if (endpoint == null) emit("error", "code", "CALL_AUDIO_ROUTE_UNAVAILABLE") else c.requestEndpointChange(endpoint)
+    }
+
+    private suspend fun selectDefaultAudioRoute(c: CallControlScope, id: String, run: Int) {
+        val endpoints = withTimeoutOrNull(2000) { c.availableEndpoints.first { list -> list.any { it.type == CallEndpointCompat.TYPE_EARPIECE } } } ?: return
+        val selected = withTimeoutOrNull(1000) { c.currentCallEndpoint.first() } ?: return
+        if (run != generation || current?.optString("callId") != id || control !== c || audioRouteChosen) return
+        // Leave connected headsets to Telecom and never override a user's route selection.
+        if (selected.type != CallEndpointCompat.TYPE_SPEAKER || endpoints.any { it.type == CallEndpointCompat.TYPE_BLUETOOTH || it.type == CallEndpointCompat.TYPE_WIRED_HEADSET }) return
+        val earpiece = endpoints.first { it.type == CallEndpointCompat.TYPE_EARPIECE }
+        try {
+            if (c.requestEndpointChange(earpiece) !is CallControlResult.Success) trace("default earpiece route unavailable")
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { trace("default earpiece route unavailable") }
     }
 
     @JvmStatic fun createVideoView(ctx: Context, local: Boolean): FrameLayout {

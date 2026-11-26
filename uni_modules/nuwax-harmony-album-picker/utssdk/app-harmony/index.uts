@@ -13,6 +13,8 @@
 // 草稿回显/跨页预览/上传都需要长期可读的路径（见 materializeToCache）。
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { media } from '@kit.MediaKit';
+import { image } from '@kit.ImageKit';
 // @kit.CoreFileKit 不导出 fs（ArkTS 编译报 10505001）；官方 runtime 同款默认导入
 import fs from '@ohos.file.fs';
 import type {
@@ -92,6 +94,86 @@ function materializeToCache(uri: string, isVideo: boolean, index: number): strin
   }
 }
 
+/**
+ * 视频缓存副本 -> 首帧 JPEG。
+ *
+ * 其它端 uni.chooseMedia 会返回 thumbTempFilePath；鸿蒙 PhotoViewPicker 只给媒体 URI，
+ * 若不主动取帧，聊天输入框暂存区只能显示灰底和播放按钮。失败返回空串，保持视频本身
+ * 仍可预览、上传，不让缩略图失败影响用户选择结果。
+ */
+function fetchVideoFirstFrame(generator: media.AVImageGenerator): Promise<image.PixelMap> {
+  const params: media.PixelMapParams = { width: 280, height: -1 };
+  return new Promise<image.PixelMap>((resolve, reject) => {
+    // UTS 对 fetchFrameByTime 的 Promise / callback 重载会推成 void & Promise<PixelMap>，
+    // 必须显式传 PixelMapParams 并走四参数 callback 重载。
+    generator.fetchFrameByTime(
+      0,
+      media.AVImageQueryOptions.AV_IMAGE_QUERY_NEXT_SYNC,
+      params,
+      (err: BusinessError, data: image.PixelMap): void => {
+        // 鸿蒙真机桥接层实测可能直接把数字 0 塞进 err（而非 BusinessError 对象）。
+        const errText = err != null ? `${err}` : "null";
+        const errCode = err != null && err.code != null ? err.code : 0;
+        if (err != null && errCode != 0 && errText != "0") {
+          reject(err);
+          return;
+        }
+        resolve(data);
+      },
+    );
+  });
+}
+
+async function createVideoPoster(videoPath: string, index: number): Promise<string> {
+  let stage = "open-source";
+  try {
+    const source = fs.openSync(videoPath, fs.OpenMode.READ_ONLY);
+    try {
+      stage = "create-generator";
+      const generator = await media.createAVImageGenerator();
+      try {
+        // fdSrc 的 offset / length 均可省略，播放器会读取整个文件；这样复制失败回退
+        // file://media URI 时也不额外依赖 statSync 对媒体库 URI 的支持。
+        generator.fdSrc = { fd: source.fd };
+        stage = "fetch-frame";
+        const pixelMap: image.PixelMap = await fetchVideoFirstFrame(generator);
+        try {
+          stage = "create-packer";
+          const packer = image.createImagePacker();
+          try {
+            const packOption: image.PackingOption = { format: 'image/jpeg', quality: 88 };
+            stage = "pack-jpeg";
+            const buffer = await packer.packToData(pixelMap, packOption);
+            const cacheDir = UTSHarmony.getUIAbilityContext().cacheDir;
+            const posterPath = `${cacheDir}/album_video_poster_${Date.now()}_${index}.jpg`;
+            stage = "write-jpeg";
+            const output = fs.openSync(posterPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+            try {
+              fs.writeSync(output.fd, buffer);
+            } finally {
+              fs.closeSync(output);
+            }
+            return posterPath;
+          } finally {
+            // 鸿蒙 UTS 桥接对部分 Promise<void> 成功结果会抛出数字 0；资源释放不应
+            // 覆盖已成功生成的 posterPath。沿用项目内 ImagePacker 的非 await 释放方式。
+            packer.release();
+          }
+        } finally {
+          pixelMap.release();
+        }
+      } finally {
+        generator.release();
+      }
+    } finally {
+      fs.closeSync(source);
+    }
+  } catch (e) {
+    console.error(`[HarmonyAlbumPicker] create video poster failed: stage=${stage} path=${videoPath} error=${e}`);
+    return '';
+  }
+}
+
 export function pickHarmonyAlbumMedia(
   count: number,
   success: HarmonyAlbumSuccessCallback,
@@ -106,7 +188,7 @@ export function pickHarmonyAlbumMedia(
     selectOptions.isOriginalSupported = false;
     new photoAccessHelper.PhotoViewPicker()
       .select(selectOptions)
-      .then((result: photoAccessHelper.PhotoSelectResult) => {
+      .then(async (result: photoAccessHelper.PhotoSelectResult) => {
         const uris = result.photoUris;
         if (uris == null || uris.length == 0) {
           // 用户取消：部分版本以空结果 resolve（而非 reject），两种口径都归 CANCEL
@@ -115,15 +197,18 @@ export function pickHarmonyAlbumMedia(
         }
         const paths: string[] = [];
         const isVideos: boolean[] = [];
+        const posters: string[] = [];
         for (let i = 0; i < uris.length; i++) {
           const uri = `${uris[i]}`;
           const video = isVideoUri(uri);
           // 一律落沙箱副本（见 materializeToCache）：暂存草稿要跨页/跨进程可读，
           // 视频还要靠它挂本地播放器与上传
-          paths.push(materializeToCache(uri, video, i));
+          const path = materializeToCache(uri, video, i);
+          paths.push(path);
           isVideos.push(video);
+          posters.push(video ? await createVideoPoster(path, i) : '');
         }
-        success(paths, isVideos);
+        success(paths, isVideos, posters);
       })
       .catch((e: BusinessError) => {
         // 用户取消在部分版本以 reject 返回，与真实失败同走 catch：

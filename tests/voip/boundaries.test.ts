@@ -48,4 +48,22 @@ describe('VoIP feature integration boundary', () => {
     expect(read('uni_modules/nuwax-voip/utssdk/app-android/AndroidManifest.xml')).not.toMatch(/VoipDevControlService|FOREGROUND_SERVICE_SPECIAL_USE/);
     expect(read('scripts/voip-native/device/configure-android.py')).toContain('VoipDevControlService');
   });
+
+  it('uses the shared Android background UI for meeting invitations and leaves foreground presentation to the app', () => {
+    const bridge = read('uni_modules/nuwax-voip/utssdk/app-android/src/com/nuwax/voip/VoipBridge.kt');
+    const meetingReceiver = bridge.slice(
+      bridge.indexOf('private fun receiveMeetingInvitation('),
+      bridge.indexOf('private fun emitMeeting('),
+    );
+    expect(bridge).toContain('type == "voip" || (type == "meeting_invite" && hidden)');
+    expect(meetingReceiver).toContain('if (!hidden) return');
+    expect(meetingReceiver).toMatch(/requestBackgroundCallUi\(inviteId\)\s+publishCall\(\)/);
+    expect(meetingReceiver).not.toContain('requestIncomingCallUi(');
+  });
+
+  it('skips iOS system presentation for foreground meetings only when PushKit permits it', () => {
+    const bridge = read('uni_modules/nuwax-voip/utssdk/app-ios/NuwaxVoipBridge.swift');
+    expect(bridge).toContain('receiveVoipPush(payload, mustReport: true, completion: completion)');
+    expect(bridge).toMatch(/if !mustReport, invitation\?\.scene == "meeting", UIApplication\.shared\.applicationState == \.active \{[^}]+completion\(\)\s+return/);
+  });
 });

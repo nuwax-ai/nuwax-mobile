@@ -1418,6 +1418,13 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         let invitation = NuwaxVoipPushInvitation(payload.dictionaryPayload, userId: configuration["userId"] as? String ?? "",
             business: business, now: Date().timeIntervalSince1970 * 1000, requiredRegistrationId: route,
             pushBusinessEnvironment: configuration["pushBusinessEnvironment"] as? String)
+        // Foreground invitations use the existing IM banner. Older PushKit callbacks
+        // still require a system report if a VoIP push reaches an active app.
+        if !mustReport, invitation?.scene == "meeting", UIApplication.shared.applicationState == .active {
+            trace("PushKit meeting report skipped in foreground")
+            completion()
+            return
+        }
         if invitation == nil && !mustReport {
             trace("PushKit ignored invitation outside current registration")
             completion()

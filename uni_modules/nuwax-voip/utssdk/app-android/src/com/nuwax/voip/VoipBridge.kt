@@ -434,7 +434,7 @@ object VoipBridge {
             calls!!.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE or CallsManager.CAPABILITY_SUPPORTS_VIDEO_CALLING)
         }
         startStream()
-        current?.let {
+        current?.takeUnless { it.optString("scene") == "meeting" }?.let {
             emitSnapshot(it)
             if (connected) emit("connected")
             if (peerReady) emit("peerMediaReady")
@@ -551,10 +551,13 @@ object VoipBridge {
                                     heartbeat = launch { while (isActive) { delay(interval); if (System.currentTimeMillis() - lastFrame > interval * 2) { ws.cancel(); closed.complete(Unit); break }; ws.send(frame(2000)) } }
                                 }
                                 1002, 9000 -> { trace("control rejected"); rejected = true; emit("error", "code", "CALL_CONTROL_REJECTED"); ws.close(1000, null); closed.complete(Unit) }
-                                3002 -> if (body.optString("msgType") == "voip") {
-                                    trace("control invitation received")
-                                    ws.send(frame(3003, JSONObject().put("convId", body.optString("convId")).put("seq", body.optLong("seq"))))
-                                    receiveInvitation(body)
+                                3002 -> {
+                                    val type = body.optString("msgType")
+                                    if (type == "voip" || (type == "meeting_invite" && hidden)) {
+                                        trace("control invitation received")
+                                        ws.send(frame(3003, JSONObject().put("convId", body.optString("convId")).put("seq", body.optLong("seq"))))
+                                        receiveInvitation(body)
+                                    }
                                 }
                                 3007 -> receiveSignal(body)
                             }
@@ -600,7 +603,11 @@ object VoipBridge {
      * 接听后由 JS 打开会议页，忽略/超时回写 meeting-invite-handled。
      */
     private fun receiveMeetingInvitation(message: JSONObject, push: JSONObject?, sessionScope: String?) {
+        // Foreground meeting invitations are presented by the existing in-app banner.
+        if (!hidden) return
         if (message.optInt("senderType", 1) != 1 || message.optInt("msgStatus", 1) != 1) return
+        val sender = message.optString("senderId")
+        if (sender == config.optString("userId")) return
         val body = message.optJSONObject("body") ?: return
         if (VoipPushPayload.isSilentMeeting(body)) return
         val inviteId = body.optString("inviteId")
@@ -621,7 +628,6 @@ object VoipBridge {
         if (deadline <= now) return
         // 忙线不打断：保留聊天卡片，用户结束后自行加入。
         if (current != null) return
-        val sender = message.optString("senderId")
         val next = JSONObject().put("protocol", "im-voip-v1").put("scene", "meeting")
             .put("callId", inviteId).put("inviteId", inviteId).put("roomName", room).put("title", title)
             .put("passcode", body.optString("passcode"))
@@ -644,7 +650,7 @@ object VoipBridge {
                 closeMeeting()
             }
         }
-        if (!hidden) requestIncomingCallUi(inviteId)
+        requestBackgroundCallUi(inviteId)
         publishCall()
     }
 
@@ -886,9 +892,9 @@ object VoipBridge {
             emit("error", "code", "CALL_ACTION_FAILED")
         }
     }
-    // After Telecom registers the call, use the user-granted overlay permission to try
-    // the native incoming Activity. Some devices show a banner for the full-screen
-    // notification intent, so keep it as the fallback when the Activity cannot open.
+    // Use the user-granted overlay permission to try the native incoming Activity.
+    // One-to-one calls reach this after Telecom registers them. Meetings reach it after validation.
+    // Keep the notification as a fallback when the Activity cannot open.
     private fun requestBackgroundCallUi(id: String) {
         val ctx = context ?: return
         val call = current ?: return
@@ -977,7 +983,7 @@ object VoipBridge {
             if (!fallbackToAppPage) return
         }
         // startActivity can return without showing anything. Leave enough time for the
-        // Activity to resume while still posting CallStyle within Telecom's five seconds.
+        // Activity to resume while keeping enough time to post the fallback notification.
         incomingUiWait = scope.launch {
             delay(750)
             val ringing = current
@@ -1374,6 +1380,10 @@ object VoipBridge {
             !businessSessionAllowed(saved, debug)) return native
         if (!debug && !saved.optBoolean("qaAccepted") && !native) return false
         if (native && !VoipPushPayload.eligible(invitation, saved.optString("userId"), System.currentTimeMillis())) return true
+        if (native && source == "transmission" && invitation.optString("scene") == "meeting" && !hidden && activity.get() != null) {
+            // Let DCloud forward the foreground event to the existing in-app banner listener.
+            return false
+        }
         trace(if (native) "native push routed to call source=$source callId=${invitation.optString("callId")}" else "native push routed to call")
         val verification = incoming(ctx, invitation, saved.optString("scope"))
         onVerification?.invoke(verification)

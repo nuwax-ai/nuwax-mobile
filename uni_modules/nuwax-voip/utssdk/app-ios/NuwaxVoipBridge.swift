@@ -1265,9 +1265,18 @@ import LiveKitClient
         updateProximity()
         guard snapshot != nil else { return }
         let session = AVAudioSession.sharedInstance()
-        let speaker = session.currentRoute.outputs.contains { $0.portType == .builtInSpeaker }
-        let external = session.currentRoute.inputs.first { $0.portType != .builtInMic }
-        let selected = external?.uid ?? (speaker ? "speaker" : "earpiece")
+        let route = session.currentRoute
+        let speaker = route.outputs.contains { $0.portType == .builtInSpeaker }
+        let receiver = route.outputs.contains { $0.portType == .builtInReceiver }
+        let external = route.inputs.first { $0.portType != .builtInMic }
+        let selected: String
+        if speaker {
+            selected = "speaker"
+        } else if receiver {
+            selected = "earpiece"
+        } else {
+            selected = external?.uid ?? (route.outputs.isEmpty ? "" : "headset")
+        }
         var routes: [[String: String]] = [["id": "earpiece", "kind": "earpiece"], ["id": "speaker", "kind": "speaker"]]
         for input in session.availableInputs ?? [] where input.portType != .builtInMic {
             routes.append(["id": input.uid, "kind": input.portType == .bluetoothHFP ? "bluetooth" : "headset", "name": input.portName])

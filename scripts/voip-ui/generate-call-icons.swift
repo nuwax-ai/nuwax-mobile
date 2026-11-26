@@ -78,7 +78,7 @@ for name in ["microphone", "microphone-off", "speaker", "earpiece", "video", "vi
         context.setShouldAntialias(true); icon(name, context)
         let png = bitmap.representation(using: .png, properties: [:])!
         try png.write(to: output.appendingPathComponent("\(name)-\(variant).png"))
-        if variant == "white" && name != "close" && name != "earpiece" {
+        if variant == "white" && name != "close" {
             let resource = "nuwax_voip_" + name.replacingOccurrences(of: "-", with: "_") + ".png"
             try png.write(to: nativeOutput.appendingPathComponent(resource))
         }

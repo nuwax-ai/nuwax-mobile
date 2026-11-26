@@ -208,6 +208,10 @@ object VoipBridge {
             "meetingIgnore" -> "忽略"
             "meetingJoining" -> "正在加入会议…"
             "meetingMinimize" -> "收起"
+            "speaker" -> "扬声器"
+            "earpiece" -> "听筒"
+            "bluetooth" -> "蓝牙"
+            "headset" -> "耳机"
             else -> key
         }
         return config.optJSONObject("labels")?.optString(key, fallback) ?: fallback
@@ -322,6 +326,7 @@ object VoipBridge {
         if (value.optString("callId") != id || value.optString("state") == "ended") return null
         return JSONObject(value.toString()).put("incoming", value.optString("calleeId") == config.optString("userId"))
             .put("microphone", microphone).put("camera", camera).put("speaker", speaker)
+            .put("audioOutput", audioOutputKind())
             .put("remoteVideo", remoteVideo).put("cameraSwitching", switchingCameraTrack != null)
             .put("defaultAudioRoutePending", defaultAudioRoutePending)
             .put("mediaReady", connected && peerReady).put("reconnecting", reconnecting)
@@ -439,7 +444,7 @@ object VoipBridge {
         startStream()
         current?.takeUnless { it.optString("scene") == "meeting" }?.let {
             emitSnapshot(it)
-            emit("speaker", "enabled", speaker)
+            emitAudioOutput()
             emit("audioRoutePending", "enabled", defaultAudioRoutePending)
             if (connected) emit("connected")
             if (peerReady) emit("peerMediaReady")
@@ -858,7 +863,7 @@ object VoipBridge {
                                 speaker = endpoint.type == CallEndpointCompat.TYPE_SPEAKER
                                 onEarpiece = endpoint.type == CallEndpointCompat.TYPE_EARPIECE
                                 currentEndpointType.value = endpoint.type
-                                if (!defaultAudioRoutePending) emit("speaker", "enabled", speaker)
+                                if (!defaultAudioRoutePending) emitAudioOutput()
                                 updateProximity()
                             }
                         }
@@ -1100,7 +1105,7 @@ object VoipBridge {
                         finally {
                             if (run == generation && current?.optString("callId") == id && control === c) {
                                 defaultAudioRoutePending = false
-                                emit("speaker", "enabled", speaker)
+                                emitAudioOutput()
                                 emit("audioRoutePending", "enabled", false)
                             }
                         }
@@ -1233,6 +1238,17 @@ object VoipBridge {
                 emit("cameraSwitching", "enabled", false)
             }
         }
+    }
+    private fun audioOutputKind(): String = when (currentEndpointType.value) {
+        CallEndpointCompat.TYPE_EARPIECE -> "earpiece"
+        CallEndpointCompat.TYPE_SPEAKER -> "speaker"
+        CallEndpointCompat.TYPE_BLUETOOTH -> "bluetooth"
+        CallEndpointCompat.TYPE_WIRED_HEADSET -> "headset"
+        else -> ""
+    }
+    private fun emitAudioOutput() {
+        emit("speaker", "enabled", speaker)
+        emit("audioRoute", "selected", audioOutputKind())
     }
     private suspend fun setSpeaker(enabled: Boolean) {
         setAudioRoute(if (enabled) "speaker" else "earpiece")

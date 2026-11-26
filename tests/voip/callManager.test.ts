@@ -122,7 +122,7 @@ describe('ordinary notification invitation', () => {
   });
 });
 
-async function deliverIncoming(presentation: { nativeIncomingUI: boolean; foregroundIncomingPage: boolean } | null = null) {
+async function deliverIncoming(presentation: { nativeIncomingUI: boolean; foregroundIncomingPage: boolean; systemRingingOnly?: boolean } | null = null) {
   const initialized = fake.commands.find(command => command.op === 'initialize');
   fake.events.push({ type: 'snapshot', scope: initialized.scope, ...presentation, snapshot: {
     callId: 'incoming', convId: 'chat', version: 1, state: 'ringing',
@@ -250,6 +250,38 @@ describe('incoming actions and event isolation', () => {
     await deliverIncoming({ nativeIncomingUI: true, foregroundIncomingPage: true });
     event({ type: 'snapshot', nativeIncomingUI: true, foregroundIncomingPage: true,
       snapshot: { ...getVoipSnapshot(), version: 2 } });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+  });
+
+  it('defers the App page while CallKit rings and opens it once after the system answers', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    await deliverIncoming({ nativeIncomingUI: true, foregroundIncomingPage: false, systemRingingOnly: true });
+    restoreVoipCall();
+    expect(navigate).not.toHaveBeenCalled();
+
+    fake.background = true;
+    event({ type: 'snapshot', foregroundIncomingPage: true,
+      snapshot: { ...getVoipSnapshot(), version: 2, state: 'connecting', acceptedDeviceId: 'a1' } });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).not.toHaveBeenCalled();
+
+    fake.background = false;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+    event({ type: 'snapshot', foregroundIncomingPage: true,
+      snapshot: { ...getVoipSnapshot(), version: 3, state: 'active' } });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledOnce();
+  });
+
+  it('still opens the App permission flow for a CallKit call', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    await deliverIncoming({ nativeIncomingUI: true, foregroundIncomingPage: false, systemRingingOnly: true });
+    event({ type: 'permissionPending', callId: 'incoming' });
+    event({ type: 'openPage', callId: 'incoming' });
     await vi.advanceTimersByTimeAsync(100);
     expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
   });

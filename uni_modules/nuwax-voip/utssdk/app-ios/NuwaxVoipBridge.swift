@@ -148,6 +148,7 @@ import LiveKitClient
     private func emitSnapshot(_ value: [String: Any]) {
         var nativeIncoming = false
         var foregroundIncomingPage = false
+        var systemRingingOnly = false
         let state = value["state"] as? String
         if let system = systemBridge,
            value["calleeId"] as? String == configuration["userId"] as? String,
@@ -156,10 +157,12 @@ import LiveKitClient
             // A failed system report must not open an ended-only incoming page.
             guard state != "ringing" || presented else { return }
             nativeIncoming = state == "ringing" && presented
-            foregroundIncomingPage = presented
+            systemRingingOnly = nativeIncoming && system is NuwaxLegacySystemCalls
+            foregroundIncomingPage = presented && !systemRingingOnly
         }
         // The App can also open the call after the system UI has already answered it.
-        emit("snapshot", ["snapshot": value, "nativeIncomingUI": nativeIncoming, "foregroundIncomingPage": foregroundIncomingPage])
+        emit("snapshot", ["snapshot": value, "nativeIncomingUI": nativeIncoming,
+                          "foregroundIncomingPage": foregroundIncomingPage, "systemRingingOnly": systemRingingOnly])
     }
     fileprivate func systemIncomingReady(_ uuid: UUID) {
         // Meeting invites have no business snapshot; they open the meeting page from the
@@ -241,18 +244,6 @@ import LiveKitClient
                 visibleCallPageID = nil
             }
             updateProximity()
-        case "background":
-            updateProximity(pageForeground: command["hidden"] as? Bool != true)
-            let target = room, id = snapshot?["callId"] as? String, run = generation
-            Task {
-                guard run == self.generation, self.snapshot?["callId"] as? String == id, self.room === target else { return }
-                let visible = command["hidden"] as? Bool != true && UIApplication.shared.applicationState == .active
-                try? await target?.localParticipant.setCamera(enabled: visible && self.camera)
-                if run != self.generation || self.snapshot?["callId"] as? String != id || self.room !== target || UIApplication.shared.applicationState != .active {
-                    try? await target?.localParticipant.setCamera(enabled: false)
-                }
-                if self.room === target { self.refreshViews() }
-            }
         default: break
         }
     }
@@ -295,13 +286,10 @@ import LiveKitClient
         } else { emitHistory() }
         if audioLifecycle == nil {
             audioLifecycle = NuwaxVoipAudioLifecycle(routeChanged: { [weak self] in self?.emitAudioRoutes() },
-                interrupted: { [weak self] began, resume in self?.handleInterruption(began: began, resume: resume) },
+                interrupted: { [weak self] began, resume, reason in self?.handleInterruption(began: began, resume: resume, reason: reason) },
                 mediaReset: { [weak self] in if self?.snapshot != nil { self?.finish("audioReset") } },
                 foreground: { [weak self] in self?.becameActive() },
-                background: { [weak self] in
-                    guard let self else { return }
-                    self.executeOnMain(["op": "background", "scope": self.configuration["scope"] as? String ?? "", "hidden": true])
-                })
+                background: { [weak self] in self?.refreshCallAfterVisibilityChange() })
         }
         #if DEBUG
         if systemDiagnostics == nil {
@@ -755,7 +743,8 @@ import LiveKitClient
                     }
                 } else {
                     AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = true
-                    let session = AVAudioSession.sharedInstance(); try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth]); try session.setActive(true)
+                    try self.configureCallAudioSession()
+                    try AVAudioSession.sharedInstance().setActive(true)
                     self.audioActive = true; self.updateAudioEngine()
                 }
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id else { await next.disconnect(); return }
@@ -916,13 +905,14 @@ import LiveKitClient
         let old = room; room = nil; switchingCameraTrack = nil; refreshViews()
         audioActive = false; systemPaused = false; audioInterrupted = false; defaultAudioRoutePending = false
         let hadCallAudio = ownsCallAudio
+        let managesAudioSession = systemBridge == nil
         ownsCallAudio = false
         if hadCallAudio { try? AudioManager.shared.setEngineAvailability(.none) }
         let run = generation
         Task {
             await old?.disconnect()
             guard hadCallAudio, !self.ownsCallAudio else { return }
-            if #unavailable(iOS 17.4), run == self.generation, self.snapshot == nil, self.room == nil {
+            if managesAudioSession, run == self.generation, self.snapshot == nil, self.room == nil {
                 try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
             }
             // LiveKit's audio engine is shared with meetings in this process.
@@ -1050,6 +1040,7 @@ import LiveKitClient
             return // Send decline only after the authenticated invitation has been verified.
         }
         guard validatedSystemUUID(uuid), let call = snapshot else { return }
+        trace("system requested call end")
         finish(NuwaxVoipCallPolicy.endReason(action: "end", state: wireString(call["state"]), callee: call["calleeId"] as? String == configuration["userId"] as? String))
     }
     fileprivate func systemReset() {
@@ -1068,7 +1059,7 @@ import LiveKitClient
         // Set the category before fulfilling the system action. Starting audio remains
         // the system's responsibility and the media engine waits for didActivate.
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
+            try configureCallAudioSession()
             acquireCallAudio()
             trace("system audio session configured")
             return true
@@ -1079,6 +1070,9 @@ import LiveKitClient
             return false
         }
     }
+    private func configureCallAudioSession() throws {
+        try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
+    }
     fileprivate func audioActivated(_ active: Bool) {
         guard ownsCallAudio else { return }
         let id = snapshot?["callId"] as? String ?? ""
@@ -1088,8 +1082,19 @@ import LiveKitClient
             audioActive = false; updateAudioEngine(); return
         }
         audioActive = active
-        if active { audioInterrupted = false }
+        trace(active ? "system call audio activated" : "system call audio deactivated")
+        if active {
+            // A competing audio session can change the category while the call's audio is paused.
+            restoreCallAudioCategoryIfNeeded()
+            audioInterrupted = false
+        }
         updateAudioEngine(); emitAudioRoutes()
+    }
+    private func restoreCallAudioCategoryIfNeeded() {
+        let session = AVAudioSession.sharedInstance()
+        guard session.category != .playAndRecord || session.mode != .voiceChat else { return }
+        do { try configureCallAudioSession() }
+        catch { trace("system call audio category restore failed code=\((error as NSError).code)") }
     }
     fileprivate func incomingAnswerMediaType(_ requested: String?) -> String {
         NuwaxVoipCallPolicy.answerMediaType(invited: snapshot?["mediaType"] as? String, requested: requested)
@@ -1129,20 +1134,46 @@ import LiveKitClient
         systemBridge?.resumePendingAnswer()
         guard snapshot != nil else { return }
         emitAudioRoutes()
-        executeOnMain(["op": "background", "scope": configuration["scope"] as? String ?? "", "hidden": false])
+        refreshCallAfterVisibilityChange()
+    }
+    private func refreshCallAfterVisibilityChange() {
+        let isForeground = UIApplication.shared.applicationState == .active
+        updateProximity(pageForeground: isForeground)
+        guard let state = snapshot?["state"] as? String, state == "connecting" || state == "active" else { return }
+        trace(isForeground ? "active call returned to foreground" : "active call entered background")
+        guard snapshot?["mediaType"] as? String == "video", let target = room else { return }
+        Task {
+            guard self.room === target else { return }
+            let enableCamera = self.camera && UIApplication.shared.applicationState == .active
+            try? await target.localParticipant.setCamera(enabled: enableCamera)
+            if self.room === target { self.refreshViews() }
+        }
     }
     private func refreshGetuiPushRoute() {
         if pushProvider == "unipush", let registry = pushRegistry,
            let token = registry.pushToken(for: .voIP) { updatePushToken(token, registry: registry) }
     }
     fileprivate func pauseAudio(_ paused: Bool) { systemPaused = paused; updateAudioEngine() }
-    private func handleInterruption(began: Bool, resume: Bool) {
+    private func handleInterruption(began: Bool, resume: Bool, reason: UInt?) {
         guard ownsCallAudio, snapshot != nil else { return }
-        if began { audioInterrupted = true }
-        // LCK's didActivate remains the authority on supported OS versions.
-        else if resume {
-            if #unavailable(iOS 17.4) { try? AVAudioSession.sharedInstance().setActive(true); audioInterrupted = false }
-            else if audioActive { audioInterrupted = false }
+        trace("call audio interruption began=\(began) resume=\(resume) reason=\(reason.map(String.init) ?? "unknown")")
+        if began {
+            audioInterrupted = true
+        } else if resume {
+            if systemBridge != nil {
+                // CallKit and LiveCommunicationKit each own activation of their audio session.
+                if audioActive { restoreCallAudioCategoryIfNeeded(); audioInterrupted = false }
+            } else {
+                do {
+                    try configureCallAudioSession()
+                    try AVAudioSession.sharedInstance().setActive(true)
+                    audioActive = true
+                    audioInterrupted = false
+                } catch {
+                    audioActive = false
+                    trace("call audio session reactivation failed code=\((error as NSError).code)")
+                }
+            }
         }
         updateAudioEngine()
     }
@@ -1160,7 +1191,10 @@ import LiveKitClient
         let enabled = NuwaxVoipClientPolicy.canRunAudio(state: snapshot?["state"] as? String, outgoing: outgoing,
             terminal: id.isEmpty || terminal.contains(id), active: audioActive, paused: systemPaused, interrupted: audioInterrupted)
         do { try AudioManager.shared.setEngineAvailability(enabled ? .default : .none) }
-        catch { emit("error", ["code": "CALL_AUDIO_ROUTE_UNAVAILABLE"]) }
+        catch {
+            trace("call audio engine transition failed enabled=\(enabled) code=\((error as NSError).code)")
+            emit("error", ["code": "CALL_AUDIO_ROUTE_UNAVAILABLE"])
+        }
         emit("audioInterrupted", ["enabled": systemPaused || audioInterrupted || !audioActive])
         updateProximity()
     }

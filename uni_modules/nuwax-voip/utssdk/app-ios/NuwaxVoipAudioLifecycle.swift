@@ -5,7 +5,7 @@ import UIKit
 @MainActor final class NuwaxVoipAudioLifecycle {
     private var observers: [NSObjectProtocol] = []
     init(routeChanged: @escaping @MainActor () -> Void,
-         interrupted: @escaping @MainActor (Bool, Bool) -> Void,
+         interrupted: @escaping @MainActor (Bool, Bool, UInt?) -> Void,
          mediaReset: @escaping @MainActor () -> Void,
          foreground: @escaping @MainActor () -> Void,
          background: @escaping @MainActor () -> Void) {
@@ -14,10 +14,12 @@ import UIKit
             Task { @MainActor in routeChanged() }
         })
         observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { note in
-            let began = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue
+            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
             let options = AVAudioSession.InterruptionOptions(rawValue: note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
             let resume = options.contains(.shouldResume)
-            Task { @MainActor in interrupted(began, resume) }
+            let reason = note.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt
+            Task { @MainActor in interrupted(type == .began, resume, reason) }
         })
         observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { _ in
             Task { @MainActor in mediaReset() }

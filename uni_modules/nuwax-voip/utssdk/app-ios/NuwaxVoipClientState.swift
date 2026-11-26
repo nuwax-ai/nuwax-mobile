@@ -4,6 +4,23 @@ enum NuwaxVoipPermission: String { case authorized, notDetermined, denied }
 enum NuwaxVoipPermissionPlan: Equatable { case ready, request, foreground, settings }
 
 enum NuwaxVoipClientPolicy {
+    /// Cloud packages do not inject build-specific plist metadata. The embedded
+    /// provisioning profile supplies the APNs environment; App Store installs
+    /// have no embedded profile and use production. An unreadable profile fails closed.
+    static func pushEnvironment(profile: Data?, explicit: String?) -> String? {
+        if let explicit {
+            return ["development", "production"].contains(explicit) ? explicit : nil
+        }
+        guard let profile else { return "production" }
+        guard let start = profile.range(of: Data("<?xml".utf8))?.lowerBound,
+              let end = profile.range(of: Data("</plist>".utf8), in: start..<profile.endIndex)?.upperBound,
+              let plist = try? PropertyListSerialization.propertyList(from: profile.subdata(in: start..<end), format: nil),
+              let dict = plist as? [String: Any], let entitlements = dict["Entitlements"] as? [String: Any],
+              let environment = entitlements["aps-environment"] as? String,
+              ["development", "production"].contains(environment) else { return nil }
+        return environment
+    }
+
     static func sharesTransport(_ previous: [String: Any], _ next: [String: Any]) -> Bool {
         guard let token = previous["accessToken"] as? String, !token.isEmpty else { return false }
         let transportKeys = ["apiBaseUrl", "userId", "deviceId", "accessToken", "protocol", "pushBusinessEnvironment"]

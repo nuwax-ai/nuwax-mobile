@@ -10,11 +10,11 @@ describe('standalone QA build boundaries', () => {
     expect(qa).toContain(`if (normalized != "${testOrigin}") return false;`);
     expect(source).toContain('DEFAULT_API_BASE_URL = "https://agent.nuwax.com";');
   });
-  it('opens only the test origin in the isolated variant and retains source production gates', () => {
+  it('keeps the isolated QA variant on test while normal builds use their configured HTTPS origin', () => {
     const source = readFileSync(new URL('../../features/voip/callManager.uts', import.meta.url), 'utf8');
     const qa = qaManager(source);
     expect(qa).toContain(`return supported && getApiBaseUrl() == "${testOrigin}";`);
-    expect(source).toContain(`return supported && process.env.NODE_ENV == "development"`);
+    expect(source).toContain('return supported && getApiBaseUrl().startsWith("https://");');
     expect(() => qaManager(qa)).toThrow(); expect(() => qaConfig(qaConfig(readFileSync(new URL('../../constants/config.uts', import.meta.url), 'utf8')))).toThrow();
   });
   it('retains the signed QA build without changing the main checkout update policy', () => {

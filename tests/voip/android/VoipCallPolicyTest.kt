@@ -5,7 +5,7 @@ object VoipCallPolicyTest {
         explicitCallIdMustMatch(); onlyAUserRejectionProducesDeclined()
         staleRingingSignalsCannotTerminateAnAcceptedCall(); userHangupIsDistinctFromCancelAndReject()
         standaloneQaCannotRestoreProductionIdentity()
-        releaseOriginRequiresAnExplicitMatchingHttpsPin()
+        releaseOriginAllowsHttpsAndHonorsAnOptionalPin()
         incomingSoundHonorsSilenceAndExplicitChoices()
         presentedNotificationRingsOnlyWhenAllowedAndTheServiceIsNotRinging()
         unlockedBackgroundUiOpensForAudioAndVideo()
@@ -134,11 +134,15 @@ object VoipCallPolicyTest {
         check(!VoipCallPolicy.originAllowed("https://testagent.xspaceagi.com", "https://agent.nuwax.com"))
         check(!VoipCallPolicy.originAllowed("https://testagent.xspaceagi.com", "https://testagent.xspaceagi.com.evil.example"))
     }
-    private fun releaseOriginRequiresAnExplicitMatchingHttpsPin() {
+    private fun releaseOriginAllowsHttpsAndHonorsAnOptionalPin() {
         val origin = "https://release.example"
-        check(!VoipCallPolicy.releaseOriginAllowed(null, origin))
+        check(VoipCallPolicy.releaseOriginAllowed(null, origin))
+        check(VoipCallPolicy.releaseOriginAllowed(null, "https://agent.nuwax.com"))
+        check(VoipCallPolicy.releaseOriginAllowed(null, "https://testagent.xspaceagi.com"))
         check(!VoipCallPolicy.releaseOriginAllowed(origin, "https://test.example"))
         check(!VoipCallPolicy.releaseOriginAllowed("http://release.example", "http://release.example"))
+        check(!VoipCallPolicy.releaseOriginAllowed(null, "https://user@release.example"))
+        check(!VoipCallPolicy.releaseOriginAllowed(null, "https://release.example/path"))
         check(VoipCallPolicy.releaseOriginAllowed(origin, origin))
     }
     private fun explicitCallIdMustMatch() {

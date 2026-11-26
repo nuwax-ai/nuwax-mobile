@@ -13,9 +13,12 @@ import { downloadAuthProtectedFileToTemp, isAuthProtectedFileUrl } from "@/utils
 // #ifdef APP-ANDROID
 import Intent from 'android.content.Intent';
 import ContentValues from 'android.content.ContentValues';
+import ContentResolver from 'android.content.ContentResolver';
+import Uri from 'android.net.Uri';
 import Environment from 'android.os.Environment';
 import Build from 'android.os.Build';
 import MediaStore from 'android.provider.MediaStore';
+import ContentUris from 'android.content.ContentUris';
 import File from 'java.io.File';
 import FileInputStream from 'java.io.FileInputStream';
 import FileOutputStream from 'java.io.FileOutputStream';
@@ -757,19 +760,44 @@ export function mergeDirectoryLevelFiles(
    * Android 10+ 分区存储：targetSdk>=29 时 legacy 标志在 Android 11+ 已被系统忽略、
    * WRITE_EXTERNAL_STORAGE 不再授予公共目录写权，File API 直写公共 Download 会被
    * **静默拒绝**（文件实际留在私有 cache，文件管理不可见）——API 29+ 改走
-   * MediaStore.Downloads 插入（自有文件免存储运行时权限；重名由系统自动加 (n)）；
-   * API 29 以下维持旧 File 直写。任一步失败回落临时路径。
+   * MediaStore.Downloads 插入（自有文件免存储运行时权限）。同名直接覆盖原记录，
+   * 避免系统自动改成 "name (n).ext" 后弹窗把这个序号显示出来。
+   * API 29 以下维持旧 File 直写，已存在则覆盖。任一步失败回落临时路径。
    */
+  function findOwnDownloadUri(resolver: ContentResolver, filename: string): Uri | null {
+    const cursor = resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI, null, null, null, null);
+    if (cursor == null) return null;
+    let found: Uri | null = null;
+    if (cursor.moveToFirst()) {
+      do {
+        const nameIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME);
+        const idIdx = cursor.getColumnIndex(MediaStore.MediaColumns._ID);
+        if (nameIdx >= 0 && idIdx >= 0) {
+          const name = cursor.getString(nameIdx);
+          if (name != null && name == filename) {
+            found = ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cursor.getLong(idIdx));
+            break;
+          }
+        }
+      } while (cursor.moveToNext());
+    }
+    cursor.close();
+    return found;
+  }
+
   function copyToPublicDownload(tempFilePath: string, filename: string): string {
     try {
       const context = UTSAndroid.getAppContext();
       if (context == null) return tempFilePath;
       if (Build.VERSION.SDK_INT >= 29) {
         const resolver = context.getContentResolver();
-        const values = new ContentValues();
-        values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
-        values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-        const uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        let uri = findOwnDownloadUri(resolver, filename);
+        if (uri == null) {
+          const values = new ContentValues();
+          values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
+          values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+          uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        }
         if (uri != null) {
           const inStream = new FileInputStream(new File(tempFilePath));
           const outStream = resolver.openOutputStream(uri);
@@ -783,21 +811,8 @@ export function mergeDirectoryLevelFiles(
             outStream.close();
           }
           inStream.close();
-          // 展示路径：DATA 列多数 ROM 仍回填物理路径（含系统重名加缀后的真名），取不到按标准位置拼
-          let displayPath = `${Environment.getExternalStorageDirectory()}/${Environment.DIRECTORY_DOWNLOADS}/${filename}`;
-          const cursor = resolver.query(uri, null, null, null, null);
-          if (cursor != null) {
-            if (cursor.moveToFirst()) {
-              const idx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA);
-              if (idx >= 0) {
-                const p = cursor.getString(idx);
-                if (p != null && p.length > 0) {
-                  displayPath = p;
-                }
-              }
-            }
-            cursor.close();
-          }
+          // 弹窗展示原始文件名。不再读 DATA 列，避免把系统重名后的 " (n)" 显示出来。
+          const displayPath = `${Environment.getExternalStorageDirectory()}/${Environment.DIRECTORY_DOWNLOADS}/${filename}`;
           console.log('已存入公共 Download(MediaStore):', displayPath);
           return displayPath;
         }
@@ -807,17 +822,7 @@ export function mergeDirectoryLevelFiles(
           if (!downloadDir.exists()) {
             downloadDir.mkdirs();
           }
-          let targetFile = new File(downloadDir, filename);
-          if (targetFile.exists()) {
-            const dotIdx = filename.lastIndexOf('.');
-            const nameWithoutExt = dotIdx > 0 ? filename.substring(0, dotIdx) : filename;
-            const ext = dotIdx > 0 ? filename.substring(dotIdx) : '';
-            let counter = 1;
-            while (targetFile.exists() && counter < 100) {
-              targetFile = new File(downloadDir, `${nameWithoutExt}(${counter})${ext}`);
-              counter++;
-            }
-          }
+          const targetFile = new File(downloadDir, filename);
           const srcFile = new File(tempFilePath);
           const inStream = new FileInputStream(srcFile);
           const outStream = new FileOutputStream(targetFile);
@@ -1263,7 +1268,7 @@ export function mergeDirectoryLevelFiles(
    * 非 Android（iOS/鸿蒙）：把下载临时文件以真实文件名拷入沙盒 Download 目录。
    * downloadFile 临时文件名为 UUID+扩展名（用户反馈：预览顶部标题显示 70d2….docx），
    * 直接 openDocument 标题即 UUID；拷贝改名后预览标题才是真实文件名。
-   * 重名加 " (n)" 缀（异步实查，上限 20 防极端堆积）；拷贝走异步回调并回验落盘，
+   * 同名直接覆盖，不再追加 " (n)"。弹窗里的保存位置因此始终是原始文件名。
    * 任一步失败回落临时路径（与 copyToPublicDownload 失败口径一致，至少还能打开）。
    */
   async function copyToNamedSandbox(tempFilePath: string, filename: string): Promise<string> {
@@ -1279,15 +1284,19 @@ export function mergeDirectoryLevelFiles(
     } catch (_eMkdir) {
       // 已存在/权限等：拷贝回验兜底
     }
-    const dotIdx = safeName.lastIndexOf('.');
-    const base = dotIdx > 0 ? safeName.substring(0, dotIdx) : safeName;
-    const ext = dotIdx > 0 ? safeName.substring(dotIdx) : '';
-    let target = `${dir}/${safeName}`;
-    for (let i = 1; i <= 20; i++) {
-      if (!(await sandboxPathExists(target))) {
-        break;
-      }
-      target = `${dir}/${base} (${i})${ext}`;
+    const target = `${dir}/${safeName}`;
+    if (await sandboxPathExists(target)) {
+      await new Promise<void>((resolve) => {
+        fs.unlink({
+          filePath: target,
+          success: (_res) => {
+            resolve();
+          },
+          fail: (_err) => {
+            resolve();
+          },
+        });
+      });
     }
     const copied = await new Promise<boolean>((resolve) => {
       fs.copyFile({

@@ -30,9 +30,6 @@ func icon(_ name: String, _ c: CGContext) {
         path(c, [CGPoint(x: 11, y: 4), CGPoint(x: 6, y: 8), CGPoint(x: 3, y: 8), CGPoint(x: 3, y: 16), CGPoint(x: 6, y: 16), CGPoint(x: 11, y: 20), CGPoint(x: 11, y: 4)])
         c.move(to: CGPoint(x: 15, y: 8)); c.addCurve(to: CGPoint(x: 15, y: 16), control1: CGPoint(x: 18, y: 10), control2: CGPoint(x: 18, y: 14)); c.strokePath()
         c.move(to: CGPoint(x: 18, y: 4.5)); c.addCurve(to: CGPoint(x: 18, y: 19.5), control1: CGPoint(x: 23, y: 8), control2: CGPoint(x: 23, y: 16)); c.strokePath()
-    case "earpiece":
-        rounded(c, CGRect(x: 6, y: 2, width: 12, height: 20), 2.5)
-        line(c, 10, 5, 14, 5); line(c, 10.5, 18.5, 13.5, 18.5)
     case "video", "video-off":
         rounded(c, CGRect(x: 2.5, y: 6, width: 13, height: 12), 2.5)
         path(c, [CGPoint(x: 15.5, y: 10), CGPoint(x: 21.5, y: 6.5), CGPoint(x: 21.5, y: 17.5), CGPoint(x: 15.5, y: 14)])
@@ -51,7 +48,7 @@ func icon(_ name: String, _ c: CGContext) {
         c.addCurve(to: CGPoint(x: 21, y: 12), control1: CGPoint(x: 6, y: 7), control2: CGPoint(x: 18, y: 7))
         c.addLine(to: CGPoint(x: 21, y: 16)); c.addLine(to: CGPoint(x: 16.5, y: 15)); c.addLine(to: CGPoint(x: 16.5, y: 11.8))
         c.move(to: CGPoint(x: 3, y: 16)); c.addLine(to: CGPoint(x: 7.5, y: 15)); c.addLine(to: CGPoint(x: 7.5, y: 11.8)); c.strokePath()
-    case "phone":
+    case "phone", "earpiece":
         c.move(to: CGPoint(x: 5, y: 3)); c.addLine(to: CGPoint(x: 9, y: 3)); c.addLine(to: CGPoint(x: 10.5, y: 8))
         c.addLine(to: CGPoint(x: 8, y: 10)); c.addCurve(to: CGPoint(x: 14, y: 16), control1: CGPoint(x: 9, y: 13), control2: CGPoint(x: 11, y: 15))
         c.addLine(to: CGPoint(x: 16, y: 13.5)); c.addLine(to: CGPoint(x: 21, y: 15)); c.addLine(to: CGPoint(x: 21, y: 19))

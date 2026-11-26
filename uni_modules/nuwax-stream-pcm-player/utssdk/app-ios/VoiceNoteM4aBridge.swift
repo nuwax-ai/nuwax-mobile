@@ -254,12 +254,17 @@ public class VoiceNoteM4aBridge {
 
     public func pauseSegment() -> String {
         return onMain {
-            guard let recorder = self.recorder else {
-                self.lastError = "录音器不存在"
-                return "0"
-            }
-            userPaused = true
-            if recorder.isRecording {
+            // 先挡住挂断后的自动续录。文件已经被残留的打断通知关掉时，也要让页面退出录音态。
+            self.userPaused = true
+            self.interruptHold = false
+            self.interruptEnded = false
+            self.keepAliveForInterrupt = false
+            self.pendingEvents.removeAll()
+            self.clearThirdPartyWatch()
+            self.stopSilence()
+            // 用户暂停只停采集。不能在这里封口：挂断后续上的文件只有几秒，
+            // 封口会用这段 currentTime 盖掉页面上已经走着的总时长。
+            if let recorder = self.recorder, recorder.isRecording {
                 recorder.pause()
             }
             return "1"
@@ -309,9 +314,8 @@ public class VoiceNoteM4aBridge {
             self.backgroundedWhileRecording = false
             self.keepAliveForInterrupt = false
             self.pendingEvents.removeAll()
-            self.armedRecorder?.stop()
-            self.armedRecorder = nil
-            self.armedPath = ""
+            self.discardArmedRecorder()
+            self.resumeKey = ""
             self.resignedDuringHold = false
             self.clearThirdPartyWatch()
             self.stopSilence()
@@ -426,10 +430,17 @@ public class VoiceNoteM4aBridge {
     /// 最近一小段输入的音量，0 到 100。面板用来画左侧音波。
     public func takeLevel() -> String {
         guard let recorder = recorder, recorder.isRecording else {
-            return "0"
+            return "-1"
+        }
+        if !recorder.isMeteringEnabled {
+            recorder.isMeteringEnabled = true
         }
         recorder.updateMeters()
         let db = recorder.averagePower(forChannel: 0)
+        // -160 是没有采样。这时不是安静，不能画成 6px 往左滑。
+        if db <= -120 {
+            return "-1"
+        }
         var level = Int((db + 50) / 50 * 100)
         if level < 0 {
             level = 0
@@ -476,6 +487,12 @@ public class VoiceNoteM4aBridge {
                 self.adoptBackgroundHoldEndIfReady()
                 self.resumeAfterReturning()
                 return
+            }
+            if self.interruptHold && !self.phoneBusy() && !self.otherAppPlaying() {
+                self.micProbeArmed = true
+                if self.micFreeSince == nil {
+                    self.micFreeSince = Date()
+                }
             }
             self.watchThirdPartyAudio()
         }
@@ -564,7 +581,8 @@ public class VoiceNoteM4aBridge {
                 logState("interruption began ignored: suppressed")
                 return
             }
-            if Date() < ignoreBeganUntil && !sessionBusy() {
+            // 飞书挂断后 secondaryAudio 提示会残留。不能把它当成还在通话，否则会把刚续上的文件关掉。
+            if Date() < ignoreBeganUntil && !phoneBusy() && !otherAppPlaying() {
                 logState("interruption began ignored: session idle")
                 return
             }
@@ -577,12 +595,14 @@ public class VoiceNoteM4aBridge {
                 pushEvent("began")
                 return
             }
-            // 飞书来电先不暂停。麦克风被连续占住后，下面的观察才会停计时和波浪。
             if interruptHold {
                 micFreeSince = nil
                 return
             }
+            // 响铃的 began 里会话已经被系统打断，这时激活麦克风通常会失败。
+            // 不能把这次失败当成接通，更不能在这里封口或新开文件。等回调结束后再看录音器还能不能写。
             noteThirdPartySuspect()
+            logState("interruption began: keep current file, do not open another")
             return
         }
         silencePlayer?.play()
@@ -600,19 +620,21 @@ public class VoiceNoteM4aBridge {
             return
         }
         if !interruptHold {
-            // 铃声结束，麦克风没有被占住。继续原来的文件，页面不进入暂停。
-            if continueCurrentRecorder() {
-                clearThirdPartyWatch()
-            }
+            // 响铃结束，麦克风没被占住。接着写原来的文件。新开文件会在接通时被掐成 0 秒或 1 秒。
+            _ = continueSameFile()
+            clearThirdPartyWatch()
+            logState("interruption ended: continue same file")
             return
         }
+        // 收到了挂断。前台或后台都在这次回调里续录。没收到这条通知时，不能在这里续。
         NSLog("[voice-note] interruption ended")
         interruptEnded = true
         micProbeArmed = true
-        if !otherAppPlaying() {
-            micFreeSince = Date().addingTimeInterval(-1.2)
+        logState("interruption ended: resume in foreground or background")
+        resumeRecordingAfterInterrupt()
+        if recorder?.isRecording != true {
+            scheduleResumeAttempts()
         }
-        watchThirdPartyAudio()
     }
 
     /// 已经收到挂断后，路由切回本机时再试一次。接通过程中的路由变化不能当成挂断。
@@ -736,6 +758,7 @@ public class VoiceNoteM4aBridge {
             keepAliveForInterrupt = false
             return true
         }
+        try? FileManager.default.removeItem(atPath: path)
         if holding {
             keepAliveForInterrupt = true
             startSilence()
@@ -805,27 +828,23 @@ public class VoiceNoteM4aBridge {
         startWatchTimer()
     }
 
-    /// 麦克风还在自己手里时接着写原文件。已经封口的文件不会走到这里。
-    private func continueCurrentRecorder() -> Bool {
+    /// 麦克风还在自己手里时，接着写已经打开的文件。
+    /// 已经 stop() 过的录音器不能再 record()，那会从文件头覆盖接通前的内容。
+    private func continueSameFile() -> Bool {
         guard let recorder = recorder, !currentPath.isEmpty else {
             return false
         }
         if recorder.isRecording {
             return true
         }
-        guard activateSession() else {
+        if !activateSession() {
             return false
         }
-        return recorder.record()
-    }
-
-    /// 激活自己的录音会话失败，说明麦克风被其他 App 占着。
-    private func microphoneAvailable() -> Bool {
-        let session = AVAudioSession.sharedInstance()
-        if !session.isInputAvailable {
-            return false
+        if recorder.record() {
+            recorder.isMeteringEnabled = true
+            return true
         }
-        return activateSession()
+        return false
     }
 
     private func startWatchTimer() {
@@ -858,7 +877,7 @@ public class VoiceNoteM4aBridge {
             return
         }
         if phoneBusy() {
-            if !interruptHold && !currentPath.isEmpty && recorder?.isRecording != true {
+            if !interruptHold && (thirdPartySuspect || !currentPath.isEmpty) && recorder?.isRecording != true {
                 thirdPartySuspect = false
                 micOccupiedSince = nil
                 interruptBeganAt = Date()
@@ -875,30 +894,24 @@ public class VoiceNoteM4aBridge {
                 }
                 return
             }
+            // 还在写原来的文件，说明响铃没占住麦克风。继续观察，不要清掉，接通后才能封口。
             if recorder?.isRecording == true {
-                clearThirdPartyWatch()
                 return
             }
             // 给系统电话留出进入通话列表的时间，这段时间不抢会话。
             if Date().timeIntervalSince(suspectStartedAt) < 0.8 {
                 return
             }
-            if microphoneAvailable() && continueCurrentRecorder() {
-                clearThirdPartyWatch()
-                logState("microphone still ours, keep recording")
+            if continueSameFile() {
+                logState("microphone still ours, continue same file")
                 return
             }
-            if micOccupiedSince == nil {
-                micOccupiedSince = Date()
-            }
-            if Date().timeIntervalSince(micOccupiedSince!) >= 1.0 {
-                thirdPartySuspect = false
-                micOccupiedSince = nil
-                interruptBeganAt = Date()
-                sealActiveFileForInterrupt()
-                pushEvent("began")
-                logState("microphone held, pause")
-            }
+            thirdPartySuspect = false
+            micOccupiedSince = nil
+            interruptBeganAt = Date()
+            sealActiveFileForInterrupt()
+            pushEvent("began")
+            logState("microphone held, pause")
             return
         }
         if otherAppPlaying() {
@@ -914,6 +927,11 @@ public class VoiceNoteM4aBridge {
             return
         }
         if Date().timeIntervalSince(micFreeSince!) < 1.2 {
+            return
+        }
+        // 没有挂断通知时，只在回到录音页（App 已到前台）后续。收到 ended 则前台后台都续。
+        if !interruptEnded && UIApplication.shared.applicationState != .active {
+            logState("microphone check skipped: no ended and app is not foreground")
             return
         }
         micProbeArmed = false
@@ -945,7 +963,8 @@ public class VoiceNoteM4aBridge {
             resignedDuringHold = true
         }
         keepAliveForInterrupt = true
-        armNextRecorder()
+        // 接通时不要 prepareToRecord。那一步就会在磁盘上建出还没写音频的 m4a。
+        discardArmedRecorder()
         startSilence()
         if !holdIsPhone {
             startWatchTimer()
@@ -959,6 +978,11 @@ public class VoiceNoteM4aBridge {
         if phoneBusy() {
             return
         }
+        // 没收到挂断通知时，后台不能开下一段。收到 interruption ended 后，前台后台都可以续。
+        if !holdIsPhone && !interruptEnded && UIApplication.shared.applicationState != .active {
+            logState("resume skipped: no ended and app is not foreground")
+            return
+        }
         if let recorder = recorder, recorder.isRecording, !currentPath.isEmpty {
             return
         }
@@ -968,19 +992,8 @@ public class VoiceNoteM4aBridge {
         beginWake()
         ignoreBeganUntil = Date().addingTimeInterval(1.5)
         logState("resume after interruption attempt")
-        // 后台里重新设置会话类别经常失败。先直接启动接通前准备好的录音器。
-        if let armed = armedRecorder, !armedPath.isEmpty {
-            try? AVAudioSession.sharedInstance().setActive(true)
-            if armed.record() {
-                recorder = armed
-                currentPath = armedPath
-                armedRecorder = nil
-                armedPath = ""
-                finishInterruptResume(currentPath)
-                return
-            }
-            NSLog("[voice-note] armed recorder refused to start")
-        }
+        // 先丢掉上次没录上的准备文件，避免它留在目录里。
+        discardArmedRecorder()
         guard activateSession() else {
             NSLog("[voice-note] resume failed: audio session not active")
             lastError = "音频会话未激活"
@@ -988,17 +1001,13 @@ public class VoiceNoteM4aBridge {
             startSilence()
             return
         }
-        if let armed = armedRecorder, !armedPath.isEmpty, armed.record() {
-            recorder = armed
-            currentPath = armedPath
-            armedRecorder = nil
-            armedPath = ""
-            finishInterruptResume(currentPath)
+        // 别的 App 还在出声时不要建文件。会话激活成功也不代表麦克风已经回到自己手里。
+        if !holdIsPhone && otherAppPlaying() {
+            logState("resume skipped: other app still playing")
+            keepAliveForInterrupt = true
+            startSilence()
             return
         }
-        armedRecorder?.stop()
-        armedRecorder = nil
-        armedPath = ""
         if resumeKey.isEmpty {
             let stamp = Int(Date().timeIntervalSince1970 * 1000)
             let indexName = segmentIndexName.isEmpty ? "c\(stamp)" : "\(segmentIndexName)c\(stamp)"
@@ -1020,37 +1029,14 @@ public class VoiceNoteM4aBridge {
         startSilence()
     }
 
-    /// 接通后先建好下一段，挂断回调里就不用再创建录音器。
-    private func armNextRecorder() {
-        if armedRecorder != nil {
-            return
+    /// 丢掉提前准备好的下一段。这个文件还没开始录，不能留在磁盘上被收成一段。
+    private func discardArmedRecorder() {
+        armedRecorder?.stop()
+        armedRecorder = nil
+        if !armedPath.isEmpty {
+            try? FileManager.default.removeItem(atPath: armedPath)
         }
-        guard !segmentLocalId.isEmpty else {
-            return
-        }
-        if resumeKey.isEmpty {
-            let stamp = Int(Date().timeIntervalSince1970 * 1000)
-            let indexName = segmentIndexName.isEmpty ? "c\(stamp)" : "\(segmentIndexName)c\(stamp)"
-            resumeKey = "\(segmentLocalId)|\(indexName)"
-        }
-        guard let path = preparePath(resumeKey) else {
-            return
-        }
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 16000,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderBitRateKey: 64000
-        ]
-        guard let next = try? AVAudioRecorder(url: URL(fileURLWithPath: path), settings: settings) else {
-            return
-        }
-        if next.prepareToRecord() {
-            armedRecorder = next
-            armedPath = path
-            return
-        }
-        next.stop()
+        armedPath = ""
     }
 
     private func finishInterruptResume(_ path: String) {
@@ -1066,18 +1052,11 @@ public class VoiceNoteM4aBridge {
         clearThirdPartyWatch()
         suppressBeganUntil = Date().addingTimeInterval(1.2)
         startSilence()
-        armNextRecorderLater()
+        discardArmedRecorder()
         endWake()
         pushEvent("ended")
         NSLog("[voice-note] resumed after interruption \(path)")
         logState("resumed after interruption")
-    }
-
-    /// 录音已经开始后再准备下一段，避免和当前录音器抢会话。
-    private func armNextRecorderLater() {
-        DispatchQueue.main.async { [weak self] in
-            self?.armNextRecorder()
-        }
     }
 
     private func beginWake() {
@@ -1151,14 +1130,20 @@ public class VoiceNoteM4aBridge {
         if bitRate > 0 {
             settings[AVEncoderBitRateKey] = bitRate
         }
+        let session = AVAudioSession.sharedInstance()
+        if !session.isInputAvailable {
+            lastError = "麦克风不可用"
+            NSLog("[voice-note] m4a record skipped: input unavailable path=\(path)")
+            return false
+        }
         do {
             let next = try AVAudioRecorder(url: URL(fileURLWithPath: path), settings: settings)
             let prepared = next.prepareToRecord()
             if !prepared || !next.record() {
-                let session = AVAudioSession.sharedInstance()
                 lastError = "录音器未能开始"
                 NSLog("[voice-note] m4a record() failed prepared=\(prepared) category=\(session.category.rawValue) permission=\(session.recordPermission.rawValue) input=\(session.isInputAvailable) bitRate=\(bitRate) path=\(path)")
                 next.stop()
+                try? FileManager.default.removeItem(atPath: path)
                 return false
             }
             lastError = ""
@@ -1169,6 +1154,7 @@ public class VoiceNoteM4aBridge {
         } catch {
             lastError = "创建录音文件失败"
             NSLog("[voice-note] m4a recorder failed \(error.localizedDescription)")
+            try? FileManager.default.removeItem(atPath: path)
             return false
         }
     }
@@ -1188,7 +1174,9 @@ public class VoiceNoteM4aBridge {
         }
         let attrs = try? FileManager.default.attributesOfItem(atPath: path)
         let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
-        if size <= 0 {
+        if size <= 0 || lastClosedDurationMs <= 0 {
+            try? FileManager.default.removeItem(atPath: path)
+            lastClosedDurationMs = 0
             lastError = "录音文件是空的"
             NSLog("[voice-note] m4a closed empty \(path)")
             return "0"

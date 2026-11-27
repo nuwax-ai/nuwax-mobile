@@ -500,9 +500,9 @@ describe('meeting ringing delivery', () => {
     expect(send.mock.calls[0][0].payload).toMatchObject({ type: 'meeting_invite', silent: true });
   });
 
-  it('routes ordinary IM meeting envelopes to the Harmony test channel when explicitly enabled', async () => {
+  it('routes valid ringing meeting envelopes to the Harmony test channel by default', async () => {
     const cid = 'registered-harmony-meeting-cid';
-    const { call, send, request, manager } = load(latestEntry, { NUWAX_VOIP_HARMONY_MEETING_RING: '1' });
+    const { call, send, request, manager } = load(latestEntry);
     manager.getClientDetailByCid = vi.fn().mockResolvedValue({
       errCode: 0, data: { validCids: { [cid]: { device_token: 'vendor-token', brand: 'hoshw', phone_type: 7 } } },
     });
@@ -512,6 +512,23 @@ describe('meeting ringing delivery', () => {
     ]);
     expect(request).toHaveBeenCalledOnce();
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { reason: 'automatic route rollback', enabled: false, silent: false, explicit: false },
+    { reason: 'explicit route rollback', enabled: false, silent: false, explicit: true },
+    { reason: 'silent invitation', enabled: true, silent: true, explicit: false },
+  ])('keeps the normal Harmony notification for $reason', async ({ enabled, silent, explicit }) => {
+    const cid = 'registered-harmony-meeting-cid';
+    const { call, send, request, manager } = load(latestEntry, { NUWAX_VOIP_HARMONY_MEETING_RING: enabled ? '1' : '0' });
+    manager.getClientDetailByCid = vi.fn().mockResolvedValue({
+      errCode: 0, data: { validCids: { [cid]: { device_token: 'vendor-token', brand: 'hoshw', phone_type: 7 } } },
+    });
+    const callRoute = explicit ? { cid, platform: 'harmonyos', transport: 'harmony-huawei' } : undefined;
+    const result = await call({ ...envelope, push_clientid: [cid], callRoute, payload: { ...ringPayload(), silent } });
+    expect(result.errCode).toBe(0);
+    expect(request).not.toHaveBeenCalled();
+    expect(send.mock.calls[0][0]).toMatchObject({ push_clientid: [cid], payload: { type: 'meeting_invite' } });
   });
 
   it.each([{ silent: true }, { calleeId: undefined }])('falls back for meetings that cannot ring: %j', async overrides => {
@@ -689,7 +706,7 @@ describe('automatic vendor route resolution', () => {
     expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({ delivery: 'android-native' });
   });
 
-  it.each([[7, 'hoshw'], ['7', 'HW']])('routes only single-chat calls to Harmony (%s, %s)', async (phoneType, brand) => {
+  it.each([[7, 'hoshw'], ['7', 'HW']])('routes single-chat calls and ringing group meetings to Harmony (%s, %s)', async (phoneType, brand) => {
     const cid = 'harmony-registry-cid';
     const { call, send, request } = withRegistry(load(), {
       [cid]: { device_token: 'vendor-token', brand, phone_type: phoneType },
@@ -702,10 +719,11 @@ describe('automatic vendor route resolution', () => {
     });
     expect(send).not.toHaveBeenCalled();
 
-    await call({ ...body, payload: { ...body.payload, scene: 'meeting', convType: 2,
+    const meeting = await call({ ...body, payload: { ...body.payload, scene: 'meeting', convType: 2,
       inviteId: 'qa-meeting', roomName: 'qa-room', title: '测试会议', silent: false, groupCall: true } });
-    expect(request).toHaveBeenCalledOnce();
-    expect(send).toHaveBeenCalledOnce();
+    expect(meeting.data.results).toMatchObject([{ cid, transport: 'harmony-huawei', delivery: 'native', errCode: 0 }]);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it.each([

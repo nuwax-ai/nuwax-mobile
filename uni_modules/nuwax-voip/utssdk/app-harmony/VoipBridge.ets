@@ -35,6 +35,14 @@ interface MeetingInvitation {
 interface ResolvedIncoming { call?: CallData; meeting?: MeetingInvitation; callerAvatar?: string }
 interface SignalBody { callId?: string; convId?: string; msgId?: string; userId?: string }
 interface ImFrame { op: number; body: CallData }
+interface VideoAudioRouting {
+  callId: string
+  session: audio.AudioSessionManager
+  previousDevice: audio.DeviceType
+  ownsSession: boolean
+  currentDevice?: audio.DeviceType
+  listener: (event: audio.CurrentOutputDeviceChangedEvent) => void
+}
 export class VoipBusinessPolicy {
   static ringDeadline(sendTime: number | undefined, now: number): number {
     return Math.min(sendTime && Number.isFinite(sendTime) && sendTime > 0 ? sendTime : now, now) + 60000
@@ -101,6 +109,7 @@ export class VoipBridge {
   private static audioRouteChosen = false
   private static audioRouteSerial = 0
   private static audioRouteWork: Promise<void> = Promise.resolve()
+  private static videoAudioRouting: VideoAudioRouting | undefined
   static camera = false
   static cameraSwitching = false
   static remoteVideo = false
@@ -1038,13 +1047,17 @@ export class VoipBridge {
     if (!call) return
     let route = ''
     try {
-      const routing = audio.getAudioManager().getRoutingManager()
-      const devices = routing.getPreferredOutputDeviceForRendererInfoSync({
-        usage: call.mediaType === 'video' ? audio.StreamUsage.STREAM_USAGE_VIDEO_COMMUNICATION :
-          audio.StreamUsage.STREAM_USAGE_VOICE_COMMUNICATION,
-        rendererFlags: 0,
-      })
-      const type = devices[0]?.deviceType
+      const videoAudio = VoipBridge.videoAudioRouting
+      let type = videoAudio?.callId === call.callId ? videoAudio.currentDevice : undefined
+      if (type === undefined) {
+        const routing = audio.getAudioManager().getRoutingManager()
+        const devices = routing.getPreferredOutputDeviceForRendererInfoSync({
+          usage: call.mediaType === 'video' ? audio.StreamUsage.STREAM_USAGE_VIDEO_COMMUNICATION :
+            audio.StreamUsage.STREAM_USAGE_VOICE_COMMUNICATION,
+          rendererFlags: 0,
+        })
+        type = devices[0]?.deviceType
+      }
       if (type === audio.DeviceType.SPEAKER) route = 'speaker'
       else if (type === audio.DeviceType.EARPIECE) route = 'earpiece'
       else if (type === audio.DeviceType.BLUETOOTH_SCO || type === audio.DeviceType.BLUETOOTH_A2DP) route = 'bluetooth'
@@ -1057,8 +1070,51 @@ export class VoipBridge {
     VoipBridge.emit('audioRoute')
     VoipBridge.emit('speaker', '', undefined, '', VoipBridge.speakerEnabled)
   }
+  private static async setVideoAudioDevice(id: string, enabled: boolean): Promise<void> {
+    let routing = VoipBridge.videoAudioRouting
+    if (!routing) {
+      const session = audio.getAudioManager().getSessionManager()
+      const listener = (event: audio.CurrentOutputDeviceChangedEvent): void => {
+        const active = VoipBridge.videoAudioRouting
+        if (!active || active.callId !== id || VoipBridge.current?.callId !== id) return
+        active.currentDevice = event.devices[0]?.deviceType
+        VoipBridge.refreshAudioRoute()
+      }
+      routing = {
+        callId: id, session, listener, ownsSession: false,
+        previousDevice: session.isAudioSessionActivated() ? session.getDefaultOutputDevice() : audio.DeviceType.DEFAULT,
+      }
+      session.on('currentOutputDeviceChanged', listener)
+      VoipBridge.videoAudioRouting = routing
+    }
+    const session = routing.session
+    if (!session.isAudioSessionActivated()) {
+      session.setAudioSessionScene(audio.AudioSessionScene.AUDIO_SESSION_SCENE_VOICE_COMMUNICATION)
+      await session.activateAudioSession({ concurrencyMode: audio.AudioConcurrencyMode.CONCURRENCY_MIX_WITH_OTHERS })
+      routing.ownsSession = true
+    }
+    if (VoipBridge.current?.callId !== id) return
+    // Video defaults to speaker on Harmony even after the speaker override is removed.
+    await session.setDefaultOutputDevice(enabled ? audio.DeviceType.SPEAKER : audio.DeviceType.EARPIECE)
+  }
+  private static restoreVideoAudioDevice(id: string): void {
+    VoipBridge.audioRouteWork = VoipBridge.audioRouteWork.then(async () => {
+      const routing = VoipBridge.videoAudioRouting
+      if (!routing || routing.callId !== id) return
+      VoipBridge.videoAudioRouting = undefined
+      const session = routing.session
+      try { session.off('currentOutputDeviceChanged', routing.listener) } catch (_) {}
+      try {
+        await session.setDefaultOutputDevice(routing.previousDevice)
+      } finally {
+        if (routing.ownsSession && session.isAudioSessionActivated()) await session.deactivateAudioSession()
+      }
+    }).catch((error: BusinessError) => {
+      VoipBridge.traceIncoming(`videoAudioRestoreFailed code=${error.code}`, id)
+    })
+  }
   static speaker(enabled: boolean, manual: boolean = true): void {
-    const id = VoipBridge.current?.callId, run = VoipBridge.generation
+    const call = VoipBridge.current, id = call?.callId, run = VoipBridge.generation
     if (!id || (!manual && VoipBridge.audioRouteChosen)) return
     if (manual) VoipBridge.audioRouteChosen = true
     const serial = ++VoipBridge.audioRouteSerial
@@ -1069,10 +1125,15 @@ export class VoipBridge {
     VoipBridge.audioRouteWork = VoipBridge.audioRouteWork.then(async () => {
       if (!live()) return
       VoipBridge.refreshAudioRoute()
+      if (call?.mediaType === 'video') {
+        await VoipBridge.setVideoAudioDevice(id, enabled)
+        return
+      }
       if (!manual && (VoipBridge.audioRoute === 'bluetooth' || VoipBridge.audioRoute === 'headset')) return
       const routing = audio.getAudioManager().getRoutingManager()
       await routing.setCommunicationDevice(audio.CommunicationDeviceType.SPEAKER, enabled)
-    }).catch(() => {
+    }).catch((error: BusinessError) => {
+      if (live()) VoipBridge.traceIncoming(`audioRouteFailed code=${error.code}`, id)
       if (live() && manual) VoipBridge.emit('error', 'CALL_AUDIO_ROUTE_FAILED')
     }).finally(() => {
       if (!live()) return
@@ -1127,7 +1188,10 @@ export class VoipBridge {
     if (VoipBridge.expiry >= 0) clearTimeout(VoipBridge.expiry)
     VoipBridge.media(JSON.stringify({ op: 'disconnect', callId: id })); VoipBridge.commands = []
     VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_DISCONNECTED); VoipBridge.nativeId = ''
-    if (id) VoipBridge.stopTask(id)
+    if (id) {
+      VoipBridge.restoreVideoAudioDevice(id)
+      VoipBridge.stopTask(id)
+    }
     if (reason) VoipBridge.emit('localEnded', '', undefined, reason)
     VoipBridge.current = null; VoipBridge.mediaId = ''; VoipBridge.connected = false; VoipBridge.reconnecting = false; VoipBridge.peerReady = false; VoipBridge.answering = ''
     VoipBridge.cameraSwitching = false; VoipBridge.remoteVideo = false; VoipBridge.audioRoutePending = false

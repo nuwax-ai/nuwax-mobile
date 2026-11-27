@@ -27,18 +27,18 @@ iOS 的测试出包入口是 `make ios-tester`，对应 Android 的 `make androi
 make ios-tester
 ```
 
-脚本先准备离线资源，再将当前源码快照复制到 `out/voip-business-qa-project`。该副本固定测试域名 `https://testagent.xspaceagi.com`，开启业务通话入口，并跳过会替换当前包的版本更新检查。QA 原生宿主还核对固定的 API origin，防止恢复旧安装遗留的生产电话身份。
+脚本直接从当前 checkout 生成资源，不再复制或导入 `voip-business-qa-project`。服务地址、通话入口和更新检查均遵循当前分支代码与设备上保存的配置；当前代码在发行模式下默认生产域名，设备已保存的域名优先。运行时确认所选环境，再登录对应账号。
 
-HBuilderX 生成本地 iOS 发行资源，随后离线 SDK 构建 Debug 原生宿主、签名、验证 APNs 元数据并生成独立 IPA。SDK `ipatype=2`，不链接 HX DebugServe；调试基座仍沿用原流程及路径。全 App 编译可临时提高 HX 堆内存，构建结束恢复既有配置。资源、证书派生文件及产物都不进入版本库。
+HBuilderX 生成本地 iOS 发行资源，随后离线 SDK 构建 Debug 原生宿主、签名、验证 APNs 元数据并生成独立 IPA。SDK `ipatype=2`，不链接 HX DebugServe；调试基座仍沿用原流程及路径。资源、证书派生文件及产物都不进入版本库。
 
 产物位置：
 
 - `out/voip-business-packages/Nuwax-iOS-Test-<时间>.ipa`：发给同事安装的完整包。
-- 同名 `.sha256`：文件完整性校验；同名 `.json`：构建变体元数据。
+- 同名 `.sha256`：文件完整性校验。
 - `Nuwax-iOS-Test-latest.ipa`：最新包的本地软链，转发时选择实际 IPA 文件。
-- `out/voip-business-packages/ios-qa-verification.json`：环境、内置资源与当前原生模块摘要核对结果。
+- `out/voip-business-packages/ios-qa-verification.json`：内置资源与当前原生模块摘要核对结果；未固定域名时 `apiOrigin` 为 null。
 
-`verify-business-qa-ios.py` 校验包名、真实产品名称、测试环境、发行宿主模式、后台模式、无 DebugServe、导出资源和内置资源逐文件一致、当前原生 Swift 实现一致及有效签名。签名与构建通过仍不代表实机启动或通话矩阵已验收。
+`verify-business-qa-ios.py` 校验包名、真实产品名称、发行宿主模式、后台模式、无 DebugServe、导出资源和内置资源逐文件一致、当前原生 Swift 实现一致及有效签名。它不将服务地址固定为测试环境。签名与构建通过仍不代表实机启动或通话矩阵已验收。
 
 ## 首次安装与覆盖更新
 

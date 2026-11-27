@@ -173,6 +173,10 @@ exports.prepareVoipScene = (body, now = Date.now()) => {
 // Getui brand codes and the UniPush strategies exercised in this test space.
 const callTransports = new Map([
   ['ios-voip', { platform: 'ios', strategy: 'ios' }],
+  // Domestic Android devices without a vendor channel (for example Samsung) use
+  // the existing Getui TCP connection. The IM service capability-gates this
+  // route so older clients keep their ordinary notification behavior.
+  ['android-getui', { platform: 'android', transmission: true }],
   ['android-huawei', { platform: 'android', brand: 'hw', strategy: 'hw' }],
   ['android-honor', { platform: 'android', brand: 'ho' }],
   ['android-xiaomi', { platform: 'android', brand: 'xm' }],
@@ -219,7 +223,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   const route = body.callRoute
   const transport = callTransports.get(route?.transport)
   if (!transport) return { error: 'unsupported call route' }
-  const { platform, strategy } = transport
+  const { platform, strategy, transmission } = transport
   const ios = platform === 'ios'
   const harmony = platform === 'harmonyos'
   const target = !ios && Array.isArray(body.push_clientid) && body.push_clientid.length === 1
@@ -237,7 +241,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
     ? prepareMeetingRingInvitation(body, now)
     : prepareCallInvitation(body, now)
   if (invitation.error || invitation.expired) return invitation
-  if (!strategy) return { notificationOnly: true }
+  if (!strategy && !transmission) return { notificationOnly: true }
   const payload = { ...invitation.payload }
   if (ios) payload.routeRegistrationId = route.registrationId
   if (platform === 'android') payload.delivery = 'android-native'
@@ -246,8 +250,10 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   const requestId = createHash('sha256')
     .update(JSON.stringify([route.transport, route.cid, ios ? route.registrationId : '', payload.callId]))
     .digest('hex').slice(0, 32)
-  const ttl = harmony ? invitation.settings.ttl : Math.min(5_000, invitation.settings.ttl)
-  const settings = { ttl, strategy: { [strategy]: 2 } }
+  const ttl = harmony || transmission
+    ? invitation.settings.ttl
+    : Math.min(5_000, invitation.settings.ttl)
+  const settings = strategy ? { ttl, strategy: { [strategy]: 2 } } : { ttl }
   if (strategy === 'vv') {
     // Test-space probe via UniPush. Vendor receipt and SDK callback are verified separately.
     const seconds = Math.floor(ttl / 1000)

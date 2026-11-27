@@ -298,8 +298,11 @@ function attachBadgeToPayload(payload, badge) {
 //   cid → 厂商 token / 品牌的档案存在个推服务端，是设备上次在线注册时写入并持久化的，
 //   云函数按 cid 查档案即可，不依赖接收端 App 存活 —— 与普通厂商通知用同一份数据。
 // device_token 非空时按 brand 选路。缺少专用发送能力或查档失败时走普通通知。
-async function resolveAutoCallRoute(cid, invocationId, singleChatCall) {
-  if (typeof uniPush.getClientDetailByCid !== 'function') return null
+async function resolveAutoCallRoute(cid, invocationId, singleChatCall, androidGetuiCids) {
+  const getuiRoute = androidGetuiCids?.has(cid)
+    ? { cid, platform: 'android', transport: 'android-getui' }
+    : null
+  if (typeof uniPush.getClientDetailByCid !== 'function') return getuiRoute
   let detail = null
   try {
     const result = await uniPush.getClientDetailByCid(cid)
@@ -309,7 +312,7 @@ async function resolveAutoCallRoute(cid, invocationId, singleChatCall) {
     console.error('[push-send] call route lookup failed', JSON.stringify({
       invocationId, error: String((e && e.message) || e).slice(0, 120)
     }))
-    return null
+    return getuiRoute
   }
   const token = typeof detail?.device_token === 'string' ? detail.device_token.trim() : ''
   const brand = typeof detail?.brand === 'string' ? detail.brand.trim().toLowerCase() : ''
@@ -321,9 +324,10 @@ async function resolveAutoCallRoute(cid, invocationId, singleChatCall) {
   const phoneType = detail?.phone_type
   const harmony = singleChatCall && (brand === 'hoshw' || brand === 'hw') &&
     (phoneType === 7 || phoneType === '7')
-  const route = token && harmony
+  const vendorRoute = token && harmony
     ? { cid, platform: 'harmonyos', transport: 'harmony-huawei' }
     : token ? androidCallRouteForCid(cid, brand, phoneType) : null
+  const route = vendorRoute ?? getuiRoute
   console.log('[push-send] call route auto', JSON.stringify({
     invocationId, hasVendorToken: token.length > 0, brand,
     detailShape: shape,
@@ -489,8 +493,13 @@ async function handle(event, invocationId) {
   // 顶层 type="voip" 是通话/会议的显式声明；payload.type 缺失时由云函数回填。
   body = withEnvelopeType(body)
   const iosRegistrations = body.payload?.iosVoip
-  if (body.payload && Object.prototype.hasOwnProperty.call(body.payload, 'iosVoip')) {
-    const { iosVoip, ...deliveryPayload } = body.payload
+  const androidGetuiIds = Array.isArray(body.payload?.androidGetui)
+    ? callTargetCids(body.payload.androidGetui)
+    : null
+  const androidGetui = new Set(androidGetuiIds ?? [])
+  if (body.payload && (Object.prototype.hasOwnProperty.call(body.payload, 'iosVoip') ||
+      Object.prototype.hasOwnProperty.call(body.payload, 'androidGetui'))) {
+    const { iosVoip, androidGetui: _androidGetui, ...deliveryPayload } = body.payload
     body = { ...body, payload: deliveryPayload }
   }
   // ★每个请求一行摘要：数 `[push-send] in` 的行数 = 后端/网关实际调了几次。
@@ -560,7 +569,8 @@ async function handle(event, invocationId) {
       const cid = ids[i]
       const iosRoute = iosCallRouteForCid(cid, iosRegistrations,
         process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT || 'development')
-      const route = iosRoute ?? await resolveAutoCallRoute(cid, invocationId, scene?.call != null)
+      const route = iosRoute ?? await resolveAutoCallRoute(
+        cid, invocationId, scene?.call != null, androidGetui)
       if (route != null) {
         const native = prepareNativeVoip({
           ...body, push_clientid: cid, payload: invitation.payload, callRoute: route,

@@ -112,6 +112,26 @@ describe('native call delivery', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it('sends a capability-gated Android Getui transmission without a vendor strategy', async () => {
+    const body = makeBody(Date.now() + 45_000);
+    const { call, send, request } = load();
+    expect((await call({
+      ...body, push_clientid: [cid],
+      callRoute: { cid, platform: 'android', transport: 'android-getui' },
+    })).errCode).toBe(0);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    const args = send.mock.calls[0][0];
+    expect(args).toMatchObject({
+      push_clientid: [cid], force_notification: false,
+      payload: { callId: 'same-call', delivery: 'android-native' },
+    });
+    expect(args.settings.ttl).toBeGreaterThan(5_000);
+    expect(args.settings.ttl).toBeLessThanOrEqual(45_000);
+    expect(args.settings).not.toHaveProperty('strategy');
+  });
+
   it('sends one Huawei HarmonyOS VoIP request through the dedicated vendor channel', async () => {
     const { call, send, request } = load();
     const { payload, ...body } = makeBody();
@@ -430,6 +450,34 @@ describe('meeting ringing delivery', () => {
     expect(send.mock.calls[1][0].options?.ios?.type).not.toBe('voip');
   });
 
+  it('rings a meeting through the capability-gated Android Getui route', async () => {
+    const cid = 'fixture-samsung';
+    const loaded = load(latestEntry, ringEnv);
+    loaded.manager.getClientDetailByCid = vi.fn().mockResolvedValue({
+      errCode: 0,
+      data: { validCids: { [cid]: { device_token: '', brand: 'samsung', phone_type: 1 } } },
+    });
+    const { call, send, request, manager } = loaded;
+    const result = await call({
+      ...envelope, push_clientid: [cid],
+      payload: { ...ringPayload(), androidGetui: [cid] },
+    });
+
+    expect(result.data.results).toMatchObject([
+      { cid, delivery: 'native', transport: 'android-getui', errCode: 0 },
+    ]);
+    expect(manager.getClientDetailByCid).toHaveBeenCalledWith(cid);
+    expect(request).not.toHaveBeenCalled();
+    const args = send.mock.calls[0][0];
+    expect(args.force_notification).toBe(false);
+    expect(args.settings.ttl).toBeGreaterThan(5_000);
+    expect(args.settings).not.toHaveProperty('strategy');
+    expect(args.payload).toMatchObject({
+      type: 'voip', scene: 'meeting', callId: 'mi-ring', delivery: 'android-native',
+    });
+    expect(args.payload).not.toHaveProperty('androidGetui');
+  });
+
   it('clamps a long meeting deadline to the 60 second ringing window', async () => {
     const { call, send } = load(latestEntry, { ...ringEnv, NUWAX_VOIP_IOS_APNS_ENVIRONMENT: 'development' });
     const cid = 'fixture-target-cid';
@@ -681,6 +729,46 @@ describe('automatic vendor route resolution', () => {
     expect(request).not.toHaveBeenCalled();
     expect(send).toHaveBeenCalledOnce();
     expect(send.mock.calls[0][0]).toMatchObject({ push_clientid: [cid], payload: { callId: 'auto-route-call' } });
+  });
+
+  it('uses Android Getui only for CIDs explicitly marked by the IM service', async () => {
+    const cid = 'samsung-getui-cid';
+    const { call, send, request } = withRegistry(load(), {
+      [cid]: { device_token: '', brand: 'samsung', phone_type: 1 },
+    });
+    const body = makeCall(cid);
+    const result = await call({
+      ...body, push_clientid: [cid],
+      payload: { ...body.payload, androidGetui: [cid] },
+    });
+
+    expect(result.data.results).toMatchObject([
+      { cid, delivery: 'native', transport: 'android-getui', errCode: 0 },
+    ]);
+    expect(request).not.toHaveBeenCalled();
+    const args = send.mock.calls[0][0];
+    expect(args).toMatchObject({
+      push_clientid: [cid], force_notification: false,
+      payload: { callId: 'auto-route-call', delivery: 'android-native' },
+    });
+    expect(args.payload).not.toHaveProperty('androidGetui');
+    expect(args.settings).not.toHaveProperty('strategy');
+  });
+
+  it('keeps a vendor route ahead of the Android Getui fallback', async () => {
+    const cid = 'vendor-first-cid';
+    const { call, send, request } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand: 'hw', phone_type: 1 },
+    });
+    const body = makeCall(cid);
+    await call({
+      ...body, push_clientid: [cid],
+      payload: { ...body.payload, androidGetui: [cid] },
+    });
+
+    expect(request).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+    expect(request.mock.calls[0][0].requestData.settings.strategy).toEqual({ hw: 2 });
   });
 
   it('never blocks delivery when the registry lookup fails', async () => {

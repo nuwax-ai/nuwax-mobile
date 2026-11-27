@@ -16,6 +16,7 @@ import android.media.Ringtone
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.VibrationEffect
@@ -128,16 +129,61 @@ object VoipBridge {
     private val renderers = mutableMapOf<FrameLayout, TextureViewRenderer>()
     private val bindings = mutableMapOf<FrameLayout, VideoTrack>()
     private var activity = WeakReference<Activity>(null)
+    private var resumedAppActivity = WeakReference<Activity>(null)
+    private var observingAppActivities = false
+    private val appActivityLifecycle = object : Application.ActivityLifecycleCallbacks {
+        override fun onActivityResumed(host: Activity) {
+            if (!isAppActivity(host)) return
+            resumedAppActivity = WeakReference(host)
+            if (hidden && cameraHandoffJob == null) scope.launch { updateCameraVisibility() }
+        }
+        override fun onActivityPaused(host: Activity) {
+            if (resumedAppActivity.get() === host) resumedAppActivity.clear()
+        }
+        override fun onActivityCreated(host: Activity, state: Bundle?) {}
+        override fun onActivityStarted(host: Activity) {}
+        override fun onActivityStopped(host: Activity) {
+            if (isAppActivity(host) && hidden && resumedAppActivity.get() == null && cameraHandoffJob == null) {
+                scope.launch { updateCameraVisibility() }
+            }
+        }
+        override fun onActivitySaveInstanceState(host: Activity, state: Bundle) {}
+        override fun onActivityDestroyed(host: Activity) {}
+    }
     private const val PREFIX = "/api/instant-message/calls"
-    private const val CAMERA_HANDOFF_MS = 500L
+    private const val CAMERA_HANDOFF_MS = 750L
 
     /** Only lifecycle stages: never log invitations, identities, URLs or credentials. */
     private fun trace(stage: String) {
         if (((context?.applicationInfo?.flags ?: 0) and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) Log.d("NuwaxVoip", stage)
     }
 
-    @JvmStatic fun setActivity(value: Activity) { activity = WeakReference(value) }
-    private fun cameraVisible() = !hidden || nativeUiId == current?.optString("callId")
+    @JvmStatic fun setActivity(value: Activity) {
+        activity = WeakReference(value)
+        scope.launch {
+            observeAppActivities(value.application)
+            if (value.hasWindowFocus() && isAppActivity(value)) resumedAppActivity = WeakReference(value)
+        }
+    }
+
+    private fun observeAppActivities(application: Application) {
+        if (observingAppActivities) return
+        application.registerActivityLifecycleCallbacks(appActivityLifecycle)
+        observingAppActivities = true
+    }
+
+    private fun isAppActivity(host: Activity): Boolean {
+        // uni-app x uses different Activity classes for the main app and for native pages.
+        var type: Class<*>? = host.javaClass
+        while (type != null) {
+            if (type.name == "io.dcloud.uniapp.UniAppActivity" ||
+                type.name == "io.dcloud.uniapp.appframe.activity.UniPageActivity") return true
+            type = type.superclass
+        }
+        return false
+    }
+
+    private fun cameraVisible() = !hidden || resumedAppActivity.get() != null || nativeUiId == current?.optString("callId")
     @JvmStatic fun presentationStatus(ctx: Context): String {
         val manager = ctx.getSystemService(NotificationManager::class.java)
         val channel = VoipNotificationChannels.incoming(manager)
@@ -337,33 +383,32 @@ object VoipBridge {
             .put("defaultAudioRoutePending", defaultAudioRoutePending)
             .put("mediaReady", connected && peerReady).put("reconnecting", reconnecting)
     }
-    internal fun nativeVisible(id: String, visible: Boolean, onEnded: (() -> Unit)? = null, minimizing: Boolean = false) {
+    internal fun nativeVisible(id: String, visible: Boolean, onEnded: (() -> Unit)? = null) {
         trace(if (visible) "native call activity visible" else "native call activity hidden")
         if (visible && current?.optString("callId") == id) {
             nativeUiId = id
             onNativeUiEnded = onEnded
+            cancelCameraHandoff()
             updatePresentedIncoming(id)
         } else if (!visible && nativeUiId == id) {
             nativeUiId = ""
             onNativeUiEnded = null
         } else return
         updateProximity()
-        cancelCameraHandoff()
+        if (cameraHandoffJob == null) scope.launch { updateCameraVisibility() }
+    }
+
+    internal fun beginVideoMinimize(id: String, application: Application) {
         val target = room ?: return
-        // The inline minimize button returns to the App. Its onShow can arrive after this Activity pauses.
-        if (minimizing && hidden && camera && target.localParticipant.getTrackPublication(Track.Source.CAMERA)?.muted == false &&
-            activity.get()?.let { !it.isFinishing && !it.isDestroyed } == true &&
-            context?.getSystemService(PowerManager::class.java)?.isInteractive == true &&
-            context?.getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == false) {
-            trace("waiting for app to resume after video minimize")
-            cameraHandoffJob = scope.launch {
-                delay(CAMERA_HANDOFF_MS)
-                cameraHandoffJob = null
-                if (room === target) updateCameraVisibility()
-            }
-            return
-        }
-        scope.launch {
+        if (nativeUiId != id || !camera || target.localParticipant.getTrackPublication(Track.Source.CAMERA)?.muted != false) return
+        if (context?.getSystemService(PowerManager::class.java)?.isInteractive != true ||
+            context?.getSystemService(KeyguardManager::class.java)?.isKeyguardLocked != false) return
+        observeAppActivities(application)
+        cancelCameraHandoff()
+        // The UTS foreground event can arrive after the resumed Android Activity is visible.
+        cameraHandoffJob = scope.launch {
+            delay(CAMERA_HANDOFF_MS)
+            cameraHandoffJob = null
             if (room === target) updateCameraVisibility()
         }
     }
@@ -437,9 +482,7 @@ object VoipBridge {
                     "speaker" -> setSpeaker(command.optBoolean("enabled"))
                     "switchCamera" -> switchCamera()
                     "background" -> {
-                        val nextHidden = command.optBoolean("hidden")
-                        if (nextHidden != hidden || !nextHidden) cancelCameraHandoff()
-                        hidden = nextHidden
+                        hidden = command.optBoolean("hidden")
                         updateProximity()
                         if (!hidden && appCallUiId.isNotEmpty()) updatePresentedIncoming(appCallUiId)
                         if (cameraHandoffJob == null) updateCameraVisibility()
@@ -1338,9 +1381,20 @@ object VoipBridge {
         views[view] = if (local) "local" else "remote"; scope.launch { refreshViews() }; return view
     }
     @JvmStatic fun releaseVideoView(view: FrameLayout) {
-        val renderer = renderers[view]
-        if (renderer != null) bindings.remove(view)?.removeRenderer(renderer)
-        renderers.remove(view)?.release(); views.remove(view); view.removeAllViews()
+        val renderer = renderers.remove(view) ?: view.getChildAt(0) as? TextureViewRenderer
+        if (renderer != null) {
+            bindings.remove(view)?.removeRenderer(renderer)
+            view.removeView(renderer)
+            renderer.release()
+        }
+        views.remove(view)
+        view.removeAllViews()
+    }
+
+    internal fun detachVideoTrackForExit(view: FrameLayout) {
+        val renderer = renderers.remove(view) ?: return
+        views.remove(view)
+        bindings.remove(view)?.removeRenderer(renderer)
     }
     private fun refreshViews() {
         val r = room ?: return

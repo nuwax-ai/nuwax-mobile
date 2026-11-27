@@ -24,7 +24,6 @@ class VoipIncomingActivity : Activity() {
     private var callId = ""
     private var pendingAnswer: String? = null
     private var actionPending = false
-    private var minimizing = false
     private var lastRenderedSnapshot: String? = null
     private var lastRenderedSecond = -1L
     private var lastRenderedAnswering = false
@@ -62,7 +61,6 @@ class VoipIncomingActivity : Activity() {
     override fun onResume() {
         super.onResume()
         if (isFinishing) return
-        minimizing = false
         lastRenderedSnapshot = null
         VoipBridge.nativeVisible(callId, true, onEnded = ::closeEndedCall)
         handler.removeCallbacks(refresh); handler.post(refresh)
@@ -70,7 +68,7 @@ class VoipIncomingActivity : Activity() {
     }
     override fun onPause() {
         handler.removeCallbacks(refresh)
-        VoipBridge.nativeVisible(callId, false, minimizing = minimizing)
+        VoipBridge.nativeVisible(callId, false)
         super.onPause()
     }
     override fun onDestroy() {
@@ -147,13 +145,19 @@ class VoipIncomingActivity : Activity() {
     }
 
     private fun closeEndedCall() {
+        if (isFinishing) return
         handler.removeCallbacks(refresh)
-        callView.hideVideoForExit()
-        if (!isFinishing) finish()
+        val hadVideo = callView.freezeVideoForExit()
+        if (hadVideo && Build.VERSION.SDK_INT >= 34) overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, 0)
+        finish()
+        if (hadVideo && Build.VERSION.SDK_INT < 34) {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(0, 0)
+        }
     }
 
     private fun minimizeCall() {
-        minimizing = true
+        VoipBridge.beginVideoMinimize(callId, application)
         finish()
     }
 

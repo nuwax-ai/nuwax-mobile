@@ -340,6 +340,7 @@ Android 按系统版本配置音视频前台服务、会议进行中通知、通
 | 本人令牌 / 续签 | `POST /rtc/rooms/{room}/tokens`；`POST /rtc/rooms/{room}/tokens/refresh` |
 | 成员 | `GET /rtc/rooms/{room}/participants` |
 | 静音 / 移出 / 权限 | `POST /rtc/rooms/{room}/participants/{target}/mute`；`DELETE /rtc/rooms/{room}/participants/{target}`；`PATCH /rtc/rooms/{room}/participants/{target}/permissions` |
+| 再次邀请前解除禁入 | `POST /rtc/rooms/{room}/participants/{target}/allow-rejoin`（仅房主，幂等）。踢人会把 `im_meeting_member.banned` 置 true，签令牌据此拒绝；主持人再次邀请被移出的人时 App 先调本接口清标记，否则对方点邀请卡片/通知仍会撞 `IM_50006` |
 | 全员静音 / 会中开关 | `POST /rtc/rooms/{room}/mute-all`；`PATCH /rtc/rooms/{room}/settings` |
 | 录制 | `POST /rtc/rooms/{room}/recordings`；`DELETE /rtc/rooms/{room}/recordings/{egressId}`；`GET` 对应任务/列表 |
 | 预约 / 取消 | `POST /schedules`；`DELETE /schedules/{meetingId}` |

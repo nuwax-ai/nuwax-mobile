@@ -698,36 +698,28 @@ export function buildMeetingMount(mount: MeetingStageMount) {
   NodeContainer(mount).width('100%').height('100%')
 }
 
-@Component
-struct MeetingStageWeb {
-  host: MeetingStageHost
-
-  build() {
-    Web({ src: mediaURL, controller: this.host.controller })
-      .width('100%').height('100%')
-      .javaScriptAccess(true).domStorageAccess(false).fileAccess(false).mediaPlayGestureAccess(false)
-      .javaScriptProxy({ object: this.host, name: 'NuwaxMeeting', methodList: ['postMessage'], controller: this.host.controller })
-      .onLoadIntercept((event) => {
-        const url = event.data.getRequestUrl()
-        return event.data.isMainFrame() && !this.host.isAsset(url, 'media.html')
-      })
-      .onInterceptRequest((event) => this.host.assetResponse(event.request.getRequestUrl()))
-      .onPageEnd((event) => { this.host.loaded(event.url) })
-      .onRenderExited((_event) => { this.host.rendererExited() })
-      .onScreenCaptureRequest((event) => { this.host.requestScreenCapture(event.handler) })
-      .onPermissionRequest((event) => {
-        if (!this.host.captureOriginAllowed(event.request.getOrigin())) {
-          event.request.deny()
-          return
-        }
-        const resources = event.request.getAccessibleResource().filter((resource) => this.host.captureResourceAllowed(resource))
-        if (resources.length > 0) event.request.grant(resources)
-        else event.request.deny()
-      })
-  }
-}
-
 @Builder
 function buildMeetingStage(host: MeetingStageHost) {
-  MeetingStageWeb({ host: host })
+  Web({ src: mediaURL, controller: host.controller })
+    .width('100%').height('100%')
+    .javaScriptAccess(true).domStorageAccess(false).fileAccess(false).mediaPlayGestureAccess(false)
+    .javaScriptProxy({ object: host, name: 'NuwaxMeeting', methodList: ['postMessage'], controller: host.controller })
+    .onLoadIntercept((event) => {
+      const url = event.data.getRequestUrl()
+      return event.data.isMainFrame() && !host.isAsset(url, 'media.html')
+    })
+    // ArkWeb uses null to defer to the normal loader, although its callback type omits null.
+    .onInterceptRequest((event) => host.assetResponse(event.request.getRequestUrl()) as WebResourceResponse)
+    .onPageEnd((event) => { host.loaded(event.url) })
+    .onRenderExited((_event) => { host.rendererExited() })
+    .onScreenCaptureRequest((event) => { host.requestScreenCapture(event.handler) })
+    .onPermissionRequest((event) => {
+      if (!host.captureOriginAllowed(event.request.getOrigin())) {
+        event.request.deny()
+        return
+      }
+      const resources = event.request.getAccessibleResource().filter((resource) => host.captureResourceAllowed(resource))
+      if (resources.length > 0) event.request.grant(resources)
+      else event.request.deny()
+    })
 }

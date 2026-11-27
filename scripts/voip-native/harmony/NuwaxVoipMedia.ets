@@ -75,6 +75,8 @@ struct NuwaxVoipMedia {
   private closeTimer = -1
   private visible = false
   private displayedCallId = ''
+  private requestedAudioRoute: string = ''
+  private requestedAudioRouteAt: number = 0
   private proximity: CallProximityLock = new CallProximityLock()
   @State private lastPeer: string = ''
   @State private lastVideo: boolean = false
@@ -103,6 +105,7 @@ struct NuwaxVoipMedia {
 
   onPageHide(): void {
     this.visible = false
+    this.requestedAudioRoute = ''
     if (this.timer >= 0) clearInterval(this.timer)
     this.timer = -1
     this.cancelClose()
@@ -123,6 +126,7 @@ struct NuwaxVoipMedia {
     const call = VoipBridge.current
     if (call) {
       this.cancelClose()
+      if (this.displayedCallId !== call.callId) this.requestedAudioRoute = ''
       this.displayedCallId = call.callId
       const outgoing = call.callerId === VoipBridge.configuration?.userId
       this.lastPeer = (outgoing ? call.calleeDisplayName : call.callerDisplayName) || call.displayName
@@ -132,6 +136,7 @@ struct NuwaxVoipMedia {
         this.avatar = avatar
         this.avatarFailed = false
       }
+      this.showAudioRouteFeedback()
     } else if (this.visible && this.displayedCallId && this.closeTimer < 0) {
       this.closeTimer = setTimeout(() => {
         this.closeTimer = -1
@@ -196,6 +201,39 @@ struct NuwaxVoipMedia {
   private speaker(): boolean {
     this.revision
     return VoipBridge.speakerEnabled
+  }
+
+  private audioOutputIcon(): string {
+    const route = VoipBridge.audioRoute
+    return this.speaker() || route === 'bluetooth' || route === 'headset' ? 'speaker' : 'speaker-off'
+  }
+
+  private audioOutputLabel(): string {
+    if (VoipBridge.audioRoutePending) return this.label('connecting')
+    const route = VoipBridge.audioRoute
+    if (route === 'bluetooth' || route === 'headset') return this.label(route)
+    return this.label(this.speaker() ? 'speakerOn' : 'speakerOff')
+  }
+
+  private toggleSpeaker(): void {
+    if (!this.visible || !VoipBridge.current || VoipBridge.audioRoutePending) return
+    const enable = !this.speaker()
+    this.requestedAudioRoute = enable ? 'speaker' : 'earpiece'
+    this.requestedAudioRouteAt = Date.now()
+    this.sendControl('speaker', enable)
+  }
+
+  private showAudioRouteFeedback(): void {
+    if (!this.visible || this.requestedAudioRoute.length === 0) return
+    if (Date.now() - this.requestedAudioRouteAt > 5000) {
+      this.requestedAudioRoute = ''
+      return
+    }
+    if (VoipBridge.audioRoutePending || VoipBridge.audioRoute !== this.requestedAudioRoute) return
+    this.requestedAudioRoute = ''
+    const message = this.label(VoipBridge.audioRoute === 'speaker' ? 'speakerOn' : 'switchedToEarpiece')
+    if (message.length === 0) return
+    try { this.getUIContext().getPromptAction().showToast({ message, duration: 1500 }) } catch (_) {}
   }
 
   private sendControl(op: string, enabled?: boolean): void {
@@ -335,10 +373,10 @@ struct NuwaxVoipMedia {
 
   @Builder private speakerControl(dense: boolean) {
     NuwaxCallControl({
-      icon: VoipBridge.audioRoute === 'earpiece' || VoipBridge.audioRoute.length === 0 ? 'earpiece' : 'speaker',
-      label: this.label(VoipBridge.audioRoutePending ? 'connecting' : VoipBridge.audioRoute || 'earpiece'),
+      icon: this.audioOutputIcon(),
+      label: this.audioOutputLabel(),
       selected: !VoipBridge.audioRoutePending && this.speaker(), disabled: VoipBridge.audioRoutePending,
-      dense: dense, onPress: () => this.sendControl('speaker', !this.speaker())
+      dense: dense, onPress: () => this.toggleSpeaker()
     })
   }
 

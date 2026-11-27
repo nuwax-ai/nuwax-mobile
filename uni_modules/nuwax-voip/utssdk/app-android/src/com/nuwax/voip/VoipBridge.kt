@@ -210,6 +210,9 @@ object VoipBridge {
             "meetingMinimize" -> "收起"
             "speaker" -> "扬声器"
             "earpiece" -> "听筒"
+            "speakerOn" -> "扬声器已打开"
+            "speakerOff" -> "扬声器已关闭"
+            "switchedToEarpiece" -> "声音已切换为“听筒”"
             "bluetooth" -> "蓝牙"
             "headset" -> "耳机"
             else -> key

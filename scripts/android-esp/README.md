@@ -42,6 +42,10 @@ make android-tester
 `android:release` 使用 `https://agent.nuwax.com`。两条流水线都会在同步到原生宿主前
 重写并校验 Android appResource，因此使用 `SKIP_APP_RESOURCE=1` 也不会串环境。
 
+用 `WITHOUT_EMBEDDED_CRONET=1 make android-tester` 生成单独命名的 Cronet 对照 APK。
+该测试保留 DCloud 的 Cronet Java API，省略内置原生引擎并检查最终 APK。
+与普通内测包对照验证启动、登录、流式会话、文件上传下载和会议进房。
+
 ### 应用市场正式包
 
 先复制 `scripts/local-secrets.env.example` 为 `scripts/local-secrets.env`，填写

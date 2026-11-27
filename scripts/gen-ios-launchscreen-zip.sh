@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 生成 iOS 系统启动屏（LaunchScreen）资源：
-#   1. 从 static/app-icon/launcher-1024.png 派生 dc_launchscreen_icon@2x/@3x.png
+#   1. 从 static/splash/icon-xxxhdpi.png 派生 dc_launchscreen_icon@2x/@3x.png
 #   2. 打成 HBuilderX 云打包要求的自定义 storyboard zip（根目录、仅一个 .storyboard）
 #
 # 产物同时供：

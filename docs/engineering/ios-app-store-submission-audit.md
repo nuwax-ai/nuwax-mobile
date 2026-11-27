@@ -126,7 +126,7 @@ manifest.json:111 配置 `universalLink: https://link.nuwax.com/wechat/`。
 | UIWebView | uni-app x 全 WKWebView，无废弃 API 风险 |
 | 热更新 | 未使用 wgt 热更 / uni.downloadFile 更新逻辑 |
 | 4.3a 套壳 | 自研业务无模板痕迹；DCloud 文档明确 uni-app x 框架本身不触发 4.3a |
-| 图标 | `static/app-icon/launcher-1024.png` 已配 appstore 图标 |
+| 图标 | `static/app-ios/app-icon/launcher-1024.png` 已配 appstore 图标 |
 | 生产 API | `https://agent.nuwax.com`（NODE_ENV=production），无明文 http 业务接口 |
 
 ---

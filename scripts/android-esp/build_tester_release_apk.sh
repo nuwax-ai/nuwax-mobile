@@ -25,6 +25,7 @@
 #   SKIP_APP_RESOURCE=1   跳过步骤 1（业务未改、资源已是最新时）
 #   SKIP_DELIVER_COPY=1   不额外复制 nuwa-zhuoda-release-YYYYMMDD.apk
 #   DELIVER_NAME=xxx.apk  覆盖交付文件名（仍写到 unpackage/debug/）
+#   WITHOUT_EMBEDDED_CRONET=1   生成单独命名的 Cronet 对照包
 # =============================================================================
 set -euo pipefail
 
@@ -34,7 +35,11 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SKIP_APP_RESOURCE="${SKIP_APP_RESOURCE:-0}"
 SKIP_DELIVER_COPY="${SKIP_DELIVER_COPY:-0}"
 STAMP="$(date +%Y%m%d-%H%M)"
-DELIVER_NAME="${DELIVER_NAME:-nuwa-zhuoda-release-${STAMP}.apk}"
+TESTER_SUFFIX=""
+if [[ "${WITHOUT_EMBEDDED_CRONET:-0}" == 1 ]]; then
+  TESTER_SUFFIX="-no-embedded-cronet"
+fi
+DELIVER_NAME="${DELIVER_NAME:-nuwa-zhuoda-release-${STAMP}${TESTER_SUFFIX}.apk}"
 
 # 默认发测试：关 HX 调试通道 + Release 变体；可用环境变量覆盖出 debug 可调试包（带 LeakCanary）
 #   ANDROID_BUILD_TYPE=debug ANDROID_SIGNING_MODE=debug make android-tester
@@ -46,7 +51,7 @@ export SKIP_INSTALL=1
 # （本机常见：~/Library/Android/sdk 或 ~/workspace/Android/sdk）
 
 OUT_DIR="$ROOT_DIR/unpackage/debug"
-RELEASE_APK="$OUT_DIR/android_${ANDROID_BUILD_TYPE}.apk"
+RELEASE_APK="$OUT_DIR/android_${ANDROID_BUILD_TYPE}${TESTER_SUFFIX}.apk"
 DELIVER_APK="$OUT_DIR/$DELIVER_NAME"
 
 step() {
@@ -116,7 +121,11 @@ export NUWAX_ANDROID_VOIP_RELEASE_ORIGIN=https://testagent.xspaceagi.com
 
 # ---------- [2/4] Release 出包 ----------
 step 2 4 "出 Release 包（无 HX debug-server，assembleRelease）"
-bash "$SCRIPT_DIR/package_custom_base.sh"
+if [[ -n "$TESTER_SUFFIX" ]]; then
+  bash "$SCRIPT_DIR/package_custom_base.sh" --without-embedded-cronet
+else
+  bash "$SCRIPT_DIR/package_custom_base.sh"
+fi
 [[ -f "$RELEASE_APK" ]] || fail "未生成 $RELEASE_APK"
 
 # ---------- [3/4] 交付副本 ----------

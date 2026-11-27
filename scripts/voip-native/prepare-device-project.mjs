@@ -30,5 +30,8 @@ await writeFile(join(output,'pages.json'),JSON.stringify({pages:[{path:'pages/la
 await writeFile(join(output,'uni.scss'),'// Isolated device test styles.\n');
 await cp(join(root,'static/splash'),join(output,'static/splash'),{recursive:true});
 await cp(join(root,'static/app-icon'),join(output,'static/app-icon'),{recursive:true});
+for (const platform of ['app-ios', 'app-harmony']) {
+  await cp(join(root, 'static', platform), join(output, 'static', platform), { recursive: true });
+}
 await writeFile(join(output,'source.json'),JSON.stringify({source:root,generatedAt:new Date().toISOString(),developmentOnly:true},null,2));
 console.log(output);

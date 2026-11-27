@@ -116,7 +116,8 @@ const EXCLUDED_RESOURCES = [
   'static/icons',                         // 0 引用
   'static/iconfont',                      // 0 引用
   'static/filetree',                      // 0 引用（file-tree 组件实际用 static/images）
-  'static/harmony-icon',                  // 鸿蒙原生图标，0 引用
+  'static/app-harmony',                   // 鸿蒙专用资源
+  'static/app-ios',                       // iOS 专用资源
   'modules/uni-ai-x/static/grammar',      // 61 个语法已内联进 aiMsgMarkdownParser，独立文件 0 引用
   'modules/uni-highlight/static/grammar', // 同上；高亮引擎 wasm 走 static/uni-highlight/_onig.wasm（保留）
   'modules/uni-ai-x/static/ai-provider',  // 0 引用

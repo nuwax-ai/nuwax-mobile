@@ -499,7 +499,7 @@ import LiveKitClient
         trace("control invitation received")
         guard var next = await businessInvitation(message, senderAvatar: senderAvatar), let id = next["callId"] as? String,
               notificationCallID.isEmpty || notificationCallID == id,
-              !terminal.contains(id), snapshot?["callId"] as? String != id,
+              !terminal.contains(id),
               let messageExpiry = next["expiresAt"] as? Double,
               let expiry = NuwaxVoipCallPolicy.incomingExpiry(messageExpiry: messageExpiry, notificationExpiry: notificationExpiry,
                                                              now: Date().timeIntervalSince1970 * 1000) else { return }
@@ -524,12 +524,23 @@ import LiveKitClient
         let next: [String: Any] = ["protocol": "im-voip-v1", "callId": id, "roomName": roomName, "msgId": wireString(message["msgId"]), "convId": conv, "version": 1, "state": "ringing", "callerId": sender, "calleeId": configuration["userId"] as? String ?? "", "callerDeviceId": "", "acceptedDeviceId": "", "mediaType": media, "displayName": name, "callerDisplayName": name, "calleeDisplayName": configuration["userId"] as? String ?? "", "callerAvatar": callerAvatar, "expiresAt": sent + 60000]
         return next
     }
-    private func adoptBusinessInvitation(_ next: [String: Any]) {
-        guard let id = next["callId"] as? String, !terminal.contains(id) else { return }
-        if snapshot != nil && snapshot?["callId"] as? String != id { notifyBusinessEnd(next, reason: "busy"); rememberTerminal(id); return }
-        let newCall = snapshot == nil
+    private func adoptBusinessInvitation(_ invitation: [String: Any]) {
+        guard let id = invitation["callId"] as? String, !terminal.contains(id) else { return }
+        var next = invitation
+        if let uuid = callUUIDs[id], let pending = pendingPushes[uuid], !pending.declined,
+           let updated = pending.invitation.backfillCallerAvatar(next, now: Date().timeIntervalSince1970 * 1000) {
+            next = updated
+        }
+        if let current = snapshot {
+            if current["callId"] as? String != id { notifyBusinessEnd(next, reason: "busy"); rememberTerminal(id); return }
+            if let updated = NuwaxVoipClientPolicy.backfillCallerAvatar(current, from: next) {
+                snapshot = updated
+                emitSnapshot(updated)
+            }
+            return
+        }
         adopt(next)
-        guard newCall, snapshot?["callId"] as? String == id,
+        guard snapshot?["callId"] as? String == id,
               NuwaxVoipClientPolicy.avatarURL(next["callerAvatar"]) == nil,
               let caller = next["callerId"] as? String else { return }
 
@@ -1590,8 +1601,17 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
             if run != self.generation || !self.validatedSystemUUID(systemUUID) { system.end(uuid: systemUUID) }
         }
         guard !Task.isCancelled, run == generation, route == requiredPushRegistration else { endIfUnverified(); return }
-        if duplicate { if pendingPushes[systemUUID]?.declined == true { system.end(uuid: systemUUID) }; return }
-        if validatedSystemUUID(systemUUID) { removePendingPush(systemUUID); return }
+        if duplicate && pendingPushes[systemUUID]?.declined == true { system.end(uuid: systemUUID); return }
+        if validatedSystemUUID(systemUUID) {
+            if let current = snapshot,
+               let updated = invitation.backfillCallerAvatar(current, now: Date().timeIntervalSince1970 * 1000) {
+                snapshot = updated
+                emitSnapshot(updated)
+            }
+            if !duplicate { removePendingPush(systemUUID) }
+            return
+        }
+        if duplicate { return }
         guard pendingPushes[systemUUID] != nil, !terminal.contains(invitation.systemKey) || pendingPushes[systemUUID]?.declined == true else { removePendingPush(systemUUID); endIfUnverified(); return }
         defer { if run == generation { removePendingPush(systemUUID) } }
         if invitation.scene == "meeting" {

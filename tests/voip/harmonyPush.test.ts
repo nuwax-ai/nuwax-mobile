@@ -334,13 +334,37 @@ describe('Harmony system call cold start', () => {
     expect(picture.release).toHaveBeenCalledOnce();
   });
 
-  it('passes a verified direct invitation avatar into the app when the profile is empty', async () => {
+  it.each([false, true])('passes a verified notification avatar into the app after a WS invitation: %s', async arrivedAfterWs => {
     setup();
-    const avatar = '/api/user/avatar/bob/current';
-    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    const avatar = 'https://cdn.example/caller.png';
     VoipBridge.execute(JSON.stringify({ op: 'background', scope: config.scope, hidden: false }));
+    if (arrivedAfterWs) {
+      vi.mocked(VoipBridge.request).mockResolvedValueOnce(detail as any);
+      await VoipBridge.receiveInvitation(message() as any);
+      expect(VoipBridge.current?.callerAvatar).toBe('');
+    }
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
     VoipBridge.execute(JSON.stringify({ op: 'invitation', scope: config.scope, convId, msgId, callId, senderAvatar: avatar }));
     await vi.waitFor(() => expect(VoipBridge.current?.callerAvatar).toBe(avatar));
+    expect(VoipBridge.current?.version).toBe(arrivedAfterWs ? 2 : 1);
+  });
+
+  it('fills the missing avatar on a native retransmission without re-ringing or overriding the selected media', async () => {
+    setup();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    await VoipBridge.incoming(push());
+    const current = VoipBridge.current!;
+    expect(current.callerAvatar).toBe('');
+    current.state = 'active';
+    current.mediaType = 'audio';
+    const senderAvatar = 'https://cdn.example/caller.png';
+    await VoipBridge.incoming(push({ msgId: '42', senderAvatar }));
+    expect(current.callerAvatar).toBe('');
+    await VoipBridge.incoming(push({ senderAvatar }));
+    await VoipBridge.incoming(push({ senderAvatar: 'https://cdn.example/other.png' }));
+    expect(VoipBridge.current).toMatchObject({ callerAvatar: senderAvatar, version: 2, state: 'active', mediaType: 'audio' });
+    expect(kits.report).toHaveBeenCalledOnce();
+    expect(VoipBridge.request).toHaveBeenCalledTimes(2);
   });
 
   it('loads a relative meeting avatar after validation and rings if its response is too slow', async () => {

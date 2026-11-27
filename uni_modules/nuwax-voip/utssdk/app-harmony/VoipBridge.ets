@@ -477,9 +477,10 @@ export class VoipBridge {
   }
   static async receiveInvitation(message: CallData, senderAvatar: string = ''): Promise<void> {
     const id = message.body?.callId
-    if (id === VoipBridge.current?.callId || id === VoipBridge.pendingIncoming?.invite.callId) return
+    if (!id || id === VoipBridge.pendingIncoming?.invite.callId ||
+      (id === VoipBridge.current?.callId && !senderAvatar && !message.senderAvatar)) return
     const next = await VoipBridge.verifiedInvitation(message, senderAvatar)
-    if (!next || next.callId === VoipBridge.current?.callId || next.callId === VoipBridge.pendingIncoming?.invite.callId) return
+    if (!next || next.callId === VoipBridge.pendingIncoming?.invite.callId || VoipBridge.reconcileVerifiedAvatar(next)) return
     if (VoipBridge.current || VoipBridge.pendingIncoming) {
       VoipBridge.notifyBusinessEnd(next, 'busy')
       VoipBridge.rememberCallId(VoipBridge.terminal, next.callId)
@@ -864,6 +865,21 @@ export class VoipBridge {
     const address = avatar.startsWith('/') && VoipBridge.avatarReference(avatar) ? baseUrl.replace(/\/$/, '') + avatar : avatar
     return /^https:\/\/[A-Za-z0-9.-]+(?::[0-9]{1,5})?\/[^\s\\]+$/.test(address) ? address : ''
   }
+  private static backfillCallerAvatar(call: CallData, avatar: string): void {
+    const config = VoipBridge.configuration
+    if (!config || call.protocol !== 'im-voip-v1' || call.calleeId !== config.userId || call.state === 'ended' ||
+      VoipBridge.avatarAddress(call.callerAvatar ?? '', config.apiBaseUrl) || !VoipBridge.avatarAddress(avatar, config.apiBaseUrl)) return
+    call.callerAvatar = avatar
+    call.version++
+    VoipBridge.emit('snapshot', '', call)
+  }
+  private static reconcileVerifiedAvatar(invitation: CallData): boolean {
+    const call = VoipBridge.current
+    if (invitation.protocol !== 'im-voip-v1' || call?.callId !== invitation.callId) return false
+    if (call.convId === invitation.convId && call.msgId === invitation.msgId && call.callerId === invitation.callerId &&
+      call.calleeId === invitation.calleeId) VoipBridge.backfillCallerAvatar(call, invitation.callerAvatar ?? '')
+    return true
+  }
   private static loadIncomingAvatar(avatar: string): Promise<image.PixelMap | null> {
     const address = VoipBridge.avatarAddress(avatar, VoipBridge.configuration?.apiBaseUrl ?? '')
     if (!address) return Promise.resolve(null)
@@ -961,15 +977,22 @@ export class VoipBridge {
       VoipBridge.traceIncoming('pushMissingCallId')
       return
     }
-    if (delivery.callId === VoipBridge.nativeId || delivery.callId === VoipBridge.pendingIncoming?.nativeId) return
+    if (delivery.callId === VoipBridge.pendingIncoming?.nativeId) return
     const id = delivery.callId
     const invite = VoipBridge.pushInvitation(delivery.data)
     if (!invite) {
+      if (id === VoipBridge.nativeId) return
       VoipBridge.traceIncoming(VoipBridge.configuration ? 'pushInvalidInvitation' : 'pushNoSession')
       await voipCall.reportIncomingCallError(id, voipCall.VoipCallFailureCause.OTHER)
       return
     }
     const current = VoipBridge.current
+    if (invite.scene !== 'meeting' && current?.callId === invite.callId && current.convId === invite.convId &&
+      current.msgId === invite.msgId && current.calleeId === invite.calleeId &&
+      (current.state !== 'ringing' || current.mediaType === invite.mediaType)) {
+      VoipBridge.backfillCallerAvatar(current, VoipBridge.avatarReference(invite.senderAvatar))
+    }
+    if (id === VoipBridge.nativeId) return
     if (VoipBridge.pendingIncoming || VoipBridge.nativeId || VoipBridge.reportedInvitations.has(invite.callId) ||
       (current && (invite.scene === 'meeting' || current.callId !== invite.callId || current.state !== 'ringing'))) {
       await voipCall.reportIncomingCallError(id, voipCall.VoipCallFailureCause.ROUTE_BUSY); return
@@ -1033,7 +1056,7 @@ export class VoipBridge {
       const call = resolved.call
       if (!call) { VoipBridge.dismissPendingIncoming(); return }
       VoipBridge.clearPendingIncoming()
-      VoipBridge.adopt(call)
+      if (!VoipBridge.reconcileVerifiedAvatar(call)) VoipBridge.adopt(call)
       if (VoipBridge.current?.callId !== call.callId) {
         VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_DISCONNECTED)
         VoipBridge.nativeId = ''

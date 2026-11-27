@@ -9,7 +9,7 @@ help:
 	@echo "自定义基座 · 只生成包 → unpackage/debug/"
 	@echo "  make base-android         # android_debug.apk"
 	@echo "  make base-ios-device       # iOS_debug.ipa（真机，先 make app-resource）"
-	@echo "  make ios-tester            # 生成可独立安装的 iOS 测试环境 IPA"
+	@echo "  make ios-tester            # 当前项目生成可独立安装的 iOS IPA"
 	@echo "  make base-ios-simulator   # Pandora_simulator_debug.app（模拟器）"
 	@echo "  make base-all             # 上述三份（仅出包，不生成资源、不上 S3）"
 	@echo "  make base-ship            # 一键：appResource → 出包 → 上传 S3"

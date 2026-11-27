@@ -132,13 +132,15 @@ def verify_native_launch_restore(app, info):
 
 def verify_business_qa(app, info, project):
     import json
-    metadata = json.loads((Path(project) / 'nuwax-local-qa.json').read_text())
-    if metadata.get('flavor') != 'voip-business-qa' or metadata.get('apiOrigin') != 'https://testagent.xspaceagi.com':
+    metadata = json.loads((Path(project) / 'nuwax-local-qa.json').read_text()) if project else None
+    if metadata and (metadata.get('flavor') != 'voip-business-qa' or metadata.get('apiOrigin') != 'https://testagent.xspaceagi.com'):
         raise ValueError('Unexpected QA source metadata')
     if info.get('CFBundleIdentifier') != 'com.nuwax.app' or info.get('NuwaxVoipDeviceTest'):
         raise ValueError('QA must package the real business App')
-    if info.get('NuwaxBuildFlavor') != metadata['flavor'] or info.get('NuwaxAPIOrigin') != metadata['apiOrigin'] or info.get('NuwaxSourceDigest') != metadata['sourceDigest']:
+    if metadata and (info.get('NuwaxBuildFlavor') != metadata['flavor'] or info.get('NuwaxAPIOrigin') != metadata['apiOrigin'] or info.get('NuwaxSourceDigest') != metadata['sourceDigest']):
         raise ValueError('QA host and compiled source metadata differ')
+    if not metadata and any(key in info for key in ('NuwaxBuildFlavor', 'NuwaxAPIOrigin', 'NuwaxSourceDigest')):
+        raise ValueError('Unexpected stale QA metadata in current-project host')
     if info.get('uniapp-x', {}).get('ipatype') != 2 or (app / 'Frameworks/DCloudDebugServe.framework').exists():
         raise ValueError('Standalone QA must not depend on the HBuilderX debug host')
     if not {'audio', 'voip', 'remote-notification'}.issubset(info.get('UIBackgroundModes', [])):
@@ -160,7 +162,7 @@ def verify_business_qa(app, info, project):
     script = (www / 'app-service.js').read_text()
     if not all(route in script for route in ('subpackages/pages/voip-call/voip-call', 'subpackages/pages/voip-history/voip-history', 'pages/message/chat')):
         raise ValueError('Missing real App business resources')
-    print('Standalone real App QA verified: test origin, embedded resources, signing profile and no private signing material')
+    print('Standalone real App verified: embedded resources, signing profile and no private signing material')
 
 
 if __name__ == '__main__':
@@ -175,6 +177,6 @@ if __name__ == '__main__':
     if not info.get('NuwaxVoipDeviceTest'):
         verify_bundled_ringtone(app)
         verify_native_launch_restore(app, info)
-    if os.environ.get('NUWAX_IOS_QA_PROJECT'):
-        verify_business_qa(app, info, os.environ['NUWAX_IOS_QA_PROJECT'])
+    if os.environ.get('NUWAX_IOS_QA_PROJECT') or os.environ.get('NUWAX_IOS_STANDALONE') == '1':
+        verify_business_qa(app, info, os.environ.get('NUWAX_IOS_QA_PROJECT'))
     print('Signed APNs VoIP metadata verified (no installation or upload)')

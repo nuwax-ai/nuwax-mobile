@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 完整 Nuwax App iOS 本地包；QA_PROJECT 为测试环境独立安装包，否则为 HX 基座。不安装、不上传。
+# 完整 Nuwax App iOS 本地包：独立安装包或 HX 基座。不安装、不上传。
 set -euo pipefail
 VOIP_REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$VOIP_REPO_ROOT"
@@ -22,13 +22,13 @@ if [[ -z "${UNIAPPX_SDK_ROOT:-}" ]]; then
 fi
 export NUWAX_VOIP_BUSINESS_HOST=1
 VOIP_BUILD_DIR="$VOIP_REPO_ROOT/out/voip-business-ios"
-if [[ -n "${NUWAX_IOS_QA_PROJECT:-}" ]]; then
+if [[ -n "${NUWAX_IOS_QA_PROJECT:-}" || "${NUWAX_IOS_STANDALONE:-0}" == 1 ]]; then
   VOIP_BUILD_DIR="$VOIP_REPO_ROOT/out/voip-business-qa-ios"
 fi
 python3 scripts/voip-native/device/prepare-ios.py
 xcodebuild -workspace "$VOIP_BUILD_DIR/VoipBusiness.xcworkspace" -scheme UniAppX -configuration Debug -destination 'generic/platform=iOS' -derivedDataPath "$VOIP_BUILD_DIR-derived" build
 VOIP_APP="$VOIP_BUILD_DIR-derived/Build/Products/Debug-iphoneos/UniAppX.app"
-if [[ -n "${NUWAX_IOS_QA_PROJECT:-}" ]]; then
+if [[ -n "${NUWAX_IOS_QA_PROJECT:-}" || "${NUWAX_IOS_STANDALONE:-0}" == 1 ]]; then
   python3 scripts/voip-native/verify-business-qa-ios.py
 else
   codesign --verify --deep --strict "$VOIP_APP"
@@ -41,12 +41,14 @@ trap 'rm -rf "$VOIP_STAGE"' EXIT
 mkdir "$VOIP_STAGE/Payload"
 cp -R "$VOIP_APP" "$VOIP_STAGE/Payload/UniAppX.app"
 VOIP_PACKAGE_PREFIX="iOS_debug"
-if [[ -n "${NUWAX_IOS_QA_PROJECT:-}" ]]; then VOIP_PACKAGE_PREFIX="Nuwax-iOS-Test"; fi
+if [[ -n "${NUWAX_IOS_QA_PROJECT:-}" || "${NUWAX_IOS_STANDALONE:-0}" == 1 ]]; then VOIP_PACKAGE_PREFIX="Nuwax-iOS-Test"; fi
 VOIP_IPA="$VOIP_PACKAGE_PREFIX-$(date +%Y%m%d-%H%M%S).ipa"
 (cd "$VOIP_STAGE" && zip -qry "$VOIP_IPA" Payload)
 mv "$VOIP_STAGE/$VOIP_IPA" "$VOIP_OUT/$VOIP_IPA"
-if [[ -n "${NUWAX_IOS_QA_PROJECT:-}" ]]; then
-  cp "$NUWAX_IOS_QA_PROJECT/nuwax-local-qa.json" "$VOIP_OUT/$VOIP_IPA.json"
+if [[ -n "${NUWAX_IOS_QA_PROJECT:-}" || "${NUWAX_IOS_STANDALONE:-0}" == 1 ]]; then
+  if [[ -n "${NUWAX_IOS_QA_PROJECT:-}" ]]; then
+    cp "$NUWAX_IOS_QA_PROJECT/nuwax-local-qa.json" "$VOIP_OUT/$VOIP_IPA.json"
+  fi
   ln -sfn "$VOIP_IPA" "$VOIP_OUT/Nuwax-iOS-Test-latest.ipa"
 else
   mkdir -p "$VOIP_REPO_ROOT/unpackage/debug"

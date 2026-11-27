@@ -23,6 +23,18 @@ class VoipPushPayloadTest {
         assertNotNull(VoipPushPayload.invitation("""{"kind":"voip.invite","convId":1987654321098765432,"msgId":1987654321098765433}"""))
     }
 
+    @Test fun preservesSafeAvatarWithoutMakingItRequiredForRinging() {
+        val avatar = "/api/user/avatar/10001/profile-hash"
+        val push = JSONObject(locator).put("senderAvatar", " $avatar ")
+        assertEquals(avatar, JSONObject(VoipPushPayload.invitation(push.toString())!!).getString("senderAvatar"))
+        for (unsafe in listOf("https://images.example.test/avatar?token=secret", "//example.test/avatar", "/api/f/%2e%2e/private")) {
+            push.put("senderAvatar", unsafe)
+            val parsed = JSONObject(VoipPushPayload.invitation(push.toString())!!)
+            assertFalse(parsed.has("senderAvatar"))
+            assertEquals("1987654321098765432", parsed.getString("convId"))
+        }
+    }
+
     @Test fun leavesOrdinaryAndUnrecognizedPushesWithTheSdk() {
         for (raw in listOf("{}", "not-json", "[]", """{"type":"message","convId":"1","msgId":"2"}""", """{"title":"Call","convId":"1","msgId":"2"}""")) {
             assertNull(raw, VoipPushPayload.invitation(raw))

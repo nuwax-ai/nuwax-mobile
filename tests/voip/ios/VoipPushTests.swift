@@ -26,6 +26,64 @@ final class VoipPushTests: XCTestCase {
         let data = try JSONSerialization.data(withJSONObject: payload)
         XCTAssertNotNil(parse(["payload": String(decoding: data, as: UTF8.self)]))
     }
+    func testPushRetainsOnlyShortAvatarReferencesForAppDisplay() throws {
+        let avatar = "/api/user/avatar/10001/profile-hash"
+        var fields = payload
+        fields["senderAvatar"] = " \(avatar) "
+        let invitation = try XCTUnwrap(parse(["payload": fields]))
+        XCTAssertEqual(invitation.senderAvatar, avatar)
+        XCTAssertNil(invitation.report(labels: [:])["senderAvatar"])
+
+        for unsafe in ["https://images.example.test/avatar?token=secret", "//example.test/avatar", "/api/f/%2e%2e/private"] {
+            fields["senderAvatar"] = unsafe
+            XCTAssertNotNil(parse(fields))
+            XCTAssertNil(parse(fields)?.senderAvatar)
+        }
+    }
+
+    func testPushCanFillMissingAvatarAfterTheIMInvitationWasVerified() throws {
+        let avatar = "/api/user/avatar/10001/profile-hash"
+        var fields = payload
+        fields["senderAvatar"] = avatar
+        fields["mediaType"] = "video"
+        let invitation = try XCTUnwrap(parse(fields))
+        let call: [String: Any] = ["protocol": "im-voip-v1", "callId": "call-123", "calleeId": "bob", "mediaType": "audio",
+                                   "convId": "245475557381246976", "msgId": "9223372036854775807", "state": "connecting", "version": 2]
+        let updated = try XCTUnwrap(invitation.backfillCallerAvatar(call, now: now))
+        XCTAssertEqual(updated["callerAvatar"] as? String, avatar)
+        XCTAssertEqual(updated["state"] as? String, "connecting")
+        XCTAssertEqual(updated["version"] as? Int, 3)
+        XCTAssertNil(invitation.backfillCallerAvatar(updated, now: now))
+        XCTAssertNil(invitation.backfillCallerAvatar(call, now: now + 45_000))
+        for key in ["protocol", "callId", "calleeId", "convId", "msgId"] {
+            var other = call; other[key] = "different"
+            XCTAssertNil(invitation.backfillCallerAvatar(other, now: now), key)
+        }
+        var ringing = call; ringing["state"] = "ringing"
+        XCTAssertNil(invitation.backfillCallerAvatar(ringing, now: now))
+        var ended = call; ended["state"] = "ended"
+        XCTAssertNil(invitation.backfillCallerAvatar(ended, now: now))
+    }
+    func testSystemReportDoesNotDisplayTheCallIdentifier() throws {
+        var fields = payload
+        fields["displayName"] = "call-123"
+        fields["senderName"] = "  Alice  "
+        let named = try XCTUnwrap(parse(["payload": fields])).report(labels: [:])
+        XCTAssertEqual(named["displayName"] as? String, "Alice")
+        XCTAssertEqual(named["handle"] as? String, "Alice")
+        XCTAssertEqual(named["callId"] as? String, "call-123")
+
+        fields["senderName"] = " "
+        let unnamed = try XCTUnwrap(parse(fields)).report(labels: [:])
+        XCTAssertEqual(unnamed["displayName"] as? String, "Nuwax")
+        XCTAssertEqual(unnamed["handle"] as? String, "Nuwax")
+    }
+
+    func testVerifiedCallerNameIgnoresMissingNamesAndIdentifiers() {
+        let call: [AnyHashable: Any] = ["callId": "call-123", "callerId": "42", "callerDisplayName": "42", "displayName": "call-123"]
+        XCTAssertNil(NuwaxVoipPushInvitation.systemCallerName(call))
+        XCTAssertEqual(NuwaxVoipPushInvitation.systemCallerName(call.merging(["senderName": " Alice "]) { _, new in new }), "Alice")
+    }
     func testOrdinaryUniPushLocatorCannotBecomePushKitAuthorization() {
         XCTAssertNil(parse(["type": "voip", "convId": "245475557381246976", "msgId": "123"]))
         var wrong = payload; wrong["calleeId"] = "another-account"; XCTAssertNil(parse(wrong))

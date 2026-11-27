@@ -3,9 +3,20 @@
 const { createHash } = require('crypto')
 
 const MAX_CALL_TARGETS = 1000
+const MAX_PAYLOAD = 800
+exports.MAX_PAYLOAD = MAX_PAYLOAD
 const matches = (value, pattern) => typeof value === 'string' && pattern.exec(value)?.[0] === value
 const locator = value => matches(value, /^[1-9][0-9]{0,18}$/) && BigInt(value) <= 9223372036854775807n
 const isCallCid = value => matches(value, /^[A-Za-z0-9_-]{1,128}$/)
+
+function withSenderAvatar(payload, value) {
+  if (typeof value !== 'string') return payload
+  const avatar = value.trim()
+  const shortReference = /^(?:https:\/\/[A-Za-z0-9.-]+(?::[0-9]{1,5})?\/|\/api\/(?:user\/avatar|f)\/)[A-Za-z0-9._~%/+-]+$/
+  if (avatar.length > 256 || !matches(avatar, shortReference) || /%2e|%2f|%5c|\/\.{1,2}(?:\/|$)/i.test(avatar)) return payload
+  const result = { ...payload, senderAvatar: avatar }
+  return JSON.stringify(result).length <= MAX_PAYLOAD ? result : payload
+}
 
 exports.callTargetCids = value => {
   const ids = Array.isArray(value) ? value : [value]
@@ -36,9 +47,14 @@ exports.prepareVoip = (body, now = Date.now()) => {
     if (!['audio', 'video'].includes(source.mediaType)) return { error: 'invalid voip mediaType' }
     payload.mediaType = source.mediaType
   }
-  // senderName is the IM envelope name; displayName is the legacy alias.
-  const displayName = source.displayName ?? source.senderName
-  if (typeof displayName === 'string') payload.displayName = Array.from(displayName.trim()).slice(0, 80).join('')
+  // The IM envelope uses senderName. Keep older display-name fields as fallbacks.
+  for (const value of [source.senderName, source.callerDisplayName, source.displayName]) {
+    if (typeof value !== 'string') continue
+    const name = value.trim()
+    if (!name || name === source.callId) continue
+    payload.displayName = Array.from(name).slice(0, 80).join('')
+    break
+  }
   let ttl = 60_000
   // The ringing window is either an explicit expiresAt or the IM sendTime + 60s.
   // Both are forwarded so the client can use its existing expiresAt check.
@@ -57,7 +73,7 @@ exports.prepareVoip = (body, now = Date.now()) => {
     if (!Number.isSafeInteger(body.settings.ttl) || body.settings.ttl <= 0) return { error: 'invalid voip ttl' }
     ttl = Math.min(ttl, body.settings.ttl)
   }
-  return { payload, settings: { ttl } }
+  return { payload: withSenderAvatar(payload, source.senderAvatar), settings: { ttl } }
 }
 
 function prepareCallInvitation(body, now) {
@@ -136,7 +152,7 @@ function prepareMeetingRingInvitation(body, now = Date.now()) {
     : now + 60_000
   payload.expiresAt = Math.min(deadline, cap)
   if (payload.expiresAt <= now) return { expired: true }
-  return { payload, settings: { ttl: Math.min(60_000, payload.expiresAt - now) } }
+  return { payload: withSenderAvatar(payload, source.senderAvatar), settings: { ttl: Math.min(60_000, payload.expiresAt - now) } }
 }
 
 exports.prepareMeetingRingInvitation = prepareMeetingRingInvitation
@@ -147,8 +163,7 @@ exports.prepareVoipScene = (body, now = Date.now()) => {
   if (source?.type !== 'voip' || !Object.prototype.hasOwnProperty.call(source, 'scene')) return null
   if (source.scene === 'call') {
     if (!locator(source.calleeId)) return { error: 'voip string calleeId required' }
-    const payload = { ...source, displayName: source.senderName ?? source.displayName }
-    return { call: prepareCallInvitation({ ...body, payload }, now) }
+    return { call: prepareCallInvitation(body, now) }
   }
   if (source.scene !== 'meeting') return { error: 'invalid voip scene' }
   if (!locator(source.convId) || !locator(source.msgId) ||
@@ -167,12 +182,16 @@ exports.prepareVoipScene = (body, now = Date.now()) => {
   for (const field of ['convId', 'convType', 'msgId', 'inviteId', 'roomName', 'title', 'mediaType', 'senderName', 'silent', 'groupCall', 'passcode']) {
     if (source[field] !== undefined) meeting[field] = source[field]
   }
-  return { meeting }
+  return { meeting: withSenderAvatar(meeting, source.senderAvatar) }
 }
 
 // Getui brand codes and the UniPush strategies exercised in this test space.
 const callTransports = new Map([
   ['ios-voip', { platform: 'ios', strategy: 'ios' }],
+  // Domestic Android devices without a vendor channel (for example Samsung) use
+  // the existing Getui TCP connection. The IM service capability-gates this
+  // route so older clients keep their ordinary notification behavior.
+  ['android-getui', { platform: 'android', transmission: true }],
   ['android-huawei', { platform: 'android', brand: 'hw', strategy: 'hw' }],
   ['android-honor', { platform: 'android', brand: 'ho' }],
   ['android-xiaomi', { platform: 'android', brand: 'xm' }],
@@ -219,7 +238,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   const route = body.callRoute
   const transport = callTransports.get(route?.transport)
   if (!transport) return { error: 'unsupported call route' }
-  const { platform, strategy } = transport
+  const { platform, strategy, transmission } = transport
   const ios = platform === 'ios'
   const harmony = platform === 'harmonyos'
   const target = !ios && Array.isArray(body.push_clientid) && body.push_clientid.length === 1
@@ -238,7 +257,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
     ? prepareMeetingRingInvitation(body, now)
     : prepareCallInvitation(body, now)
   if (invitation.error || invitation.expired) return invitation
-  if (!strategy) return { notificationOnly: true }
+  if (!strategy && !transmission) return { notificationOnly: true }
   const payload = { ...invitation.payload }
   if (ios) payload.routeRegistrationId = route.registrationId
   if (platform === 'android') payload.delivery = 'android-native'
@@ -247,16 +266,19 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
     delete payload.roomName
     delete payload.passcode
   }
+  const { senderAvatar, ...callFields } = payload
   const requestId = createHash('sha256')
     .update(JSON.stringify([route.transport, route.cid, ios ? route.registrationId : '', payload.callId]))
     .digest('hex').slice(0, 32)
-  const ttl = harmony ? invitation.settings.ttl : Math.min(5_000, invitation.settings.ttl)
-  const settings = { ttl, strategy: { [strategy]: 2 } }
+  const ttl = harmony || transmission
+    ? invitation.settings.ttl
+    : Math.min(5_000, invitation.settings.ttl)
+  const settings = strategy ? { ttl, strategy: { [strategy]: 2 } } : { ttl }
   if (strategy === 'vv') {
     // Test-space probe via UniPush. Vendor receipt and SDK callback are verified separately.
     const seconds = Math.floor(ttl / 1000)
     if (seconds < 1) return { expired: true }
-    const callPayload = { ...payload, scene: payload.scene ?? 'call', pushEnvironment: 'test' }
+    const callPayload = withSenderAvatar({ ...callFields, scene: payload.scene ?? 'call', pushEnvironment: 'test' }, senderAvatar)
     const options = { android: { VV: {
       '/header/message-type': 3,
       '/message/extraData': JSON.stringify(callPayload),
@@ -265,6 +287,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
     } } }
     return { payload: callPayload, requestId, settings, options }
   }
-  return { payload, requestId, settings,
-    ...(ios ? { options: { ios: { type: 'voip', payload: JSON.stringify(payload) } } } : {}) }
+  const callPayload = withSenderAvatar(callFields, senderAvatar)
+  return { payload: callPayload, requestId, settings,
+    ...(ios ? { options: { ios: { type: 'voip', payload: JSON.stringify(callPayload) } } } : {}) }
 }

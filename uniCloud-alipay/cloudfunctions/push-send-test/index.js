@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto')
-const { callTargetCids, androidCallRouteForCid, iosCallRouteForCid, prepareVoip, prepareNativeVoip, prepareVoipScene, prepareMeetingRingInvitation } = require('./voip')
+const { MAX_PAYLOAD, callTargetCids, androidCallRouteForCid, iosCallRouteForCid, prepareVoip, prepareNativeVoip, prepareVoipScene, prepareMeetingRingInvitation } = require('./voip')
 
 const APP_ID = '__UNI__8BF05E4'          // 本项目的 DCloud AppID
 // 后端握手密钥：**只**从环境变量读（uniCloud 控制台 → 云函数 → 环境变量 PUSH_SIGN_KEY）。
@@ -12,7 +12,6 @@ const BATCH_SIZE = 500                    // 单次最多 500 个 cid
 // 官方长度上限（uni-push 2.0 服务端 sendMessage 入参说明）：超长会被厂商通道截断或拒绝
 const MAX_TITLE = 19                      // 通知栏标题（官方：小于 20，留一格给省略号）
 const MAX_CONTENT = 49                    // 通知栏内容（官方：小于 50）
-const MAX_PAYLOAD = 800                   // 透传数据字符数
 // 临时联调开关：设为 1 时输出推送正文、完整 payload 与目标 cid。
 // 默认关闭，避免生产云函数日志长期留存用户私聊内容。
 const DEBUG_MESSAGE_CONTENT = process.env.PUSH_DEBUG_MESSAGE_CONTENT === '1'
@@ -289,7 +288,12 @@ function attachBadgeToPayload(payload, badge) {
   if (n === null) return payload
   const out = Object.assign({}, payload)
   out.badge = n
-  return JSON.stringify(out).length <= MAX_PAYLOAD ? out : payload
+  if (JSON.stringify(out).length <= MAX_PAYLOAD) return out
+  if ((payload.type === 'voip' || payload.type === 'meeting_invite') && payload.senderAvatar) {
+    delete out.senderAvatar
+    if (JSON.stringify(out).length <= MAX_PAYLOAD) return out
+  }
+  return payload
 }
 
 // ==================== 无 callRoute 时的厂商通道动态判定 ====================
@@ -298,8 +302,11 @@ function attachBadgeToPayload(payload, badge) {
 //   cid → 厂商 token / 品牌的档案存在个推服务端，是设备上次在线注册时写入并持久化的，
 //   云函数按 cid 查档案即可，不依赖接收端 App 存活 —— 与普通厂商通知用同一份数据。
 // device_token 非空时按 brand 选路。缺少专用发送能力或查档失败时走普通通知。
-async function resolveAutoCallRoute(cid, invocationId, allowHarmony) {
-  if (typeof uniPush.getClientDetailByCid !== 'function') return null
+async function resolveAutoCallRoute(cid, invocationId, allowHarmony, androidGetuiCids) {
+  const getuiRoute = androidGetuiCids?.has(cid)
+    ? { cid, platform: 'android', transport: 'android-getui' }
+    : null
+  if (typeof uniPush.getClientDetailByCid !== 'function') return getuiRoute
   let detail = null
   try {
     const result = await uniPush.getClientDetailByCid(cid)
@@ -309,7 +316,7 @@ async function resolveAutoCallRoute(cid, invocationId, allowHarmony) {
     console.error('[push-send] call route lookup failed', JSON.stringify({
       invocationId, error: String((e && e.message) || e).slice(0, 120)
     }))
-    return null
+    return getuiRoute
   }
   const token = typeof detail?.device_token === 'string' ? detail.device_token.trim() : ''
   const brand = typeof detail?.brand === 'string' ? detail.brand.trim().toLowerCase() : ''
@@ -321,9 +328,10 @@ async function resolveAutoCallRoute(cid, invocationId, allowHarmony) {
   const phoneType = detail?.phone_type
   const harmony = allowHarmony && (brand === 'hoshw' || brand === 'hw') &&
     (phoneType === 7 || phoneType === '7')
-  const route = token && harmony
+  const vendorRoute = token && harmony
     ? { cid, platform: 'harmonyos', transport: 'harmony-huawei' }
     : token ? androidCallRouteForCid(cid, brand, phoneType) : null
+  const route = vendorRoute ?? getuiRoute
   console.log('[push-send] call route auto', JSON.stringify({
     invocationId, hasVendorToken: token.length > 0, brand,
     detailShape: shape,
@@ -494,8 +502,13 @@ async function handle(event, invocationId) {
   // 顶层 type="voip" 是通话/会议的显式声明；payload.type 缺失时由云函数回填。
   body = withEnvelopeType(body)
   const iosRegistrations = body.payload?.iosVoip
-  if (body.payload && Object.prototype.hasOwnProperty.call(body.payload, 'iosVoip')) {
-    const { iosVoip, ...deliveryPayload } = body.payload
+  const androidGetuiIds = Array.isArray(body.payload?.androidGetui)
+    ? callTargetCids(body.payload.androidGetui)
+    : null
+  const androidGetui = new Set(androidGetuiIds ?? [])
+  if (body.payload && (Object.prototype.hasOwnProperty.call(body.payload, 'iosVoip') ||
+      Object.prototype.hasOwnProperty.call(body.payload, 'androidGetui'))) {
+    const { iosVoip, androidGetui: _androidGetui, ...deliveryPayload } = body.payload
     body = { ...body, payload: deliveryPayload }
   }
   // ★每个请求一行摘要：数 `[push-send] in` 的行数 = 后端/网关实际调了几次。
@@ -561,7 +574,6 @@ async function handle(event, invocationId) {
   // iOS 读 IM 登记，其他设备继续按个推档案选路。普通通知合并发送。
   const invitation = scene?.call ?? (meetingRinging ? ringAttempt : null)
   if (body.callRoute == null && invitation != null) {
-    // Test HAPs support native meeting invitations. Allow a rollback for meetings only.
     const allowHarmony = scene?.call != null || harmonyMeetingEnabled
     const results = []
     const notificationCids = []
@@ -569,7 +581,8 @@ async function handle(event, invocationId) {
       const cid = ids[i]
       const iosRoute = iosCallRouteForCid(cid, iosRegistrations,
         process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT || 'development')
-      const route = iosRoute ?? await resolveAutoCallRoute(cid, invocationId, allowHarmony)
+      const route = iosRoute ?? await resolveAutoCallRoute(
+        cid, invocationId, allowHarmony, androidGetui)
       if (route != null) {
         const native = prepareNativeVoip({
           ...body, push_clientid: cid, payload: invitation.payload, callRoute: route,

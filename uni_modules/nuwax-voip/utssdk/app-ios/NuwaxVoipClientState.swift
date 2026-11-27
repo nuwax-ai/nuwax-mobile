@@ -48,13 +48,25 @@ enum NuwaxVoipClientPolicy {
     static func backfillCallerAvatar(_ call: [String: Any], callID: String, callerID: String,
                                      contacts: [[String: Any]]) -> [String: Any]? {
         guard call["callId"] as? String == callID, call["callerId"] as? String == callerID,
-              call["state"] as? String != "ended", avatarURL(call["callerAvatar"]) == nil,
-              let version = call["version"] as? Int,
               let contact = contacts.first(where: {
                   String(describing: $0["userId"] ?? "") == callerID &&
                       $0["subjectType"] as? Int == 1 && $0["status"] as? Int == 1
-              }),
-              let avatar = avatarURL(contact["avatar"]) else { return nil }
+              }) else { return nil }
+        return backfillCallerAvatar(call, from: contact["avatar"])
+    }
+
+    static func backfillCallerAvatar(_ call: [String: Any], from invitation: [String: Any]) -> [String: Any]? {
+        let identity = ["callId", "convId", "msgId", "callerId", "calleeId"]
+        guard call["protocol"] as? String == "im-voip-v1", identity.allSatisfy({ key in
+            guard let value = invitation[key] as? String, !value.isEmpty else { return false }
+            return call[key] as? String == value
+        }) else { return nil }
+        return backfillCallerAvatar(call, from: invitation["callerAvatar"])
+    }
+
+    static func backfillCallerAvatar(_ call: [String: Any], from value: Any?) -> [String: Any]? {
+        guard call["state"] as? String != "ended", avatarURL(call["callerAvatar"]) == nil,
+              let avatar = avatarURL(value), let version = call["version"] as? Int else { return nil }
         var updated = call
         updated["callerAvatar"] = avatar
         updated["version"] = version + 1

@@ -169,6 +169,9 @@ import LiveKitClient
         // accepted/rejected events instead.
         if meetingPushUUIDs.contains(uuid) { trace("meeting incoming ready"); return }
         guard validatedSystemUUID(uuid), let value = snapshot else { return }
+        if value["state"] as? String == "ringing", let name = NuwaxVoipPushInvitation.systemCallerName(value) {
+            systemBridge?.updateIncomingCallerName(name, uuid: uuid)
+        }
         emitSnapshot(value)
     }
     fileprivate func systemIncomingFailed(_ uuid: UUID, error: Error) {
@@ -203,7 +206,8 @@ import LiveKitClient
                     guard let message = try? await self.request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true),
                           run == self.generation, self.wireString(message["convId"]) == conv,
                           self.wireString(message["msgId"]) == msg else { return }
-                    await self.receiveInvitation(message, notificationCallID: commandId, notificationExpiry: expiresAt)
+                    await self.receiveInvitation(message, notificationCallID: commandId, notificationExpiry: expiresAt,
+                                                 senderAvatar: NuwaxVoipPushInvitation.avatarReference(command["senderAvatar"]))
                 }
             }
         case "watch":
@@ -490,18 +494,19 @@ import LiveKitClient
         trace("background meeting invitation received from IM")
         system.register(invitation.report(labels: configuration["labels"] as? [String: Any] ?? [:]), uuid: systemUUID, incoming: true)
     }
-    private func receiveInvitation(_ message: [String: Any], notificationCallID: String = "", notificationExpiry: Double = 0) async {
+    private func receiveInvitation(_ message: [String: Any], notificationCallID: String = "", notificationExpiry: Double = 0,
+                                   senderAvatar: String? = nil) async {
         trace("control invitation received")
-        guard var next = await businessInvitation(message), let id = next["callId"] as? String,
+        guard var next = await businessInvitation(message, senderAvatar: senderAvatar), let id = next["callId"] as? String,
               notificationCallID.isEmpty || notificationCallID == id,
-              !terminal.contains(id), snapshot?["callId"] as? String != id,
+              !terminal.contains(id),
               let messageExpiry = next["expiresAt"] as? Double,
               let expiry = NuwaxVoipCallPolicy.incomingExpiry(messageExpiry: messageExpiry, notificationExpiry: notificationExpiry,
                                                              now: Date().timeIntervalSince1970 * 1000) else { return }
         next["expiresAt"] = expiry
         adoptBusinessInvitation(next)
     }
-    private func businessInvitation(_ message: [String: Any]) async -> [String: Any]? {
+    private func businessInvitation(_ message: [String: Any], senderAvatar: String? = nil) async -> [String: Any]? {
         let run = generation, user = configuration["userId"] as? String
         guard message["msgType"] as? String == "voip", (message["senderType"] as? Int ?? 1) == 1, (message["msgStatus"] as? Int ?? 1) == 1,
               let body = message["body"] as? [String: Any], let id = body["callId"] as? String, let roomName = body["roomName"] as? String,
@@ -514,16 +519,28 @@ import LiveKitClient
               run == generation, user == configuration["userId"] as? String,
               conversation["convType"] as? Int == 1, wireString(conversation["peerUserId"]) == sender else { return nil }
         let callerAvatar = NuwaxVoipClientPolicy.avatarURL(conversation["peerAvatar"])
-            ?? NuwaxVoipClientPolicy.avatarURL(message["senderAvatar"]) ?? ""
-        let next: [String: Any] = ["protocol": "im-voip-v1", "callId": id, "roomName": roomName, "msgId": wireString(message["msgId"]), "convId": conv, "version": 1, "state": "ringing", "callerId": sender, "calleeId": configuration["userId"] as? String ?? "", "callerDeviceId": "", "acceptedDeviceId": "", "mediaType": media, "displayName": conversation["peerName"] as? String ?? sender, "callerDisplayName": conversation["peerName"] as? String ?? sender, "calleeDisplayName": configuration["userId"] as? String ?? "", "callerAvatar": callerAvatar, "expiresAt": sent + 60000]
+            ?? NuwaxVoipClientPolicy.avatarURL(message["senderAvatar"]) ?? senderAvatar ?? ""
+        let name = NuwaxVoipPushInvitation.callerName(excluding: [id, sender], conversation["peerName"], message["senderName"]) ?? sender
+        let next: [String: Any] = ["protocol": "im-voip-v1", "callId": id, "roomName": roomName, "msgId": wireString(message["msgId"]), "convId": conv, "version": 1, "state": "ringing", "callerId": sender, "calleeId": configuration["userId"] as? String ?? "", "callerDeviceId": "", "acceptedDeviceId": "", "mediaType": media, "displayName": name, "callerDisplayName": name, "calleeDisplayName": configuration["userId"] as? String ?? "", "callerAvatar": callerAvatar, "expiresAt": sent + 60000]
         return next
     }
-    private func adoptBusinessInvitation(_ next: [String: Any]) {
-        guard let id = next["callId"] as? String, !terminal.contains(id) else { return }
-        if snapshot != nil && snapshot?["callId"] as? String != id { notifyBusinessEnd(next, reason: "busy"); rememberTerminal(id); return }
-        let newCall = snapshot == nil
+    private func adoptBusinessInvitation(_ invitation: [String: Any]) {
+        guard let id = invitation["callId"] as? String, !terminal.contains(id) else { return }
+        var next = invitation
+        if let uuid = callUUIDs[id], let pending = pendingPushes[uuid], !pending.declined,
+           let updated = pending.invitation.backfillCallerAvatar(next, now: Date().timeIntervalSince1970 * 1000) {
+            next = updated
+        }
+        if let current = snapshot {
+            if current["callId"] as? String != id { notifyBusinessEnd(next, reason: "busy"); rememberTerminal(id); return }
+            if let updated = NuwaxVoipClientPolicy.backfillCallerAvatar(current, from: next) {
+                snapshot = updated
+                emitSnapshot(updated)
+            }
+            return
+        }
         adopt(next)
-        guard newCall, snapshot?["callId"] as? String == id,
+        guard snapshot?["callId"] as? String == id,
               NuwaxVoipClientPolicy.avatarURL(next["callerAvatar"]) == nil,
               let caller = next["callerId"] as? String else { return }
 
@@ -1584,8 +1601,17 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
             if run != self.generation || !self.validatedSystemUUID(systemUUID) { system.end(uuid: systemUUID) }
         }
         guard !Task.isCancelled, run == generation, route == requiredPushRegistration else { endIfUnverified(); return }
-        if duplicate { if pendingPushes[systemUUID]?.declined == true { system.end(uuid: systemUUID) }; return }
-        if validatedSystemUUID(systemUUID) { removePendingPush(systemUUID); return }
+        if duplicate && pendingPushes[systemUUID]?.declined == true { system.end(uuid: systemUUID); return }
+        if validatedSystemUUID(systemUUID) {
+            if let current = snapshot,
+               let updated = invitation.backfillCallerAvatar(current, now: Date().timeIntervalSince1970 * 1000) {
+                snapshot = updated
+                emitSnapshot(updated)
+            }
+            if !duplicate { removePendingPush(systemUUID) }
+            return
+        }
+        if duplicate { return }
         guard pendingPushes[systemUUID] != nil, !terminal.contains(invitation.systemKey) || pendingPushes[systemUUID]?.declined == true else { removePendingPush(systemUUID); endIfUnverified(); return }
         defer { if run == generation { removePendingPush(systemUUID) } }
         if invitation.scene == "meeting" {
@@ -1619,7 +1645,7 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
                 let message = try await request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true)
                 guard !Task.isCancelled, run == generation, route == requiredPushRegistration,
                       invitation.matches(message, now: Date().timeIntervalSince1970 * 1000),
-                      var next = await businessInvitation(message), run == generation,
+                      var next = await businessInvitation(message, senderAvatar: invitation.senderAvatar), run == generation,
                       !Task.isCancelled, route == requiredPushRegistration, let pending = pendingPushes[systemUUID] else { endIfUnverified(); return }
                 next["expiresAt"] = invitation.expiresAt
                 if pending.declined { notifyBusinessEnd(next, reason: "rejected"); system.end(uuid: systemUUID); return }
@@ -1655,6 +1681,7 @@ private enum VoipError: Error { case invalid }
     func reportIncoming(_ payload: [AnyHashable: Any], uuid: UUID, requiredByPushKit: Bool,
                         completion: @escaping NuwaxVoipPushWork.ReportCompletion)
     func register(_ snapshot: [String: Any], uuid: UUID, incoming: Bool)
+    func updateIncomingCallerName(_ name: String, uuid: UUID)
     func isPresented(uuid: UUID) -> Bool
     func requestAnswer(uuid: UUID, mediaType: String)
     func requestMute(uuid: UUID, muted: Bool)
@@ -1704,8 +1731,9 @@ private enum VoipError: Error { case invalid }
             return
         }
         let update = CXCallUpdate()
-        update.remoteHandle = CXHandle(type: .generic, value: payload["handle"] as? String ?? payload["callId"] as? String ?? uuid.uuidString)
-        update.localizedCallerName = payload["displayName"] as? String ?? "Nuwax"
+        let name = NuwaxVoipPushInvitation.systemCallerName(payload) ?? "Nuwax"
+        update.remoteHandle = CXHandle(type: .generic, value: payload["handle"] as? String ?? name)
+        update.localizedCallerName = name
         update.hasVideo = payload["mediaType"] as? String == "video"
         provider.reportNewIncomingCall(with: uuid, update: update) { error in
             Task { @MainActor in
@@ -1756,6 +1784,14 @@ private enum VoipError: Error { case invalid }
     }
 
     func isPresented(uuid: UUID) -> Bool { registry.isReported(uuid) && !registry.hasEnded(uuid) }
+
+    func updateIncomingCallerName(_ name: String, uuid: UUID) {
+        guard isPresented(uuid: uuid) else { return }
+        let update = CXCallUpdate()
+        update.remoteHandle = CXHandle(type: .generic, value: name)
+        update.localizedCallerName = name
+        provider.reportCall(with: uuid, updated: update)
+    }
 
     func requestAnswer(uuid: UUID, mediaType: String) {
         guard owner?.validatedSystemUUID(uuid) == true, !registry.hasEnded(uuid), answers[uuid] == nil else { return }
@@ -1924,7 +1960,8 @@ private enum VoipError: Error { case invalid }
             else { owner?.systemIncomingReady(uuid) }
             return
         }
-        let handle = Handle(type: .generic, value: payload["handle"] as? String ?? payload["callId"] as? String ?? uuid.uuidString, displayName: payload["displayName"] as? String ?? "Nuwax")
+        let name = NuwaxVoipPushInvitation.systemCallerName(payload) ?? "Nuwax"
+        let handle = Handle(type: .generic, value: payload["handle"] as? String ?? name, displayName: name)
         trace("incoming report requested")
         do {
             try await manager.reportNewIncomingConversation(uuid: uuid, update: .init(members: [handle], capabilities: payload["mediaType"] as? String == "video" ? [.video, .pausing] : [.pausing]))
@@ -1969,6 +2006,14 @@ private enum VoipError: Error { case invalid }
         }
     }
     func isPresented(uuid: UUID) -> Bool { registry.isReported(uuid) && !registry.hasEnded(uuid) }
+
+    func updateIncomingCallerName(_ name: String, uuid: UUID) {
+        guard isPresented(uuid: uuid),
+              let conversation = manager.conversations.first(where: { $0.uuid == uuid }),
+              conversation.state != .left else { return }
+        let handle = Handle(type: .generic, value: name, displayName: name)
+        manager.reportConversationEvent(.conversationUpdated(.init(members: [handle])), for: conversation)
+    }
     func requestAnswer(uuid: UUID, mediaType: String) {
         guard owner?.validatedSystemUUID(uuid) == true, !registry.hasEnded(uuid), joining[uuid] == nil, !answering.contains(uuid), answerRequested.insert(uuid).inserted else { return }
         answerModes[uuid] = mediaType

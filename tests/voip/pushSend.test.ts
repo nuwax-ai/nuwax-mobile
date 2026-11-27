@@ -12,6 +12,7 @@ const { prepareVoip } = createRequire(latestEntry)('./voip');
 const ordinaryFixtures = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures/push-send-ordinary.json'), 'utf8'));
 const now = 1_793_000_000_000;
 const locator = { type: 'voip', convId: '245475557381246976', msgId: '9223372036854775807' };
+const senderAvatar = '/api/user/avatar/10001/profile-hash';
 const notificationOnlyTransports = [
   ['android-honor', 'ho'],
   ['android-xiaomi', 'xm'],
@@ -58,7 +59,7 @@ describe('native call delivery', () => {
     };
     const result = await call({
       ...body, push_clientid: [cid, 'second-ios', 'android-cid', 'invalid-ios', cid],
-      payload: { ...body.payload, scene: 'call', calleeId: '1234', iosVoip },
+      payload: { ...body.payload, scene: 'call', calleeId: '1234', iosVoip, senderAvatar },
     });
     expect(result.errCode).toBe(0);
     expect(send).toHaveBeenCalledTimes(3);
@@ -67,10 +68,11 @@ describe('native call delivery', () => {
     ]);
     for (const [index, expected] of [registrationId, nextRegistrationId].entries()) {
       const args = send.mock.calls[index][0];
-      expect(JSON.parse(args.options.ios.payload)).toMatchObject({ routeRegistrationId: expected, calleeId: '1234' });
+      expect(JSON.parse(args.options.ios.payload)).toMatchObject({ routeRegistrationId: expected, calleeId: '1234', senderAvatar });
       expect(args.payload).not.toHaveProperty('iosVoip');
     }
     expect(send.mock.calls[2][0].push_clientid).toEqual(['android-cid', 'invalid-ios']);
+    expect(send.mock.calls[2][0].payload.senderAvatar).toBe(senderAvatar);
     expect(send.mock.calls[2][0].payload).not.toHaveProperty('iosVoip');
   });
 
@@ -93,7 +95,7 @@ describe('native call delivery', () => {
   it('sends Huawei Android pure transmission for a verified route', async () => {
     const transport = 'android-huawei';
     const body = makeBody();
-    const invitation = { ...body, callRoute: { cid, platform: 'android', transport }, settings: { ttl: 2000 }, options: { ios: { type: 'voip' } } };
+    const invitation = { ...body, payload: { ...body.payload, senderAvatar }, callRoute: { cid, platform: 'android', transport }, settings: { ttl: 2000 }, options: { ios: { type: 'voip' } } };
 
     const { call, send, request, manager } = load();
     expect((await call(invitation)).errCode).toBe(0);
@@ -105,11 +107,31 @@ describe('native call delivery', () => {
     });
     const transmission = args.requestData.push_message.transmission;
     expect(args.requestData.push_channel).toEqual({ android: { ups: { transmission } } });
-    expect(JSON.parse(transmission)).toEqual({ unipush_version: '2.0', payload: { ...body.payload, delivery: 'android-native' } });
+    expect(JSON.parse(transmission)).toEqual({ unipush_version: '2.0', payload: { ...body.payload, delivery: 'android-native', senderAvatar } });
 
     Object.assign(manager, { request: undefined });
     expect(await call(invitation)).toMatchObject({ errCode: 503, errMsg: 'UniPush transmission adapter unavailable' });
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it('sends a capability-gated Android Getui transmission without a vendor strategy', async () => {
+    const body = makeBody(Date.now() + 45_000);
+    const { call, send, request } = load();
+    expect((await call({
+      ...body, push_clientid: [cid],
+      callRoute: { cid, platform: 'android', transport: 'android-getui' },
+    })).errCode).toBe(0);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    const args = send.mock.calls[0][0];
+    expect(args).toMatchObject({
+      push_clientid: [cid], force_notification: false,
+      payload: { callId: 'same-call', delivery: 'android-native' },
+    });
+    expect(args.settings.ttl).toBeGreaterThan(5_000);
+    expect(args.settings.ttl).toBeLessThanOrEqual(45_000);
+    expect(args.settings).not.toHaveProperty('strategy');
   });
 
   it('sends one Huawei HarmonyOS VoIP request through the dedicated vendor channel', async () => {
@@ -117,7 +139,7 @@ describe('native call delivery', () => {
     const { payload, ...body } = makeBody();
     const invitation = { ...body, push_clientid: [cid],
       callRoute: { cid, platform: 'harmonyos', transport: 'harmony-huawei' },
-      payload: { ...payload, scene: 'call', calleeId: '10002', roomName: 'call-same-call', token: 'omitted' },
+      payload: { ...payload, scene: 'call', calleeId: '10002', roomName: 'call-same-call', token: 'omitted', senderAvatar },
       options: { ios: { type: 'voip' } }, settings: { ttl: 30000 },
     };
     expect((await call(invitation)).errCode).toBe(0);
@@ -131,7 +153,7 @@ describe('native call delivery', () => {
     const channel = args.requestData.push_channel.harmony.custom.HW;
     expect(channel.type).toBe('voip_call');
     expect(args.requestData.push_channel.harmony.options.HW).toEqual({ '/pushOptions/testMessage': true });
-    expect(JSON.parse(JSON.parse(channel.payload).extraData)).toEqual({ ...payload, calleeId: '10002' });
+    expect(JSON.parse(JSON.parse(channel.payload).extraData)).toEqual({ ...payload, calleeId: '10002', senderAvatar });
     expect(Object.keys(args.requestData.push_channel)).toEqual(['harmony']);
     await call({ ...invitation, push_clientid: cid });
     expect(request.mock.calls[1][0].requestData.request_id).toBe(args.requestData.request_id);
@@ -184,6 +206,16 @@ describe('native call delivery', () => {
     expect(args.category).toEqual({ harmony: 'VOIP', huawei: 'VOIP' });
     expect(args.options.ios.type).toBe('voip');
     expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
+  });
+
+  it('delivers a caller name in the PushKit payload even if senderName is blank', async () => {
+    const { call, send } = load(latestEntry, env);
+    const body = makeBody();
+    const payload = { ...body.payload, calleeId: '10002', scene: 'call',
+      senderName: ' ', callerDisplayName: ' Alice ', displayName: body.payload.callId };
+    expect((await call({ ...body, type: 'voip', payload })).errCode).toBe(0);
+    const delivered = JSON.parse(send.mock.calls[0][0].options.ios.payload);
+    expect(delivered).toMatchObject({ callId: body.payload.callId, displayName: 'Alice' });
   });
 
   it('fails closed for mixed devices, wrong platform and invalid invites', async () => {
@@ -242,17 +274,32 @@ describe('IM invitation scenes', () => {
   const meetingFields = { ...locator, scene: 'meeting', convType: 2, inviteId: 'fixture-invite', roomName: '123456789',
     title: '周会', mediaType: 'audio', senderName: '张三', silent: true, groupCall: true, passcode: '1234' };
 
+  it('drops only the avatar when the meeting would otherwise exceed the push budget', async () => {
+    const { call, send } = load();
+    const payload = { ...meetingFields, title: '会'.repeat(120), senderName: '人'.repeat(120),
+      roomName: 'r'.repeat(128), inviteId: 'm'.repeat(128), senderAvatar: 'https://images.example.test/' + 'a'.repeat(210) };
+    expect((await call({ ...envelope, payload })).errCode).toBe(0);
+    expect(send.mock.calls[0][0].payload).toMatchObject({ type: 'meeting_invite', inviteId: payload.inviteId });
+    expect(send.mock.calls[0][0].payload).not.toHaveProperty('senderAvatar');
+  });
+
+  it.each(['//images.example.test/avatar', 'https://images.example.test/avatar?token=secret', '/api/f/../private',
+    'file:///tmp/avatar', 'https://images.example.test/' + 'a'.repeat(240), 42])('ignores an invalid optional avatar %s', value => {
+    const result = prepareVoip({ payload: { ...locator, senderAvatar: value } }, now);
+    expect(result.payload).toEqual(locator);
+  });
+
   it('keeps a meeting with an IM envelope on the IM category', async () => {
     const { call, send, database } = load();
     const { scene, ...expected } = meetingFields;
     const request = {
       ...envelope, type: 'im',
-      payload: { ...meetingFields, expiresAt: 1, accessToken: 'fixture-extra' },
+      payload: { ...meetingFields, expiresAt: 1, accessToken: 'fixture-extra', senderAvatar },
     };
     const result = await call(request);
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
-    expect(args.payload).toEqual({ ...expected, type: 'meeting_invite' });
+    expect(args.payload).toEqual({ ...expected, type: 'meeting_invite', senderAvatar });
     expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM', vivo: 'IM' });
     expect(args).not.toHaveProperty('settings');
     expect(args).not.toHaveProperty('options');
@@ -403,7 +450,7 @@ describe('meeting ringing delivery', () => {
     const result = await call({
       ...envelope, push_clientid: cid, channelId: 'VoipCall',
       callRoute: { cid, platform: 'ios', transport: 'ios-voip', environment: 'development', registrationId },
-      payload: ringPayload(),
+      payload: { ...ringPayload(), senderAvatar },
     });
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
@@ -413,7 +460,7 @@ describe('meeting ringing delivery', () => {
     expect(args.options).not.toHaveProperty('android');
     const pushed = JSON.parse(args.options.ios.payload);
     expect(pushed).toMatchObject({ type: 'voip', scene: 'meeting', callId: 'mi-ring', calleeId: '10002',
-      inviteId: 'mi-ring', roomName: '123456789', title: '周会', mediaType: 'video', displayName: '张三' });
+      inviteId: 'mi-ring', roomName: '123456789', title: '周会', mediaType: 'video', displayName: '张三', senderAvatar });
     expect(pushed.expiresAt).toBeLessThanOrEqual(Date.now() + 61_000);
   });
 
@@ -429,6 +476,34 @@ describe('meeting ringing delivery', () => {
     expect(send.mock.calls[1][0].payload).toMatchObject({ type: 'meeting_invite', silent: true });
     expect(send.mock.calls[1][0].payload).not.toHaveProperty('iosVoip');
     expect(send.mock.calls[1][0].options?.ios?.type).not.toBe('voip');
+  });
+
+  it('rings a meeting through the capability-gated Android Getui route', async () => {
+    const cid = 'fixture-samsung';
+    const loaded = load(latestEntry, ringEnv);
+    loaded.manager.getClientDetailByCid = vi.fn().mockResolvedValue({
+      errCode: 0,
+      data: { validCids: { [cid]: { device_token: '', brand: 'samsung', phone_type: 1 } } },
+    });
+    const { call, send, request, manager } = loaded;
+    const result = await call({
+      ...envelope, push_clientid: [cid],
+      payload: { ...ringPayload(), androidGetui: [cid] },
+    });
+
+    expect(result.data.results).toMatchObject([
+      { cid, delivery: 'native', transport: 'android-getui', errCode: 0 },
+    ]);
+    expect(manager.getClientDetailByCid).toHaveBeenCalledWith(cid);
+    expect(request).not.toHaveBeenCalled();
+    const args = send.mock.calls[0][0];
+    expect(args.force_notification).toBe(false);
+    expect(args.settings.ttl).toBeGreaterThan(5_000);
+    expect(args.settings).not.toHaveProperty('strategy');
+    expect(args.payload).toMatchObject({
+      type: 'voip', scene: 'meeting', callId: 'mi-ring', delivery: 'android-native',
+    });
+    expect(args.payload).not.toHaveProperty('androidGetui');
   });
 
   it('clamps a long meeting deadline to the 60 second ringing window', async () => {
@@ -462,73 +537,52 @@ describe('meeting ringing delivery', () => {
     const result = await call({
       ...envelope, push_clientid: cid,
       callRoute: { cid, platform: 'android', transport: 'android-huawei' },
-      payload: ringPayload(),
+      payload: { ...ringPayload(), senderAvatar },
     });
     expect(result.errCode).toBe(0);
     const [{ requestData }] = request.mock.calls[0];
     expect(requestData.audience.cid).toEqual([cid]);
     expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({
-      type: 'voip', scene: 'meeting', calleeId: '10002', delivery: 'android-native',
+      type: 'voip', scene: 'meeting', calleeId: '10002', delivery: 'android-native', senderAvatar,
     });
     expect(send).not.toHaveBeenCalled();
     expect(database).not.toHaveBeenCalled();
   });
 
-  it('sends an explicit Harmony meeting through the Huawei test VoIP transport with just the IM locator', async () => {
+  it('keeps the avatar on the Harmony meeting route and retrieves the room and passcode through IM', async () => {
     const cid = 'fixture-harmony-meeting-cid';
     const { call, send, request } = load(latestEntry);
     const body = {
       ...envelope, push_clientid: [cid],
       callRoute: { cid, platform: 'harmonyos', transport: 'harmony-huawei' },
-      payload: { ...ringPayload(), passcode: '1234' },
+      payload: { ...ringPayload(), passcode: '1234', senderAvatar },
     };
     expect((await call(body)).errCode).toBe(0);
     const [{ requestData }] = request.mock.calls[0];
-    expect(requestData.audience.cid).toEqual([cid]);
-    expect(requestData.settings.strategy).toEqual({ hoshw: 2 });
-    const channel = requestData.push_channel.harmony.custom.HW;
-    expect(channel.type).toBe('voip_call');
-    const pushed = JSON.parse(JSON.parse(channel.payload).extraData);
-    expect(pushed).toMatchObject({ scene: 'meeting', callId: 'mi-ring', inviteId: 'mi-ring', calleeId: '10002',
-      convId: body.payload.convId, msgId: body.payload.msgId });
+    const { custom, options } = requestData.push_channel.harmony;
+    expect(options.HW).toEqual({ '/pushOptions/testMessage': true });
+    const pushed = JSON.parse(JSON.parse(custom.HW.payload).extraData);
+    expect(pushed).toMatchObject({ scene: 'meeting', inviteId: 'mi-ring', calleeId: '10002',
+      convId: body.payload.convId, msgId: body.payload.msgId, senderAvatar });
     expect(pushed).not.toHaveProperty('roomName');
     expect(pushed).not.toHaveProperty('passcode');
-    expect(send).not.toHaveBeenCalled();
-
-    await call({ ...body, payload: { ...body.payload, silent: true } });
-    expect(request).toHaveBeenCalledOnce();
-    expect(send.mock.calls[0][0].payload).toMatchObject({ type: 'meeting_invite', silent: true });
-  });
-
-  it('routes valid ringing meeting envelopes to the Harmony test channel by default', async () => {
-    const cid = 'registered-harmony-meeting-cid';
-    const { call, send, request, manager } = load(latestEntry);
-    manager.getClientDetailByCid = vi.fn().mockResolvedValue({
-      errCode: 0, data: { validCids: { [cid]: { device_token: 'vendor-token', brand: 'hoshw', phone_type: 7 } } },
-    });
-    const result = await call({ ...envelope, push_clientid: [cid], payload: ringPayload() });
-    expect(result.data.results).toMatchObject([
-      { cid, transport: 'harmony-huawei', delivery: 'native', errCode: 0 },
-    ]);
-    expect(request).toHaveBeenCalledOnce();
     expect(send).not.toHaveBeenCalled();
   });
 
   it.each([
-    { reason: 'automatic route rollback', enabled: false, silent: false, explicit: false },
-    { reason: 'explicit route rollback', enabled: false, silent: false, explicit: true },
-    { reason: 'silent invitation', enabled: true, silent: true, explicit: false },
-  ])('keeps the normal Harmony notification for $reason', async ({ enabled, silent, explicit }) => {
-    const cid = 'registered-harmony-meeting-cid';
+    { enabled: false, silent: false, explicit: false },
+    { enabled: false, silent: false, explicit: true },
+    { enabled: true, silent: true, explicit: false },
+  ])('keeps ordinary Harmony meeting delivery with %j', async ({ enabled, silent, explicit }) => {
+    const cid = 'fixture-harmony-meeting-cid';
     const { call, send, request, manager } = load(latestEntry, { NUWAX_VOIP_HARMONY_MEETING_RING: enabled ? '1' : '0' });
     manager.getClientDetailByCid = vi.fn().mockResolvedValue({
       errCode: 0, data: { validCids: { [cid]: { device_token: 'vendor-token', brand: 'hoshw', phone_type: 7 } } },
     });
     const callRoute = explicit ? { cid, platform: 'harmonyos', transport: 'harmony-huawei' } : undefined;
-    const result = await call({ ...envelope, push_clientid: [cid], callRoute, payload: { ...ringPayload(), silent } });
-    expect(result.errCode).toBe(0);
+    expect((await call({ ...envelope, push_clientid: [cid], callRoute, payload: { ...ringPayload(), silent, senderAvatar } })).errCode).toBe(0);
     expect(request).not.toHaveBeenCalled();
-    expect(send.mock.calls[0][0]).toMatchObject({ push_clientid: [cid], payload: { type: 'meeting_invite' } });
+    expect(send.mock.calls[0][0]).toMatchObject({ push_clientid: [cid], payload: { type: 'meeting_invite', senderAvatar } });
   });
 
   it.each([{ silent: true }, { calleeId: undefined }])('falls back for meetings that cannot ring: %j', async overrides => {
@@ -706,7 +760,7 @@ describe('automatic vendor route resolution', () => {
     expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({ delivery: 'android-native' });
   });
 
-  it.each([[7, 'hoshw'], ['7', 'HW']])('routes single-chat calls and ringing group meetings to Harmony (%s, %s)', async (phoneType, brand) => {
+  it.each([[7, 'hoshw'], ['7', 'HW']])('routes direct calls and audible meeting invitations to Harmony (%s, %s)', async (phoneType, brand) => {
     const cid = 'harmony-registry-cid';
     const { call, send, request } = withRegistry(load(), {
       [cid]: { device_token: 'vendor-token', brand, phone_type: phoneType },
@@ -740,6 +794,46 @@ describe('automatic vendor route resolution', () => {
     expect(request).not.toHaveBeenCalled();
     expect(send).toHaveBeenCalledOnce();
     expect(send.mock.calls[0][0]).toMatchObject({ push_clientid: [cid], payload: { callId: 'auto-route-call' } });
+  });
+
+  it('uses Android Getui only for CIDs explicitly marked by the IM service', async () => {
+    const cid = 'samsung-getui-cid';
+    const { call, send, request } = withRegistry(load(), {
+      [cid]: { device_token: '', brand: 'samsung', phone_type: 1 },
+    });
+    const body = makeCall(cid);
+    const result = await call({
+      ...body, push_clientid: [cid],
+      payload: { ...body.payload, androidGetui: [cid] },
+    });
+
+    expect(result.data.results).toMatchObject([
+      { cid, delivery: 'native', transport: 'android-getui', errCode: 0 },
+    ]);
+    expect(request).not.toHaveBeenCalled();
+    const args = send.mock.calls[0][0];
+    expect(args).toMatchObject({
+      push_clientid: [cid], force_notification: false,
+      payload: { callId: 'auto-route-call', delivery: 'android-native' },
+    });
+    expect(args.payload).not.toHaveProperty('androidGetui');
+    expect(args.settings).not.toHaveProperty('strategy');
+  });
+
+  it('keeps a vendor route ahead of the Android Getui fallback', async () => {
+    const cid = 'vendor-first-cid';
+    const { call, send, request } = withRegistry(load(), {
+      [cid]: { device_token: 'vendor-token', brand: 'hw', phone_type: 1 },
+    });
+    const body = makeCall(cid);
+    await call({
+      ...body, push_clientid: [cid],
+      payload: { ...body.payload, androidGetui: [cid] },
+    });
+
+    expect(request).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+    expect(request.mock.calls[0][0].requestData.settings.strategy).toEqual({ hw: 2 });
   });
 
   it('never blocks delivery when the registry lookup fails', async () => {

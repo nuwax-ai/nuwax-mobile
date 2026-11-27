@@ -1,6 +1,6 @@
 # 荣耀／华为 Android 真实 App 测试包
 
-使用包含当前 VoIP 实现的移动端分支（联调使用 `feat-2026.11`）、macOS 上的 HBuilderX 5.34 和同版本 Android 离线 SDK，生成 `com.nuwax.app` 完整女娲 App。仅忽略目录中的 QA 副本固定测试环境 `https://testagent.xspaceagi.com`，跳过商店版本升级，保留真实单聊语音／视频入口。页面资源内置，安装后无需 HBuilderX、电脑或局域网测试服务。
+使用包含当前 VoIP 实现的移动端分支（联调使用 `feat-2026.11`）、macOS 上的 HBuilderX 5.34 和同版本 Android 离线 SDK，生成 `com.nuwax.app` 完整女娲 App。标准测试包直接编译当前项目，再对导出资源设置测试环境；页面资源内置，安装后无需 HBuilderX、电脑或局域网测试服务。
 
 ## 本地准备与安装
 
@@ -18,9 +18,9 @@ make base-android     # 生成 unpackage/debug/android_debug.apk
 
 先前发布的 `1.4.0` 云基座包含华为 SDK 和接听页，使用 DCloud 默认 UniPush 接收器。当前云打包和标准本地入口都会注册 `NuwaxUniPushIntentService`；它在无 Activity 时补普通 IM 通知，并把识别出的通话邀请送进原生流程。云端和本地包都必须重新验收 manifest、透传回调、通知展示及点击行为。
 
-## 专用诊断包
+## 历史专用诊断包
 
-VoIP 原生排查可用 `bash scripts/voip-native/package-business-qa-android.sh`。它保留原生阶段日志和专用验包证据，供下文的设备测试工具使用。
+旧的 `bash scripts/voip-native/package-business-qa-android.sh` 入口现在转到 `make android-tester` 的流程，不再创建或导入 QA 项目。下文专用包路径、专用验包和安装工具属于历史记录；`android-qa-device.py install` 只接受旧的专用包及其元数据，不适用于新的标准测试包。日志、快照和进程检查仍可单独使用。
 
 签名配置从 `${NUWAX_SIGNING_HOME:-$HOME/workspace/nuwax-signing}/local-secrets.env` 加载；UniPush 客户端配置为同目录下 `android/unipush-client.json`，也可用 `NUWAX_ANDROID_UNIPUSH_CONFIG` 指向受控文件。结构为：
 

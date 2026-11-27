@@ -184,8 +184,10 @@ export class VoipBridge {
       if (['action', 'microphone', 'camera', 'speaker', 'audioRoute', 'switchCamera'].includes(command.op) && command.callId !== VoipBridge.current?.callId) return
       if (command.op === 'invitation' && VoipBridge.business()) {
         VoipBridge.notificationMessage(command.convId, command.msgId, command.callId)
-          .then(message => {
-            if (message) return VoipBridge.receiveInvitation(message, command.senderAvatar ?? '')
+          .then((message): void => {
+            if (message == null) return
+            VoipBridge.receiveInvitation(message, command.senderAvatar ?? '')
+              .catch(() => VoipBridge.emit('error', 'CALL_INVITATION_FAILED'))
           }).catch(() => VoipBridge.emit('error', 'CALL_INVITATION_FAILED'))
         return
       }

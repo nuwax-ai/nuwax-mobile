@@ -12,6 +12,11 @@ final class VoipPushTests: XCTestCase {
         ["msgType": "voip", "convId": "245475557381246976", "msgId": "9223372036854775807", "sendTime": now - 1_000,
          "body": ["callId": "call-123", "mediaType": "audio", "roomName": "voip-call-123"]]
     }
+    private var meetingMessage: [String: Any] {
+        ["msgType": "meeting_invite", "senderId": "123", "senderName": "Alice",
+         "convId": "245475557381246976", "msgId": NSNumber(value: Int64.max), "sendTime": now - 1_000,
+         "body": ["inviteId": "invite.123", "roomName": "room-123", "title": "Meeting", "mediaType": "video"]]
+    }
     private func parse(_ raw: [AnyHashable: Any]) -> NuwaxVoipPushInvitation? {
         NuwaxVoipPushInvitation(raw, userId: "bob", business: true, now: now)
     }
@@ -91,5 +96,31 @@ final class VoipPushTests: XCTestCase {
         var legacy = payload; legacy.removeValue(forKey: "convId"); legacy.removeValue(forKey: "msgId")
         XCTAssertNotNil(NuwaxVoipPushInvitation(legacy, userId: "bob", business: false, now: now))
         XCTAssertNil(parse(legacy))
+    }
+
+    func testMeetingMessageAndPushUseTheSameSystemIdentity() throws {
+        let online = try XCTUnwrap(NuwaxVoipPushInvitation(meetingMessage: meetingMessage, userId: "456", now: now))
+        var fields = payload
+        fields["scene"] = "meeting"; fields["inviteId"] = "invite.123"
+        fields["roomName"] = "room-123"; fields["title"] = "Meeting"; fields["mediaType"] = "video"
+        let pushed = try XCTUnwrap(parse(fields))
+        XCTAssertEqual(online.systemKey, pushed.systemKey)
+        XCTAssertEqual(online.msgId, "9223372036854775807")
+        XCTAssertEqual(online.expiresAt, now + 59_000)
+        XCTAssertEqual(online.mediaType, "video")
+        XCTAssertTrue(pushed.matches(meetingMessage, now: now))
+    }
+
+    func testMeetingMessageIgnoresSelfEchoExpiredAndSilentInvitations() throws {
+        XCTAssertNil(NuwaxVoipPushInvitation(meetingMessage: meetingMessage, userId: "123", now: now))
+        XCTAssertNil(NuwaxVoipPushInvitation(meetingMessage: meetingMessage, userId: "456", now: now + 59_000))
+        let audible = try XCTUnwrap(NuwaxVoipPushInvitation(meetingMessage: meetingMessage, userId: "456", now: now))
+        var silent = meetingMessage
+        var body = try XCTUnwrap(silent["body"] as? [String: Any])
+        for value: Any in [true, "true"] {
+            body["silent"] = value; silent["body"] = body
+            XCTAssertNil(NuwaxVoipPushInvitation(meetingMessage: silent, userId: "456", now: now))
+            XCTAssertFalse(audible.matches(silent, now: now))
+        }
     }
 }

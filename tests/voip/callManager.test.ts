@@ -50,7 +50,7 @@ vi.mock('../../features/voip/audioFocus.uts', () => ({ claimVoipAudio: fake.clai
 vi.mock('../../utils/voice/stopAllSpeechPlayback.uts', () => ({ stopAllSpeechPlayback: vi.fn() }));
 vi.mock('../../utils/i18n.uts', () => ({ t: (key: string) => key }));
 
-import { bootstrapVoip, clearVoipSession, getVoipSnapshot, handleVoipInvitation, startVoipCall, answerVoipCall, endVoipCall, restoreVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioRoutePending, voipAudioInterrupted, voipPermissionPending, voipPushRegistration, voipRemoteVideo, voipCameraSwitching, setVoipBackground } from '../../features/voip/callManager.uts';
+import { bootstrapVoip, clearVoipSession, getVoipSnapshot, handleVoipInvitation, startVoipCall, answerVoipCall, endVoipCall, restoreVoipCall, voipError, voipHistory, voipAudioRoute, voipAudioRoutes, voipAudioRoutePending, voipAudioInterrupted, voipPermissionPending, voipPushRegistration, voipRemoteVideo, voipCameraSwitching, voipSpeaker, setVoipBackground } from '../../features/voip/callManager.uts';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -421,19 +421,27 @@ describe('incoming actions and event isolation', () => {
     await incoming();
     fake.events.push({ scope: 'previous-account', type: 'history', records: [{ callId: 'leaked', convId: 'chat' }] });
     event({ type: 'audioInterrupted', callId: 'old-call', enabled: true });
+    event({ type: 'audioRoute', callId: 'incoming', selected: 'earpiece' });
+    event({ type: 'audioRoute', callId: 'old-call', selected: 'speaker' });
     await vi.advanceTimersByTimeAsync(100);
     expect(voipHistory.value).toEqual([]); expect(voipAudioInterrupted.value).toBe(false);
+    expect(voipAudioRoute.value).toBe('earpiece');
   });
   it('resets permissions, interruption and routes at terminal cleanup', async () => {
     await incoming();
     event({ type: 'permissionPending', callId: 'incoming' });
+    event({ type: 'speaker', callId: 'incoming', enabled: true });
     event({ type: 'audioRoutes', callId: 'incoming', routes: [{ id: 'speaker', kind: 'speaker' }], selected: 'speaker' });
     event({ type: 'audioInterrupted', callId: 'incoming', enabled: true });
     await vi.advanceTimersByTimeAsync(100);
     expect(voipAudioRoutes.value).toHaveLength(1); expect(voipPermissionPending.value).toBe(true); expect(voipAudioInterrupted.value).toBe(true);
+    expect(voipSpeaker.value).toBe(true);
+    expect(voipAudioRoute.value).toBe('speaker');
     event({ type: 'localEnded', callId: 'incoming', reason: 'permissionRequired' });
     await vi.advanceTimersByTimeAsync(100);
     expect(voipAudioRoutes.value).toEqual([]); expect(voipPermissionPending.value).toBe(false); expect(voipAudioInterrupted.value).toBe(false);
+    expect(voipSpeaker.value).toBe(false);
+    expect(voipAudioRoute.value).toBe('');
   });
   it('tracks initial audio routing only for the current call and clears it on end', async () => {
     await incoming();

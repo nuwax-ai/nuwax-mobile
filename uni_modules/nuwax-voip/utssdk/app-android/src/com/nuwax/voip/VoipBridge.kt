@@ -47,6 +47,7 @@ import io.livekit.android.room.track.VideoTrack
 import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.renderer.TextureViewRenderer
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import okhttp3.*
@@ -112,6 +113,8 @@ object VoipBridge {
     private var incomingUiWait: Job? = null
     private var incomingAvatarJob: Job? = null
     private var incomingAvatar: Bitmap? = null
+    private val currentEndpointType = MutableStateFlow<Int?>(null)
+    private val availableCallEndpoints = MutableStateFlow<List<CallEndpointCompat>>(emptyList())
     private var speaker = false
     private var onEarpiece = false
     private var audioRouteChosen = false
@@ -205,6 +208,10 @@ object VoipBridge {
             "meetingIgnore" -> "忽略"
             "meetingJoining" -> "正在加入会议…"
             "meetingMinimize" -> "收起"
+            "speaker" -> "扬声器"
+            "earpiece" -> "听筒"
+            "bluetooth" -> "蓝牙"
+            "headset" -> "耳机"
             else -> key
         }
         return config.optJSONObject("labels")?.optString(key, fallback) ?: fallback
@@ -319,6 +326,7 @@ object VoipBridge {
         if (value.optString("callId") != id || value.optString("state") == "ended") return null
         return JSONObject(value.toString()).put("incoming", value.optString("calleeId") == config.optString("userId"))
             .put("microphone", microphone).put("camera", camera).put("speaker", speaker)
+            .put("audioOutput", audioOutputKind())
             .put("remoteVideo", remoteVideo).put("cameraSwitching", switchingCameraTrack != null)
             .put("defaultAudioRoutePending", defaultAudioRoutePending)
             .put("mediaReady", connected && peerReady).put("reconnecting", reconnecting)
@@ -436,6 +444,8 @@ object VoipBridge {
         startStream()
         current?.takeUnless { it.optString("scene") == "meeting" }?.let {
             emitSnapshot(it)
+            emitAudioOutput()
+            emit("audioRoutePending", "enabled", defaultAudioRoutePending)
             if (connected) emit("connected")
             if (peerReady) emit("peerMediaReady")
             emit("remoteVideo", "enabled", remoteVideo)
@@ -845,12 +855,15 @@ object VoipBridge {
                     if (incoming && ownsCall()) requestBackgroundCallUi(id)
                     publishCall()
                     launch { isMuted.collect { muted -> if (control === owner) setMicrophone(!muted) } }
+                    // Core-Telecom 1.0 delivers each endpoint event to just one collector.
+                    launch { availableEndpoints.collect { if (control === owner) availableCallEndpoints.value = it } }
                     launch {
                         currentCallEndpoint.collect { endpoint ->
                             if (control === owner) {
                                 speaker = endpoint.type == CallEndpointCompat.TYPE_SPEAKER
                                 onEarpiece = endpoint.type == CallEndpointCompat.TYPE_EARPIECE
-                                if (!defaultAudioRoutePending) emit("speaker", "enabled", speaker)
+                                currentEndpointType.value = endpoint.type
+                                if (!defaultAudioRoutePending) emitAudioOutput()
                                 updateProximity()
                             }
                         }
@@ -1060,7 +1073,13 @@ object VoipBridge {
         val id = snapshot.optString("callId")
         if (mediaId == id) return
         mediaId = id; connected = false; peerReady = false; readySent = false
-        defaultAudioRoutePending = snapshot.optString("mediaType") == "audio" && !audioRouteChosen
+        val defaultEndpoint = if (snapshot.optString("mediaType") == "video") {
+            CallEndpointCompat.TYPE_SPEAKER
+        } else {
+            CallEndpointCompat.TYPE_EARPIECE
+        }
+        defaultAudioRoutePending = !audioRouteChosen
+        if (defaultAudioRoutePending) emit("audioRoutePending", "enabled", true)
         remoteLeftJob?.cancel(); remoteLeftJob = null; everHadRemote = false
         val run = generation
         mediaJob = scope.launch {
@@ -1076,18 +1095,18 @@ object VoipBridge {
                 if (defaultAudioRoutePending) {
                     launch {
                         try {
-                            selectDefaultAudioRoute(c, id, run)
-                            // Some OEMs publish their initial speaker route just after answer succeeds.
-                            // Keep the control pending briefly and recheck the actual endpoint once.
+                            selectDefaultAudioRoute(c, defaultEndpoint)
+                            // Telecom can publish its initial route shortly after activation succeeds.
                             delay(300)
-                            selectDefaultAudioRoute(c, id, run)
+                            selectDefaultAudioRoute(c, defaultEndpoint)
                         }
                         catch (cancelled: CancellationException) { throw cancelled }
-                        catch (_: Exception) { trace("default earpiece route unavailable") }
+                        catch (_: Exception) { trace("default audio route unavailable") }
                         finally {
                             if (run == generation && current?.optString("callId") == id && control === c) {
                                 defaultAudioRoutePending = false
-                                emit("speaker", "enabled", speaker)
+                                emitAudioOutput()
+                                emit("audioRoutePending", "enabled", false)
                             }
                         }
                     }
@@ -1220,39 +1239,47 @@ object VoipBridge {
             }
         }
     }
+    private fun audioOutputKind(): String = when (currentEndpointType.value) {
+        CallEndpointCompat.TYPE_EARPIECE -> "earpiece"
+        CallEndpointCompat.TYPE_SPEAKER -> "speaker"
+        CallEndpointCompat.TYPE_BLUETOOTH -> "bluetooth"
+        CallEndpointCompat.TYPE_WIRED_HEADSET -> "headset"
+        else -> ""
+    }
+    private fun emitAudioOutput() {
+        emit("speaker", "enabled", speaker)
+        emit("audioRoute", "selected", audioOutputKind())
+    }
     private suspend fun setSpeaker(enabled: Boolean) {
         setAudioRoute(if (enabled) "speaker" else "earpiece")
     }
     private suspend fun setAudioRoute(route: String) {
-        audioRouteChosen = true
         val c = control ?: return
-        val endpoints = withTimeoutOrNull(1000) { c.availableEndpoints.first() } ?: return
         val type = when (route) { "speaker" -> CallEndpointCompat.TYPE_SPEAKER; "earpiece" -> CallEndpointCompat.TYPE_EARPIECE; "bluetooth" -> CallEndpointCompat.TYPE_BLUETOOTH; "wired" -> CallEndpointCompat.TYPE_WIRED_HEADSET; else -> return }
+        audioRouteChosen = true
+        val endpoints = withTimeoutOrNull(1000) { availableCallEndpoints.first { it.isNotEmpty() } } ?: return
+        if (control !== c) return
         val endpoint = endpoints.firstOrNull { it.type == type }
         if (endpoint == null) emit("error", "code", "CALL_AUDIO_ROUTE_UNAVAILABLE") else c.requestEndpointChange(endpoint)
     }
 
-    private suspend fun selectDefaultAudioRoute(c: CallControlScope, id: String, run: Int) {
-        val endpoints = withTimeoutOrNull(2000) { c.availableEndpoints.first { list -> list.any { it.type == CallEndpointCompat.TYPE_EARPIECE } } } ?: return
-        val selected = withTimeoutOrNull(1000) { c.currentCallEndpoint.first() } ?: return
-        if (run != generation || current?.optString("callId") != id || control !== c || audioRouteChosen) return
-        // Leave connected headsets to Telecom and never override a user's route selection.
-        if (selected.type != CallEndpointCompat.TYPE_SPEAKER || endpoints.any { it.type == CallEndpointCompat.TYPE_BLUETOOTH || it.type == CallEndpointCompat.TYPE_WIRED_HEADSET }) return
-        val earpiece = endpoints.first { it.type == CallEndpointCompat.TYPE_EARPIECE }
-        try {
-            if (c.requestEndpointChange(earpiece) !is CallControlResult.Success) {
-                trace("default earpiece route unavailable")
-                return
-            }
-            // Telecom may acknowledge the request before publishing the resulting endpoint.
-            val routed = withTimeoutOrNull(1000) { c.currentCallEndpoint.first { it.type != CallEndpointCompat.TYPE_SPEAKER } }
-            if (routed != null && run == generation && current?.optString("callId") == id && control === c && !audioRouteChosen) {
-                speaker = routed.type == CallEndpointCompat.TYPE_SPEAKER
-                onEarpiece = routed.type == CallEndpointCompat.TYPE_EARPIECE
-                updateProximity()
-            }
-        } catch (cancelled: CancellationException) { throw cancelled }
-        catch (_: Exception) { trace("default earpiece route unavailable") }
+    private suspend fun selectDefaultAudioRoute(c: CallControlScope, targetType: Int) {
+        if (control !== c || audioRouteChosen) return
+        withTimeoutOrNull(1000) {
+            currentEndpointType.first { it != null }
+            availableCallEndpoints.first { it.isNotEmpty() }
+        } ?: return
+        if (control !== c || audioRouteChosen) return
+        val selected = currentEndpointType.value
+        // Keep the system's active headset or Bluetooth route.
+        if (selected == targetType || (selected != CallEndpointCompat.TYPE_SPEAKER && selected != CallEndpointCompat.TYPE_EARPIECE)) return
+        val endpoint = availableCallEndpoints.value.firstOrNull { it.type == targetType } ?: return
+        if (c.requestEndpointChange(endpoint) !is CallControlResult.Success) {
+            trace("default audio route unavailable")
+            return
+        }
+        // The request can succeed before Telecom reports where audio is playing.
+        withTimeoutOrNull(1000) { currentEndpointType.first { it != null && it != selected } }
     }
 
     @JvmStatic fun createVideoView(ctx: Context, local: Boolean): FrameLayout {
@@ -1316,6 +1343,7 @@ object VoipBridge {
         clearIncomingAvatar()
         releaseMedia(); mediaJob?.cancel(); mediaJob = null; mediaId = ""
         val c = control; control = null
+        currentEndpointType.value = null; availableCallEndpoints.value = emptyList()
         val job = telecomJob; telecomJob = null
         val ready = telecomReady; telecomReady = null
         val cleanup = scope.launch(start = CoroutineStart.LAZY) {

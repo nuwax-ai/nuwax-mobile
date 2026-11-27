@@ -16,6 +16,10 @@ struct NuwaxVoipPushInvitation {
     let roomName: String?
     let title: String?
 
+    var systemKey: String { inviteId.map(Self.meetingSystemKey) ?? callId }
+
+    static func meetingSystemKey(_ inviteId: String) -> String { "meeting:\(inviteId)" }
+
     init?(_ raw: [AnyHashable: Any], userId: String, business: Bool, now: Double,
           requiredRegistrationId: String? = nil, pushBusinessEnvironment: String? = nil) {
         var payload = raw
@@ -62,7 +66,21 @@ struct NuwaxVoipPushInvitation {
         displayName = name.isEmpty ? "Nuwax" : String(name.prefix(80))
     }
 
-    func report(labels: [String: Any]) -> [AnyHashable: Any] {
+    init?(meetingMessage message: [String: Any], userId: String, now: Double) {
+        guard let sender = Self.responseId(message["senderId"]), sender != userId,
+              let conv = Self.responseId(message["convId"]), let msg = Self.responseId(message["msgId"]),
+              let sent = message["sendTime"] as? NSNumber, let body = message["body"] as? [String: Any],
+              let inviteId = body["inviteId"] as? String, let room = body["roomName"] as? String,
+              let media = body["mediaType"] as? String, let title = body["title"] as? String else { return nil }
+        self.init(["type": "voip", "scene": "meeting", "callId": "meeting-\(msg)", "calleeId": userId,
+                   "convId": conv, "msgId": msg, "inviteId": inviteId, "roomName": room,
+                   "mediaType": media, "title": String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80)),
+                   "displayName": message["senderName"] as? String ?? "Nuwax", "expiresAt": sent.doubleValue + 60_000],
+                  userId: userId, business: true, now: now)
+        guard matches(message, now: now) else { return nil }
+    }
+
+    func report(labels: [String: Any]) -> [String: Any] {
         // 系统接听布局不可定制；显示会议语义和会议号，不把业务 inviteId 当电话号码。
         let meetingLabel = labels["meetingInvitation"] as? String ?? "会议邀请"
         let numberLabel = labels["meetingNumber"] as? String ?? "会议号"
@@ -97,6 +115,7 @@ struct NuwaxVoipPushInvitation {
         guard let body = message["body"] as? [String: Any],
               message["msgType"] as? String == "meeting_invite",
               (message["senderType"] as? Int ?? 1) == 1, (message["msgStatus"] as? Int ?? 1) == 1,
+              body["silent"] as? Bool != true, body["silent"] as? String != "true",
               let expectedInvite = inviteId, body["inviteId"] as? String == expectedInvite,
               let expectedRoom = roomName, body["roomName"] as? String == expectedRoom,
               Self.responseId(message["convId"]) == convId, Self.responseId(message["msgId"]) == msgId,

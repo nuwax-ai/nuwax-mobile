@@ -2,6 +2,14 @@ import XCTest
 @testable import VoipPush
 
 final class ClientStateTests: XCTestCase {
+    func testCloudHostCanSelectUniPushWithoutACustomProviderKey() {
+        let getui = ["appid": "fixture-app", "appKey": "fixture-key", "appSecret": "fixture-secret"]
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushProvider(info: ["getui": getui]), "unipush")
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushProvider(info: ["getui": getui, "NuwaxVoipPushProvider": "apns"]), "apns")
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushProvider(info: ["NuwaxVoipPushProvider": "unipush"]), "unipush")
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushProvider(info: ["getui": ["appid": "fixture-app"]]), "")
+    }
+
     func testCloudPushEnvironmentUsesProfileOrAppStoreDefault() throws {
         func profile(_ environment: String) throws -> Data {
             let data = try PropertyListSerialization.data(fromPropertyList: ["Entitlements": ["aps-environment": environment]], format: .xml, options: 0)

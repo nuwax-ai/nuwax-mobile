@@ -81,13 +81,18 @@ export function createMediaEngine(emit, root = document.body) {
       return;
     }
     if (command.op === 'switchCamera') {
-      await queueCamera(async target => {
-        if (!camera || hidden) return;
-        const track = target.localParticipant.getTrackPublication(Track.Source.Camera)?.videoTrack;
-        if (!track) return;
-        const mode = track.mediaStreamTrack.getSettings().facingMode;
-        await track.restartTrack({ facingMode: mode === 'environment' ? 'user' : 'environment' });
-      });
+      const run = generation;
+      try {
+        await queueCamera(async target => {
+          if (!camera || hidden) return;
+          const track = target.localParticipant.getTrackPublication(Track.Source.Camera)?.videoTrack;
+          if (!track) return;
+          const mode = track.mediaStreamTrack.getSettings().facingMode;
+          await track.restartTrack({ facingMode: mode === 'environment' ? 'user' : 'environment' });
+        });
+      } finally {
+        if (run === generation) notify('cameraSwitching', { enabled: false });
+      }
       return;
     }
     if (command.op === 'background') {
@@ -123,6 +128,20 @@ export function createMediaEngine(emit, root = document.body) {
       }, 3000);
     };
     let localReady = false;
+    const remoteVideos = new Map();
+    let remoteVideoVisible = false;
+    const syncRemoteVideo = () => {
+      if (!current()) return;
+      let visible = false;
+      for (const [publication, element] of remoteVideos) {
+        element.style.visibility = publication.isMuted ? 'hidden' : 'visible';
+        visible ||= !publication.isMuted;
+      }
+      if (visible !== remoteVideoVisible) {
+        remoteVideoVisible = visible;
+        notify('remoteVideo', { enabled: visible });
+      }
+    };
     const announceReady = () => {
       if (!current() || !localReady) return;
       next.localParticipant.publishData?.(new TextEncoder().encode(JSON.stringify({ v: 1, type: 'ready', callId })), { reliable: true, topic: MEDIA_READY_TOPIC }).catch(() => {});
@@ -139,9 +158,18 @@ export function createMediaEngine(emit, root = document.body) {
       element.dataset.participant = participant.identity;
       element.className = track.kind === Track.Kind.Video ? 'remote-video' : 'remote-audio';
       views.add(element); root.append(element);
+      if (track.kind === Track.Kind.Video) {
+        remoteVideos.set(publication, element);
+        syncRemoteVideo();
+      }
       if (track.kind === Track.Kind.Audio) notify('peerMediaReady');
     });
-    next.on(RoomEvent.TrackUnsubscribed, track => { for (const element of track.detach()) { views.delete(element); element.remove(); } });
+    next.on(RoomEvent.TrackUnsubscribed, (track, publication) => {
+      for (const element of track.detach()) { views.delete(element); element.remove(); }
+      if (remoteVideos.delete(publication)) syncRemoteVideo();
+    });
+    next.on(RoomEvent.TrackMuted, syncRemoteVideo);
+    next.on(RoomEvent.TrackUnmuted, syncRemoteVideo);
     next.on(RoomEvent.Reconnecting, () => { if (current()) { recovering = true; notify('reconnecting'); observeRemotePresence(); } });
     next.on(RoomEvent.Reconnected, () => { if (current()) { recovering = false; notify('connected'); observeRemotePresence(); announceReady(); } });
     next.on(RoomEvent.AudioPlaybackStatusChanged, () => { if (current() && !next.canPlaybackAudio) notify('playbackBlocked'); });

@@ -58,7 +58,8 @@ interface Command {
 interface Envelope { code: string; data: CallData }
 interface MediaEvent { type: string; callId?: string; code?: string; enabled?: boolean; fatal?: boolean; released?: boolean }
 interface CallEvent extends MediaEvent {
-  scope: string; snapshot?: CallData; reason?: string; nativeIncomingUI?: boolean;
+  scope: string; snapshot?: CallData; reason?: string; nativeIncomingUI?: boolean; systemRingingOnly?: boolean;
+  selected?: string;
   action?: string; inviteId?: string; convId?: string; msgId?: string; roomName?: string;
   title?: string; mediaType?: string; passcode?: string; handoffExpiresAt?: number;
 }
@@ -95,7 +96,14 @@ export class VoipBridge {
   static peerReady = false
   static microphone = true
   static speakerEnabled = false
+  static audioRoute = ''
+  static audioRoutePending = false
+  private static audioRouteChosen = false
+  private static audioRouteSerial = 0
+  private static audioRouteWork: Promise<void> = Promise.resolve()
   static camera = false
+  static cameraSwitching = false
+  static remoteVideo = false
   static generation = 0
   static mediaId = ''
   static nativeId = ''
@@ -137,7 +145,9 @@ export class VoipBridge {
   static emit(type: string, code: string = '', snapshot?: CallData, reason: string = '', enabled?: boolean): void {
     const event: CallEvent = { type, code, scope: VoipBridge.configuration?.scope ?? '',
       callId: VoipBridge.current?.callId ?? '', snapshot, reason, enabled,
-      nativeIncomingUI: !!VoipBridge.nativeId && snapshot !== undefined && snapshot.calleeId === VoipBridge.configuration?.userId }
+      nativeIncomingUI: !!VoipBridge.nativeId && snapshot !== undefined && snapshot.calleeId === VoipBridge.configuration?.userId,
+      systemRingingOnly: !!VoipBridge.nativeId && snapshot?.state === 'ringing' && snapshot.calleeId === VoipBridge.configuration?.userId,
+      selected: type === 'audioRoute' ? VoipBridge.audioRoute : undefined }
     VoipBridge.queue.push(event)
     if (VoipBridge.queue.length > 256) VoipBridge.queue.shift()
     VoipBridge.listeners.forEach(callback => callback())
@@ -172,6 +182,7 @@ export class VoipBridge {
       else if (command.op === 'speaker') VoipBridge.speaker(command.enabled === true)
       else if (command.op === 'showMedia') VoipBridge.showMedia()
       else if (command.op === 'camera') VoipBridge.setCamera(command.enabled === true)
+      else if (command.op === 'switchCamera') VoipBridge.switchCamera()
       else if (command.op === 'background') {
         VoipBridge.background = command.hidden === true
         // EntryAbility hiding while the call Ability opens is not a camera-background event.
@@ -214,6 +225,11 @@ export class VoipBridge {
     }).catch(() => {})
     if (VoipBridge.current) {
       VoipBridge.emit('snapshot', '', VoipBridge.current)
+      VoipBridge.emit('speaker', '', undefined, '', VoipBridge.speakerEnabled)
+      VoipBridge.emit('audioRoute')
+      VoipBridge.emit('audioRoutePending', '', undefined, '', VoipBridge.audioRoutePending)
+      VoipBridge.emit('remoteVideo', '', undefined, '', VoipBridge.remoteVideo)
+      VoipBridge.emit('cameraSwitching', '', undefined, '', VoipBridge.cameraSwitching)
       if (VoipBridge.connected) VoipBridge.emit('connected')
       if (VoipBridge.peerReady) VoipBridge.emit('peerMediaReady')
     }
@@ -527,7 +543,12 @@ export class VoipBridge {
     if (!previous || previous.callId !== value.callId) {
       VoipBridge.microphone = true
       VoipBridge.camera = value.mediaType === 'video'
+      VoipBridge.cameraSwitching = false
+      VoipBridge.remoteVideo = false
       VoipBridge.speakerEnabled = false
+      VoipBridge.audioRoute = ''
+      VoipBridge.audioRoutePending = false
+      VoipBridge.audioRouteChosen = false
     }
     VoipBridge.current = value; VoipBridge.emit('snapshot', '', value)
     if (value.state === 'ended') { VoipBridge.finish(); return }
@@ -620,6 +641,14 @@ export class VoipBridge {
     VoipBridge.media(JSON.stringify({ op: 'camera', callId: call.callId, enabled }))
     VoipBridge.emit('camera', '', undefined, '', enabled)
   }
+  private static switchCamera(): void {
+    const call = VoipBridge.current
+    if (!call || call.mediaType !== 'video' || !VoipBridge.camera || VoipBridge.cameraSwitching ||
+      !VoipBridge.mediaForeground || !VoipBridge.mediaReady) return
+    VoipBridge.cameraSwitching = true
+    VoipBridge.emit('cameraSwitching', '', undefined, '', true)
+    VoipBridge.media(JSON.stringify({ op: 'switchCamera', callId: call.callId }))
+  }
   static startMedia(call: CallData): void {
     const run = VoipBridge.generation
     VoipBridge.connect(call).catch((error: BusinessError) => {
@@ -637,6 +666,7 @@ export class VoipBridge {
     if (run !== VoipBridge.generation || VoipBridge.current?.callId !== call.callId || VoipBridge.terminal.has(call.callId)) return
     const signal = credentials.serverUrl ?? ''
     if (!signal.startsWith('wss://') && !(VoipBridge.configuration?.development && signal.startsWith('ws://'))) throw new Error('CALL_INSECURE_MEDIA_URL')
+    VoipBridge.speaker(VoipBridge.current?.mediaType === 'video', false)
     VoipBridge.traceIncoming('mediaEndpointReady', call.callId)
     if (VoipBridge.nativeVoiceCallId === call.callId) {
       const context = VoipBridge.context, start = VoipBridge.nativeVoiceStart
@@ -672,7 +702,15 @@ export class VoipBridge {
       return
     }
     if (!VoipBridge.controller || !VoipBridge.mediaReady) { VoipBridge.commands.push(raw); if (VoipBridge.commands.length > 16) VoipBridge.commands.shift(); return }
-    VoipBridge.controller.runJavaScript(`window.nuwaxVoipMedia.execute(${JSON.stringify(raw)})`).catch(() => VoipBridge.emit('error', 'CALL_MEDIA_COMMAND_FAILED'))
+    VoipBridge.controller.runJavaScript(`window.nuwaxVoipMedia.execute(${JSON.stringify(raw)})`).catch(() => {
+      const command = JSON.parse(raw) as Command
+      if (command.callId && command.callId !== VoipBridge.current?.callId) return
+      if (command.op === 'switchCamera') {
+        VoipBridge.cameraSwitching = false
+        VoipBridge.emit('cameraSwitching', '', undefined, '', false)
+      }
+      VoipBridge.emit('error', 'CALL_MEDIA_COMMAND_FAILED')
+    })
   }
   static mediaEvent(raw: string): void {
     try {
@@ -691,15 +729,19 @@ export class VoipBridge {
       if (event.type === 'connected') {
         const firstConnection = !VoipBridge.connected
         VoipBridge.connected = true; VoipBridge.reconnecting = false
+        if (firstConnection) VoipBridge.speaker(call.mediaType === 'video', false)
+        else VoipBridge.refreshAudioRoute()
         if (VoipBridge.nativeVoiceCallId !== call.callId) VoipBridge.startTask()
         const id = call.callId, run = VoipBridge.generation
         if (firstConnection && VoipBridge.business()) VoipBridge.mediaJoined().catch(() => { if (run === VoipBridge.generation && VoipBridge.current?.callId === id) VoipBridge.finish('mediaFailed') })
       }
       if (event.type === 'reconnecting') VoipBridge.reconnecting = true
       if (event.type === 'peerMediaReady') VoipBridge.peerReady = true
+      if (event.type === 'remoteVideo') VoipBridge.remoteVideo = event.enabled === true
+      if (event.type === 'cameraSwitching') VoipBridge.cameraSwitching = event.enabled === true
       if (event.type === 'remoteEnded') { VoipBridge.finish('remoteEnded', false); return }
       if (event.type === 'disconnected' || (event.type === 'error' && event.fatal !== false)) { VoipBridge.finish('disconnected'); return }
-      VoipBridge.emit(event.type, event.code)
+      VoipBridge.emit(event.type, event.code, undefined, '', event.enabled)
       if (VoipBridge.current?.callId === call.callId && VoipBridge.connected && VoipBridge.peerReady && !VoipBridge.readySent) {
         VoipBridge.readySent = true
         VoipBridge.reportState(voipCall.VoipCallState.VOIP_CALL_STATE_ACTIVE, VoipBridge.nativeId, call.mediaType)
@@ -988,14 +1030,52 @@ export class VoipBridge {
       if (callId) VoipBridge.traceIncoming(`systemState=${state}`, callId)
     }).catch(() => {})
   }
-  static speaker(enabled: boolean): void {
+  static refreshAudioRoute(): void {
+    const call = VoipBridge.current
+    if (!call) return
+    let route = ''
+    try {
+      const routing = audio.getAudioManager().getRoutingManager()
+      const devices = routing.getPreferredOutputDeviceForRendererInfoSync({
+        usage: call.mediaType === 'video' ? audio.StreamUsage.STREAM_USAGE_VIDEO_COMMUNICATION :
+          audio.StreamUsage.STREAM_USAGE_VOICE_COMMUNICATION,
+        rendererFlags: 0,
+      })
+      const type = devices[0]?.deviceType
+      if (type === audio.DeviceType.SPEAKER) route = 'speaker'
+      else if (type === audio.DeviceType.EARPIECE) route = 'earpiece'
+      else if (type === audio.DeviceType.BLUETOOTH_SCO || type === audio.DeviceType.BLUETOOTH_A2DP) route = 'bluetooth'
+      else if (type === audio.DeviceType.WIRED_HEADSET || type === audio.DeviceType.WIRED_HEADPHONES ||
+        type === audio.DeviceType.USB_HEADSET) route = 'headset'
+    } catch (_) {}
+    if (route === VoipBridge.audioRoute) return
+    VoipBridge.audioRoute = route
+    VoipBridge.speakerEnabled = route === 'speaker'
+    VoipBridge.emit('audioRoute')
+    VoipBridge.emit('speaker', '', undefined, '', VoipBridge.speakerEnabled)
+  }
+  static speaker(enabled: boolean, manual: boolean = true): void {
     const id = VoipBridge.current?.callId, run = VoipBridge.generation
-    audio.getAudioManager().getRoutingManager().setCommunicationDevice(audio.CommunicationDeviceType.SPEAKER, enabled).then(() => {
-      if (run !== VoipBridge.generation || id !== VoipBridge.current?.callId) return
-      VoipBridge.speakerEnabled = enabled
-      VoipBridge.emit('speaker', '', undefined, '', enabled)
+    if (!id || (!manual && VoipBridge.audioRouteChosen)) return
+    if (manual) VoipBridge.audioRouteChosen = true
+    const serial = ++VoipBridge.audioRouteSerial
+    const live = (): boolean => run === VoipBridge.generation && id === VoipBridge.current?.callId &&
+      serial === VoipBridge.audioRouteSerial
+    VoipBridge.audioRoutePending = true
+    VoipBridge.emit('audioRoutePending', '', undefined, '', true)
+    VoipBridge.audioRouteWork = VoipBridge.audioRouteWork.then(async () => {
+      if (!live()) return
+      VoipBridge.refreshAudioRoute()
+      if (!manual && (VoipBridge.audioRoute === 'bluetooth' || VoipBridge.audioRoute === 'headset')) return
+      const routing = audio.getAudioManager().getRoutingManager()
+      await routing.setCommunicationDevice(audio.CommunicationDeviceType.SPEAKER, enabled)
     }).catch(() => {
-      if (run === VoipBridge.generation && id === VoipBridge.current?.callId) VoipBridge.emit('error', 'CALL_AUDIO_ROUTE_FAILED')
+      if (live() && manual) VoipBridge.emit('error', 'CALL_AUDIO_ROUTE_FAILED')
+    }).finally(() => {
+      if (!live()) return
+      VoipBridge.refreshAudioRoute()
+      VoipBridge.audioRoutePending = false
+      VoipBridge.emit('audioRoutePending', '', undefined, '', false)
     })
   }
   static startTask(): void {
@@ -1047,6 +1127,7 @@ export class VoipBridge {
     if (id) VoipBridge.stopTask(id)
     if (reason) VoipBridge.emit('localEnded', '', undefined, reason)
     VoipBridge.current = null; VoipBridge.mediaId = ''; VoipBridge.connected = false; VoipBridge.reconnecting = false; VoipBridge.peerReady = false; VoipBridge.answering = ''
+    VoipBridge.cameraSwitching = false; VoipBridge.remoteVideo = false; VoipBridge.audioRoutePending = false
     VoipBridge.listeners.forEach(callback => callback())
   }
   static traceIncoming(stage: string, callId: string = ''): void {

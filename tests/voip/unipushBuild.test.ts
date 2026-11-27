@@ -14,10 +14,16 @@ describe('UniPush native call adapter packaging', () => {
       'src/com/nuwax/pushkeepalive/ImHeadlessPush.kt'), 'utf8');
     const runtime = readFileSync(resolve(plugin,
       'src/com/nuwax/pushkeepalive/PushRuntime.kt'), 'utf8');
+    const bootstrap = readFileSync(resolve(plugin,
+      'src/com/nuwax/pushkeepalive/PushBootstrapProvider.kt'), 'utf8');
     expect(manifest).not.toContain('DCloudUniPush.UniPushIntentService');
     expect(manifest).not.toContain('NuwaxUniPushIntentService');
     expect(appManifest).not.toContain('DCloudUniPush.UniPushIntentService');
     expect(appManifest).not.toContain('NuwaxUniPushIntentService');
+    const provider = manifest.match(/<provider\b[^>]*PushBootstrapProvider[^>]*\/>/)?.[0];
+    expect(provider).toContain('android:exported="false"');
+    expect(provider).not.toContain('android:process');
+    expect(bootstrap).toContain('PushDeliverySession.canRestoreReceiver(app) && PushRuntime.installDCloudBridge(app)');
     expect(config.dependencies[0].source).toContain("compileOnly('com.getui:gtsdk:3.3.7.0')");
     expect(config.project.repositories.join(' ')).toContain('mvn.getui.com');
     expect(headless).toContain('Class.forName(PUSH_MESSAGE)');

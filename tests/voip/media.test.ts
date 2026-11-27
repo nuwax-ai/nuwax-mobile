@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const fake = vi.hoisted(() => ({ rooms: [] as any[] }));
 vi.mock('livekit-client', () => ({
-  RoomEvent: { TrackSubscribed: 'subscribed', TrackUnsubscribed: 'unsubscribed', ParticipantConnected: 'participant', ParticipantDisconnected: 'left', DataReceived: 'data', Reconnecting: 'reconnecting', Reconnected: 'reconnected', AudioPlaybackStatusChanged: 'audio', Disconnected: 'disconnected' },
+  RoomEvent: { TrackSubscribed: 'subscribed', TrackUnsubscribed: 'unsubscribed', TrackMuted: 'muted', TrackUnmuted: 'unmuted', ParticipantConnected: 'participant', ParticipantDisconnected: 'left', DataReceived: 'data', Reconnecting: 'reconnecting', Reconnected: 'reconnected', AudioPlaybackStatusChanged: 'audio', Disconnected: 'disconnected' },
   ConnectionState: { Reconnecting: 'reconnecting', Connected: 'connected' },
   Track: { Source: { Camera: 'camera', Microphone: 'microphone' }, Kind: { Audio: 'audio', Video: 'video' } },
   Room: class {
@@ -114,7 +114,7 @@ describe('ArkWeb camera preview', () => {
   }
 
   it('restores one preview after returning and keeps an explicitly disabled camera off', async () => {
-    const { root, engine, pending, room, participant, track } = await joiningVideo();
+    const { root, engine, events, pending, room, participant, track } = await joiningVideo();
     await engine.execute({ op: 'background', hidden: true });
     await engine.execute({ op: 'camera', callId: 'video', enabled: true });
     room.resolve();
@@ -129,6 +129,7 @@ describe('ArkWeb camera preview', () => {
     expect(track.attach).toHaveBeenCalledTimes(1);
     await engine.execute({ op: 'switchCamera', callId: 'video' });
     expect(track.restartTrack).toHaveBeenCalledWith({ facingMode: 'environment' });
+    expect(events).toContainEqual({ type: 'cameraSwitching', callId: 'video', enabled: false });
 
     await engine.execute({ op: 'background', hidden: true });
     expect(track.detach).toHaveBeenCalledWith(firstPreview);
@@ -142,6 +143,30 @@ describe('ArkWeb camera preview', () => {
     await engine.execute({ op: 'background', hidden: false });
     expect(participant.setCameraEnabled).toHaveBeenLastCalledWith(false);
     expect(root.append).toHaveBeenCalledTimes(2);
+    await engine.execute({ op: 'disconnect', callId: 'video' });
+  });
+
+  it('falls back to the caller avatar when the remote video is muted or unsubscribed', async () => {
+    const { engine, events, pending, room } = await joiningVideo();
+    room.resolve();
+    await pending;
+    vi.stubGlobal('HTMLVideoElement', class {});
+    const element = { dataset: {}, style: { visibility: '' }, remove: vi.fn() };
+    const track = { kind: 'video', attach: () => element, detach: () => [element] };
+    const publication = { isMuted: false };
+    const emit = (event: string) => room.on.mock.calls.find(([type]: any[]) => type === event)[1](
+      track, publication, { identity: 'peer' },
+    );
+    emit('subscribed');
+    expect(element.style.visibility).toBe('visible');
+    publication.isMuted = true;
+    emit('muted');
+    expect(element.style.visibility).toBe('hidden');
+    publication.isMuted = false;
+    emit('unmuted');
+    emit('unsubscribed');
+    expect(events.filter(e => e.type === 'remoteVideo').map(e => e.enabled)).toEqual([true, false, true, false]);
+    expect(element.remove).toHaveBeenCalledOnce();
     await engine.execute({ op: 'disconnect', callId: 'video' });
   });
 

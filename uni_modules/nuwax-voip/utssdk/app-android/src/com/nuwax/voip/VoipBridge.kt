@@ -41,11 +41,13 @@ import io.livekit.android.audio.NoAudioHandler
 import io.livekit.android.events.collect
 import io.livekit.android.events.RoomEvent
 import io.livekit.android.room.Room
+import io.livekit.android.room.track.CameraPosition
 import io.livekit.android.room.track.Track
 import io.livekit.android.room.track.VideoTrack
 import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.renderer.TextureViewRenderer
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import okhttp3.*
@@ -103,14 +105,20 @@ object VoipBridge {
     private var readySent = false
     private var microphone = true
     private var camera = false
+    private var remoteVideo = false
+    private var switchingCameraTrack: LocalVideoTrack? = null
     private var hidden = false
     private var nativeUiId = ""
     private var appCallUiId = ""
     private var incomingUiWait: Job? = null
     private var incomingAvatarJob: Job? = null
     private var incomingAvatar: Bitmap? = null
+    private val currentEndpointType = MutableStateFlow<Int?>(null)
+    private val availableCallEndpoints = MutableStateFlow<List<CallEndpointCompat>>(emptyList())
     private var speaker = false
     private var onEarpiece = false
+    private var audioRouteChosen = false
+    private var defaultAudioRoutePending = false
     private var proximityLock: PowerManager.WakeLock? = null
     private val terminal = LinkedHashSet<String>()
     private val incomingNotifications = VoipIncomingNotificationGate()
@@ -200,6 +208,10 @@ object VoipBridge {
             "meetingIgnore" -> "忽略"
             "meetingJoining" -> "正在加入会议…"
             "meetingMinimize" -> "收起"
+            "speaker" -> "扬声器"
+            "earpiece" -> "听筒"
+            "bluetooth" -> "蓝牙"
+            "headset" -> "耳机"
             else -> key
         }
         return config.optJSONObject("labels")?.optString(key, fallback) ?: fallback
@@ -314,6 +326,9 @@ object VoipBridge {
         if (value.optString("callId") != id || value.optString("state") == "ended") return null
         return JSONObject(value.toString()).put("incoming", value.optString("calleeId") == config.optString("userId"))
             .put("microphone", microphone).put("camera", camera).put("speaker", speaker)
+            .put("audioOutput", audioOutputKind())
+            .put("remoteVideo", remoteVideo).put("cameraSwitching", switchingCameraTrack != null)
+            .put("defaultAudioRoutePending", defaultAudioRoutePending)
             .put("mediaReady", connected && peerReady).put("reconnecting", reconnecting)
     }
     internal fun nativeVisible(id: String, visible: Boolean) {
@@ -327,6 +342,7 @@ object VoipBridge {
             try {
                 if (room != null) VoipCallService.enableCapture(camera && cameraVisible())
                 room?.localParticipant?.setCameraEnabled(camera && cameraVisible())
+                refreshViews()
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { if (current?.optString("callId") == id) emit("error", "code", "CALL_NATIVE_FAILED") }
         }
@@ -345,7 +361,7 @@ object VoipBridge {
                 if (command.optString("op") == "initialize") { initialize(command); return@launch }
                 if (command.optString("op") == "reset") { reset(); return@launch }
                 if (command.optString("scope") != config.optString("scope")) return@launch
-                if (command.optString("op") in listOf("action", "microphone", "camera", "speaker", "audioRoute", "switchCamera") &&
+                if (command.optString("op") in listOf("action", "microphone", "camera", "speaker", "audioRoute", "switchCamera", "restoreCall") &&
                     command.optString("callId") != current?.optString("callId")) return@launch
                 when (command.optString("op")) {
                     "developmentListener" -> {
@@ -356,18 +372,29 @@ object VoipBridge {
                     }
                     "reset" -> reset()
                     "watch" -> adopt(command.getJSONObject("snapshot"))
+                    "restoreCall" -> {
+                        val id = command.optString("callId")
+                        val call = uiSnapshot(id) ?: return@launch
+                        if (isRingingIncoming(call) && call.optLong("expiresAt") <= System.currentTimeMillis()) return@launch
+                        try {
+                            ctx.startActivity(VoipIncomingActivity.intent(ctx, id))
+                        } catch (_: RuntimeException) {
+                            emit("openPage")
+                        }
+                    }
                     "invitation" -> if (business()) receiveInvitation(api("/api/instant-message/messages/" + Uri.encode(command.getString("msgId")) + "?convId=" + Uri.encode(command.getString("convId")), absolute = true))
                     "action" -> act(command.optString("action"), command.optString("answerMediaType", "audio"))
                     "microphone" -> setMicrophone(command.optBoolean("enabled"))
                     "camera" -> setCamera(command.optBoolean("enabled"))
                     "speaker" -> setSpeaker(command.optBoolean("enabled"))
-                    "switchCamera" -> (room?.localParticipant?.getTrackPublication(Track.Source.CAMERA)?.track as? LocalVideoTrack)?.switchCamera()
+                    "switchCamera" -> switchCamera()
                     "background" -> {
                         hidden = command.optBoolean("hidden")
                         updateProximity()
                         if (!hidden && appCallUiId.isNotEmpty()) updatePresentedIncoming(appCallUiId)
                         room?.localParticipant?.setCameraEnabled(camera && cameraVisible())
                         if (room != null) VoipCallService.enableCapture(camera && cameraVisible())
+                        refreshViews()
                         if (!hidden && activity.get()?.intent?.getBooleanExtra("nuwaxVoip", false) == true) {
                             activity.get()?.intent?.removeExtra("nuwaxVoip"); emit("openPage")
                         }
@@ -415,7 +442,15 @@ object VoipBridge {
             calls!!.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE or CallsManager.CAPABILITY_SUPPORTS_VIDEO_CALLING)
         }
         startStream()
-        current?.let { emitSnapshot(it); if (connected) emit("connected"); if (peerReady) emit("peerMediaReady") }
+        current?.takeUnless { it.optString("scene") == "meeting" }?.let {
+            emitSnapshot(it)
+            emitAudioOutput()
+            emit("audioRoutePending", "enabled", defaultAudioRoutePending)
+            if (connected) emit("connected")
+            if (peerReady) emit("peerMediaReady")
+            emit("remoteVideo", "enabled", remoteVideo)
+            emit("cameraSwitching", "enabled", switchingCameraTrack != null)
+        }
     }
 
     private fun emit(type: String, key: String = "", value: Any = "") {
@@ -526,10 +561,13 @@ object VoipBridge {
                                     heartbeat = launch { while (isActive) { delay(interval); if (System.currentTimeMillis() - lastFrame > interval * 2) { ws.cancel(); closed.complete(Unit); break }; ws.send(frame(2000)) } }
                                 }
                                 1002, 9000 -> { trace("control rejected"); rejected = true; emit("error", "code", "CALL_CONTROL_REJECTED"); ws.close(1000, null); closed.complete(Unit) }
-                                3002 -> if (body.optString("msgType") == "voip") {
-                                    trace("control invitation received")
-                                    ws.send(frame(3003, JSONObject().put("convId", body.optString("convId")).put("seq", body.optLong("seq"))))
-                                    receiveInvitation(body)
+                                3002 -> {
+                                    val type = body.optString("msgType")
+                                    if (type == "voip" || (type == "meeting_invite" && hidden)) {
+                                        trace("control invitation received")
+                                        ws.send(frame(3003, JSONObject().put("convId", body.optString("convId")).put("seq", body.optLong("seq"))))
+                                        receiveInvitation(body)
+                                    }
                                 }
                                 3007 -> receiveSignal(body)
                             }
@@ -575,7 +613,11 @@ object VoipBridge {
      * 接听后由 JS 打开会议页，忽略/超时回写 meeting-invite-handled。
      */
     private fun receiveMeetingInvitation(message: JSONObject, push: JSONObject?, sessionScope: String?) {
+        // Foreground meeting invitations are presented by the existing in-app banner.
+        if (!hidden) return
         if (message.optInt("senderType", 1) != 1 || message.optInt("msgStatus", 1) != 1) return
+        val sender = message.optString("senderId")
+        if (sender == config.optString("userId")) return
         val body = message.optJSONObject("body") ?: return
         if (VoipPushPayload.isSilentMeeting(body)) return
         val inviteId = body.optString("inviteId")
@@ -596,7 +638,6 @@ object VoipBridge {
         if (deadline <= now) return
         // 忙线不打断：保留聊天卡片，用户结束后自行加入。
         if (current != null) return
-        val sender = message.optString("senderId")
         val next = JSONObject().put("protocol", "im-voip-v1").put("scene", "meeting")
             .put("callId", inviteId).put("inviteId", inviteId).put("roomName", room).put("title", title)
             .put("passcode", body.optString("passcode"))
@@ -619,7 +660,7 @@ object VoipBridge {
                 closeMeeting()
             }
         }
-        if (!hidden) requestIncomingCallUi(inviteId)
+        requestBackgroundCallUi(inviteId)
         publishCall()
     }
 
@@ -753,7 +794,7 @@ object VoipBridge {
         if (old?.optString("callId") == id && snapshot.optLong("version") <= old.optLong("version")) return
         if (snapshot.optString("state") == "ringing" && snapshot.optLong("expiresAt") <= System.currentTimeMillis()) return
         val first = old == null || old.optString("callId") != id
-        if (first) { microphone = true; camera = snapshot.optString("mediaType") == "video"; speaker = false; onEarpiece = false }
+        if (first) { microphone = true; camera = snapshot.optString("mediaType") == "video"; speaker = false; onEarpiece = false; audioRouteChosen = false; defaultAudioRoutePending = false }
         current = snapshot; emitSnapshot(snapshot)
         updateProximity()
         if (snapshot.optString("state") == "ended") { finish(); return }
@@ -814,12 +855,15 @@ object VoipBridge {
                     if (incoming && ownsCall()) requestBackgroundCallUi(id)
                     publishCall()
                     launch { isMuted.collect { muted -> if (control === owner) setMicrophone(!muted) } }
+                    // Core-Telecom 1.0 delivers each endpoint event to just one collector.
+                    launch { availableEndpoints.collect { if (control === owner) availableCallEndpoints.value = it } }
                     launch {
                         currentCallEndpoint.collect { endpoint ->
                             if (control === owner) {
                                 speaker = endpoint.type == CallEndpointCompat.TYPE_SPEAKER
                                 onEarpiece = endpoint.type == CallEndpointCompat.TYPE_EARPIECE
-                                emit("speaker", "enabled", speaker)
+                                currentEndpointType.value = endpoint.type
+                                if (!defaultAudioRoutePending) emitAudioOutput()
                                 updateProximity()
                             }
                         }
@@ -861,21 +905,50 @@ object VoipBridge {
             emit("error", "code", "CALL_ACTION_FAILED")
         }
     }
-    // After Telecom registers the call, use the user-granted overlay permission to try
-    // the native incoming Activity. Some devices show a banner for the full-screen
-    // notification intent, so keep it as the fallback when the Activity cannot open.
+    // Use the user-granted overlay permission to try the native incoming Activity.
+    // One-to-one calls reach this after Telecom registers them. Meetings reach it after validation.
+    // Keep the notification as a fallback when the Activity cannot open.
     private fun requestBackgroundCallUi(id: String) {
         val ctx = context ?: return
         val call = current ?: return
-        if (!business() || call.optString("callId") != id || !isRingingIncoming(call) ||
-            call.optLong("expiresAt") <= System.currentTimeMillis() || callUiVisible(id) || incomingUiWait != null) return
-        val locked = ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked
-        if (!VoipCallPolicy.shouldOpenBackgroundCallUi(locked, call.optString("mediaType")) || !Settings.canDrawOverlays(ctx)) return
+        if (!business()) { trace("background call activity skipped: not a business call"); return }
+        if (call.optString("callId") != id) { trace("background call activity skipped: call changed"); return }
+        if (!isRingingIncoming(call)) { trace("background call activity skipped: not an incoming ringing call"); return }
+        if (call.optLong("expiresAt") <= System.currentTimeMillis()) { trace("background call activity skipped: invitation expired"); return }
+        if (callUiVisible(id)) { trace("background call activity skipped: call UI already visible"); return }
+        if (incomingUiWait != null) { trace("background call activity skipped: request pending"); return }
+        // The ringing screen can show either media type over keyguard. The activity handles unlock on answer.
+        if (!VoipCallPolicy.shouldOpenBackgroundCallUi(call.optString("mediaType"))) {
+            trace("background call activity skipped: unsupported media type")
+            return
+        }
+        if (!Settings.canDrawOverlays(ctx)) {
+            trace("background call activity skipped: overlay unavailable")
+            return
+        }
         val manager = ctx.getSystemService(NotificationManager::class.java)
-        if (runCatching { ensureNotificationChannels(ctx) }.isFailure) return
-        val channel = VoipNotificationChannels.incoming(manager) ?: return
-        if (!manager.areNotificationsEnabled() || channel.importance < NotificationManager.IMPORTANCE_HIGH ||
-            manager.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) return
+        if (runCatching { ensureNotificationChannels(ctx) }.isFailure) {
+            trace("background call activity skipped: notification channel setup failed")
+            return
+        }
+        val channel = VoipNotificationChannels.incoming(manager)
+        if (channel == null) {
+            trace("background call activity skipped: notification channel missing")
+            return
+        }
+        if (!manager.areNotificationsEnabled()) {
+            trace("background call activity skipped: notifications disabled")
+            return
+        }
+        if (channel.importance < NotificationManager.IMPORTANCE_HIGH) {
+            trace("background call activity skipped: notification channel importance below high")
+            return
+        }
+        if (manager.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) {
+            trace("background call activity skipped: interruption filter active or unknown")
+            return
+        }
+        val locked = ctx.getSystemService(KeyguardManager::class.java).isKeyguardLocked
         trace(if (locked) "locked call activity requested" else "unlocked incoming call activity requested")
         requestIncomingCallUi(id)
     }
@@ -923,7 +996,7 @@ object VoipBridge {
             if (!fallbackToAppPage) return
         }
         // startActivity can return without showing anything. Leave enough time for the
-        // Activity to resume while still posting CallStyle within Telecom's five seconds.
+        // Activity to resume while keeping enough time to post the fallback notification.
         incomingUiWait = scope.launch {
             delay(750)
             val ringing = current
@@ -934,7 +1007,10 @@ object VoipBridge {
             }
             incomingUiWait = null
             val call = current
-            if (call?.optString("callId") == id && isRingingIncoming(call) && hasSystemCall()) publishCall()
+            if (call?.optString("callId") == id && isRingingIncoming(call) && hasSystemCall()) {
+                trace(if (callUiVisible(id)) "incoming call UI visible after activity request" else "incoming call UI not visible after activity request")
+                publishCall()
+            }
         }
     }
 
@@ -997,6 +1073,13 @@ object VoipBridge {
         val id = snapshot.optString("callId")
         if (mediaId == id) return
         mediaId = id; connected = false; peerReady = false; readySent = false
+        val defaultEndpoint = if (snapshot.optString("mediaType") == "video") {
+            CallEndpointCompat.TYPE_SPEAKER
+        } else {
+            CallEndpointCompat.TYPE_EARPIECE
+        }
+        defaultAudioRoutePending = !audioRouteChosen
+        if (defaultAudioRoutePending) emit("audioRoutePending", "enabled", true)
         remoteLeftJob?.cancel(); remoteLeftJob = null; everHadRemote = false
         val run = generation
         mediaJob = scope.launch {
@@ -1009,6 +1092,25 @@ object VoipBridge {
                 }
                 val result = if (snapshot.optString("calleeId") == config.optString("userId")) c.answer(if (camera) CallAttributesCompat.CALL_TYPE_VIDEO_CALL else CallAttributesCompat.CALL_TYPE_AUDIO_CALL) else c.setActive()
                 check(result is CallControlResult.Success)
+                if (defaultAudioRoutePending) {
+                    launch {
+                        try {
+                            selectDefaultAudioRoute(c, defaultEndpoint)
+                            // Telecom can publish its initial route shortly after activation succeeds.
+                            delay(300)
+                            selectDefaultAudioRoute(c, defaultEndpoint)
+                        }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { trace("default audio route unavailable") }
+                        finally {
+                            if (run == generation && current?.optString("callId") == id && control === c) {
+                                defaultAudioRoutePending = false
+                                emitAudioOutput()
+                                emit("audioRoutePending", "enabled", false)
+                            }
+                        }
+                    }
+                }
                 val credentials = if (business()) businessCredentials(snapshot) else api("/$id/credentials", JSONObject())
                 val signal = credentials.getString("serverUrl")
                 check(signal.startsWith("wss://") || (config.optBoolean("development") && signal.startsWith("ws://")))
@@ -1024,7 +1126,8 @@ object VoipBridge {
                                 if (event.track.kind == Track.Kind.AUDIO) { peerReady = true; emit("peerMediaReady"); maybeReady() }
                                 refreshViews()
                             }
-                            is RoomEvent.TrackUnsubscribed -> refreshViews()
+                            is RoomEvent.TrackUnsubscribed, is RoomEvent.TrackUnpublished,
+                            is RoomEvent.TrackMuted, is RoomEvent.TrackUnmuted -> refreshViews()
                             is RoomEvent.ParticipantConnected -> { everHadRemote = true; observeRemotePresence(next, id, run); announceMediaReady() }
                             is RoomEvent.DataReceived -> {
                                 if (event.participant != null && event.topic == "nuwax.voip.media-ready.v1" && event.data.size <= 256) {
@@ -1035,8 +1138,8 @@ object VoipBridge {
                                 }
                             }
                             is RoomEvent.Reconnecting -> { reconnecting = true; emit("reconnecting"); observeRemotePresence(next, id, run) }
-                            is RoomEvent.Reconnected -> { reconnecting = false; emit("connected"); observeRemotePresence(next, id, run); announceMediaReady() }
-                            is RoomEvent.ParticipantDisconnected -> observeRemotePresence(next, id, run)
+                            is RoomEvent.Reconnected -> { reconnecting = false; emit("connected"); refreshViews(); observeRemotePresence(next, id, run); announceMediaReady() }
+                            is RoomEvent.ParticipantDisconnected -> { refreshViews(); observeRemotePresence(next, id, run) }
                             is RoomEvent.Disconnected -> if (!terminal.contains(id)) { finish("disconnected") }
                             else -> {}
                         }
@@ -1107,15 +1210,76 @@ object VoipBridge {
         target?.localParticipant?.setCameraEnabled(enabled && cameraVisible())
         if (run == generation && current?.optString("callId") == id && room === target) { refreshViews(); emit("camera", "enabled", enabled) }
     }
+
+    private suspend fun switchCamera() {
+        if (!camera || !cameraVisible() || switchingCameraTrack != null) return
+        val target = room ?: return
+        val publication = target.localParticipant.getTrackPublication(Track.Source.CAMERA) ?: return
+        val track = publication.track as? LocalVideoTrack ?: return
+        if (publication.muted) return
+        val next = if (track.options.position == CameraPosition.FRONT) CameraPosition.BACK else CameraPosition.FRONT
+        switchingCameraTrack = track
+        emit("cameraSwitching", "enabled", true)
+        try {
+            track.switchCamera(position = next)
+            // LiveKit updates the track options after the new camera starts sending frames.
+            val switched = withTimeoutOrNull(5000) {
+                while (room === target && camera && cameraVisible() && !publication.muted && track.options.position != next) {
+                    delay(50)
+                }
+                track.options.position == next
+            }
+            if (switched != true && room === target && camera && cameraVisible() && !publication.muted) {
+                emit("error", "code", "CALL_MEDIA_FAILED")
+            }
+        } finally {
+            if (switchingCameraTrack === track) {
+                switchingCameraTrack = null
+                emit("cameraSwitching", "enabled", false)
+            }
+        }
+    }
+    private fun audioOutputKind(): String = when (currentEndpointType.value) {
+        CallEndpointCompat.TYPE_EARPIECE -> "earpiece"
+        CallEndpointCompat.TYPE_SPEAKER -> "speaker"
+        CallEndpointCompat.TYPE_BLUETOOTH -> "bluetooth"
+        CallEndpointCompat.TYPE_WIRED_HEADSET -> "headset"
+        else -> ""
+    }
+    private fun emitAudioOutput() {
+        emit("speaker", "enabled", speaker)
+        emit("audioRoute", "selected", audioOutputKind())
+    }
     private suspend fun setSpeaker(enabled: Boolean) {
         setAudioRoute(if (enabled) "speaker" else "earpiece")
     }
     private suspend fun setAudioRoute(route: String) {
         val c = control ?: return
-        val endpoints = withTimeoutOrNull(1000) { c.availableEndpoints.first() } ?: return
         val type = when (route) { "speaker" -> CallEndpointCompat.TYPE_SPEAKER; "earpiece" -> CallEndpointCompat.TYPE_EARPIECE; "bluetooth" -> CallEndpointCompat.TYPE_BLUETOOTH; "wired" -> CallEndpointCompat.TYPE_WIRED_HEADSET; else -> return }
+        audioRouteChosen = true
+        val endpoints = withTimeoutOrNull(1000) { availableCallEndpoints.first { it.isNotEmpty() } } ?: return
+        if (control !== c) return
         val endpoint = endpoints.firstOrNull { it.type == type }
         if (endpoint == null) emit("error", "code", "CALL_AUDIO_ROUTE_UNAVAILABLE") else c.requestEndpointChange(endpoint)
+    }
+
+    private suspend fun selectDefaultAudioRoute(c: CallControlScope, targetType: Int) {
+        if (control !== c || audioRouteChosen) return
+        withTimeoutOrNull(1000) {
+            currentEndpointType.first { it != null }
+            availableCallEndpoints.first { it.isNotEmpty() }
+        } ?: return
+        if (control !== c || audioRouteChosen) return
+        val selected = currentEndpointType.value
+        // Keep the system's active headset or Bluetooth route.
+        if (selected == targetType || (selected != CallEndpointCompat.TYPE_SPEAKER && selected != CallEndpointCompat.TYPE_EARPIECE)) return
+        val endpoint = availableCallEndpoints.value.firstOrNull { it.type == targetType } ?: return
+        if (c.requestEndpointChange(endpoint) !is CallControlResult.Success) {
+            trace("default audio route unavailable")
+            return
+        }
+        // The request can succeed before Telecom reports where audio is playing.
+        withTimeoutOrNull(1000) { currentEndpointType.first { it != null && it != selected } }
     }
 
     @JvmStatic fun createVideoView(ctx: Context, local: Boolean): FrameLayout {
@@ -1129,17 +1293,44 @@ object VoipBridge {
     }
     private fun refreshViews() {
         val r = room ?: return
+        val localTrack = if (camera && cameraVisible()) {
+            r.localParticipant.getTrackPublication(Track.Source.CAMERA)?.takeUnless { it.muted }?.track as? VideoTrack
+        } else null
+        val remoteTrack = r.remoteParticipants.values.firstNotNullOfOrNull { participant ->
+            participant.getTrackPublication(Track.Source.CAMERA)?.takeUnless { it.muted }?.track as? VideoTrack
+        }
+        val remoteVideoOn = remoteTrack != null
+        if (remoteVideo != remoteVideoOn) {
+            remoteVideo = remoteVideoOn
+            emit("remoteVideo", "enabled", remoteVideoOn)
+        }
         for ((host, kind) in views) {
-            val renderer = renderers.getOrPut(host) { TextureViewRenderer(host.context).also { r.initVideoRenderer(it); host.addView(it, FrameLayout.LayoutParams(-1, -1)) } }
-            val track = if (kind == "local") r.localParticipant.getTrackPublication(Track.Source.CAMERA)?.track as? VideoTrack
-                else r.remoteParticipants.values.firstNotNullOfOrNull { it.getTrackPublication(Track.Source.CAMERA)?.track as? VideoTrack }
-            if (bindings[host] !== track) { bindings.remove(host)?.removeRenderer(renderer); track?.addRenderer(renderer); if (track != null) bindings[host] = track }
+            val track = if (kind == "local") localTrack else remoteTrack
+            if (track == null) {
+                renderers.remove(host)?.let { renderer ->
+                    bindings.remove(host)?.removeRenderer(renderer)
+                    host.removeView(renderer)
+                    renderer.release()
+                }
+                continue
+            }
+            val renderer = renderers.getOrPut(host) {
+                TextureViewRenderer(host.context).also { r.initVideoRenderer(it); host.addView(it, FrameLayout.LayoutParams(-1, -1)) }
+            }
+            if (bindings[host] !== track) {
+                bindings.remove(host)?.removeRenderer(renderer)
+                renderer.clearImage()
+                track.addRenderer(renderer)
+                bindings[host] = track
+            }
         }
     }
     private fun releaseMedia() {
         remoteLeftJob?.cancel(); remoteLeftJob = null; everHadRemote = false
         reconnecting = false
         val old = room; room = null
+        remoteVideo = false
+        switchingCameraTrack = null
         for ((host, renderer) in renderers) { bindings[host]?.removeRenderer(renderer); renderer.release(); host.removeAllViews() }
         renderers.clear(); bindings.clear(); old?.release(); connected = false; peerReady = false; reconnecting = false
     }
@@ -1152,6 +1343,7 @@ object VoipBridge {
         clearIncomingAvatar()
         releaseMedia(); mediaJob?.cancel(); mediaJob = null; mediaId = ""
         val c = control; control = null
+        currentEndpointType.value = null; availableCallEndpoints.value = emptyList()
         val job = telecomJob; telecomJob = null
         val ready = telecomReady; telecomReady = null
         val cleanup = scope.launch(start = CoroutineStart.LAZY) {
@@ -1169,7 +1361,7 @@ object VoipBridge {
         context?.stopService(Intent(context, VoipCallService::class.java))
         context?.getSystemService(NotificationManager::class.java)?.cancel(9090)
         if (reason.isNotEmpty()) emit("localEnded", "reason", reason)
-        current = null; nativeUiId = ""; appCallUiId = ""; onEarpiece = false
+        current = null; nativeUiId = ""; appCallUiId = ""; onEarpiece = false; defaultAudioRoutePending = false
         updateProximity()
     }
     private fun expireSession() {
@@ -1216,6 +1408,10 @@ object VoipBridge {
             !businessSessionAllowed(saved, debug)) return native
         if (!debug && !saved.optBoolean("qaAccepted") && !native) return false
         if (native && !VoipPushPayload.eligible(invitation, saved.optString("userId"), System.currentTimeMillis())) return true
+        if (native && source == "transmission" && invitation.optString("scene") == "meeting" && !hidden && activity.get() != null) {
+            // Let DCloud forward the foreground event to the existing in-app banner listener.
+            return false
+        }
         trace(if (native) "native push routed to call source=$source callId=${invitation.optString("callId")}" else "native push routed to call")
         val verification = incoming(ctx, invitation, saved.optString("scope"))
         onVerification?.invoke(verification)

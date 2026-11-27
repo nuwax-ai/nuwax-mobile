@@ -131,6 +131,78 @@ function preprocessHarmony(source, platform) {
     (_, condition, body) => (condition === 'ifdef') === (platform === 'APP-HARMONY') ? body : '');
 }
 
+function meetingNotificationClick(nativeVoip = true) {
+  const timers = [];
+  const opens = [], handled = [], dismissed = [], webViews = [];
+  const appEntryStage = { value: 'entry' };
+  let userId = '', stamp = 'session';
+  const pushClient = readFileSync(new URL('../utils/im/imPushClient.uts', import.meta.url), 'utf8');
+  const source = pushClient.slice(pushClient.indexOf('function openMeetingRoomWithRetry('), pushClient.indexOf('// #ifdef APP-ANDROID\n/** 上一次'));
+  const context = vm.createContext({
+    setTimeout: callback => timers.push(callback),
+    getImSessionStamp: () => stamp,
+    isLoggedIn: () => true,
+    getMyUserIdSync: () => userId,
+    getCurrentPages: () => [{ route: 'pages/tab-shell/tab-shell' }],
+    appEntryStage, LAUNCH_PAGE_ROUTE: 'launch', LOGIN_PAGE_ROUTE: 'login',
+    PUSH_CLICK_NAV_DELAY_MS: 300, PUSH_CLICK_NAV_MAX_RETRY: 2,
+    isNativeImVoipEnabled: () => nativeVoip,
+    meetingMediaSupported: () => true,
+    getNativeMeetingInviteState: msgId => handled.includes(msgId) ? 'handled' : 'pending',
+    markNativeMeetingInviteHandled: msgId => handled.push(msgId),
+    hideHandledMeetingInviteBanner: (...args) => dismissed.push(args),
+    openMeetingInvite: (...args) => opens.push(args),
+    getApiBaseUrl: () => 'https://app.test',
+    buildMeetingInviteUrl: (origin, room) => origin + '/meet/' + room,
+    uni: { navigateTo: ({ url }) => webViews.push(url) },
+  });
+  vm.runInContext(stripTypeScriptTypes(preprocessHarmony(source, 'APP-HARMONY')), context);
+  return {
+    opens, handled, dismissed, webViews, appEntryStage,
+    click: () => context.openMeetingRoomWithRetry('123', '会议', 'video', 'p&c', 0, stamp, 'invite', 'msg', 'callee'),
+    loginAs: id => { userId = id; },
+    switchSession: () => { stamp = 'new-session'; },
+    tick: () => timers.shift()?.(),
+  };
+}
+
+test('鸿蒙点会议通知等主界面和收件账号就绪，再交接原生入会且只处理一次', () => {
+  const h = meetingNotificationClick();
+  h.click();
+  h.tick();
+  h.appEntryStage.value = 'main';
+  h.tick();
+  assert.deepEqual(h.opens, []);
+  h.loginAs('callee');
+  h.tick();
+  h.click();
+  h.tick();
+  assert.deepEqual(h.opens, [['invite', '123', '会议', 'video', 'p&c']]);
+  assert.deepEqual(h.handled, ['msg']);
+  assert.deepEqual(h.dismissed, [['msg', 'invite']]);
+  assert.deepEqual(h.webViews, []);
+});
+
+test('鸿蒙会议通知拒绝其他账号和过时会话，常规入口保持 H5 处理', () => {
+  for (const invalidate of [h => h.loginAs('other'), h => h.switchSession()]) {
+    const h = meetingNotificationClick();
+    h.click();
+    h.tick();
+    h.appEntryStage.value = 'main';
+    invalidate(h);
+    h.tick();
+    assert.deepEqual(h.opens, []);
+    assert.deepEqual(h.handled, []);
+  }
+  const h = meetingNotificationClick(false);
+  h.appEntryStage.value = 'main';
+  h.loginAs('callee');
+  h.click();
+  h.tick();
+  assert.deepEqual(h.opens, []);
+  assert.deepEqual(h.webViews, ['/subpackages/pages/webview/webview?url=https%3A%2F%2Fapp.test%2Fmeet%2F123']);
+});
+
 function meetingInviteReceiver(platform, nativeVoip = true) {
   let now = 1_000_000;
   let background = true;

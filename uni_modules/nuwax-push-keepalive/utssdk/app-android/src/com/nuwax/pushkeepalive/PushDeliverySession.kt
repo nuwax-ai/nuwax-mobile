@@ -22,6 +22,13 @@ object PushDeliverySession {
             .remove("user").remove("environment").putBoolean("enabled", false).commit()
     }
 
+    fun canRestoreReceiver(context: Context): Boolean {
+        val saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val environment = saved.getString("environment", null)
+        return !saved.getString("user", null).isNullOrEmpty() &&
+            (environment == "test" || environment == "production")
+    }
+
     @JvmStatic fun isEnabled(context: Context): Boolean {
         val saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         return saved.getBoolean("enabled", false) && saved.getBoolean("fallback", false)

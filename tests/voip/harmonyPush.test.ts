@@ -5,6 +5,7 @@ const transport = vi.hoisted(() => ({ request: vi.fn(), destroy: vi.fn() }));
 const kits = vi.hoisted(() => ({
   receive: vi.fn(), loadAsset: vi.fn(), report: vi.fn(), reportError: vi.fn(), reportState: vi.fn(),
   onCall: vi.fn(), createPicture: vi.fn(), createImageSource: vi.fn(), createCallId: vi.fn(),
+  getOutputDevices: vi.fn(), setCommunicationDevice: vi.fn(),
 }));
 vi.mock('BuildProfile', () => ({ default: { DEBUG: true } }));
 vi.mock('@kit.AbilityKit', () => ({ bundleManager: {
@@ -41,7 +42,18 @@ vi.mock('@kit.BackgroundTasksKit', () => ({ backgroundTaskManager: {} }));
 vi.mock('@kit.ImageKit', () => ({ image: {
   createPixelMap: kits.createPicture, createImageSource: kits.createImageSource, PixelMapFormat: { RGBA_8888: 0 },
 } }));
-vi.mock('@kit.AudioKit', () => ({ audio: {} }));
+vi.mock('@kit.AudioKit', () => ({ audio: {
+  getAudioManager: () => ({ getRoutingManager: () => ({
+    getPreferredOutputDeviceForRendererInfoSync: kits.getOutputDevices,
+    setCommunicationDevice: kits.setCommunicationDevice,
+  }) }),
+  StreamUsage: { STREAM_USAGE_VIDEO_COMMUNICATION: 'video', STREAM_USAGE_VOICE_COMMUNICATION: 'voice' },
+  CommunicationDeviceType: { SPEAKER: 'speaker' },
+  DeviceType: {
+    SPEAKER: 'speaker', EARPIECE: 'earpiece', BLUETOOTH_SCO: 'sco', BLUETOOTH_A2DP: 'a2dp',
+    WIRED_HEADSET: 'wired', WIRED_HEADPHONES: 'headphones', USB_HEADSET: 'usb',
+  },
+} }));
 vi.mock('@kit.ArkWeb', () => ({ webview: {} }));
 
 import { VoipBridge, VoipBusinessPolicy } from '../../uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge.ets';
@@ -74,6 +86,10 @@ beforeEach(() => {
   kits.createPicture.mockReset().mockResolvedValue({ release: vi.fn() });
   kits.createImageSource.mockReset();
   kits.createCallId.mockReset().mockReturnValue('local-system-call');
+  kits.getOutputDevices.mockReset().mockReturnValue([{ deviceType: 'earpiece' }]);
+  kits.setCommunicationDevice.mockReset().mockImplementation(async (_device, enabled) => {
+    kits.getOutputDevices.mockReturnValue([{ deviceType: enabled ? 'speaker' : 'earpiece' }]);
+  });
   vi.spyOn(VoipBridge, 'startStream').mockImplementation(() => {});
   vi.spyOn(VoipBridge, 'finish').mockImplementation(() => {});
   vi.spyOn(VoipBridge, 'request').mockResolvedValue({} as any);
@@ -111,6 +127,40 @@ describe('Harmony system call cold start', () => {
     convId, msgId, msgType: 'meeting_invite', senderId: 'bob', sendTime: Date.now(),
     body: { inviteId: 'qa-meeting', roomName: '123456789', mediaType: 'video', title: '测试会议', passcode: '1234' },
   });
+  const ringingCall = (mediaType: string) => ({
+    callId, mediaType, state: 'ringing', callerId: 'bob', calleeId: 'alice', version: 1, expiresAt: Date.now() + 30_000,
+  }) as Parameters<typeof VoipBridge.adopt>[0];
+
+  it.each([['audio', 'voice', 'earpiece'], ['video', 'video', 'speaker']])(
+    'applies the %s default using the OS route and retains later manual changes',
+    async (mediaType, usage, route) => {
+      setup();
+      VoipBridge.adopt(ringingCall(mediaType));
+      VoipBridge.speaker(mediaType === 'video', false);
+      await vi.waitFor(() => expect(VoipBridge.audioRoutePending).toBe(false));
+      expect(kits.getOutputDevices).toHaveBeenCalledWith({ usage, rendererFlags: 0 });
+      expect(kits.setCommunicationDevice).toHaveBeenCalledExactlyOnceWith('speaker', mediaType === 'video');
+      expect(VoipBridge.audioRoute).toBe(route);
+      VoipBridge.speaker(mediaType === 'audio');
+      VoipBridge.speaker(mediaType === 'video', false);
+      await vi.waitFor(() => expect(VoipBridge.audioRoutePending).toBe(false));
+      expect(kits.setCommunicationDevice).toHaveBeenCalledTimes(2);
+      expect(VoipBridge.audioRoute).toBe(mediaType === 'audio' ? 'speaker' : 'earpiece');
+    },
+  );
+
+  it.each([['sco', 'bluetooth'], ['wired', 'headset']])(
+    'keeps the connected %s device when the video default is applied',
+    async (deviceType, route) => {
+      setup();
+      VoipBridge.adopt(ringingCall('video'));
+      kits.getOutputDevices.mockReturnValue([{ deviceType }]);
+      VoipBridge.speaker(true, false);
+      await vi.waitFor(() => expect(VoipBridge.audioRoutePending).toBe(false));
+      expect(kits.setCommunicationDevice).not.toHaveBeenCalled();
+      expect(VoipBridge.queue).toContainEqual(expect.objectContaining({ type: 'audioRoute', selected: route }));
+    },
+  );
 
   it('binds the push listener before session restore and preserves the system envelope identifier', async () => {
     const ability = { context: {} } as any;

@@ -45,6 +45,8 @@ iOS 使用系统 `LaunchScreen`（App 启动瞬间由系统直接渲染，不经
 
 uni-app x 的 iOS 不支持 `splashScreens` 多密度启动图（那是老 uni-app 的 Android 方案），只支持自定义 storyboard。业务页面同样不再补画启动 Logo。
 
+HarmonyOS 使用 `EntryAbility` 的系统简易启动页，同样不经过业务页面。启动图与背景色配置在 [manifest.json](../../manifest.json) 的 `app-harmony.distribute.splashScreens`；[harmony-configs/entry/src/main/module.json5](../../harmony-configs/entry/src/main/module.json5) 仅保留 `startWindowIcon` / `startWindowBackground` 资源引用。必须通过 manifest 指定图片，否则 HBuilderX 生成到 AppScope 的 1×1 透明占位图会覆盖 entry 下的同名资源，冷启动只显示白色背景。修改后需删除旧的 `unpackage/dist/dev/app-harmony` 原生工程并重新编译/安装；业务热更新不会替换 HAP 内的原生启动资源。
+
 需要基于最新资源重新生成一次基座；清理旧原生构建缓存，避免残留旧模块。可检查最终 APK Manifest：不应再包含 `com.nuwax.launchsplash.LaunchSplashInitializer`。本轮没有启动 HBuilderX 编译或云打包。
 
 ## 新基座验收

@@ -19,9 +19,13 @@ export function qaConfig(source) {
   return source;
 }
 export function qaManager(source) {
-  const before = 'process.env.NODE_ENV == "development" && getApiBaseUrl() == "https://testagent.xspaceagi.com"';
-  if (source.split(before).length !== 2) throw Error('QA VoIP gate source changed; review the variant');
-  return source.replace(before, 'getApiBaseUrl() == "https://testagent.xspaceagi.com"');
+  const before = 'return supported && getApiBaseUrl().startsWith("https://");';
+  const harmony = `return process.env.NODE_ENV == "development" && getApiBaseUrl() == "${testOrigin}";`;
+  if (source.split(before).length !== 2 || source.split(harmony).length !== 2) {
+    throw Error('QA VoIP gate source changed; review the variant');
+  }
+  return source.replace(before, `return supported && getApiBaseUrl() == "${testOrigin}";`)
+    .replace(harmony, `return getApiBaseUrl() == "${testOrigin}";`);
 }
 
 export function qaUpdate(source) {

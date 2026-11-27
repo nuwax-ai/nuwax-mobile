@@ -50,7 +50,7 @@ vi.mock('../../features/voip/audioFocus.uts', () => ({ claimVoipAudio: fake.clai
 vi.mock('../../utils/voice/stopAllSpeechPlayback.uts', () => ({ stopAllSpeechPlayback: vi.fn() }));
 vi.mock('../../utils/i18n.uts', () => ({ t: (key: string) => key }));
 
-import { bootstrapVoip, clearVoipSession, getVoipSnapshot, handleVoipInvitation, startVoipCall, answerVoipCall, endVoipCall, voipError, voipHistory, voipAudioRoutes, voipAudioInterrupted, voipPermissionPending, voipPushRegistration, setVoipBackground } from '../../features/voip/callManager.uts';
+import { bootstrapVoip, clearVoipSession, getVoipSnapshot, handleVoipInvitation, startVoipCall, answerVoipCall, endVoipCall, restoreVoipCall, voipError, voipHistory, voipAudioRoute, voipAudioRoutes, voipAudioRoutePending, voipAudioInterrupted, voipPermissionPending, voipPushRegistration, voipRemoteVideo, voipCameraSwitching, voipSpeaker, setVoipBackground } from '../../features/voip/callManager.uts';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -122,7 +122,7 @@ describe('ordinary notification invitation', () => {
   });
 });
 
-async function deliverIncoming(presentation: { nativeIncomingUI: boolean; foregroundIncomingPage: boolean } | null = null) {
+async function deliverIncoming(presentation: { nativeIncomingUI: boolean; foregroundIncomingPage: boolean; systemRingingOnly?: boolean } | null = null) {
   const initialized = fake.commands.find(command => command.op === 'initialize');
   fake.events.push({ type: 'snapshot', scope: initialized.scope, ...presentation, snapshot: {
     callId: 'incoming', convId: 'chat', version: 1, state: 'ringing',
@@ -254,6 +254,38 @@ describe('incoming actions and event isolation', () => {
     expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
   });
 
+  it('defers the App page while CallKit rings and opens it once after the system answers', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    await deliverIncoming({ nativeIncomingUI: true, foregroundIncomingPage: false, systemRingingOnly: true });
+    restoreVoipCall();
+    expect(navigate).not.toHaveBeenCalled();
+
+    fake.background = true;
+    event({ type: 'snapshot', foregroundIncomingPage: true,
+      snapshot: { ...getVoipSnapshot(), version: 2, state: 'connecting', acceptedDeviceId: 'a1' } });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).not.toHaveBeenCalled();
+
+    fake.background = false;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+    event({ type: 'snapshot', foregroundIncomingPage: true,
+      snapshot: { ...getVoipSnapshot(), version: 3, state: 'active' } });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledOnce();
+  });
+
+  it('still opens the App permission flow for a CallKit call', async () => {
+    await bootstrapVoip();
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    await deliverIncoming({ nativeIncomingUI: true, foregroundIncomingPage: false, systemRingingOnly: true });
+    event({ type: 'permissionPending', callId: 'incoming' });
+    event({ type: 'openPage', callId: 'incoming' });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+  });
+
   it('opens a still-ringing iOS call after the App returns to the foreground', async () => {
     await bootstrapVoip();
     const navigate = vi.spyOn(uni, 'navigateTo');
@@ -284,6 +316,21 @@ describe('incoming actions and event isolation', () => {
     expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
     endVoipCall();
     expect(fake.commands.at(-1)).toMatchObject({ op: 'action', action: 'end', callId: 'accepted' });
+  });
+
+  it('reopens a minimized call without creating another call and ignores a late tap after hangup', async () => {
+    await incoming();
+    event({ type: 'snapshot', snapshot: { ...getVoipSnapshot(), version: 2, state: 'active', acceptedDeviceId: 'a1' } });
+    await vi.advanceTimersByTimeAsync(100);
+    const navigate = vi.spyOn(uni, 'navigateTo');
+    const sent = fake.commands.length;
+    restoreVoipCall();
+    expect(navigate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ url: '/subpackages/pages/voip-call/voip-call' }));
+    expect(fake.commands).toHaveLength(sent);
+    event({ type: 'localEnded', callId: 'incoming', reason: 'ended' });
+    await vi.advanceTimersByTimeAsync(100);
+    restoreVoipCall();
+    expect(navigate).toHaveBeenCalledOnce();
   });
 
   it('leaves background calls and native-only incoming activities to the system', async () => {
@@ -374,19 +421,67 @@ describe('incoming actions and event isolation', () => {
     await incoming();
     fake.events.push({ scope: 'previous-account', type: 'history', records: [{ callId: 'leaked', convId: 'chat' }] });
     event({ type: 'audioInterrupted', callId: 'old-call', enabled: true });
+    event({ type: 'audioRoute', callId: 'incoming', selected: 'earpiece' });
+    event({ type: 'audioRoute', callId: 'old-call', selected: 'speaker' });
     await vi.advanceTimersByTimeAsync(100);
     expect(voipHistory.value).toEqual([]); expect(voipAudioInterrupted.value).toBe(false);
+    expect(voipAudioRoute.value).toBe('earpiece');
   });
   it('resets permissions, interruption and routes at terminal cleanup', async () => {
     await incoming();
     event({ type: 'permissionPending', callId: 'incoming' });
+    event({ type: 'speaker', callId: 'incoming', enabled: true });
     event({ type: 'audioRoutes', callId: 'incoming', routes: [{ id: 'speaker', kind: 'speaker' }], selected: 'speaker' });
     event({ type: 'audioInterrupted', callId: 'incoming', enabled: true });
     await vi.advanceTimersByTimeAsync(100);
     expect(voipAudioRoutes.value).toHaveLength(1); expect(voipPermissionPending.value).toBe(true); expect(voipAudioInterrupted.value).toBe(true);
+    expect(voipSpeaker.value).toBe(true);
+    expect(voipAudioRoute.value).toBe('speaker');
     event({ type: 'localEnded', callId: 'incoming', reason: 'permissionRequired' });
     await vi.advanceTimersByTimeAsync(100);
     expect(voipAudioRoutes.value).toEqual([]); expect(voipPermissionPending.value).toBe(false); expect(voipAudioInterrupted.value).toBe(false);
+    expect(voipSpeaker.value).toBe(false);
+    expect(voipAudioRoute.value).toBe('');
+  });
+  it('tracks initial audio routing only for the current call and clears it on end', async () => {
+    await incoming();
+    event({ type: 'audioRoutePending', callId: 'old-call', enabled: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipAudioRoutePending.value).toBe(false);
+    event({ type: 'audioRoutePending', callId: 'incoming', enabled: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipAudioRoutePending.value).toBe(true);
+    event({ type: 'audioRoutePending', callId: 'incoming', enabled: false });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipAudioRoutePending.value).toBe(false);
+    event({ type: 'audioRoutePending', callId: 'incoming', enabled: true });
+    event({ type: 'localEnded', callId: 'incoming', reason: 'ended' });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipAudioRoutePending.value).toBe(false);
+  });
+
+  it('hides remote video on mute, restores it on unmute, and discards ended-call video state', async () => {
+    await incoming();
+    event({ type: 'snapshot', snapshot: { ...getVoipSnapshot(), version: 2, state: 'active', mediaType: 'video', acceptedDeviceId: 'a1' } });
+    event({ type: 'remoteVideo', callId: 'incoming', enabled: true });
+    event({ type: 'cameraSwitching', callId: 'incoming', enabled: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipRemoteVideo.value).toBe(true);
+    expect(voipCameraSwitching.value).toBe(true);
+    event({ type: 'remoteVideo', callId: 'incoming', enabled: false });
+    event({ type: 'cameraSwitching', callId: 'incoming', enabled: false });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipRemoteVideo.value).toBe(false);
+    expect(voipCameraSwitching.value).toBe(false);
+    event({ type: 'remoteVideo', callId: 'incoming', enabled: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipRemoteVideo.value).toBe(true);
+    event({ type: 'cameraSwitching', callId: 'incoming', enabled: true });
+    event({ type: 'localEnded', callId: 'incoming', reason: 'ended' });
+    event({ type: 'remoteVideo', callId: 'incoming', enabled: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(voipRemoteVideo.value).toBe(false);
+    expect(voipCameraSwitching.value).toBe(false);
   });
 });
 

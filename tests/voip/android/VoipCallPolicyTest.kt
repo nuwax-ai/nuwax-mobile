@@ -5,10 +5,10 @@ object VoipCallPolicyTest {
         explicitCallIdMustMatch(); onlyAUserRejectionProducesDeclined()
         staleRingingSignalsCannotTerminateAnAcceptedCall(); userHangupIsDistinctFromCancelAndReject()
         standaloneQaCannotRestoreProductionIdentity()
-        releaseOriginRequiresAnExplicitMatchingHttpsPin()
+        releaseOriginAllowsHttpsAndHonorsAnOptionalPin()
         incomingSoundHonorsSilenceAndExplicitChoices()
         presentedNotificationRingsOnlyWhenAllowedAndTheServiceIsNotRinging()
-        unlockedBackgroundUiOpensForAudioAndVideo()
+        backgroundUiSupportsAudioAndVideo()
         notificationAnswerPreservesTheInvitationMedia()
         duplicatedInvitationsCannotRestartOrStopTheRingingNotification()
         showingTheCallUiReplacesTheAlertWithoutRearmingIt()
@@ -73,12 +73,10 @@ object VoipCallPolicyTest {
         check(gate.publish("call-b", true))
         check(!gate.publish("call-b", true))
     }
-    private fun unlockedBackgroundUiOpensForAudioAndVideo() {
-        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = "audio"))
-        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = "video"))
-        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = false, mediaType = ""))
-        check(VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, mediaType = "audio"))
-        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(locked = true, mediaType = "video"))
+    private fun backgroundUiSupportsAudioAndVideo() {
+        check(VoipCallPolicy.shouldOpenBackgroundCallUi("audio"))
+        check(VoipCallPolicy.shouldOpenBackgroundCallUi("video"))
+        check(!VoipCallPolicy.shouldOpenBackgroundCallUi(""))
     }
     private fun notificationAnswerPreservesTheInvitationMedia() {
         check(VoipCallPolicy.answerMediaType(invited = "video", requested = null) == "video")
@@ -134,11 +132,15 @@ object VoipCallPolicyTest {
         check(!VoipCallPolicy.originAllowed("https://testagent.xspaceagi.com", "https://agent.nuwax.com"))
         check(!VoipCallPolicy.originAllowed("https://testagent.xspaceagi.com", "https://testagent.xspaceagi.com.evil.example"))
     }
-    private fun releaseOriginRequiresAnExplicitMatchingHttpsPin() {
+    private fun releaseOriginAllowsHttpsAndHonorsAnOptionalPin() {
         val origin = "https://release.example"
-        check(!VoipCallPolicy.releaseOriginAllowed(null, origin))
+        check(VoipCallPolicy.releaseOriginAllowed(null, origin))
+        check(VoipCallPolicy.releaseOriginAllowed(null, "https://agent.nuwax.com"))
+        check(VoipCallPolicy.releaseOriginAllowed(null, "https://testagent.xspaceagi.com"))
         check(!VoipCallPolicy.releaseOriginAllowed(origin, "https://test.example"))
         check(!VoipCallPolicy.releaseOriginAllowed("http://release.example", "http://release.example"))
+        check(!VoipCallPolicy.releaseOriginAllowed(null, "https://user@release.example"))
+        check(!VoipCallPolicy.releaseOriginAllowed(null, "https://release.example/path"))
         check(VoipCallPolicy.releaseOriginAllowed(origin, origin))
     }
     private fun explicitCallIdMustMatch() {

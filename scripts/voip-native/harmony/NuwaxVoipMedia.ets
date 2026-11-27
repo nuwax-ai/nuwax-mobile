@@ -1,6 +1,5 @@
 import { webview } from '@kit.ArkWeb'
 import { abilityAccessCtrl } from '@kit.AbilityKit'
-import { audio } from '@kit.AudioKit'
 import { runningLock } from '@kit.BasicServicesKit'
 import { VoipBridge } from '@uni_modules/nuwax-voip'
 
@@ -42,6 +41,7 @@ struct NuwaxCallControl {
   @Prop selected: boolean = false
   @Prop large: boolean = false
   @Prop dense: boolean = false
+  @Prop disabled: boolean = false
   onPress: () => void = () => {}
 
   build() {
@@ -61,6 +61,7 @@ struct NuwaxCallControl {
     }
     .padding(0).backgroundColor(Color.Transparent).borderRadius(18)
     .width(this.dense ? 72 : this.large ? 96 : 88).height(114)
+    .enabled(!this.disabled).opacity(this.disabled ? 0.5 : 1)
     .accessibilityText(this.label).onClick(() => this.onPress())
   }
 }
@@ -91,9 +92,11 @@ struct NuwaxVoipMedia {
 
   onPageShow(): void {
     this.visible = true
+    VoipBridge.refreshAudioRoute()
     this.refreshCall()
     if (this.timer < 0) this.timer = setInterval(() => {
       this.revision++
+      VoipBridge.refreshAudioRoute()
       this.updateProximity()
     }, 1000)
   }
@@ -141,18 +144,8 @@ struct NuwaxVoipMedia {
 
   private updateProximity(): void {
     const call = VoipBridge.current
-    let receiver = false
-    if (this.visible && VoipBridge.mediaForeground && VoipBridge.connected &&
-        call?.state === 'active' && call.mediaType === 'audio') {
-      try {
-        const routing = audio.getAudioManager().getRoutingManager()
-        const devices = routing.getPreferredOutputDeviceForRendererInfoSync({
-          usage: audio.StreamUsage.STREAM_USAGE_VOICE_COMMUNICATION, rendererFlags: 0,
-        })
-        receiver = devices[0]?.deviceType === audio.DeviceType.EARPIECE
-      } catch (_) {}
-    }
-    this.proximity.update(receiver)
+    this.proximity.update(this.visible && VoipBridge.mediaForeground && VoipBridge.connected &&
+      call?.state === 'active' && call.mediaType === 'audio' && VoipBridge.audioRoute === 'earpiece')
   }
 
   private label(key: string): string {
@@ -184,6 +177,10 @@ struct NuwaxVoipMedia {
   private showVideo(): boolean {
     const phase = this.phase()
     return this.lastVideo && (phase === 'connecting' || phase === 'reconnecting' || phase === 'active')
+  }
+
+  private showRemoteVideo(): boolean {
+    return this.showVideo() && VoipBridge.remoteVideo
   }
 
   private microphone(): boolean {
@@ -246,7 +243,7 @@ struct NuwaxVoipMedia {
 
   @Builder private identity() {
     Column() {
-      if (!this.showVideo()) {
+      if (!this.showRemoteVideo()) {
         Stack() {
           Stack() {
             if (this.avatar.startsWith('https://') && !this.avatarFailed) {
@@ -258,8 +255,8 @@ struct NuwaxVoipMedia {
           }.width(104).height(104).backgroundColor('#71867C').borderRadius(24).clip(true)
         }.width(116).height(116).border({ width: 1, color: '#1AFFFFFF', radius: 30 }).margin({ bottom: 25 })
       }
-      Text(this.peerName()).width('100%').fontSize(this.showVideo() ? 20 : 28).fontWeight(FontWeight.Bold)
-        .fontColor(Color.White).textAlign(this.showVideo() ? TextAlign.Start : TextAlign.Center)
+      Text(this.peerName()).width('100%').fontSize(this.showRemoteVideo() ? 20 : 28).fontWeight(FontWeight.Bold)
+        .fontColor(Color.White).textAlign(this.showRemoteVideo() ? TextAlign.Start : TextAlign.Center)
         .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
       Row({ space: 9 }) {
         if (this.phase() !== 'ended') {
@@ -268,8 +265,8 @@ struct NuwaxVoipMedia {
         Text(this.status()).fontSize(this.phase() === 'active' ? 20 : 15)
           .fontColor(this.phase() === 'active' ? Color.White : '#ADFFFFFF')
       }.height(24).margin({ top: 14 })
-    }.width('100%').alignItems(this.showVideo() ? HorizontalAlign.Start : HorizontalAlign.Center)
-      .padding({ top: this.showVideo() ? 14 : 48, left: 28, right: this.showVideo() ? 128 : 28 })
+    }.width('100%').alignItems(this.showRemoteVideo() ? HorizontalAlign.Start : HorizontalAlign.Center)
+      .padding({ top: this.showRemoteVideo() ? 14 : 48, left: 28, right: this.showRemoteVideo() ? 128 : 28 })
   }
 
   @Builder private callDock() {
@@ -307,6 +304,7 @@ struct NuwaxVoipMedia {
             })
             NuwaxCallControl({
               icon: 'switch-camera', label: this.label('switchCamera'), dense: true,
+              disabled: !this.camera() || VoipBridge.cameraSwitching,
               onPress: () => this.sendControl('switchCamera')
             })
             this.speakerControl(true)
@@ -337,7 +335,9 @@ struct NuwaxVoipMedia {
 
   @Builder private speakerControl(dense: boolean) {
     NuwaxCallControl({
-      icon: 'speaker', label: this.label(this.speaker() ? 'earpiece' : 'speaker'), selected: this.speaker(),
+      icon: VoipBridge.audioRoute === 'earpiece' || VoipBridge.audioRoute.length === 0 ? 'earpiece' : 'speaker',
+      label: this.label(VoipBridge.audioRoutePending ? 'connecting' : VoipBridge.audioRoute || 'earpiece'),
+      selected: !VoipBridge.audioRoutePending && this.speaker(), disabled: VoipBridge.audioRoutePending,
       dense: dense, onPress: () => this.sendControl('speaker', !this.speaker())
     })
   }

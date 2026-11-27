@@ -24,6 +24,9 @@ class VoipIncomingActivity : Activity() {
     private var callId = ""
     private var pendingAnswer: String? = null
     private var actionPending = false
+    private var lastRenderedSnapshot: String? = null
+    private var lastRenderedSecond = -1L
+    private var lastRenderedAnswering = false
     private lateinit var callView: VoipNativeCallView
     private val refresh = object : Runnable {
         override fun run() { render(); if (!isFinishing) handler.postDelayed(this, 250) }
@@ -47,6 +50,7 @@ class VoipIncomingActivity : Activity() {
     override fun onNewIntent(value: Intent) {
         super.onNewIntent(value)
         intent = value
+        lastRenderedSnapshot = null
         val nextCallId = value.getStringExtra("callId") ?: ""
         if (nextCallId != callId) {
             callId = nextCallId
@@ -57,6 +61,7 @@ class VoipIncomingActivity : Activity() {
     override fun onResume() {
         super.onResume()
         if (isFinishing) return
+        lastRenderedSnapshot = null
         VoipBridge.nativeVisible(callId, true)
         handler.removeCallbacks(refresh); handler.post(refresh)
         consumeAnswerIntent()
@@ -156,6 +161,13 @@ class VoipIncomingActivity : Activity() {
         if (value == null) { finish(); return }
         val ringing = value.optString("state") == "ringing"
         val hasVideo = value.optString("mediaType") == "video"
+        val snapshot = value.toString()
+        val showDuration = value.optString("state") == "active" && value.optBoolean("mediaReady") && !value.optBoolean("reconnecting")
+        val second = if (showDuration) ((System.currentTimeMillis() - value.optLong("connectedAt", System.currentTimeMillis())) / 1000).coerceAtLeast(0) else -1L
+        if (snapshot == lastRenderedSnapshot && second == lastRenderedSecond && actionPending == lastRenderedAnswering) return
+        lastRenderedSnapshot = snapshot
+        lastRenderedSecond = second
+        lastRenderedAnswering = actionPending
         callView.render(value, ringing, hasVideo, actionPending)
         if (!ringing && hasVideo) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)

@@ -2,6 +2,26 @@ import XCTest
 @testable import VoipPush
 
 final class ClientStateTests: XCTestCase {
+    func testCloudHostCanSelectUniPushWithoutACustomProviderKey() {
+        let getui = ["appid": "fixture-app", "appKey": "fixture-key", "appSecret": "fixture-secret"]
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushProvider(info: ["getui": getui]), "unipush")
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushProvider(info: ["getui": getui, "NuwaxVoipPushProvider": "apns"]), "apns")
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushProvider(info: ["NuwaxVoipPushProvider": "unipush"]), "unipush")
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushProvider(info: ["getui": ["appid": "fixture-app"]]), "")
+    }
+
+    func testCloudPushEnvironmentUsesProfileOrAppStoreDefault() throws {
+        func profile(_ environment: String) throws -> Data {
+            let data = try PropertyListSerialization.data(fromPropertyList: ["Entitlements": ["aps-environment": environment]], format: .xml, options: 0)
+            return Data([0, 1]) + data + Data([2, 3])
+        }
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushEnvironment(profile: try profile("development"), explicit: nil), "development")
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushEnvironment(profile: try profile("production"), explicit: nil), "production")
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushEnvironment(profile: nil, explicit: nil), "production")
+        XCTAssertEqual(NuwaxVoipClientPolicy.pushEnvironment(profile: nil, explicit: "development"), "development")
+        XCTAssertNil(NuwaxVoipClientPolicy.pushEnvironment(profile: Data("invalid".utf8), explicit: nil))
+        XCTAssertNil(NuwaxVoipClientPolicy.pushEnvironment(profile: nil, explicit: "invalid"))
+    }
     func testNativeRestoreAndUiBootstrapShareTransportOnlyForTheSameCredentials() {
         let native = [
             "apiBaseUrl": "https://test.example", "userId": "user-a", "deviceId": "phone-a",

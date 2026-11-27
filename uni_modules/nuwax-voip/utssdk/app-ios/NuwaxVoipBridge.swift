@@ -39,7 +39,11 @@ import LiveKitClient
     private var mediaId = ""
     private var connected = false, peerReady = false, readySent = false
     private var microphone = true, camera = false, audioActive = false
+    private var remoteVideo = false
+    private var switchingCameraTrack: LocalVideoTrack?
     private var ownsCallAudio = false
+    private var audioRouteChosen = false
+    private var defaultAudioRoutePending = false
     private var visibleCallPageID: String?
     private var pushRegistry: PKPushRegistry?
     private var callUUIDs: [String: UUID] = [:]
@@ -56,7 +60,7 @@ import LiveKitClient
     private var pushRegistration: NuwaxVoipApnsRegistration?
     private var getuiBindingTask: Task<Void, Never>?
     private var getuiBinding: (token: Data, cid: String)?
-    private var pushProvider: String { Bundle.main.object(forInfoDictionaryKey: "NuwaxVoipPushProvider") as? String ?? "" }
+    private var pushProvider: String { NuwaxVoipClientPolicy.pushProvider(info: Bundle.main.infoDictionary ?? [:]) }
     private var systemBridge: NuwaxSystemCalling?
     #if DEBUG
     private var systemDiagnostics: NuwaxVoipSystemDiagnostics?
@@ -144,6 +148,7 @@ import LiveKitClient
     private func emitSnapshot(_ value: [String: Any]) {
         var nativeIncoming = false
         var foregroundIncomingPage = false
+        var systemRingingOnly = false
         let state = value["state"] as? String
         if let system = systemBridge,
            value["calleeId"] as? String == configuration["userId"] as? String,
@@ -152,10 +157,12 @@ import LiveKitClient
             // A failed system report must not open an ended-only incoming page.
             guard state != "ringing" || presented else { return }
             nativeIncoming = state == "ringing" && presented
-            foregroundIncomingPage = presented
+            systemRingingOnly = nativeIncoming && system is NuwaxLegacySystemCalls
+            foregroundIncomingPage = presented && !systemRingingOnly
         }
         // The App can also open the call after the system UI has already answered it.
-        emit("snapshot", ["snapshot": value, "nativeIncomingUI": nativeIncoming, "foregroundIncomingPage": foregroundIncomingPage])
+        emit("snapshot", ["snapshot": value, "nativeIncomingUI": nativeIncoming,
+                          "foregroundIncomingPage": foregroundIncomingPage, "systemRingingOnly": systemRingingOnly])
     }
     fileprivate func systemIncomingReady(_ uuid: UUID) {
         // Meeting invites have no business snapshot; they open the meeting page from the
@@ -166,6 +173,7 @@ import LiveKitClient
     }
     fileprivate func systemIncomingFailed(_ uuid: UUID, error: Error) {
         if meetingPushUUIDs.contains(uuid) {
+            trace("meeting system report failed")
             clearMeeting(uuid)
             return
         }
@@ -226,8 +234,10 @@ import LiveKitClient
         case "speaker":
             selectAudioRoute(command["enabled"] as? Bool == true ? "speaker" : "earpiece")
         case "switchCamera":
-            Task { guard self.snapshot?["callId"] as? String == commandId else { return }; if let track = self.room?.localParticipant.videoTracks.first?.track as? LocalVideoTrack,
-                      let capturer = track.capturer as? CameraCapturer { _ = try? await capturer.switchCameraPosition() } }
+            Task {
+                guard self.snapshot?["callId"] as? String == commandId else { return }
+                await self.switchCamera()
+            }
         case "callPageVisibility":
             if command["visible"] as? Bool == true, commandId == snapshot?["callId"] as? String {
                 visibleCallPageID = commandId
@@ -235,24 +245,13 @@ import LiveKitClient
                 visibleCallPageID = nil
             }
             updateProximity()
-        case "background":
-            updateProximity(pageForeground: command["hidden"] as? Bool != true)
-            let target = room, id = snapshot?["callId"] as? String, run = generation
-            Task {
-                guard run == self.generation, self.snapshot?["callId"] as? String == id, self.room === target else { return }
-                let visible = command["hidden"] as? Bool != true && UIApplication.shared.applicationState == .active
-                try? await target?.localParticipant.setCamera(enabled: visible && self.camera)
-                if run != self.generation || self.snapshot?["callId"] as? String != id || self.room !== target || UIApplication.shared.applicationState != .active {
-                    try? await target?.localParticipant.setCamera(enabled: false)
-                }
-            }
         default: break
         }
     }
     private func initialize(_ config: [String: Any]) {
         trace("initialize requested")
         #if !DEBUG
-        guard config["development"] as? Bool != true, config["businessEnabled"] as? Bool != true || config["qaAccepted"] as? Bool == true else { return }
+        guard config["development"] as? Bool != true else { return }
         #endif
         guard config["development"] as? Bool == true || config["qaAccepted"] as? Bool == true || config["businessEnabled"] as? Bool == true,
               let base = config["apiBaseUrl"] as? String, let url = URL(string: base), url.host != nil,
@@ -288,13 +287,10 @@ import LiveKitClient
         } else { emitHistory() }
         if audioLifecycle == nil {
             audioLifecycle = NuwaxVoipAudioLifecycle(routeChanged: { [weak self] in self?.emitAudioRoutes() },
-                interrupted: { [weak self] began, resume in self?.handleInterruption(began: began, resume: resume) },
+                interrupted: { [weak self] began, resume, reason in self?.handleInterruption(began: began, resume: resume, reason: reason) },
                 mediaReset: { [weak self] in if self?.snapshot != nil { self?.finish("audioReset") } },
                 foreground: { [weak self] in self?.becameActive() },
-                background: { [weak self] in
-                    guard let self else { return }
-                    self.executeOnMain(["op": "background", "scope": self.configuration["scope"] as? String ?? "", "hidden": true])
-                })
+                background: { [weak self] in self?.refreshCallAfterVisibilityChange() })
         }
         #if DEBUG
         if systemDiagnostics == nil {
@@ -325,7 +321,11 @@ import LiveKitClient
         if !reuseTransport { startStream() }
         if let value = snapshot {
             emitSnapshot(value)
+            emit("audioRoutePending", ["enabled": defaultAudioRoutePending])
+            emitAudioRoutes()
             if connected { emit("connected") }; if peerReady { emit("peerMediaReady") }
+            emit("remoteVideo", ["enabled": remoteVideo])
+            emit("cameraSwitching", ["enabled": switchingCameraTrack != nil])
         }
     }
 
@@ -431,7 +431,7 @@ import LiveKitClient
                 do {
                     let physical = (config["deviceId"] as? String ?? "").components(separatedBy: "#").first ?? ""
                     try await socket.send(.string(self.frame(1000, ["token": config["accessToken"] as? String ?? "", "deviceId": physical + "#voip", "platform": "ios", "lastAckSeq": 0])))
-                    while !Task.isCancelled && run == self.generation {
+                    receive: while !Task.isCancelled && run == self.generation {
                         let received = try await socket.receive()
                         guard self.imSocket === socket, run == self.generation else { break }
                         guard case .string(let text) = received, let bytes = text.data(using: .utf8), let env = try JSONSerialization.jsonObject(with: bytes) as? [String: Any] else { continue }
@@ -454,9 +454,12 @@ import LiveKitClient
                             }
                             socket.cancel(with: .normalClosure, reason: nil)
                         case 3002:
-                            if body["msgType"] as? String == "voip" {
+                            let type = body["msgType"] as? String
+                            if type == "voip" || (type == "meeting_invite" && UIApplication.shared.applicationState == .background) {
                                 try await socket.send(.string(self.frame(3003, ["convId": self.wireString(body["convId"]), "seq": body["seq"] ?? 0])))
-                                await self.receiveInvitation(body)
+                                guard run == self.generation, self.imSocket === socket else { break receive }
+                                if type == "meeting_invite" { self.receiveBackgroundMeeting(body) }
+                                else { await self.receiveInvitation(body) }
                             }
                         case 3007: self.receiveSignal(body)
                         default: break
@@ -470,6 +473,22 @@ import LiveKitClient
                 try? await Task.sleep(nanoseconds: retry); retry = min(30_000_000_000, retry * 2)
             }
         }
+    }
+    private func receiveBackgroundMeeting(_ message: [String: Any]) {
+        guard UIApplication.shared.applicationState == .background, snapshot == nil,
+              let system = systemBridge,
+              let invitation = NuwaxVoipPushInvitation(meetingMessage: message, userId: wireString(configuration["userId"]),
+                  now: Date().timeIntervalSince1970 * 1000),
+              !terminal.contains(invitation.systemKey) else { return }
+        let systemUUID = uuid(invitation.systemKey)
+        guard meetingInvites[systemUUID] == nil, pendingPushes[systemUUID] == nil else { return }
+        meetingPushUUIDs.insert(systemUUID)
+        meetingInvites[systemUUID] = invitation
+        meetingValidatedUUIDs.insert(systemUUID)
+        meetingPasscodes[systemUUID] = (message["body"] as? [String: Any])?["passcode"] as? String ?? ""
+        expirePendingPush(systemUUID, invitation: invitation)
+        trace("background meeting invitation received from IM")
+        system.register(invitation.report(labels: configuration["labels"] as? [String: Any] ?? [:]), uuid: systemUUID, incoming: true)
     }
     private func receiveInvitation(_ message: [String: Any], notificationCallID: String = "", notificationExpiry: Double = 0) async {
         trace("control invitation received")
@@ -525,14 +544,14 @@ import LiveKitClient
         let type = event["eventType"] as? String ?? ""
         if type == "meeting:invite-handled" {
             let msg = wireString(payload["msgId"]), invite = wireString(payload["inviteId"])
-            if !invite.isEmpty { rememberTerminal(invite) }
+            if !invite.isEmpty { rememberTerminal(NuwaxVoipPushInvitation.meetingSystemKey(invite)) }
             let matches = meetingInvites.compactMap { uuid, value -> UUID? in
                 if !msg.isEmpty && value.msgId == msg { return uuid }
                 if !invite.isEmpty && value.inviteId == invite { return uuid }
                 return nil
             }
             for uuid in matches {
-                if let value = meetingInvites[uuid] { rememberTerminal(value.callId) }
+                if let value = meetingInvites[uuid] { rememberTerminal(value.systemKey) }
                 clearMeeting(uuid); removePendingPush(uuid); systemBridge?.end(uuid: uuid)
             }
             return
@@ -654,7 +673,7 @@ import LiveKitClient
         let ranks = ["ringing", "connecting", "active", "ended"]
         guard let rank = ranks.firstIndex(of: state), (value["version"] as? Int ?? 0) > 0 else { return }
         if let previous = snapshot, previous["callId"] as? String == id, let oldRank = ranks.firstIndex(of: previous["state"] as? String ?? ""), rank < oldRank { return }
-        if snapshot?["callId"] as? String != id { microphone = true; camera = value["mediaType"] as? String == "video"; systemPaused = false; audioInterrupted = false }
+        if snapshot?["callId"] as? String != id { microphone = true; camera = value["mediaType"] as? String == "video"; systemPaused = false; audioInterrupted = false; audioRouteChosen = false; defaultAudioRoutePending = false }
         snapshot = value; observeHistory(value); emitSnapshot(value)
         updateProximity()
         if state == "ended" { finish(); return }
@@ -712,6 +731,9 @@ import LiveKitClient
         mediaId = id; connected = false; peerReady = false; readySent = false
         cancelRemoteLeft(); everHadRemote = false
         let run = generation
+        let preferSpeaker = value["mediaType"] as? String == "video"
+        defaultAudioRoutePending = !audioRouteChosen
+        if defaultAudioRoutePending { emit("audioRoutePending", ["enabled": true]) }
         mediaTask = Task { @MainActor in
             do {
                 if value["mediaType"] as? String != "video" { self.camera = false }
@@ -721,6 +743,7 @@ import LiveKitClient
                 let signal = credentials["serverUrl"] as? String ?? ""
                 guard signal.hasPrefix("wss://") || (self.configuration["development"] as? Bool == true && signal.hasPrefix("ws://")) else { throw VoipError.invalid }
                 self.acquireCallAudio()
+                if !self.audioRouteChosen { AudioManager.shared.isSpeakerOutputPreferred = preferSpeaker }
                 let next = Room(delegate: self); self.room = next
                 try await next.connect(url: credentials["serverUrl"] as? String ?? "", token: credentials["participantToken"] as? String ?? "")
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id, !self.terminal.contains(id) else { await next.disconnect(); return }
@@ -739,12 +762,26 @@ import LiveKitClient
                     }
                 } else {
                     AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = true
-                    let session = AVAudioSession.sharedInstance(); try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth]); try session.setActive(true)
+                    try self.configureCallAudioSession()
+                    try AVAudioSession.sharedInstance().setActive(true)
                     self.audioActive = true; self.updateAudioEngine()
                 }
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id else { await next.disconnect(); return }
+                self.applyDefaultAudioRoute(preferSpeaker: preferSpeaker)
                 try await next.localParticipant.setMicrophone(enabled: self.microphone)
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id else { await next.disconnect(); return }
+                if self.defaultAudioRoutePending {
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 300_000_000)
+                        guard run == self.generation, self.snapshot?["callId"] as? String == id,
+                              self.room === next, !self.terminal.contains(id) else { return }
+                        // Starting media can change the route after the system activates the audio session.
+                        self.applyDefaultAudioRoute(preferSpeaker: preferSpeaker)
+                        self.emitAudioRoutes()
+                        self.defaultAudioRoutePending = false
+                        self.emit("audioRoutePending", ["enabled": false])
+                    }
+                }
                 if self.camera && UIApplication.shared.applicationState == .active { try await next.localParticipant.setCamera(enabled: true) }
                 if UIApplication.shared.applicationState != .active { try? await next.localParticipant.setCamera(enabled: false) }
                 guard !Task.isCancelled, self.room === next, run == self.generation, self.snapshot?["callId"] as? String == id else { await next.disconnect(); return }
@@ -819,15 +856,52 @@ import LiveKitClient
         guard run == generation, snapshot?["callId"] as? String == id, room === target else { return }
         camera = enabled; refreshViews(); emit("camera", ["enabled": enabled])
     }
-    private func refreshViews() {
-        views.removeAll { $0.view == nil }
-        for item in views {
-            let track = item.local ? room?.localParticipant.videoTracks.first?.track : room?.remoteParticipants.values.first?.videoTracks.first?.track
-            item.view?.track = track as? VideoTrack
+
+    private func switchCamera() async {
+        guard camera, switchingCameraTrack == nil, UIApplication.shared.applicationState == .active,
+              let target = room, target.localParticipant.isCameraEnabled(),
+              let track = target.localParticipant.firstCameraVideoTrack as? LocalVideoTrack,
+              let capturer = track.capturer as? CameraCapturer else { return }
+        switchingCameraTrack = track
+        emit("cameraSwitching", ["enabled": true])
+        defer {
+            if switchingCameraTrack === track {
+                switchingCameraTrack = nil
+                emit("cameraSwitching", ["enabled": false])
+            }
+        }
+        do {
+            let switched = try await capturer.switchCameraPosition()
+            if !switched && room === target && camera && target.localParticipant.isCameraEnabled() {
+                emit("error", ["code": "CALL_MEDIA_FAILED"])
+            }
+        } catch {
+            if room === target && camera && target.localParticipant.isCameraEnabled() {
+                emit("error", ["code": "CALL_MEDIA_FAILED"])
+            }
         }
     }
+
+    private func refreshViews() {
+        let localTrack = camera && UIApplication.shared.applicationState == .active && room?.localParticipant.isCameraEnabled() == true
+            ? room?.localParticipant.firstCameraVideoTrack : nil
+        let peer = room?.remoteParticipants.values.first
+        let remoteTrack = peer?.isCameraEnabled() == true ? peer?.firstCameraVideoTrack : nil
+        let remoteVideoOn = remoteTrack != nil
+        if remoteVideo != remoteVideoOn {
+            remoteVideo = remoteVideoOn
+            emit("remoteVideo", ["enabled": remoteVideoOn])
+        }
+        views.removeAll { $0.view == nil }
+        for item in views {
+            let track = item.local ? localTrack : remoteTrack
+            item.view?.isHidden = track == nil
+            item.view?.track = track
+        }
+    }
+
     private func releaseMedia() async {
-        let old = room; room = nil; for view in views { view.view?.track = nil }
+        let old = room; room = nil; switchingCameraTrack = nil; refreshViews()
         connected = false; peerReady = false; await old?.disconnect()
     }
     fileprivate func finish(_ reason: String = "", notifyRemote: Bool = true) {
@@ -844,16 +918,17 @@ import LiveKitClient
         mediaTask?.cancel(); mediaTask = nil; mediaId = ""
         reconnectTask?.cancel(); reconnectTask = nil; reconnectWindow.cancel()
         cancelRemoteLeft(); everHadRemote = false
-        let old = room; room = nil; for item in views { item.view?.track = nil }
-        audioActive = false; systemPaused = false; audioInterrupted = false
+        let old = room; room = nil; switchingCameraTrack = nil; refreshViews()
+        audioActive = false; systemPaused = false; audioInterrupted = false; defaultAudioRoutePending = false
         let hadCallAudio = ownsCallAudio
+        let managesAudioSession = systemBridge == nil
         ownsCallAudio = false
         if hadCallAudio { try? AudioManager.shared.setEngineAvailability(.none) }
         let run = generation
         Task {
             await old?.disconnect()
             guard hadCallAudio, !self.ownsCallAudio else { return }
-            if #unavailable(iOS 17.4), run == self.generation, self.snapshot == nil, self.room == nil {
+            if managesAudioSession, run == self.generation, self.snapshot == nil, self.room == nil {
                 try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
             }
             // LiveKit's audio engine is shared with meetings in this process.
@@ -896,8 +971,8 @@ import LiveKitClient
         return revocation
     }
     private func removePendingPush(_ uuid: UUID) {
-        pendingPushExpiry.removeValue(forKey: uuid)?.cancel()
         pendingPushes.removeValue(forKey: uuid)
+        if meetingInvites[uuid] == nil { pendingPushExpiry.removeValue(forKey: uuid)?.cancel() }
     }
     private func expirePendingPush(_ uuid: UUID, invitation: NuwaxVoipPushInvitation) {
         let run = generation
@@ -908,6 +983,7 @@ import LiveKitClient
             // Meeting invites leave pendingPushes after validation; keep the ringing
             // window alive through meetingInvites and close it with a timeout event.
             if self.meetingInvites[uuid] != nil {
+                self.rememberTerminal(invitation.systemKey)
                 self.clearMeeting(uuid)
                 self.emit("meetingInvite", ["action": "timeout", "callId": invitation.callId,
                     "inviteId": invitation.inviteId ?? "", "roomName": invitation.roomName ?? "",
@@ -917,7 +993,7 @@ import LiveKitClient
                 return
             }
             guard self.pendingPushes[uuid] != nil, !self.validatedSystemUUID(uuid) else { return }
-            self.rememberTerminal(invitation.callId)
+            self.rememberTerminal(invitation.systemKey)
             self.removePendingPush(uuid)
             self.systemBridge?.end(uuid: uuid)
         }
@@ -935,6 +1011,7 @@ import LiveKitClient
     fileprivate func isMeetingSystemCall(_ uuid: UUID) -> Bool { meetingInvites[uuid] != nil }
 
     private func clearMeeting(_ uuid: UUID) {
+        pendingPushExpiry.removeValue(forKey: uuid)?.cancel()
         meetingPasscodes.removeValue(forKey: uuid)
         meetingPushUUIDs.remove(uuid)
         meetingValidatedUUIDs.remove(uuid)
@@ -946,6 +1023,7 @@ import LiveKitClient
     fileprivate func meetingAccepted(_ uuid: UUID) {
         guard meetingValidatedUUIDs.contains(uuid), let invitation = meetingInvites[uuid] else { return }
         let passcode = meetingPasscodes[uuid] ?? ""
+        rememberTerminal(invitation.systemKey)
         clearMeeting(uuid)
         pendingMeetingAccept = ["action": "accept", "callId": invitation.callId,
             "inviteId": invitation.inviteId ?? "", "roomName": invitation.roomName ?? "",
@@ -967,6 +1045,7 @@ import LiveKitClient
 
     fileprivate func endSystemCall(_ uuid: UUID) {
         if let invitation = meetingInvites[uuid] {
+            rememberTerminal(invitation.systemKey)
             clearMeeting(uuid)
             emit("meetingInvite", ["action": "reject", "callId": invitation.callId,
                 "inviteId": invitation.inviteId ?? "", "roomName": invitation.roomName ?? "",
@@ -981,12 +1060,13 @@ import LiveKitClient
             return // Send decline only after the authenticated invitation has been verified.
         }
         guard validatedSystemUUID(uuid), let call = snapshot else { return }
+        trace("system requested call end")
         finish(NuwaxVoipCallPolicy.endReason(action: "end", state: wireString(call["state"]), callee: call["calleeId"] as? String == configuration["userId"] as? String))
     }
     fileprivate func systemReset() {
         pendingMeetingAccept = nil
         meetingPasscodes.removeAll()
-        for pending in pendingPushes.values { rememberTerminal(pending.invitation.callId) }
+        for pending in pendingPushes.values { rememberTerminal(pending.invitation.systemKey) }
         for task in pendingPushExpiry.values { task.cancel() }; pendingPushExpiry = [:]; pendingPushes = [:]
         meetingPushUUIDs.removeAll(); meetingValidatedUUIDs.removeAll(); meetingInvites.removeAll()
         finish("systemReset")
@@ -999,7 +1079,7 @@ import LiveKitClient
         // Set the category before fulfilling the system action. Starting audio remains
         // the system's responsibility and the media engine waits for didActivate.
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
+            try configureCallAudioSession()
             acquireCallAudio()
             trace("system audio session configured")
             return true
@@ -1010,6 +1090,9 @@ import LiveKitClient
             return false
         }
     }
+    private func configureCallAudioSession() throws {
+        try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
+    }
     fileprivate func audioActivated(_ active: Bool) {
         guard ownsCallAudio else { return }
         let id = snapshot?["callId"] as? String ?? ""
@@ -1019,8 +1102,19 @@ import LiveKitClient
             audioActive = false; updateAudioEngine(); return
         }
         audioActive = active
-        if active { audioInterrupted = false }
+        trace(active ? "system call audio activated" : "system call audio deactivated")
+        if active {
+            // A competing audio session can change the category while the call's audio is paused.
+            restoreCallAudioCategoryIfNeeded()
+            audioInterrupted = false
+        }
         updateAudioEngine(); emitAudioRoutes()
+    }
+    private func restoreCallAudioCategoryIfNeeded() {
+        let session = AVAudioSession.sharedInstance()
+        guard session.category != .playAndRecord || session.mode != .voiceChat else { return }
+        do { try configureCallAudioSession() }
+        catch { trace("system call audio category restore failed code=\((error as NSError).code)") }
     }
     fileprivate func incomingAnswerMediaType(_ requested: String?) -> String {
         NuwaxVoipCallPolicy.answerMediaType(invited: snapshot?["mediaType"] as? String, requested: requested)
@@ -1060,20 +1154,46 @@ import LiveKitClient
         systemBridge?.resumePendingAnswer()
         guard snapshot != nil else { return }
         emitAudioRoutes()
-        executeOnMain(["op": "background", "scope": configuration["scope"] as? String ?? "", "hidden": false])
+        refreshCallAfterVisibilityChange()
+    }
+    private func refreshCallAfterVisibilityChange() {
+        let isForeground = UIApplication.shared.applicationState == .active
+        updateProximity(pageForeground: isForeground)
+        guard let state = snapshot?["state"] as? String, state == "connecting" || state == "active" else { return }
+        trace(isForeground ? "active call returned to foreground" : "active call entered background")
+        guard snapshot?["mediaType"] as? String == "video", let target = room else { return }
+        Task {
+            guard self.room === target else { return }
+            let enableCamera = self.camera && UIApplication.shared.applicationState == .active
+            try? await target.localParticipant.setCamera(enabled: enableCamera)
+            if self.room === target { self.refreshViews() }
+        }
     }
     private func refreshGetuiPushRoute() {
         if pushProvider == "unipush", let registry = pushRegistry,
            let token = registry.pushToken(for: .voIP) { updatePushToken(token, registry: registry) }
     }
     fileprivate func pauseAudio(_ paused: Bool) { systemPaused = paused; updateAudioEngine() }
-    private func handleInterruption(began: Bool, resume: Bool) {
+    private func handleInterruption(began: Bool, resume: Bool, reason: UInt?) {
         guard ownsCallAudio, snapshot != nil else { return }
-        if began { audioInterrupted = true }
-        // LCK's didActivate remains the authority on supported OS versions.
-        else if resume {
-            if #unavailable(iOS 17.4) { try? AVAudioSession.sharedInstance().setActive(true); audioInterrupted = false }
-            else if audioActive { audioInterrupted = false }
+        trace("call audio interruption began=\(began) resume=\(resume) reason=\(reason.map(String.init) ?? "unknown")")
+        if began {
+            audioInterrupted = true
+        } else if resume {
+            if systemBridge != nil {
+                // CallKit and LiveCommunicationKit each own activation of their audio session.
+                if audioActive { restoreCallAudioCategoryIfNeeded(); audioInterrupted = false }
+            } else {
+                do {
+                    try configureCallAudioSession()
+                    try AVAudioSession.sharedInstance().setActive(true)
+                    audioActive = true
+                    audioInterrupted = false
+                } catch {
+                    audioActive = false
+                    trace("call audio session reactivation failed code=\((error as NSError).code)")
+                }
+            }
         }
         updateAudioEngine()
     }
@@ -1091,11 +1211,30 @@ import LiveKitClient
         let enabled = NuwaxVoipClientPolicy.canRunAudio(state: snapshot?["state"] as? String, outgoing: outgoing,
             terminal: id.isEmpty || terminal.contains(id), active: audioActive, paused: systemPaused, interrupted: audioInterrupted)
         do { try AudioManager.shared.setEngineAvailability(enabled ? .default : .none) }
-        catch { emit("error", ["code": "CALL_AUDIO_ROUTE_UNAVAILABLE"]) }
+        catch {
+            trace("call audio engine transition failed enabled=\(enabled) code=\((error as NSError).code)")
+            emit("error", ["code": "CALL_AUDIO_ROUTE_UNAVAILABLE"])
+        }
         emit("audioInterrupted", ["enabled": systemPaused || audioInterrupted || !audioActive])
         updateProximity()
     }
+    private func applyDefaultAudioRoute(preferSpeaker: Bool) {
+        guard audioActive, !audioRouteChosen else { return }
+        let session = AVAudioSession.sharedInstance()
+        let route = session.currentRoute
+        let otherBuiltInPort: AVAudioSession.Port = preferSpeaker ? .builtInReceiver : .builtInSpeaker
+        // Only switch between built-in outputs. Leave a routed headset with the system.
+        guard !route.outputs.isEmpty, route.outputs.allSatisfy({ $0.portType == otherBuiltInPort }),
+              route.inputs.allSatisfy({ $0.portType == .builtInMic }) else { return }
+        do {
+            if !preferSpeaker && session.categoryOptions.contains(.defaultToSpeaker) {
+                try configureCallAudioSession()
+            }
+            try session.overrideOutputAudioPort(preferSpeaker ? .speaker : .none)
+        } catch { trace("default audio route unavailable") }
+    }
     private func selectAudioRoute(_ route: String) {
+        audioRouteChosen = true
         let session = AVAudioSession.sharedInstance()
         do {
             if route == "speaker" || route == "earpiece" {
@@ -1126,9 +1265,18 @@ import LiveKitClient
         updateProximity()
         guard snapshot != nil else { return }
         let session = AVAudioSession.sharedInstance()
-        let speaker = session.currentRoute.outputs.contains { $0.portType == .builtInSpeaker }
-        let external = session.currentRoute.inputs.first { $0.portType != .builtInMic }
-        let selected = external?.uid ?? (speaker ? "speaker" : "earpiece")
+        let route = session.currentRoute
+        let speaker = route.outputs.contains { $0.portType == .builtInSpeaker }
+        let receiver = route.outputs.contains { $0.portType == .builtInReceiver }
+        let external = route.inputs.first { $0.portType != .builtInMic }
+        let selected: String
+        if speaker {
+            selected = "speaker"
+        } else if receiver {
+            selected = "earpiece"
+        } else {
+            selected = external?.uid ?? (route.outputs.isEmpty ? "" : "headset")
+        }
         var routes: [[String: String]] = [["id": "earpiece", "kind": "earpiece"], ["id": "speaker", "kind": "speaker"]]
         for input in session.availableInputs ?? [] where input.portType != .builtInMic {
             routes.append(["id": input.uid, "kind": input.portType == .bluetoothHFP ? "bluetooth" : "headset", "name": input.portName])
@@ -1202,11 +1350,24 @@ extension NuwaxVoipBridge: RoomDelegate {
         }
     }
     public nonisolated func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
-        DispatchQueue.main.async { self.observeRemotePresence(room) }
+        DispatchQueue.main.async {
+            if self.room === room { self.refreshViews() }
+            self.observeRemotePresence(room)
+        }
     }
     public nonisolated func room(_ room: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {
         DispatchQueue.main.async { guard self.room === room else { return }; self.refreshViews()
             if publication.track is AudioTrack { self.peerReady = true; self.emit("peerMediaReady"); self.maybeReady() } }
+    }
+    public nonisolated func room(_ room: Room, participant: RemoteParticipant, didUnsubscribeTrack publication: RemoteTrackPublication) {
+        DispatchQueue.main.async { if self.room === room { self.refreshViews() } }
+    }
+    public nonisolated func room(_ room: Room, participant: RemoteParticipant, didUnpublishTrack publication: RemoteTrackPublication) {
+        DispatchQueue.main.async { if self.room === room { self.refreshViews() } }
+    }
+    public nonisolated func room(_ room: Room, participant: Participant, trackPublication: TrackPublication, didUpdateIsMuted isMuted: Bool) {
+        guard trackPublication.source == .camera else { return }
+        DispatchQueue.main.async { if self.room === room { self.refreshViews() } }
     }
     public nonisolated func room(_ room: Room, didStartReconnectWithMode reconnectMode: ReconnectMode) {
         DispatchQueue.main.async { self.beginReconnect(room); self.observeRemotePresence(room) }
@@ -1215,6 +1376,7 @@ extension NuwaxVoipBridge: RoomDelegate {
         DispatchQueue.main.async { if self.room === room {
             self.reconnectTask?.cancel(); self.reconnectTask = nil; self.reconnectWindow.cancel()
             self.emit("connected"); self.announceMediaReady()
+            self.refreshViews()
             self.observeRemotePresence(room)
         } }
     }
@@ -1287,7 +1449,11 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
     private func registerPushDevice(_ data: Data, cid: String?) {
         let config = configuration
         // The signed host owns APNs environment. Never infer it from DEBUG or the API domain.
-        let environment = Bundle.main.object(forInfoDictionaryKey: "NuwaxVoipAPNSEnvironment") as? String ?? ""
+        let profileURL = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision")
+        let profile = profileURL.flatMap { try? Data(contentsOf: $0) }
+        let environment = profileURL != nil && profile == nil ? "" :
+            (NuwaxVoipClientPolicy.pushEnvironment(profile: profile,
+                explicit: Bundle.main.object(forInfoDictionaryKey: "NuwaxVoipAPNSEnvironment") as? String) ?? "")
         let bundle = Bundle.main.bundleIdentifier ?? "", device = config["deviceId"] as? String ?? ""
         guard let candidate = NuwaxVoipApnsDevice(token: data, bundleId: bundle, environment: environment,
                                                  deviceId: device, cid: cid), candidate.provider == pushProvider else {
@@ -1330,25 +1496,33 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         let invitation = NuwaxVoipPushInvitation(payload.dictionaryPayload, userId: configuration["userId"] as? String ?? "",
             business: business, now: Date().timeIntervalSince1970 * 1000, requiredRegistrationId: route,
             pushBusinessEnvironment: configuration["pushBusinessEnvironment"] as? String)
+        // Foreground invitations use the existing IM banner. Older PushKit callbacks
+        // still require a system report if a VoIP push reaches an active app.
+        if !mustReport, invitation?.scene == "meeting", UIApplication.shared.applicationState == .active {
+            trace("PushKit meeting report skipped in foreground")
+            completion()
+            return
+        }
         if invitation == nil && !mustReport {
             trace("PushKit ignored invitation outside current registration")
             completion()
             return
         }
-        let systemUUID = invitation.map { uuid($0.callId) } ?? UUID()
+        let systemUUID = invitation.map { uuid($0.systemKey) } ?? UUID()
         trace("PushKit received callId=\(invitation?.callId ?? "invalid") systemUUID=\(systemUUID.uuidString)")
         let system: NuwaxSystemCalling
         if let current = systemBridge { system = current }
         else if #available(iOS 17.4, *) { system = NuwaxSystemCalls(owner: self); systemBridge = system }
         else { system = NuwaxLegacySystemCalls(owner: self); systemBridge = system }
         let duplicate = pendingPushes[systemUUID] != nil
-        if let invitation, !terminal.contains(invitation.callId), !duplicate, !validatedSystemUUID(systemUUID) {
+        if let invitation, !terminal.contains(invitation.systemKey), !duplicate, !validatedSystemUUID(systemUUID) {
             pendingPushes[systemUUID] = PendingPush(invitation: invitation)
             expirePendingPush(systemUUID, invitation: invitation)
         }
         // Mark the meeting UUID before report so an early answer still routes to the
         // meeting flow instead of the 1:1 call state machine.
-        if let invitation, invitation.scene == "meeting", snapshot == nil, !terminal.contains(invitation.callId) {
+        if let invitation, invitation.scene == "meeting", snapshot == nil, meetingInvites[systemUUID] == nil,
+           !terminal.contains(invitation.systemKey) {
             meetingPushUUIDs.insert(systemUUID)
             meetingInvites[systemUUID] = invitation
         }
@@ -1366,7 +1540,10 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
                 work?.cancel()
                 guard let self, run == self.generation, !self.validatedSystemUUID(systemUUID) else { return }
                 self.trace("PushKit validation background time expired systemUUID=\(systemUUID.uuidString)")
-                if let invitation { self.rememberTerminal(invitation.callId) }
+                if let invitation {
+                    self.rememberTerminal(invitation.systemKey)
+                    if invitation.scene == "meeting" { self.clearMeeting(systemUUID) }
+                }
                 self.removePendingPush(systemUUID); system.end(uuid: systemUUID)
             }
         }
@@ -1390,9 +1567,10 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
             case .failure(let error):
                 system.end(uuid: systemUUID)
                 if run == self.generation {
+                    if invitation?.scene == "meeting" { self.clearMeeting(systemUUID) }
                     self.removePendingPush(systemUUID)
                     if let invitation {
-                        self.rememberTerminal(invitation.callId)
+                        self.rememberTerminal(invitation.systemKey)
                         if self.snapshot == nil { self.emit("error", ["code": NuwaxVoipIncomingFailure(error).code]) }
                     }
                 }
@@ -1408,26 +1586,23 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
         guard !Task.isCancelled, run == generation, route == requiredPushRegistration else { endIfUnverified(); return }
         if duplicate { if pendingPushes[systemUUID]?.declined == true { system.end(uuid: systemUUID) }; return }
         if validatedSystemUUID(systemUUID) { removePendingPush(systemUUID); return }
-        guard pendingPushes[systemUUID] != nil, !terminal.contains(invitation.callId) || pendingPushes[systemUUID]?.declined == true else { removePendingPush(systemUUID); endIfUnverified(); return }
+        guard pendingPushes[systemUUID] != nil, !terminal.contains(invitation.systemKey) || pendingPushes[systemUUID]?.declined == true else { removePendingPush(systemUUID); endIfUnverified(); return }
         defer { if run == generation { removePendingPush(systemUUID) } }
         if invitation.scene == "meeting" {
             // Busy: keep the chat card only, never interrupt an active call.
             guard snapshot == nil else { system.end(uuid: systemUUID); return }
             do {
-                guard let conv = invitation.convId, let msg = invitation.msgId,
-                      let pending = pendingPushes[systemUUID] else {
+                guard let conv = invitation.convId, let msg = invitation.msgId else {
                     clearMeeting(systemUUID)
                     endIfUnverified(); return
                 }
                 let message = try await request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true)
                 guard !Task.isCancelled, run == generation, route == requiredPushRegistration,
+                      !terminal.contains(invitation.systemKey), meetingInvites[systemUUID] != nil,
+                      pendingPushes[systemUUID]?.declined == false,
                       invitation.matches(message, now: Date().timeIntervalSince1970 * 1000) else {
                     clearMeeting(systemUUID)
                     endIfUnverified(); return
-                }
-                if pending.declined {
-                    clearMeeting(systemUUID)
-                    system.end(uuid: systemUUID); return
                 }
                 meetingValidatedUUIDs.insert(systemUUID)
                 // 只使用鉴权消息接口返回的密码，不信任推送里的凭据。

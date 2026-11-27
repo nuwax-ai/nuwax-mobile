@@ -22,6 +22,18 @@ function nativeStage() {
     setCommunicationDevice: vi.fn(async (_device: number, _active: boolean) => {}),
     isCommunicationDeviceActiveSync: vi.fn((_device: number) => true),
   };
+  // App-level audio session (API 20): the meeting routes ArkWeb WebRTC audio through it.
+  const audioSession = {
+    active: false,
+    device: 1000,
+    scene: 0,
+    setAudioSessionScene: vi.fn((scene: number) => { audioSession.scene = scene; }),
+    activateAudioSession: vi.fn(async () => { audioSession.active = true; }),
+    deactivateAudioSession: vi.fn(async () => { audioSession.active = false; }),
+    isAudioSessionActivated: vi.fn(() => audioSession.active),
+    setDefaultOutputDevice: vi.fn(async (device: number) => { audioSession.device = device; }),
+    getDefaultOutputDevice: vi.fn(() => audioSession.device),
+  };
   const destroy = vi.fn();
   const request = vi.fn().mockResolvedValue({ responseCode: 200, result: '{"code":"0000"}' });
   const timers = new Map<number, { callback: () => void; delay: number }>();
@@ -50,7 +62,10 @@ function nativeStage() {
     EntryVoipBackgroundTask: task,
     audio: {
       CommunicationDeviceType: { SPEAKER: 2 },
-      getAudioManager: () => ({ getRoutingManager: () => routing }),
+      DeviceType: { DEFAULT: 1000, EARPIECE: 1, SPEAKER: 2 },
+      AudioSessionScene: { AUDIO_SESSION_SCENE_VOICE_COMMUNICATION: 3 },
+      AudioConcurrencyMode: { CONCURRENCY_MIX_WITH_OTHERS: 1 },
+      getAudioManager: () => ({ getRoutingManager: () => routing, getSessionManager: () => audioSession }),
     },
     abilityAccessCtrl: { createAtManager: () => permissions },
     ProtectedResourceType: { AUDIO_CAPTURE: 'audio', VIDEO_CAPTURE: 'video' },
@@ -68,7 +83,7 @@ function nativeStage() {
     clearTimeout(id: number) { timers.delete(id); },
   });
   const session = vm.runInContext(stripTypeScriptTypes(hostSource) + '\nMeetingStageSession;', context);
-  return { session, stages, request, destroy, timers, task, permissions, routing };
+  return { session, stages, request, destroy, timers, task, permissions, routing, audioSession };
 }
 
 describe('Harmony meeting native stage', () => {
@@ -101,6 +116,8 @@ describe('Harmony meeting native stage', () => {
     expect(page).toContain('meetingMediaSwitchCamera();');
     expect(page).not.toContain('v-if="harmonyMediaVisible && cameraOn"');
     expect(page).toContain('meetingMediaSetSpeaker(!speakerOn.value);');
+    // 主持人禁言：给「已禁言」，不要泛化的「操作失败」。
+    expect(page).toContain('deviceError == "mic_denied" ? t("Mobile.Meeting.speakDisabledBadge")');
     expect(page).not.toContain('mr-harmony-roster');
     expect(page).toContain('hostLabel: tile.host ? t("Mobile.Meeting.hostBadge") : ""');
     expect(page).toContain('resolveHarmonyMeetingAvatarData(raw)');
@@ -191,55 +208,77 @@ function settle() {
   return new Promise(resolve => setImmediate(resolve));
 }
 
-it('reads back the system speaker state after switching and on return to the foreground', async () => {
-  const { session, routing } = connectedStage();
-  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
+it('routes ArkWeb meeting audio through the app-level audio session', async () => {
+  const { session, audioSession, routing } = connectedStage();
+  await settle();
+  // 入会即激活会话（VOICE_COMMUNICATION 场景）并默认外放，与 Android 入会同口径。
+  expect(audioSession.setAudioSessionScene).toHaveBeenCalledWith(3);
+  expect(audioSession.activateAudioSession).toHaveBeenCalledOnce();
+  expect(audioSession.setDefaultOutputDevice).toHaveBeenNthCalledWith(1, 2);
+
   session.control('speaker', false);
   await settle();
-  expect(routing.setCommunicationDevice).toHaveBeenCalledWith(2, false);
+  // 切听筒走应用级会话；不再碰已废弃的 setCommunicationDevice。
+  expect(audioSession.setDefaultOutputDevice).toHaveBeenLastCalledWith(1);
+  expect(routing.setCommunicationDevice).not.toHaveBeenCalled();
   expect(session.speaker).toBe(false);
   expect(session.controlError).toBe('');
 
   session.setAppForeground(false);
-  routing.isCommunicationDeviceActiveSync.mockReturnValue(true);
   session.setAppForeground(true);
-  expect(session.speaker).toBe(true);
+  // 回前台按会话记录的输出设备回读，仍是听筒。
+  expect(session.speaker).toBe(false);
 
-  routing.isCommunicationDeviceActiveSync.mockReturnValue(true);
   session.control('speaker', true);
   await settle();
+  expect(audioSession.setDefaultOutputDevice).toHaveBeenLastCalledWith(2);
   expect(session.speaker).toBe(true);
+  expect(session.controlError).toBe('');
 });
 
-it('waits for a delayed Harmony speaker route update without reporting a false failure', async () => {
-  const { session, routing, timers } = connectedStage();
+it('reports a speaker failure when the system rejects the route change', async () => {
+  const { session, audioSession } = connectedStage();
+  await settle();
+  audioSession.setDefaultOutputDevice.mockRejectedValueOnce(new Error('unsupported'));
   session.control('speaker', false);
   await settle();
-  expect(session.controlError).toBe('');
-  expect(timers.size).toBe(1);
+  expect(session.speaker).toBe(true);
+  expect(session.controlError).toBe('speaker');
+});
 
-  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
-  Array.from(timers.values())[0].callback();
+it('returns the output device to the system when the meeting ends', async () => {
+  const { session, audioSession } = connectedStage();
+  session.control('speaker', false);
   await settle();
-  expect(session.speaker).toBe(false);
-  expect(session.controlError).toBe('');
-  expect(routing.setCommunicationDevice).toHaveBeenCalledTimes(2);
-  expect(routing.isCommunicationDeviceActiveSync).toHaveBeenCalledTimes(2);
+  void session.disconnect();
+  await settle();
+  expect(audioSession.setDefaultOutputDevice).toHaveBeenLastCalledWith(1000);
+  expect(audioSession.deactivateAudioSession).toHaveBeenCalledOnce();
+});
+
+it('reports a host-denied microphone as a distinct error instead of a device failure', async () => {
+  const { session } = connectedStage();
+  session.micAllowed = false;
+  session.control('mic', true);
+  await settle();
+  expect(session.controlError).toBe('mic_denied');
+  expect(session.mic).toBe(false);
 });
 
 it('ignores a speaker change that finishes after the room generation changes', async () => {
-  const { session, routing } = connectedStage();
+  const { session, audioSession } = connectedStage();
+  await settle();
+  audioSession.setDefaultOutputDevice.mockClear();
   let finish!: () => void;
-  routing.setCommunicationDevice.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+  audioSession.setDefaultOutputDevice.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
   session.control('speaker', false);
   await settle();
-  expect(routing.setCommunicationDevice).toHaveBeenCalledOnce();
+  expect(audioSession.setDefaultOutputDevice).toHaveBeenCalledOnce();
 
   void session.disconnect();
   session.connect('wss://other-room.test', 'new-token');
   finish();
   await settle();
-  expect(routing.isCommunicationDeviceActiveSync).not.toHaveBeenCalled();
   expect(session.speaker).toBe(true);
   expect(session.controlError).toBe('');
 });
@@ -402,7 +441,8 @@ it('requests OS permissions only for media the participant can publish in the fo
   session.control('mic', true);
   await settle();
   expect(permissions.requestPermissionsFromUser).not.toHaveBeenCalled();
-  expect(session.controlError).toBe('mic');
+  // 发布权限被主持人撤掉（禁止发言）：单独的错误码，页面据此提示「已禁言」。
+  expect(session.controlError).toBe('mic_denied');
 
   session.setAppForeground(false);
   session.control('camera', true);

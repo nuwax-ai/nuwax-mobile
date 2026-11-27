@@ -108,6 +108,13 @@ export class MeetingStageSession {
   static videos: string = ''
   static messages: MeetingMessage[] = []
   private static stageTap: string = ''
+  /**
+   * 会议自己激活的音频会话（应用级）。退会时只归还自己激活的那一次，
+   * 避免把别的模块（如单聊 VoIP）已经激活的会话一起关掉。
+   */
+  private static audioSessionOwned: boolean = false
+  /** 音频会话/输出设备操作的串行队列：激活与归还不能交叉（见 setSpeakerRoute）。 */
+  private static audioRouteWork: Promise<void> = Promise.resolve()
 
   static setStagePresentation(mountId: number, presentation: string): void {
     if (MeetingStageSession.mount?.id === mountId) MeetingStageSession.host?.setStagePresentation(presentation)
@@ -158,6 +165,10 @@ export class MeetingStageSession {
     command.url = url
     command.token = token
     MeetingStageSession.pending = command
+    // 会议默认外放（与 Android 入会 setSpeakerEnabled(true) 同口径），并且赶在 ArkWeb
+    // 开始播放之前把应用级会话激活成 VoIP 场景 —— 播放流按激活时的场景确定流类型，
+    // 等用户点扬声器才激活的话，后设的输出设备可能作用不到已开始的播放流上。
+    MeetingStageSession.setSpeakerRoute(true, MeetingStageSession.id).catch((): void => {})
     MeetingStageSession.flush()
   }
 
@@ -167,6 +178,59 @@ export class MeetingStageSession {
     if (!command || !host?.ready || host.leaving) return
     MeetingStageSession.pending = undefined
     host.send(command)
+  }
+
+  /**
+   * 切会议音频出口：true=外放，false=听筒。**所有会话/路由操作串行**，避免退会归还与
+   * 重新激活交叉（重进会议时会把刚设好的输出设备顶掉）。
+   *
+   * ★为什么不再用 AudioRoutingManager.setCommunicationDevice：
+   *   会议远端声音由 ArkWeb 里的 WebRTC 播放（按 VoIP 通话流类型出声）。该接口在系统侧
+   *   已标记废弃、对这类播放改不了路由，而 isCommunicationDeviceActiveSync 会一直回读
+   *   「扬声器仍激活」——用户看到的就是「点了关不掉 + 操作失败」。
+   *   应用级 AudioSession（VOICE_COMMUNICATION 场景）的 setDefaultOutputDevice 才会作用到
+   *   VoIP 类播放流上，且 getDefaultOutputDevice 能回读设置结果（官方音频路由切换指南）。
+   *
+   * @param id 会场代次：切的过程中退会/换会（id 变了）就放弃，不写回状态。
+   * @returns 输出设备是否确认切到位（false = 失败或已作废）。
+   */
+  static setSpeakerRoute(on: boolean, id: number): Promise<boolean> {
+    const run = MeetingStageSession.audioRouteWork.then(async (): Promise<boolean> => {
+      if (MeetingStageSession.id !== id) return false
+      try {
+        const session = audio.getAudioManager().getSessionManager()
+        if (!session.isAudioSessionActivated()) {
+          session.setAudioSessionScene(audio.AudioSessionScene.AUDIO_SESSION_SCENE_VOICE_COMMUNICATION)
+          await session.activateAudioSession({ concurrencyMode: audio.AudioConcurrencyMode.CONCURRENCY_MIX_WITH_OTHERS })
+          MeetingStageSession.audioSessionOwned = true
+        }
+        if (MeetingStageSession.id !== id) return false
+        const target = on ? audio.DeviceType.SPEAKER : audio.DeviceType.EARPIECE
+        await session.setDefaultOutputDevice(target)
+        if (MeetingStageSession.id !== id) return false
+        // 回读应用级设置（系统随后才真正切换路由）；比旧实现读 isCommunicationDeviceActiveSync 稳。
+        if (session.getDefaultOutputDevice() !== target) return false
+        MeetingStageSession.speaker = on
+        return true
+      } catch (_) {
+        return false
+      }
+    })
+    MeetingStageSession.audioRouteWork = run.then((): void => {}).catch((): void => {})
+    return run
+  }
+
+  /** 退会：会话是我们激活的那一次才把输出设备交还系统并归还；别人激活的不动。 */
+  static releaseAudioSession(): void {
+    if (!MeetingStageSession.audioSessionOwned) return
+    MeetingStageSession.audioSessionOwned = false
+    MeetingStageSession.audioRouteWork = MeetingStageSession.audioRouteWork.then(async () => {
+      try {
+        const session = audio.getAudioManager().getSessionManager()
+        await session.setDefaultOutputDevice(audio.DeviceType.DEFAULT)
+        await session.deactivateAudioSession()
+      } catch (_) {}
+    })
   }
 
   static disconnect(): Promise<boolean> {
@@ -204,6 +268,7 @@ export class MeetingStageSession {
     MeetingStageSession.videos = ''
     MeetingStageSession.messages = []
     MeetingStageSession.stageTap = ''
+    MeetingStageSession.releaseAudioSession()
     return leaving ?? Promise.resolve(true)
   }
 
@@ -618,24 +683,22 @@ export class MeetingStageHost {
       if (MeetingStageSession.host !== this || MeetingStageSession.id !== command.id) return
       if (command.type === 'speaker') {
         if (!MeetingStageSession.isConnected()) return
-        const on = command.on === true
-        const routing = audio.getAudioManager().getRoutingManager()
-        // ArkWeb can restore its WebRTC output route just after the first switch. Re-apply the
-        // communication route while it settles, and expose only the route confirmed by the OS.
-        for (let attempt = 0; attempt < 4; attempt++) {
-          await routing.setCommunicationDevice(audio.CommunicationDeviceType.SPEAKER, on)
-          if (MeetingStageSession.host !== this || MeetingStageSession.id !== command.id ||
-              !MeetingStageSession.isConnected()) return
-          if (this.readSpeaker() && MeetingStageSession.speaker === on) return
-          if (attempt < 3) await new Promise<void>((resolve) => { setTimeout(resolve, 80) })
-        }
-        if (MeetingStageSession.host === this && MeetingStageSession.id === command.id &&
+        const applied = await MeetingStageSession.setSpeakerRoute(command.on === true, command.id)
+        if (!applied && MeetingStageSession.host === this && MeetingStageSession.id === command.id &&
             MeetingStageSession.isConnected()) MeetingStageSession.controlError = command.type
         return
       }
       if (command.on && (command.type === 'mic' || command.type === 'camera')) {
         const allowed = command.type === 'mic' ? MeetingStageSession.micAllowed : MeetingStageSession.cameraAllowed
-        if (!allowed || !MeetingStageSession.isAppForeground()) throw new Error('media permission')
+        if (!allowed) {
+          // 主持人撤了发布权限（禁止发言 / 未授权摄像头）：这不是设备故障，
+          // 用 *_denied 区分开，页面才能给出「已禁言」而不是泛化的「操作失败」。
+          if (MeetingStageSession.host === this && MeetingStageSession.id === command.id) {
+            MeetingStageSession.controlError = command.type + '_denied'
+          }
+          return
+        }
+        if (!MeetingStageSession.isAppForeground()) throw new Error('media permission')
         const permission: Permissions = command.type === 'mic' ? 'ohos.permission.MICROPHONE' : 'ohos.permission.CAMERA'
         const manager = abilityAccessCtrl.createAtManager()
         if (manager.checkAccessTokenSync(this.context.applicationInfo.accessTokenId, permission) !== 0) {
@@ -651,8 +714,18 @@ export class MeetingStageHost {
 
   readSpeaker(): boolean {
     try {
-      const routing = audio.getAudioManager().getRoutingManager()
-      MeetingStageSession.speaker = routing.isCommunicationDeviceActiveSync(
+      // 会议里音频走应用级 AudioSession：有会话时以它记录的输出设备为准。
+      const manager = audio.getAudioManager()
+      const session = manager.getSessionManager()
+      if (session.isAudioSessionActivated()) {
+        const device = session.getDefaultOutputDevice()
+        if (device !== audio.DeviceType.DEFAULT) {
+          MeetingStageSession.speaker = device === audio.DeviceType.SPEAKER
+          return true
+        }
+      }
+      // 还没切过（没有会话/未设置）时退回系统当前通信路由，给图标一个初始值。
+      MeetingStageSession.speaker = manager.getRoutingManager().isCommunicationDeviceActiveSync(
         audio.CommunicationDeviceType.SPEAKER)
       return true
     } catch (_) {

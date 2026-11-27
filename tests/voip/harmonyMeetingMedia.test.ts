@@ -408,15 +408,23 @@ describe('Harmony LiveKit room', () => {
 
 
 describe('Harmony meeting card controls', () => {
-  it('does not expose picture in picture and uses image assets for microphone and raised hand state', () => {
+  it('keeps camera and raised-hand controls on the local video card and omits recording text', () => {
     const source = readFileSync(new URL('../../scripts/meeting-harmony/room.mjs', import.meta.url), 'utf8');
     const page = readFileSync(new URL('../../scripts/meeting-harmony/media.html', import.meta.url), 'utf8');
     expect(source.toLowerCase()).not.toContain('pictureinpicture');
     expect(page).not.toContain('meeting-pip');
     expect(source).toContain('microphone-ink.png');
     expect(source).toContain('microphone-off-ink.png');
+    expect(source).toContain('switch-camera-white.png');
     expect(source).toContain('icon-hand.svg');
+    expect(source).toContain('track.source === Track.Source.Camera && track.isLocal');
+    expect(source).toContain('mediaRoom.switchCamera()');
+    expect(source).not.toContain("'member-rec'");
+    expect(source).not.toContain("recording ? 'REC'");
+    expect(page).toContain('.member-camera-switch');
     expect(page).toContain('.member-hand { position: absolute;');
     expect(page).toContain('top: 8px; left: 8px;');
+    expect(page).toContain('border-radius: 50%');
+    expect(page).toContain('.member-hand.after-camera-switch { left: 42px; }');
   });
 });

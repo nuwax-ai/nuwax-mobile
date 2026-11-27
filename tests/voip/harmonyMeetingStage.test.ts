@@ -20,7 +20,7 @@ function nativeStage() {
   };
   const routing = {
     setCommunicationDevice: vi.fn(async (_device: number, _active: boolean) => {}),
-    getPreferredOutputDeviceForRendererInfoSync: vi.fn((_info: object) => [{ deviceType: 1 }]),
+    isCommunicationDeviceActiveSync: vi.fn((_device: number) => true),
   };
   const destroy = vi.fn();
   const request = vi.fn().mockResolvedValue({ responseCode: 200, result: '{"code":"0000"}' });
@@ -50,8 +50,6 @@ function nativeStage() {
     EntryVoipBackgroundTask: task,
     audio: {
       CommunicationDeviceType: { SPEAKER: 2 },
-      DeviceType: { SPEAKER: 1, EARPIECE: 2 },
-      StreamUsage: { STREAM_USAGE_VIDEO_COMMUNICATION: 3 },
       getAudioManager: () => ({ getRoutingManager: () => routing }),
     },
     abilityAccessCtrl: { createAtManager: () => permissions },
@@ -101,6 +99,7 @@ describe('Harmony meeting native stage', () => {
     expect(mic).toContain('meetingMediaSetMic(next);');
     expect(camera).toContain('meetingMediaSetCamera(next);');
     expect(page).toContain('meetingMediaSwitchCamera();');
+    expect(page).not.toContain('v-if="harmonyMediaVisible && cameraOn"');
     expect(page).toContain('meetingMediaSetSpeaker(!speakerOn.value);');
     expect(page).not.toContain('mr-harmony-roster');
     expect(page).toContain('hostLabel: tile.host ? t("Mobile.Meeting.hostBadge") : ""');
@@ -194,7 +193,7 @@ function settle() {
 
 it('reads back the system speaker state after switching and on return to the foreground', async () => {
   const { session, routing } = connectedStage();
-  routing.getPreferredOutputDeviceForRendererInfoSync.mockReturnValue([{ deviceType: 2 }]);
+  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
   session.control('speaker', false);
   await settle();
   expect(routing.setCommunicationDevice).toHaveBeenCalledWith(2, false);
@@ -202,11 +201,11 @@ it('reads back the system speaker state after switching and on return to the for
   expect(session.controlError).toBe('');
 
   session.setAppForeground(false);
-  routing.getPreferredOutputDeviceForRendererInfoSync.mockReturnValue([{ deviceType: 1 }]);
+  routing.isCommunicationDeviceActiveSync.mockReturnValue(true);
   session.setAppForeground(true);
   expect(session.speaker).toBe(true);
 
-  routing.getPreferredOutputDeviceForRendererInfoSync.mockReturnValue([{ deviceType: 1 }]);
+  routing.isCommunicationDeviceActiveSync.mockReturnValue(true);
   session.control('speaker', true);
   await settle();
   expect(session.speaker).toBe(true);
@@ -219,12 +218,13 @@ it('waits for a delayed Harmony speaker route update without reporting a false f
   expect(session.controlError).toBe('');
   expect(timers.size).toBe(1);
 
-  routing.getPreferredOutputDeviceForRendererInfoSync.mockReturnValue([{ deviceType: 2 }]);
+  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
   Array.from(timers.values())[0].callback();
   await settle();
   expect(session.speaker).toBe(false);
   expect(session.controlError).toBe('');
-  expect(routing.getPreferredOutputDeviceForRendererInfoSync).toHaveBeenCalledTimes(2);
+  expect(routing.setCommunicationDevice).toHaveBeenCalledTimes(2);
+  expect(routing.isCommunicationDeviceActiveSync).toHaveBeenCalledTimes(2);
 });
 
 it('ignores a speaker change that finishes after the room generation changes', async () => {
@@ -239,7 +239,7 @@ it('ignores a speaker change that finishes after the room generation changes', a
   session.connect('wss://other-room.test', 'new-token');
   finish();
   await settle();
-  expect(routing.getPreferredOutputDeviceForRendererInfoSync).not.toHaveBeenCalled();
+  expect(routing.isCommunicationDeviceActiveSync).not.toHaveBeenCalled();
   expect(session.speaker).toBe(true);
   expect(session.controlError).toBe('');
 });

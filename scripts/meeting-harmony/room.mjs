@@ -1,6 +1,7 @@
 import { ConnectionState, LogLevel, Room, RoomEvent, Track, setLogLevel } from 'livekit-client';
 import microphoneIcon from '../../static/voip/call-icons/microphone-ink.png';
 import microphoneOffIcon from '../../static/voip/call-icons/microphone-off-ink.png';
+import switchCameraIcon from '../../static/voip/call-icons/switch-camera-white.png';
 import handIcon from '../../static/images/icon-hand.svg';
 
 const encoder = new TextEncoder();
@@ -272,7 +273,11 @@ export function createMeetingMedia(post, render) {
     if (current) post({ type: 'stageTap', id: current.id, identity, thumbnail });
   }
 
-  return { dispatch, disconnect, startCapture, stageTap };
+  function switchCamera() {
+    if (current) dispatch({ type: 'flip', id: current.id });
+  }
+
+  return { dispatch, disconnect, startCapture, stageTap, switchCamera };
 }
 
 export function meetingGridGeometry(count, preferredColumns) {
@@ -344,7 +349,7 @@ function mount() {
     mic.className = 'member-mic';
     mic.alt = '';
     caption.append(mic);
-    for (const className of ['member-name', 'member-host', 'member-rec']) {
+    for (const className of ['member-name', 'member-host']) {
       const label = document.createElement('span');
       label.className = className;
       caption.append(label);
@@ -354,12 +359,27 @@ function mount() {
 
   function updateCaption(caption, identity, fallbackName, details) {
     const detail = details.get(identity) || { name: fallbackName || identity };
-    const [mic, name, host, recording] = caption.children;
+    const [mic, name, host] = caption.children;
     const micSource = detail.micOn ? microphoneIcon : microphoneOffIcon;
     if (mic.getAttribute('src') !== micSource) mic.src = micSource;
     name.textContent = detail.name || fallbackName || identity;
     host.textContent = detail.hostLabel || '';
-    recording.textContent = detail.recording ? 'REC' : '';
+  }
+
+  function createCameraSwitch() {
+    const button = document.createElement('button');
+    button.className = 'member-camera-switch';
+    button.type = 'button';
+    button.setAttribute('aria-label', 'Switch camera');
+    const image = document.createElement('img');
+    image.src = switchCameraIcon;
+    image.alt = '';
+    button.append(image);
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      mediaRoom.switchCamera();
+    });
+    return button;
   }
 
   function createHand() {
@@ -371,8 +391,9 @@ function mount() {
     return hand;
   }
 
-  function updateHand(hand, identity, details) {
+  function updateHand(hand, identity, details, afterCameraSwitch = false) {
     hand.hidden = details.get(identity)?.handRaised !== true;
+    hand.classList.toggle('after-camera-switch', afterCameraSwitch);
   }
 
   function updateAvatar(image, initial, identity, name, details) {
@@ -416,15 +437,18 @@ function mount() {
         const element = participant ? document.createElement('figure') : media;
         const caption = participant ? createCaption() : undefined;
         const hand = participant ? createHand() : undefined;
+        const cameraSwitch = participant && track.source === Track.Source.Camera && track.isLocal ? createCameraSwitch() : undefined;
         if (caption) {
-          element.append(media, hand, caption);
+          element.append(media);
+          if (cameraSwitch) element.append(cameraSwitch);
+          element.append(hand, caption);
           element.addEventListener('click', () => {
             if (element.parentElement === grid) mediaRoom.stageTap(participant.identity, false);
           });
         }
         track.attach(media);
         container.append(element);
-        tracks.set(track, { media, element, caption, hand });
+        tracks.set(track, { media, element, caption, hand, cameraSwitch });
       }
     }
     cameras.forEach(({ participant, track }) => attach(track, grid, participant));
@@ -445,7 +469,7 @@ function mount() {
       node.element.hidden = order < 0 || replacedByShare;
       node.element.style.order = order;
       updateCaption(node.caption, participant.identity, participant.name, layout.details);
-      updateHand(node.hand, participant.identity, layout.details);
+      updateHand(node.hand, participant.identity, layout.details, !!node.cameraSwitch);
       if (order >= 0 && !replacedByShare) visualKeys.add(participant.identity);
     }
     if (shared) {

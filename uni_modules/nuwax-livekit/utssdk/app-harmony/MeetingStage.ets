@@ -620,20 +620,17 @@ export class MeetingStageHost {
         if (!MeetingStageSession.isConnected()) return
         const on = command.on === true
         const routing = audio.getAudioManager().getRoutingManager()
-        await routing.setCommunicationDevice(audio.CommunicationDeviceType.SPEAKER, on)
-        if (MeetingStageSession.host !== this || MeetingStageSession.id !== command.id ||
-            !MeetingStageSession.isConnected()) return
-        // The route query can lag behind setCommunicationDevice. The system call resolving is the
-        // success boundary; the retries only converge to the actual output device for the icon.
-        MeetingStageSession.speaker = on
+        // ArkWeb can restore its WebRTC output route just after the first switch. Re-apply the
+        // communication route while it settles, and expose only the route confirmed by the OS.
         for (let attempt = 0; attempt < 4; attempt++) {
+          await routing.setCommunicationDevice(audio.CommunicationDeviceType.SPEAKER, on)
           if (MeetingStageSession.host !== this || MeetingStageSession.id !== command.id ||
               !MeetingStageSession.isConnected()) return
           if (this.readSpeaker() && MeetingStageSession.speaker === on) return
           if (attempt < 3) await new Promise<void>((resolve) => { setTimeout(resolve, 80) })
         }
         if (MeetingStageSession.host === this && MeetingStageSession.id === command.id &&
-            MeetingStageSession.isConnected()) MeetingStageSession.speaker = on
+            MeetingStageSession.isConnected()) MeetingStageSession.controlError = command.type
         return
       }
       if (command.on && (command.type === 'mic' || command.type === 'camera')) {
@@ -655,13 +652,8 @@ export class MeetingStageHost {
   readSpeaker(): boolean {
     try {
       const routing = audio.getAudioManager().getRoutingManager()
-      const devices = routing.getPreferredOutputDeviceForRendererInfoSync({
-        usage: audio.StreamUsage.STREAM_USAGE_VIDEO_COMMUNICATION,
-        rendererFlags: 0,
-      })
-      const type = devices[0]?.deviceType
-      if (type == null) return false
-      MeetingStageSession.speaker = type === audio.DeviceType.SPEAKER
+      MeetingStageSession.speaker = routing.isCommunicationDeviceActiveSync(
+        audio.CommunicationDeviceType.SPEAKER)
       return true
     } catch (_) {
       return false

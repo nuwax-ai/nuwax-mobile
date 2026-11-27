@@ -54,12 +54,32 @@ HBuilderX 生成 Harmony 原生工程后、hvigor 编译前执行：
 
 ```bash
 pnpm voip:prepare
-pnpm voip:harmony:assemble -- "$PWD/unpackage/dist/dev/app-harmony"
+pnpm voip:harmony:assemble "$PWD/unpackage/dist/dev/app-harmony"
 ```
 
 assemble 入口使用 DevEco 自带的 Node/JBR/hvigor，先执行 prepare 再编译 HAP。prepare 脚本只允许修改当前 worktree 忽略目录下的工程；合并权限、单个推送监听、媒体 Ability 和页面路由，并复制模板、i18n reason 和 ArkWeb 资源。重复执行不增加重复项；发现其他 Ability 已拥有 push listener 则拒绝构建，让维护者协调现有 uni-push 接收方，不能默默抢占。模板源在 `scripts/voip-native/harmony/`，不手改生成目录。每次 HBuilderX 重生成工程后都须重新运行该步骤；正式打包入口须把它设为 hvigor 前置步骤。
 
 **ArkWeb 能否在后台/锁屏持续双向音频必须以真机验证为准。** 30 分钟、系统应答、回收后冷启动任一未通过，鸿蒙开关保持关闭。前台两页演示不能作为替代。
+
+### 鸿蒙业务测试包与挂断日志
+
+带原生锁屏语音能力的测试包使用隔离项目。先运行 `node scripts/voip-native/prepare-business-qa.mjs`，再在 HBuilderX 为生成的 `out/voip-business-qa-project` 导出鸿蒙工程。准备好 OpenHarmony Go 本地工具链后，在原 worktree 执行：
+
+```bash
+bash scripts/voip-native/harmony-voice-qa/build-library.sh
+NUWAX_HARMONY_VOICE_LIBRARY="$PWD/out/harmony-native-audio-rtc/libnuwax_harmony_rtc.so" \
+  pnpm voip:harmony:assemble "$PWD/out/voip-business-qa-project/unpackage/dist/dev/app-harmony"
+```
+
+使用测试签名出包，记录 HAP 的 SHA-256。原生语音库只允许装入指向测试环境的业务测试工程，系统接听语音时才使用。视频继续由 ArkWeb 承载。
+
+鸿蒙业务测试包组装前会核对当前工作树与 QA 源码快照，并检查 HBuilderX 导出时间。源码有更新时，重新生成 QA 工程并导出鸿蒙工程后再组装。这个检查也覆盖随测试包交付的会议媒体资源。
+
+真机上分别由本端和对端挂断，按同一 `callId` 检查日志，并在进程仍存活时采集系统音频和后台任务状态：
+
+- 原生语音核对 `nativeVoiceResourceReleased` 的 `capturer`、`renderer`、`backgroundTask` 三项和最终的 `nativeVoiceReleased`。资源调用报错时会记录 `nativeVoiceResourceReleaseFailed`。
+- ArkWeb 核对 `mediaWebReleased` 和 `mediaBackgroundReleased`，再确认系统音频列表中该进程的采集和播放流已停止、VoIP 后台任务已结束。
+- 冷启动回归单独记录发起时的锁屏及进程状态、华为专用推送回调、系统接听和实际双向媒体。挂断后先留取证据，再为下一通清理或退出进程。
 
 ## 集成边界
 

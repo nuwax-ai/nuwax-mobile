@@ -1,6 +1,5 @@
 import { handleVoipInvitation, isNativeImVoipEnabled } from "@/features/voip/integration";
 import { getApiBaseUrl, getImPushEnvironment } from "@/constants/config";
-import { buildMeetingInviteUrl } from "@/utils/meeting/meetingLink";
 import { showMeetingInviteBanner } from "@/utils/im/meetingInviteBanner";
 import { getMyUserIdSync } from "@/utils/imNoticeBar";
 // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
@@ -14,6 +13,13 @@ import { syncAppIconBadge } from "@/utils/appIconBadge";
 import { syncVoipPushCid } from "@/uni_modules/nuwax-voip";
 // #endif
 // #ifdef APP-HARMONY
+import { appEntryStage } from "@/utils/appEntryState";
+import { buildMeetingInviteUrl } from "@/utils/meeting/meetingLink";
+import { openMeetingInvite } from "@/utils/meeting/meetingInviteNavigation";
+import { meetingMediaSupported } from "@/utils/meeting/meetingMedia";
+import { markNativeMeetingInviteHandled } from "@/features/voip/integration";
+import { getNativeMeetingInviteState } from "@/uni_modules/nuwax-voip";
+import { hideHandledMeetingInviteBanner } from "@/utils/im/meetingInviteBanner";
 // ★勿改成 @kit.NotificationKit 具名导入：基座 JS 运行时模块表不提供 notificationManager
 //   具名导出（SyntaxError，2026-10-22 真机实锤），必须默认导入（官方 runtime 同款）。
 import notificationManager from "@ohos.notificationManager";
@@ -251,10 +257,19 @@ function registerPushListener(): void {
             pushPayloadField(evData, "passcode"),
             0,
             getImSessionStamp(),
+            pushPayloadField(evData, "inviteId"),
+            pushPayloadField(evData, "msgId"),
+            pushedCallee,
           );
           return;
         }
         if (!isAppInBackground()) {
+          // #ifdef APP-HARMONY
+          try {
+            const nativeState = getNativeMeetingInviteState(pushPayloadField(evData, "msgId"));
+            if (nativeState == "pending" || nativeState == "handled") return;
+          } catch (_error) {}
+          // #endif
           const banner = new UTSJSONObject();
           banner["inviteId"] = pushPayloadField(evData, "inviteId");
           banner["convId"] = pushPayloadField(evData, "convId");
@@ -312,18 +327,8 @@ function registerPushListener(): void {
         const meetingMedia = pushPayloadField(data, "mediaType");
         // 被直接邀请的人免填密码：邀请推送里带了密码就带给令牌接口
         const meetingPasscode = pushPayloadField(data, "passcode");
-        // #ifdef APP-HARMONY
-        // 鸿蒙会议后续直接接 H5 会议地址，点击通知打开 Web 会议页。
-        const h5 = buildMeetingInviteUrl(getApiBaseUrl(), meetingRoom);
-        if (h5.length > 0) {
-          uni.navigateTo({ url: "/subpackages/pages/webview/webview?url=" + encodeURIComponent(h5) });
-        }
-        // #endif
-        // #ifdef APP-ANDROID || APP-IOS
-        // ★同一个等待页面栈就绪的入口：冷启动点通知时直接 navigateTo 会被启动页的
-        //   reLaunch 冲掉（表现为进了消息页/首页，没进会议）。
-        openMeetingRoomWithRetry(meetingRoom, meetingTitle, meetingMedia, meetingPasscode, 0, getImSessionStamp());
-        // #endif
+        openMeetingRoomWithRetry(meetingRoom, meetingTitle, meetingMedia, meetingPasscode, 0, getImSessionStamp(),
+          pushPayloadField(data, "inviteId"), pushPayloadField(data, "msgId"), pushPayloadField(data, "calleeId"));
         return;
       }
       const convId = pushPayloadField(data, "convId");
@@ -1114,6 +1119,9 @@ function openMeetingRoomWithRetry(
   passcode: string,
   attempt: number,
   stamp: string,
+  inviteId: string = "",
+  msgId: string = "",
+  calleeId: string = "",
 ): void {
   setTimeout((): void => {
     if (stamp != getImSessionStamp()) return;
@@ -1124,15 +1132,34 @@ function openMeetingRoomWithRetry(
     const pages = getCurrentPages();
     const top = pages.length > 0 ? pages[pages.length - 1] : null;
     const topRoute = top != null ? `${top.route}` : "";
-    const notReady = pages.length == 0 || topRoute == LAUNCH_PAGE_ROUTE || topRoute == LOGIN_PAGE_ROUTE;
+    let notReady = pages.length == 0 || topRoute == LAUNCH_PAGE_ROUTE || topRoute == LOGIN_PAGE_ROUTE;
+    // #ifdef APP-HARMONY
+    const userId = getMyUserIdSync();
+    if (calleeId.length > 0 && userId.length > 0 && userId != calleeId) return;
+    notReady = notReady || (topRoute == "pages/tab-shell/tab-shell" && appEntryStage.value != "main");
+    notReady = notReady || (calleeId.length > 0 && userId.length == 0);
+    // #endif
     if (notReady && attempt < PUSH_CLICK_NAV_MAX_RETRY) {
-      openMeetingRoomWithRetry(roomName, title, mediaType, passcode, attempt + 1, stamp);
+      openMeetingRoomWithRetry(roomName, title, mediaType, passcode, attempt + 1, stamp, inviteId, msgId, calleeId);
       return;
     }
     if (topRoute == LOGIN_PAGE_ROUTE) {
       console.error("[ImPush] meeting click dropped: still on login page");
       return;
     }
+    // #ifdef APP-HARMONY
+    if (notReady) return;
+    if (isNativeImVoipEnabled() && meetingMediaSupported()) {
+      try { if (getNativeMeetingInviteState(msgId) == "handled") return; } catch (_error) {}
+      markNativeMeetingInviteHandled(msgId);
+      hideHandledMeetingInviteBanner(msgId, inviteId);
+      openMeetingInvite(inviteId, roomName, title, mediaType, passcode);
+    } else {
+      const h5 = buildMeetingInviteUrl(getApiBaseUrl(), roomName);
+      if (h5.length > 0) uni.navigateTo({ url: "/subpackages/pages/webview/webview?url=" + encodeURIComponent(h5) });
+    }
+    return;
+    // #endif
     let url = "/subpackages/pages/im-meeting/im-meeting-room?room=" + encodeURIComponent(roomName) +
       "&title=" + encodeURIComponent(title) + "&status=1&host=0&call=1&video=" + (mediaType == "video" ? "1" : "0");
     if (passcode.length > 0) {

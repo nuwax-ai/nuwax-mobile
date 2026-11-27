@@ -3,10 +3,10 @@ import { callFailure, callErrorTranslationKey, isIncomingPresentationError } fro
 import { ref } from "vue";
 import { CallStateStore, CallSnapshot, parseCallSnapshot } from "./callState";
 import { VoipHistoryRecord, parseVoipHistory } from "./callHistory";
-// #ifdef APP-ANDROID || APP-IOS
+// #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
 import { voipChatEndTranslationKey } from "./callHistory";
 // #endif
-// #ifdef APP-ANDROID
+// #ifdef APP-ANDROID || APP-HARMONY
 import { VoipChatTerminal, addVoipChatTerminal, readVoipChatTerminals } from "./callHistory";
 // #endif
 import { apiCallCapabilities, apiCreateCall, apiCallSnapshot, voipSessionConfig, readVoipDevSession, setVoipDevSession, cancelCreatedVoipCall } from "@/servers/voip";
@@ -18,6 +18,9 @@ import { getImSessionStamp } from "@/utils/im/imSessionScope";
 import { hasAppPrivacyConsent } from "@/utils/appPrivacyConsent";
 import { isAppInBackground } from "@/utils/appLifecycle";
 import { openMeetingInvite, clearMeetingInviteNavigation, flushMeetingInviteNavigation } from "@/utils/meeting/meetingInviteNavigation";
+// #ifdef APP-HARMONY
+import { hideHandledMeetingInviteBanner } from "@/utils/im/meetingInviteBanner";
+// #endif
 import { executeVoip, drainVoipEvents, ensureVoipPermissions, openVoipAppSettings } from "@/uni_modules/nuwax-voip";
 // #ifdef APP-IOS
 import { revokeVoipPushBeforeLogout } from "@/uni_modules/nuwax-voip";
@@ -45,10 +48,10 @@ export const voipSystemRingingOnly = ref<boolean>(false);
 export const voipAudioRoutes = ref<UTSJSONObject[]>([]);
 export const voipAudioRoute = ref<string>("");
 export const voipHistory = ref<VoipHistoryRecord[]>([]);
-// #ifdef APP-ANDROID || APP-IOS
+// #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
 const chatHistoryImStamp = ref<string>("");
 // #endif
-// #ifdef APP-ANDROID
+// #ifdef APP-ANDROID || APP-HARMONY
 const chatTerminals = ref<VoipChatTerminal[]>([]);
 let chatHistoryStorageKey = "";
 // #endif
@@ -76,10 +79,13 @@ export function isVoipPlatformAccepted(): boolean {
   return false;
 }
 
-/** Android/iOS 使用同一套业务通话；实际服务地址来自当前登录环境。 */
+/** Android/iOS 使用当前登录环境；鸿蒙在测试环境联调。 */
 export function isVoipBusinessEnabled(): boolean {
   // #ifdef APP-ANDROID
   return isVoipReleaseOrigin(getApiBaseUrl());
+  // #endif
+  // #ifdef APP-HARMONY
+  return process.env.NODE_ENV == "development" && getApiBaseUrl() == "https://testagent.xspaceagi.com";
   // #endif
   let supported = false;
   // #ifdef APP-IOS
@@ -95,13 +101,20 @@ function send(command: UTSJSONObject): void {
   executeVoip(JSON.stringify(command));
 }
 
+// #ifdef APP-HARMONY
+export function markNativeMeetingInviteHandled(msgId: string): void {
+  if (nativeScope.length == 0 || msgId.length == 0) return;
+  try { send({ op: "meetingInviteHandled", msgId } as UTSJSONObject); } catch (_error) {}
+}
+// #endif
+
 export function getVoipSnapshot(): CallSnapshot | null { return store.current; }
 export function getVoipChatEndKey(convId: string, callId: string): string {
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   const stamp = chatHistoryImStamp.value;
   if (stamp.length == 0 || stamp != getImSessionStamp()) return "";
   // #endif
-  // #ifdef APP-ANDROID
+  // #ifdef APP-ANDROID || APP-HARMONY
   const row = chatTerminals.value.find((entry: VoipChatTerminal): boolean => entry.convId == convId && entry.callId == callId);
   if (row != null) return voipChatEndTranslationKey(row.reason);
   // #endif
@@ -112,7 +125,7 @@ export function getVoipChatEndKey(convId: string, callId: string): string {
   return "";
 }
 
-// #ifdef APP-ANDROID
+// #ifdef APP-ANDROID || APP-HARMONY
 function rememberVoipChatTerminal(call: CallSnapshot, reason: string): void {
   if (chatHistoryStorageKey.length == 0 || chatHistoryImStamp.value != getImSessionStamp()) return;
   const records = addVoipChatTerminal(chatTerminals.value, call.callId, call.convId, reason);
@@ -214,7 +227,7 @@ function consumeNative(): void {
             } else if (next.state == "ringing" && !voipNativeIncomingUI.value && !isAppInBackground()) openVoipPage();
           }
         } else {
-          // #ifdef APP-ANDROID
+          // #ifdef APP-ANDROID || APP-HARMONY
           rememberVoipChatTerminal(next, next.reason);
           // #endif
           voipNativeIncomingUI.value = false; resetCallControls(); releaseVoipAudio();
@@ -224,7 +237,7 @@ function consumeNative(): void {
         }
       } else if (type == "meetingInvite") {
         // 会议来电：原生只负责熄屏响铃/来电卡片，接听后由这里打开会议页；
-        // 忽略/超时回写 meeting-invite-handled，其余端收起邀请。
+        // 系统卡片接管时收起同一条应用内邀请，接听/忽略/超时再同步给其余端。
         const action = `${event["action"] ?? ""}`;
         const inviteId = `${event["inviteId"] ?? ""}`;
         const room = `${event["roomName"] ?? ""}`;
@@ -232,11 +245,20 @@ function consumeNative(): void {
         const media = `${event["mediaType"] ?? "audio"}`;
         const convId = `${event["convId"] ?? ""}`;
         const msgId = `${event["msgId"] ?? ""}`;
+        // #ifdef APP-HARMONY
+        hideHandledMeetingInviteBanner(msgId, inviteId);
+        // #endif
         if (action == "accept" && room.length > 0) {
           if (convId.length > 0 && msgId.length > 0 && inviteId.length > 0) {
             apiImMeetingInviteHandled(convId, msgId, inviteId, room, true);
           }
+          // #ifdef APP-HARMONY
+          const expiry = event["handoffExpiresAt"];
+          openMeetingInvite(inviteId, room, title, media, `${event["passcode"] ?? ""}`, typeof expiry == "number" ? expiry : 0);
+          // #endif
+          // #ifndef APP-HARMONY
           openMeetingInvite(inviteId, room, title, media, `${event["passcode"] ?? ""}`);
+          // #endif
         } else if ((action == "reject" || action == "timeout") && convId.length > 0 && msgId.length > 0 && inviteId.length > 0) {
           apiImMeetingInviteHandled(convId, msgId, inviteId, room, false);
         }
@@ -254,7 +276,7 @@ function consumeNative(): void {
         traceCall("native call ended");
         if (store.current != null && `${event["callId"] ?? ""}` != store.current?.callId) continue;
         const reason = `${event["reason"] ?? "failed"}`;
-        // #ifdef APP-ANDROID
+        // #ifdef APP-ANDROID || APP-HARMONY
         const call = store.current;
         if (call != null && call.state != "ended") rememberVoipChatTerminal(call, reason);
         // #endif
@@ -331,10 +353,10 @@ export function clearVoipSession(): void {
   voipError.value = ""; voipRevision.value += 1;
   voipNativeIncomingUI.value = false;
   resetCallControls(); voipHistory.value = [];
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   chatHistoryImStamp.value = "";
   // #endif
-  // #ifdef APP-ANDROID
+  // #ifdef APP-ANDROID || APP-HARMONY
   chatHistoryStorageKey = "";
   chatTerminals.value = [];
   // #endif
@@ -370,7 +392,7 @@ export async function bootstrapVoip(): Promise<void> {
   if (timer != 0) { clearInterval(timer); timer = 0; }
   const sameIdentity = userId == uid && deviceId == `${config["deviceId"]}` && sessionApiBase == `${config["apiBaseUrl"]}`;
   if (!sameIdentity) {
-    // #ifdef APP-ANDROID || APP-IOS
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
     chatHistoryImStamp.value = "";
     // #endif
     if (userId.length > 0) clearMeetingInviteNavigation();
@@ -390,6 +412,9 @@ export async function bootstrapVoip(): Promise<void> {
   const labels = new UTSJSONObject();
   const labelKeys = ["meetingInvitation", "meetingNumber", "meetingInvitedBy", "meetingJoin", "meetingIgnore", "meetingJoining", "meetingMinimize", "title", "audio", "video", "minimize", "mute", "unmute", "speaker", "earpiece", "speakerOn", "speakerOff", "switchedToEarpiece", "bluetooth", "headset", "cameraOff", "cameraOn", "switchCamera", "hangup", "connecting", "reconnecting", "ended", "incoming", "dialing", "answerAudio", "answerVideo", "reject", "permissionRequired", "permissionForeground", "testListenerTitle", "testListenerNotification", "testListenerStop"];
   for (let i = 0; i < labelKeys.length; i++) labels[labelKeys[i]] = t("Mobile.Voip." + labelKeys[i]);
+  // #ifdef APP-HARMONY
+  labels["close"] = t("Mobile.Voip.close");
+  // #endif
   // 原生展示时才知道邀请人；保留占位符，避免 t 的空参数插值提前抹去姓名。
   const inviterParams = new Map<string, string | number>();
   inviterParams.set("name", "{name}");
@@ -400,25 +425,28 @@ export async function bootstrapVoip(): Promise<void> {
   } catch (error) {
     // 初始化失败不能留下“已经初始化”的会话戳，否则下次回前台也不会重试。
     sessionStamp = "";
-    // #ifdef APP-ANDROID || APP-IOS
+    // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
     chatHistoryImStamp.value = "";
     // #endif
     voipError.value = "CALL_SYSTEM_UNAVAILABLE";
     throw error;
   }
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   const historyStamp = dev == null && `${config["accessToken"] ?? ""}`.length > 0 ? stamp : "";
   // #endif
-  // #ifdef APP-ANDROID
-  // Android reports the terminal event but has no native history store. Keep only the status for the chat row.
+  // #ifdef APP-ANDROID || APP-HARMONY
+  // Android and Harmony report terminal events. Keep just enough history to render the chat record.
   const historyKey = historyStamp.length > 0 ? `NUWAX_VOIP_CHAT_V1:${encodeURIComponent(sessionApiBase)}:${encodeURIComponent(uid)}` : "";
   if (chatHistoryStorageKey != historyKey) {
     chatHistoryStorageKey = historyKey;
     chatTerminals.value = historyKey.length > 0 ? readVoipChatTerminals(historyKey) : [];
   }
   // #endif
-  // #ifdef APP-ANDROID || APP-IOS
+  // #ifdef APP-ANDROID || APP-IOS || APP-HARMONY
   chatHistoryImStamp.value = historyStamp;
+  // #endif
+  // #ifdef APP-HARMONY
+  voipRevision.value += 1;
   // #endif
   timer = setInterval((): void => { consumeNative(); }, 100);
 }
@@ -490,6 +518,9 @@ export async function answerVoipCall(mediaType: string): Promise<void> {
     const permitted = await ensureVoipPermissions(mediaType);
     if (epoch != store.epoch || store.current?.callId != current.callId || store.current?.state != "ringing") return;
     if (!permitted) { voipError.value = "CALL_PERMISSION_REQUIRED"; return; }
+    // #ifdef APP-HARMONY
+    if (voipError.value == "CALL_PERMISSION_REQUIRED") voipError.value = "";
+    // #endif
     send({ op: "action", action: "accept", answerMediaType: mediaType, callId: current.callId } as UTSJSONObject);
   } finally { if (epoch == store.epoch && answeringCallId == current.callId) answeringCallId = ""; }
 }

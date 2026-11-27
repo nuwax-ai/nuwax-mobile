@@ -14,6 +14,7 @@ describe('standalone QA build boundaries', () => {
     const source = readFileSync(new URL('../../features/voip/callManager.uts', import.meta.url), 'utf8');
     const qa = qaManager(source);
     expect(qa).toContain(`return supported && getApiBaseUrl() == "${testOrigin}";`);
+    expect(qa).toContain(`return getApiBaseUrl() == "${testOrigin}";`);
     expect(source).toContain('return supported && getApiBaseUrl().startsWith("https://");');
     expect(() => qaManager(qa)).toThrow(); expect(() => qaConfig(qaConfig(readFileSync(new URL('../../constants/config.uts', import.meta.url), 'utf8')))).toThrow();
   });

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const fake = vi.hoisted(() => ({ rooms: [] as any[] }));
 vi.mock('livekit-client', () => ({
-  RoomEvent: { TrackSubscribed: 'subscribed', TrackUnsubscribed: 'unsubscribed', ParticipantConnected: 'participant', ParticipantDisconnected: 'left', DataReceived: 'data', Reconnecting: 'reconnecting', Reconnected: 'reconnected', AudioPlaybackStatusChanged: 'audio', Disconnected: 'disconnected' },
+  RoomEvent: { TrackSubscribed: 'subscribed', TrackUnsubscribed: 'unsubscribed', TrackMuted: 'muted', TrackUnmuted: 'unmuted', ParticipantConnected: 'participant', ParticipantDisconnected: 'left', DataReceived: 'data', Reconnecting: 'reconnecting', Reconnected: 'reconnected', AudioPlaybackStatusChanged: 'audio', Disconnected: 'disconnected' },
   ConnectionState: { Reconnecting: 'reconnecting', Connected: 'connected' },
   Track: { Source: { Camera: 'camera', Microphone: 'microphone' }, Kind: { Audio: 'audio', Video: 'video' } },
   Room: class {
@@ -15,10 +15,10 @@ vi.mock('livekit-client', () => ({
 }));
 beforeEach(() => { fake.rooms.length = 0; vi.stubGlobal('document', { documentElement: { dataset: {} } }); });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
-async function media() {
+async function media(root = {}) {
   const { createMediaEngine } = await import('../../scripts/voip-dev/media.mjs');
   const events: any[] = [];
-  return { engine: createMediaEngine((event: any) => events.push(event), {}), events };
+  return { engine: createMediaEngine((event: any) => events.push(event), root), events };
 }
 describe('media bridge lifetime', () => {
   it('confirms a muted peer through a scoped reliable packet and repeats after a peer joins', async () => {
@@ -91,6 +91,101 @@ describe('media bridge lifetime', () => {
     expect(fake.rooms[0].localParticipant.setMicrophoneEnabled).toHaveBeenCalledWith(false);
     expect(fake.rooms[0].localParticipant.setCameraEnabled).not.toHaveBeenCalledWith(true);
     await engine.execute({ op: 'disconnect' });
+  });
+});
+
+describe('ArkWeb camera preview', () => {
+  async function joiningVideo() {
+    const root = { append: vi.fn() };
+    const { engine, events } = await media(root);
+    const pending = engine.execute({ op: 'connect', callId: 'video', mediaType: 'video', cameraEnabled: false });
+    await vi.waitFor(() => expect(fake.rooms).toHaveLength(1));
+    const room = fake.rooms[0], participant = room.localParticipant;
+    const track = {
+      attach: vi.fn(() => ({ remove: vi.fn() })),
+      detach: vi.fn(),
+      restartTrack: vi.fn(async () => {}),
+      mediaStreamTrack: { getSettings: () => ({ facingMode: 'user' }) },
+    };
+    const publication = { videoTrack: track };
+    participant.setCameraEnabled.mockResolvedValue(publication);
+    participant.getTrackPublication.mockReturnValue(publication);
+    return { root, engine, events, pending, room, participant, track, publication };
+  }
+
+  it('restores one preview after returning and keeps an explicitly disabled camera off', async () => {
+    const { root, engine, events, pending, room, participant, track } = await joiningVideo();
+    await engine.execute({ op: 'background', hidden: true });
+    await engine.execute({ op: 'camera', callId: 'video', enabled: true });
+    room.resolve();
+    await pending;
+    expect(participant.setCameraEnabled).not.toHaveBeenCalledWith(true);
+    expect(root.append).not.toHaveBeenCalled();
+
+    await engine.execute({ op: 'background', hidden: false });
+    const firstPreview = root.append.mock.calls[0][0];
+    expect(firstPreview).toMatchObject({ className: 'local-video', muted: true, playsInline: true });
+    await engine.execute({ op: 'background', hidden: false });
+    expect(track.attach).toHaveBeenCalledTimes(1);
+    await engine.execute({ op: 'switchCamera', callId: 'video' });
+    expect(track.restartTrack).toHaveBeenCalledWith({ facingMode: 'environment' });
+    expect(events).toContainEqual({ type: 'cameraSwitching', callId: 'video', enabled: false });
+
+    await engine.execute({ op: 'background', hidden: true });
+    expect(track.detach).toHaveBeenCalledWith(firstPreview);
+    expect(firstPreview.remove).toHaveBeenCalledOnce();
+    expect(participant.setCameraEnabled).toHaveBeenLastCalledWith(false);
+    await engine.execute({ op: 'background', hidden: false });
+    expect(root.append).toHaveBeenCalledTimes(2);
+
+    await engine.execute({ op: 'camera', callId: 'video', enabled: false });
+    await engine.execute({ op: 'background', hidden: true });
+    await engine.execute({ op: 'background', hidden: false });
+    expect(participant.setCameraEnabled).toHaveBeenLastCalledWith(false);
+    expect(root.append).toHaveBeenCalledTimes(2);
+    await engine.execute({ op: 'disconnect', callId: 'video' });
+  });
+
+  it('falls back to the caller avatar when the remote video is muted or unsubscribed', async () => {
+    const { engine, events, pending, room } = await joiningVideo();
+    room.resolve();
+    await pending;
+    vi.stubGlobal('HTMLVideoElement', class {});
+    const element = { dataset: {}, style: { visibility: '' }, remove: vi.fn() };
+    const track = { kind: 'video', attach: () => element, detach: () => [element] };
+    const publication = { isMuted: false };
+    const emit = (event: string) => room.on.mock.calls.find(([type]: any[]) => type === event)[1](
+      track, publication, { identity: 'peer' },
+    );
+    emit('subscribed');
+    expect(element.style.visibility).toBe('visible');
+    publication.isMuted = true;
+    emit('muted');
+    expect(element.style.visibility).toBe('hidden');
+    publication.isMuted = false;
+    emit('unmuted');
+    emit('unsubscribed');
+    expect(events.filter(e => e.type === 'remoteVideo').map(e => e.enabled)).toEqual([true, false, true, false]);
+    expect(element.remove).toHaveBeenCalledOnce();
+    await engine.execute({ op: 'disconnect', callId: 'video' });
+  });
+
+  it('ignores a camera enable completion after the call is hung up', async () => {
+    const { root, engine, events, pending, room, participant, publication } = await joiningVideo();
+    room.resolve();
+    await pending;
+    let finishEnable!: () => void;
+    participant.setCameraEnabled.mockImplementationOnce(() => new Promise(resolve => {
+      finishEnable = () => resolve(publication);
+    }));
+    const enable = engine.execute({ op: 'camera', callId: 'video', enabled: true });
+    await vi.waitFor(() => expect(participant.setCameraEnabled).toHaveBeenCalledWith(true));
+    await engine.execute({ op: 'disconnect', callId: 'video' });
+    finishEnable();
+    await enable;
+    expect(room.disconnect).toHaveBeenCalledOnce();
+    expect(events).toContainEqual({ type: 'disconnected', callId: 'video', released: true });
+    expect(root.append).not.toHaveBeenCalled();
   });
 });
 

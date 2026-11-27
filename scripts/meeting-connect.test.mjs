@@ -4,9 +4,7 @@ import { readFileSync } from 'node:fs';
 import { stripTypeScriptTypes } from 'node:module';
 import vm from 'node:vm';
 
-// 执行业务状态机，原生桥和网络为桩；不调用 HBuilderX/设备或真实接口。
-function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = false, preCode = '0', tokenCode = '0' } = {}) {
-  const raw = readFileSync(new URL('../utils/meeting/meetingMedia.uts', import.meta.url), 'utf8');
+function forPlatform(raw, platform) {
   const stack = [true];
   const lines = [];
   for (const line of raw.split('\n')) {
@@ -17,25 +15,36 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     } else if (/^\s*\/\/ #endif/.test(line)) stack.pop();
     else if (stack.at(-1)) lines.push(line);
   }
-  const source = lines.join('\n').replace(/^import[\s\S]*?;\s*$/gm, '');
+  return lines.join('\n');
+}
+
+// 执行业务状态机，原生桥和网络为桩；不调用 HBuilderX/设备或真实接口。
+function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = false, preCode = '0', tokenCode = '0',
+  apiOrigin = 'https://testagent.xspaceagi.com', screenSupported = true, nativeShareAccepted = true,
+  nativeShareStopping = false, claimResult = async () => ({ code: '0' }),
+  preData = { active: true }, tokenData = {} } = {}) {
+  const raw = readFileSync(new URL('../utils/meeting/meetingMedia.uts', import.meta.url), 'utf8');
+  const source = forPlatform(raw, platform).replace(/^import[\s\S]*?;\s*$/gm, '');
   const timers = new Map(), logs = [], operations = [], presentations = [], navigations = [];
   let restoreRequested = false, persistentRestore = false;
   let restoreAcks = 0;
-  let pageReady = true, navigationFails = false, deferNavigation = false;
+  let pageReady = true, navigationFails = false, deferNavigation = false, voipActive = false;
   let routes = ['pages/tab-shell/tab-shell'];
   let nativeSnapshot = '';
   const backDeltas = [];
   const navigationObservers = new Map();
   let now = 10000;
   let nextTimer = 0, connected = false, configured = false, claims = 0;
-  let microphone = false, speaker = true;
+  let microphone = false, speaker = true, remoteScreen = false, shareError = '', releases = 0;
   const globals = {
     console: { error: value => logs.push(String(value)) },
     Date: { now: () => now },
     JSON: { parseObject: JSON.parse, parse: JSON.parse, stringify: JSON.stringify },
     SUCCESS_CODE: '0', eventBus: { emit() {} },
-    apiImMeetingPublicRoomSafe: async () => ({ code: preCode, data: { active: true } }),
-    apiImMeetingIssueToken: async () => ({ code: tokenCode, data: { wsUrl: 'wss://rtc.test', token: 'secret-seat-token' } }),
+    apiImMeetingPublicRoomSafe: async () => ({ code: preCode, data: preData }),
+    apiImMeetingIssueToken: async () => ({ code: tokenCode, data: {
+      wsUrl: 'wss://rtc.test', token: 'secret-seat-token', ...tokenData,
+    } }),
     apiResCode: response => response.code,
     apiResData: response => response.data,
     meetingShareReleaseEndpoint: room => 'https://api.test/rooms/' + room + '/release',
@@ -48,8 +57,6 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     livekitIsConnected: () => connected,
     livekitIsMicEnabled: () => microphone,
     livekitIsSpeakerEnabled: () => speaker,
-    livekitSetMic: on => operations.push(`mic:${on}`),
-    livekitSetSpeaker: on => operations.push(`speaker:${on}`),
     livekitLastError: () => '', livekitParticipantCount: () => connected ? 1 : 0,
     livekitConfigureBackgroundSession(endpoint, token) {
       assert.equal(connected, true, '不能在原生连接成功前配置后台能力');
@@ -58,18 +65,38 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
       if (configThrows) throw new Error('missing bridge method: secret-seat-token');
       configured = true;
     },
-    livekitIsScreenShareOn: () => false, livekitScreenShareError: () => '',
+    getApiBaseUrl: () => apiOrigin,
+    hasNativeVoipCall: () => voipActive,
+    livekitMicEnabled: () => microphone,
+    livekitCameraEnabled: () => false,
+    livekitSpeakerEnabled: () => true,
+    livekitSetMic: on => operations.push(platform === 'APP-HARMONY' ? (on ? 'unmute' : 'mute') : `mic:${on}`),
+    livekitSetCamera: on => operations.push(on ? 'cameraOn' : 'cameraOff'),
+    livekitSwitchCamera: () => operations.push('flipCamera'),
+    livekitSetSpeaker: on => operations.push(platform === 'APP-HARMONY' ? (on ? 'speaker' : 'earpiece') : `speaker:${on}`),
+    livekitRemoteVideoIdentities: () => '',
+    livekitRemoteScreenVisible: () => remoteScreen,
+    livekitScreenCaptureSupported: () => screenSupported,
+    livekitAwaitingScreenCapture: () => false,
+    livekitPrepareScreenCapture(label, cancel, url, token) {
+      operations.push(label + '/' + cancel);
+      assert.equal(url, 'https://api.test/rooms/123456789/release');
+      assert.equal(token, 'secret-seat-token');
+      return nativeShareAccepted;
+    },
+    livekitIsScreenShareOn: () => false, livekitScreenShareError: () => shareError,
     livekitIsScreenShareStopping: () => {
       if (configThrows) throw new Error('旧基座不能调用新增导出');
-      return false;
+      return nativeShareStopping;
     },
     livekitRequestScreenShare() { if (!configThrows) assert.equal(configured, true); operations.push('share'); },
-    apiImMeetingTakeShareHolder: async () => { claims++; return { code: '0' }; },
+    apiImMeetingTakeShareHolder: async () => { claims++; return claimResult(); },
     livekitDisconnect: () => { connected = false; operations.push('disconnect'); },
+    livekitDisconnectConfirmed: async () => { connected = false; operations.push('disconnect'); return true; },
     livekitSendMeetingMessage: () => operations.push('chat'),
     livekitSetHandRaised: on => operations.push(on ? 'raise' : 'lower'),
     livekitStopScreenShare: () => operations.push('stopShare'),
-    apiImMeetingGuestReleaseShareHolder: async () => ({ code: '0' }),
+    apiImMeetingGuestReleaseShareHolder: async () => { releases++; return { code: '0' }; },
     livekitSetMeetingPresentation(visible, foreground) {
       if (configThrows) throw new Error('旧基座没有自动小窗');
       presentations.push({ visible, foreground });
@@ -111,6 +138,8 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     join: () => context.meetingMediaConnect({ room: '123456789', displayName: 'Test', passcode: '' }),
     complete() { connected = true; for (const callback of [...timers.values()]) callback(); },
     claims: () => claims,
+    releases: () => releases,
+    media({ mic = false, shared = false, error = '' }) { microphone = mic; remoteScreen = shared; shareError = error; },
     staleFailure() {
       vm.runInContext('state.connected = false; state.connecting = false; state.errorText = "exception";', context);
     },
@@ -120,6 +149,7 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     requestRestore(persistent = false) { restoreRequested = true; persistentRestore = persistent; },
     restoreAcks: () => restoreAcks,
     pageReady(value) { pageReady = value; },
+    voipActive(value) { voipActive = value; },
     navigationFails(value) { navigationFails = value; },
     routes(value) { routes = value; },
     deferNavigation(value) { deferNavigation = value; },
@@ -236,13 +266,14 @@ test('页面返回/退后台自动更新小窗，原会话不断开，点击小�
   assert.equal(h.operations.includes('disconnect'), false);
 });
 
-function pageFunctions(names) {
+function pageFunctions(names, platform = 'APP-IOS') {
   const source = readFileSync(new URL('../subpackages/pages/im-meeting/im-meeting-room.uvue', import.meta.url), 'utf8');
   return names.map(name => {
-    const start = source.indexOf(`  function ${name}(`);
+    const plainStart = source.indexOf(`  function ${name}(`);
+    const start = plainStart >= 0 ? plainStart : source.indexOf(`  async function ${name}(`);
     assert.notEqual(start, -1);
     const end = source.indexOf('\n  }', start);
-    return source.slice(start, end + 4);
+    return forPlatform(source.slice(start, end + 4), platform);
   }).join('\n');
 }
 
@@ -362,6 +393,43 @@ test('实际页面聊天、举手和共享入口先校准连接，返回不再�
   assert.deepEqual(navigated, ['back']);
   assert.equal(h.api.meetingMediaState().connected, true);
   assert.equal(h.api.meetingMediaIsMinimized(), true);
+});
+
+test('鸿蒙会议连接后返回最小化，点击入口复用当前房间', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  const resume = '/subpackages/pages/im-meeting/im-meeting-room?room=123456789';
+  h.api.meetingMediaSetResumeURL(resume);
+  h.routes(['pages/tab-shell/tab-shell', 'subpackages/pages/im-meeting/im-meeting-room']);
+  await h.join(); h.complete();
+  const ref = value => ({ value });
+  const context = vm.createContext({
+    ...h.api, sheet: ref(''), status: ref(1), mediaConnected: ref(true), mediaConnecting: ref(false),
+    meetingClosing: false, preserveMeetingOnUnmount: false,
+    syncConnectionBeforeAction() {},
+  });
+  vm.runInContext(stripTypeScriptTypes(pageFunctions(['minimizeMeetingPage', 'handleBack'], 'APP-HARMONY')), context);
+  context.handleBack();
+  assert.deepEqual(h.backDeltas, [1]);
+  assert.equal(h.api.meetingMediaIsMinimized(), true);
+  h.api.meetingMediaResume();
+  assert.deepEqual(h.navigations, [resume]);
+  await h.join();
+  assert.deepEqual(h.operations, ['connect']);
+});
+
+test('鸿蒙连接途中返回取消入会，避免恢复一个尚未建立的会话', () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  const ref = value => ({ value });
+  const context = vm.createContext({
+    ...h.api, sheet: ref(''), status: ref(1), mediaConnected: ref(false), mediaConnecting: ref(true),
+    meetingClosing: false,
+    syncConnectionBeforeAction() {},
+    minimizeMeetingPage: () => assert.fail('入会尚未完成'),
+  });
+  vm.runInContext(stripTypeScriptTypes(pageFunctions(['handleBack'], 'APP-HARMONY')), context);
+  context.handleBack();
+  assert.deepEqual(h.backDeltas, [1]);
+  assert.equal(context.meetingClosing, true);
 });
 
 test('通知返回会议：页面未就绪或导航失败时保留请求，成功后不重复打开', async () => {
@@ -518,6 +586,238 @@ test('原生页面切换尚未完成：短间隔轮询不能重复压入会议�
   assert.deepEqual(h.backDeltas, []);
 });
 
+
+test('鸿蒙会议媒体在正式环境启用，设备开关跟随实际采集状态', async () => {
+  const production = harness({ platform: 'APP-HARMONY', apiOrigin: 'https://agent.nuwax.com' });
+  await production.join();
+  assert.equal(production.api.meetingMediaSupported(), true);
+  assert.deepEqual(production.operations, ['connect']);
+
+  const h = harness({ platform: 'APP-HARMONY' });
+  await h.join(); h.complete();
+  h.api.meetingMediaSetMic(true);
+  assert.ok(h.operations.includes('unmute'));
+  assert.equal(h.api.meetingMediaState().micOn, false);
+  h.media({ mic: true, shared: true }); h.api.meetingMediaReconcile();
+  assert.equal(h.api.meetingMediaState().micOn, true);
+  assert.equal(h.api.meetingMediaState().visualMedia, true);
+});
+
+test('鸿蒙令牌时长立即进入页面快照，连接后启动结束与成员联动', async () => {
+  const startedAt = 1795741200000;
+  const h = harness({ platform: 'APP-HARMONY', tokenData: {
+    plannedDurationSec: 7200, meetingStartedAt: startedAt,
+  } });
+  await h.join();
+  assert.equal(h.api.meetingMediaState().plannedDurationSec, 7200);
+  assert.equal(h.api.meetingMediaState().meetingStartedAtMs, startedAt);
+
+  const page = forPlatform(readFileSync(
+    new URL('../subpackages/pages/im-meeting/im-meeting-room.uvue', import.meta.url), 'utf8'), 'APP-HARMONY');
+  const refresh = page.slice(page.indexOf('function refreshMediaState(): void {'), page.indexOf('/** 返回页时保留会议', page.indexOf('function refreshMediaState(): void {')));
+  assert.equal(refresh.includes('plannedSec.value = snap.plannedDurationSec;'), true);
+  assert.equal(refresh.includes('meetingStartedAtMs.value = snap.meetingStartedAtMs;'), true);
+  assert.equal(refresh.includes('startRemoteEndWatch();'), true);
+  assert.equal(refresh.includes('startPeoplePoll();'), true);
+  assert.equal(page.includes('return userId.length > 0 && isInMeetingUser(userId);'), true);
+  assert.equal(page.includes('if (failCode == "IM_50006")'), true);
+  assert.equal(page.includes('if (ended == 2 || ended == 3)'), true);
+});
+
+test('鸿蒙整屏共享交给原生释放，业务层停止时不重复释放', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  await h.join(); h.complete();
+  assert.equal(await h.api.meetingMediaStartScreenShare('other', '共享整个屏幕', '取消'), false);
+  assert.equal(h.claims(), 0);
+  assert.equal(await h.api.meetingMediaStartScreenShare('123456789', '共享整个屏幕', '取消'), true);
+  assert.equal(h.claims(), 1);
+  assert.ok(h.operations.includes('共享整个屏幕/取消'));
+  h.media({ error: 'cancelled' }); h.api.meetingMediaReconcile();
+  assert.ok(h.operations.includes('stopShare'));
+  assert.equal(h.releases(), 0);
+  h.api.meetingMediaReconcile();
+  assert.equal(h.operations.filter(operation => operation === 'stopShare').length, 1);
+});
+
+test('鸿蒙 ArkWeb 无采屏能力时不申请服务端占位', async () => {
+  const h = harness({ platform: 'APP-HARMONY', screenSupported: false });
+  await h.join(); h.complete();
+  assert.equal(await h.api.meetingMediaStartScreenShare('123456789', '共享整个屏幕', '取消'), false);
+  assert.equal(h.claims(), 0);
+});
+
+
+test('鸿蒙原生未接管共享时，业务层归还已申请的席位', async () => {
+  const h = harness({ platform: 'APP-HARMONY', nativeShareAccepted: false });
+  await h.join(); h.complete();
+  assert.equal(await h.api.meetingMediaStartScreenShare('123456789', '共享整个屏幕', '取消'), false);
+  assert.equal(h.claims(), 1);
+  assert.equal(h.releases(), 1);
+});
+
+test('鸿蒙释放尚在途中时不重新申请同席位共享', async () => {
+  const h = harness({ platform: 'APP-HARMONY', nativeShareStopping: true });
+  await h.join(); h.complete();
+  assert.equal(await h.api.meetingMediaStartScreenShare('123456789', '共享整个屏幕', '取消'), false);
+  assert.equal(h.claims(), 0);
+});
+
+test('鸿蒙离会后迟到的共享占用由业务层归还，不唤起采集', async () => {
+  let grant;
+  const h = harness({ platform: 'APP-HARMONY', claimResult: () => new Promise(resolve => { grant = resolve; }) });
+  await h.join(); h.complete();
+  const start = h.api.meetingMediaStartScreenShare('123456789', '共享整个屏幕', '取消');
+  assert.equal(h.claims(), 1);
+  await h.api.meetingMediaDisconnect();
+  assert.equal(h.releases(), 0);
+  grant({ code: '0' });
+  assert.equal(await start, false);
+  assert.equal(h.releases(), 1);
+  assert.equal(h.operations.includes('共享整个屏幕/取消'), false);
+});
+
+test('会议共享请求使用鸿蒙席位，保持 Android 和 iOS 请求形状', async () => {
+  const source = readFileSync(new URL('../servers/imMeeting.uts', import.meta.url), 'utf8');
+  const start = source.indexOf('export async function apiImMeetingTakeShareHolder(');
+  const end = source.indexOf('\n}', start) + 2;
+  for (const platform of ['harmonyos', 'android', 'ios']) {
+    let sent;
+    const part = source.slice(start, end).replace('export ', '');
+    const context = vm.createContext({
+      MEETING_RTC_BASE: '/meetings/rtc', enc: encodeURIComponent,
+      request: async options => { sent = options; },
+    });
+    vm.runInContext(stripTypeScriptTypes(part), context);
+    await context.apiImMeetingTakeShareHolder('123456789', platform);
+    assert.equal(sent.url, '/meetings/rtc/rooms/123456789/share-holder');
+    assert.equal(sent.method, 'POST');
+    assert.equal(sent.data?.platform, platform);
+  }
+});
+
+
+test('鸿蒙点击系统通知时复用当前会议并等待回到前台', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  const resume = '/subpackages/pages/im-meeting/im-meeting-room?room=123456789';
+  h.api.meetingMediaSetResumeURL(resume);
+  await h.join(); h.complete();
+  h.api.meetingMediaSetAppForeground(false);
+  h.requestRestore();
+  h.api.meetingMediaReconcile();
+  assert.deepEqual(h.navigations, []);
+  h.api.meetingMediaSetAppForeground(true);
+  h.api.meetingMediaReconcile();
+  assert.deepEqual(h.navigations, [resume]);
+  assert.deepEqual(h.operations, ['connect']);
+});
+
+test('鸿蒙单聊来电优先，通知返回请求不会在挂断后跳到旧会议页', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  h.api.meetingMediaSetResumeURL('/subpackages/pages/im-meeting/im-meeting-room?room=123456789');
+  await h.join(); h.complete();
+  h.pageReady(false);
+  h.requestRestore();
+  h.api.meetingMediaReconcile();
+  h.voipActive(true);
+  h.pageReady(true);
+  h.api.meetingMediaReconcile();
+  h.voipActive(false);
+  h.api.meetingMediaReconcile();
+  assert.deepEqual(h.navigations, []);
+});
+
+test('鸿蒙会议在原生单聊占用通话路由时不切换扬声器', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  await h.join();
+  h.complete();
+  h.voipActive(true);
+  h.api.meetingMediaSetSpeaker(false);
+  assert.equal(h.operations.includes('earpiece'), false);
+  h.voipActive(false);
+  h.api.meetingMediaSetSpeaker(false);
+  assert.equal(h.operations.at(-1), 'earpiece');
+});
+
+test('鸿蒙原生单聊占用设备期间会议只能关闭本地麦克风和摄像头', async () => {
+  const h = harness({ platform: 'APP-HARMONY' });
+  await h.join();
+  h.complete();
+  h.voipActive(true);
+  h.api.meetingMediaSetMic(true);
+  h.api.meetingMediaSetCamera(true);
+  h.api.meetingMediaSwitchCamera();
+  h.api.meetingMediaSetMic(false);
+  h.api.meetingMediaSetCamera(false);
+  assert.deepEqual(h.operations, ['connect', 'mute', 'cameraOff']);
+
+  h.voipActive(false);
+  h.api.meetingMediaSetMic(true);
+  h.api.meetingMediaSetCamera(true);
+  h.api.meetingMediaSwitchCamera();
+  assert.deepEqual(h.operations.slice(-3), ['unmute', 'cameraOn', 'flipCamera']);
+});
+
+test('鸿蒙提前入会时媒体舞台已挂载，收到进行中详情时不重建', async () => {
+  const page = readFileSync(new URL('../subpackages/pages/im-meeting/im-meeting-room.uvue', import.meta.url), 'utf8');
+  const markup = page.match(/<native-view v-if="mediaSupported && meetingStageEnabled"[^>]+@init="handleHarmonyStageInit"/s);
+  assert.ok(markup);
+  const stageStart = page.indexOf('const meetingStageEnabled = computed(');
+  assert.notEqual(stageStart, -1);
+  const stage = page.slice(stageStart, page.indexOf(';', stageStart) + 1);
+  const context = vm.createContext({
+    computed: get => get, roomRaw: { value: '123456789' }, status: { value: 0 },
+    mediaConnecting: { value: false }, mediaConnected: { value: false },
+  });
+  vm.runInContext(stripTypeScriptTypes(stage) + '\nglobalThis.stage = meetingStageEnabled;', context);
+  assert.equal(context.stage(), true);
+  const h = harness({ platform: 'APP-HARMONY', preData: { active: false, status: 0, allowEarlyJoin: true } });
+  await h.join();
+  assert.deepEqual(h.operations, ['connect']);
+  h.complete();
+  context.mediaConnected.value = h.api.meetingMediaState().connected;
+  context.status.value = 1;
+  assert.equal(context.stage(), true);
+  context.status.value = 2;
+  context.mediaConnected.value = false;
+  assert.equal(context.stage(), false);
+});
+
+test('鸿蒙未开放提前入会时，预检会阻止媒体连接', async () => {
+  const h = harness({ platform: 'APP-HARMONY', preData: { active: false, status: 0, allowEarlyJoin: false } });
+  assert.equal(await h.join(), false);
+  assert.equal(h.api.meetingMediaState().errorText, 'notStarted');
+  assert.deepEqual(h.operations, []);
+});
+
+
+test('鸿蒙最后一位参会者只在退席确认后请求结束空房', async () => {
+  const room = '123456789';
+  for (const [left, rejoined, expected] of [[true, false, [room]], [false, false, []], [true, true, []]]) {
+    let finishLeave;
+    const deleted = [];
+    const context = vm.createContext({
+      meetingMediaDisconnect: () => new Promise(resolve => { finishLeave = resolve; }),
+      meetingMediaActiveRoom: () => rejoined ? room : '',
+      apiImMeetingDeleteRoom: async room => { deleted.push(room); },
+    });
+    vm.runInContext(stripTypeScriptTypes(pageFunctions(['deleteRoomAfterLeaving'], 'APP-HARMONY')), context);
+    const result = context.deleteRoomAfterLeaving(room);
+    assert.deepEqual(deleted, []);
+    finishLeave(left);
+    await result;
+    assert.deepEqual(deleted, expected);
+  }
+});
+
+test('鸿蒙媒体舞台在卡片内承载成员状态且不再重复渲染横向名单', () => {
+  const page = readFileSync(new URL('../subpackages/pages/im-meeting/im-meeting-room.uvue', import.meta.url), 'utf8');
+  assert.equal(page.includes('mr-harmony-roster'), false);
+  const start = page.indexOf('const harmonyStagePresentation = computed(');
+  const presentation = page.slice(start, page.indexOf('// #endif', start));
+  for (const field of ['micOn:', 'handRaised:', 'hostLabel:', 'recording:']) {
+    assert.equal(presentation.includes(field), true);
+  }
+});
 
 test('iOS 会议音频按钮以原生启麦和路由的实际结果为准', async () => {
   const h = harness();

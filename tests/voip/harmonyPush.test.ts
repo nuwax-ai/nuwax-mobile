@@ -2,36 +2,88 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const token = vi.hoisted(() => ({ get: vi.fn() }));
 const transport = vi.hoisted(() => ({ request: vi.fn(), destroy: vi.fn() }));
-const system = vi.hoisted(() => ({ incoming: vi.fn(), error: vi.fn() }));
+const kits = vi.hoisted(() => ({
+  receive: vi.fn(), loadAsset: vi.fn(), report: vi.fn(), reportError: vi.fn(), reportState: vi.fn(),
+  onCall: vi.fn(), createPicture: vi.fn(), createImageSource: vi.fn(), createCallId: vi.fn(),
+  getOutputDevices: vi.fn(), setCommunicationDevice: vi.fn(),
+  setDefaultOutputDevice: vi.fn(), getDefaultOutputDevice: vi.fn(), isAudioSessionActivated: vi.fn(),
+  activateAudioSession: vi.fn(), deactivateAudioSession: vi.fn(), setAudioSessionScene: vi.fn(),
+  onOutputDeviceChange: vi.fn(), offOutputDeviceChange: vi.fn(),
+  checkAccessToken: vi.fn(), requestPermissions: vi.fn(),
+}));
 vi.mock('BuildProfile', () => ({ default: { DEBUG: true } }));
-vi.mock('@kit.AbilityKit', () => ({ bundleManager: {
-  BundleFlag: { GET_BUNDLE_INFO_DEFAULT: 0 },
-  getBundleInfoForSelfSync: () => ({ name: 'com.nuwax.app' }),
-} }));
+vi.mock('@kit.AbilityKit', () => ({
+  bundleManager: {
+    BundleFlag: { GET_BUNDLE_INFO_DEFAULT: 0 },
+    getBundleInfoForSelfSync: () => ({ name: 'com.nuwax.app' }),
+  },
+  abilityAccessCtrl: { createAtManager: () => ({
+    checkAccessTokenSync: kits.checkAccessToken,
+    requestPermissionsFromUser: kits.requestPermissions,
+  }) },
+}));
 vi.mock('@kit.NetworkKit', () => ({ http: {
   createHttp: () => ({ request: transport.request, destroy: transport.destroy }),
-  HttpDataType: { STRING: 0 }, RequestMethod: { GET: 'GET', POST: 'POST' },
+  HttpDataType: { STRING: 0, ARRAY_BUFFER: 1 }, RequestMethod: { GET: 'GET', POST: 'POST' },
 } }));
-vi.mock('@kit.ArkTS', () => ({ util: { TextEncoder: class {
+vi.mock('@kit.ArkTS', () => ({ util: { generateRandomUUID: kits.createCallId, TextEncoder: class {
   encodeInto(value: string) { return new TextEncoder().encode(value); }
+}, TextDecoder: class {
+  decodeWithStream(value: Uint8Array) { return new TextDecoder().decode(value); }
 } } }));
 vi.mock('@kit.AssetStoreKit', () => ({ asset: {
-  Tag: {}, Accessibility: {}, ConflictResolution: {}, SyncType: {},
-  addSync: vi.fn(), removeSync: vi.fn(),
+  Tag: {}, Accessibility: {}, ConflictResolution: {}, SyncType: {}, ReturnType: { ALL: 0 },
+  addSync: vi.fn(), removeSync: vi.fn(), querySync: kits.loadAsset,
 } }));
-vi.mock('@kit.PushKit', () => ({ pushService: { getToken: token.get } }));
-vi.mock('@kit.CallServiceKit', () => ({ voipCall: { on: vi.fn(),
-  reportIncomingCall: system.incoming, reportIncomingCallError: system.error,
-  VoipCallType: { VOIP_CALL_VIDEO: 1, VOIP_CALL_VOICE: 0 }, VoipCallState: { VOIP_CALL_STATE_RINGING: 1 },
-  VoipCallFailureCause: { OTHER: 1, ROUTE_BUSY: 2 }, ErrorReason: { ERROR_NONE: 0 },
+vi.mock('@kit.PushKit', () => ({ pushService: { getToken: token.get, receiveMessage: kits.receive } }));
+vi.mock('@kit.CallServiceKit', () => ({ voipCall: {
+  on: kits.onCall, reportIncomingCall: kits.report, reportIncomingCallError: kits.reportError, reportCallStateChange: kits.reportState,
+  ErrorReason: { ERROR_NONE: 0 },
+  VoipCallType: { VOIP_CALL_VOICE: 'voice', VOIP_CALL_VIDEO: 'video' },
+  VoipCallFailureCause: { OTHER: 'other', ROUTE_BUSY: 'busy' },
+  VoipCallState: {
+    VOIP_CALL_STATE_RINGING: 'ringing', VOIP_CALL_STATE_ANSWERED: 'answered',
+    VOIP_CALL_STATE_ACTIVE: 'active', VOIP_CALL_STATE_DISCONNECTED: 'disconnected',
+  },
+  VoipCallUiEvent: { VOIP_CALL_EVENT_VOICE_ANSWER: 'answer-voice', VOIP_CALL_EVENT_VIDEO_ANSWER: 'answer-video',
+    VOIP_CALL_EVENT_REJECT: 'reject', VOIP_CALL_EVENT_HANGUP: 'hangup' },
 } }));
 vi.mock('@kit.BackgroundTasksKit', () => ({ backgroundTaskManager: {} }));
-vi.mock('@kit.ImageKit', () => ({ image: {} }));
-vi.mock('@kit.AudioKit', () => ({ audio: {} }));
+vi.mock('@kit.ImageKit', () => ({ image: {
+  createPixelMap: kits.createPicture, createImageSource: kits.createImageSource, PixelMapFormat: { RGBA_8888: 0 },
+} }));
+vi.mock('@kit.AudioKit', () => ({ audio: {
+  getAudioManager: () => ({
+    getRoutingManager: () => ({
+      getPreferredOutputDeviceForRendererInfoSync: kits.getOutputDevices,
+      setCommunicationDevice: kits.setCommunicationDevice,
+    }),
+    getSessionManager: () => ({
+      isAudioSessionActivated: kits.isAudioSessionActivated,
+      setAudioSessionScene: kits.setAudioSessionScene,
+      activateAudioSession: kits.activateAudioSession,
+      deactivateAudioSession: kits.deactivateAudioSession,
+      getDefaultOutputDevice: kits.getDefaultOutputDevice,
+      setDefaultOutputDevice: kits.setDefaultOutputDevice,
+      on: kits.onOutputDeviceChange,
+      off: kits.offOutputDeviceChange,
+    }),
+  }),
+  AudioSessionScene: { AUDIO_SESSION_SCENE_VOICE_COMMUNICATION: 'call' },
+  AudioConcurrencyMode: { CONCURRENCY_MIX_WITH_OTHERS: 'mix' },
+  StreamUsage: { STREAM_USAGE_VIDEO_COMMUNICATION: 'video', STREAM_USAGE_VOICE_COMMUNICATION: 'voice' },
+  CommunicationDeviceType: { SPEAKER: 'speaker' },
+  DeviceType: {
+    DEFAULT: 'default', SPEAKER: 'speaker', EARPIECE: 'earpiece', BLUETOOTH_SCO: 'sco', BLUETOOTH_A2DP: 'a2dp',
+    WIRED_HEADSET: 'wired', WIRED_HEADPHONES: 'headphones', USB_HEADSET: 'usb',
+  },
+} }));
 vi.mock('@kit.ArkWeb', () => ({ webview: {} }));
 
 import { VoipBridge, VoipBusinessPolicy } from '../../uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge.ets';
+import { hasNativeVoipCall, openVoipAppSettings } from '../../uni_modules/nuwax-voip/utssdk/app-harmony/index.uts';
 const actualRequest = VoipBridge.request;
+const actualFinish = VoipBridge.finish;
 
 function session(userId: string) {
   return {
@@ -43,9 +95,39 @@ function session(userId: string) {
 beforeEach(() => {
   if (VoipBridge.expiry >= 0) clearTimeout(VoipBridge.expiry);
   VoipBridge.expiry = -1; VoipBridge.mediaId = ''; VoipBridge.nativeId = ''; VoipBridge.connected = false; VoipBridge.readySent = false;
+  VoipBridge.peerReady = false;
+  VoipBridge.mediaForeground = false;
+  VoipBridge.mediaContentLoaded = false;
+  VoipBridge.context = null;
+  VoipBridge.mediaContext = null;
+  VoipBridge.answeredNativeId = ''; VoipBridge.ability = null; VoipBridge.systemRegistered = false;
+  VoipBridge.clearPendingIncoming();
   token.get.mockReset();
-  system.incoming.mockReset().mockResolvedValue(0); system.error.mockReset().mockResolvedValue(undefined);
   transport.request.mockReset(); transport.destroy.mockClear();
+  kits.receive.mockReset(); kits.loadAsset.mockReset();
+  kits.report.mockReset().mockResolvedValue(0);
+  kits.reportError.mockReset().mockResolvedValue(undefined);
+  kits.reportState.mockReset().mockResolvedValue(undefined);
+  kits.createPicture.mockReset().mockResolvedValue({ release: vi.fn() });
+  kits.createImageSource.mockReset();
+  kits.createCallId.mockReset().mockReturnValue('local-system-call');
+  kits.getOutputDevices.mockReset().mockReturnValue([{ deviceType: 'earpiece' }]);
+  kits.getDefaultOutputDevice.mockReset().mockReturnValue('default');
+  kits.isAudioSessionActivated.mockReset().mockReturnValue(false);
+  kits.setAudioSessionScene.mockReset();
+  kits.activateAudioSession.mockReset().mockImplementation(async () => { kits.isAudioSessionActivated.mockReturnValue(true); });
+  kits.deactivateAudioSession.mockReset().mockImplementation(async () => { kits.isAudioSessionActivated.mockReturnValue(false); });
+  kits.onOutputDeviceChange.mockReset(); kits.offOutputDeviceChange.mockReset();
+  kits.setDefaultOutputDevice.mockReset().mockImplementation(async deviceType => {
+    const preferred = kits.getOutputDevices();
+    const hasAccessory = ['sco', 'wired'].includes(preferred[0]?.deviceType);
+    kits.onOutputDeviceChange.mock.lastCall?.[1]({ devices: hasAccessory ? preferred : [{ deviceType }] });
+  });
+  kits.checkAccessToken.mockReset().mockReturnValue(-1);
+  kits.requestPermissions.mockReset().mockResolvedValue({ authResults: [] });
+  kits.setCommunicationDevice.mockReset().mockImplementation(async (_device, enabled) => {
+    kits.getOutputDevices.mockReturnValue([{ deviceType: enabled ? 'speaker' : 'earpiece' }]);
+  });
   vi.spyOn(VoipBridge, 'startStream').mockImplementation(() => {});
   vi.spyOn(VoipBridge, 'finish').mockImplementation(() => {});
   vi.spyOn(VoipBridge, 'request').mockResolvedValue({} as any);
@@ -53,7 +135,523 @@ beforeEach(() => {
   VoipBridge.reset();
   vi.mocked(VoipBridge.finish).mockClear();
 });
-afterEach(() => { VoipBridge.reset(); vi.restoreAllMocks(); vi.useRealTimers(); });
+afterEach(() => { VoipBridge.clearPendingIncoming(); VoipBridge.reset(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+
+describe('Harmony video permission recovery', () => {
+  it('opens the system authorization page from the call permission button', () => {
+    const openAppAuthorizeSetting = vi.fn();
+    vi.stubGlobal('uni', { openAppAuthorizeSetting });
+    openVoipAppSettings();
+    expect(openAppAuthorizeSetting).toHaveBeenCalledExactlyOnceWith({});
+  });
+
+  it.each([false, true])('requests only the missing camera grant from the visible Ability (media foreground: %s)', async foreground => {
+    const entry = { applicationInfo: { accessTokenId: 1 } } as NonNullable<typeof VoipBridge.context>;
+    const media = { applicationInfo: { accessTokenId: 2 } } as NonNullable<typeof VoipBridge.mediaContext>;
+    VoipBridge.context = entry;
+    VoipBridge.mediaContext = media;
+    VoipBridge.mediaForeground = foreground;
+    kits.checkAccessToken.mockImplementation((_token, permission) => permission === 'ohos.permission.CAMERA' ? -1 : 0);
+    kits.requestPermissions.mockResolvedValue({ authResults: [0] });
+
+    await expect(VoipBridge.ensurePermissions('video')).resolves.toBe(true);
+    expect(kits.requestPermissions).toHaveBeenCalledExactlyOnceWith(foreground ? media : entry, ['ohos.permission.CAMERA']);
+
+    kits.checkAccessToken.mockReturnValue(0);
+    await expect(VoipBridge.ensurePermissions('video')).resolves.toBe(true);
+    expect(kits.requestPermissions).toHaveBeenCalledOnce();
+  });
+});
+
+describe('Harmony system call cold start', () => {
+  const convId = '245475557381246976';
+  const msgId = '9223372036854775807';
+  const callId = 'business-call';
+  const systemId = 'huawei-system-call';
+  const config = { ...session('alice'), protocol: 'im-voip-v1' };
+  const invite = (override: Record<string, unknown> = {}) => ({
+    type: 'voip', callId, convId, msgId, mediaType: 'video', calleeId: 'alice',
+    displayName: 'Bob', expiresAt: Date.now() + 30000, ...override,
+  });
+  const push = (override: Record<string, unknown> = {}, nativeId = systemId) => ({
+    callId: nativeId, data: JSON.stringify(invite(override)),
+  });
+  const message = () => ({
+    convId, msgId, msgType: 'voip', senderId: 'bob', senderType: 1, msgStatus: 1,
+    sendTime: Date.now(), body: { callId, roomName: 'authenticated-room', mediaType: 'video' },
+  });
+  const detail = { convType: 1, peerUserId: 'bob', peerName: 'Bob' };
+  const setup = () => {
+    vi.mocked(VoipBridge.finish).mockImplementation(actualFinish);
+    VoipBridge.initialize(config);
+  };
+  const meetingConfig = { ...config, apiBaseUrl: 'https://testagent.xspaceagi.com' };
+  const meetingPush = () => push({ scene: 'meeting', inviteId: 'qa-meeting', roomName: 'untrusted-room', passcode: '4321' });
+  const meetingMessage = () => ({
+    convId, msgId, msgType: 'meeting_invite', senderId: 'bob', sendTime: Date.now(),
+    body: { inviteId: 'qa-meeting', roomName: '123456789', mediaType: 'video', title: '测试会议', passcode: '1234' },
+  });
+  const ringingCall = (mediaType: string) => ({
+    callId, mediaType, state: 'ringing', callerId: 'bob', calleeId: 'alice', version: 1, expiresAt: Date.now() + 30_000,
+  }) as Parameters<typeof VoipBridge.adopt>[0];
+
+  it.each([['audio', 'voice', 'earpiece'], ['video', 'video', 'speaker']])(
+    'applies the %s default using the OS route and retains later manual changes',
+    async (mediaType, usage, route) => {
+      setup();
+      VoipBridge.adopt(ringingCall(mediaType));
+      if (mediaType === 'video') kits.getOutputDevices.mockReturnValue([{ deviceType: 'speaker' }]);
+      VoipBridge.speaker(mediaType === 'video', false);
+      await vi.waitFor(() => expect(VoipBridge.audioRoutePending).toBe(false));
+      expect(kits.getOutputDevices).toHaveBeenCalledWith({ usage, rendererFlags: 0 });
+      if (mediaType === 'video') {
+        expect(kits.setDefaultOutputDevice).toHaveBeenCalledExactlyOnceWith('speaker');
+        expect(kits.setCommunicationDevice).not.toHaveBeenCalled();
+      } else {
+        expect(kits.setCommunicationDevice).toHaveBeenCalledExactlyOnceWith('speaker', false);
+      }
+      expect(VoipBridge.audioRoute).toBe(route);
+      VoipBridge.speaker(mediaType === 'audio');
+      VoipBridge.speaker(mediaType === 'video', false);
+      await vi.waitFor(() => expect(VoipBridge.audioRoutePending).toBe(false));
+      expect(VoipBridge.audioRoute).toBe(mediaType === 'audio' ? 'speaker' : 'earpiece');
+      if (mediaType === 'video') {
+        VoipBridge.speaker(true);
+        await vi.waitFor(() => expect(VoipBridge.audioRoutePending).toBe(false));
+        expect(VoipBridge.audioRoute).toBe('speaker');
+        expect(kits.setDefaultOutputDevice.mock.calls).toEqual([['speaker'], ['earpiece'], ['speaker']]);
+        expect(kits.activateAudioSession).toHaveBeenCalledOnce();
+        VoipBridge.finish('ended', false);
+        await vi.waitFor(() => expect(kits.deactivateAudioSession).toHaveBeenCalledOnce());
+        expect(kits.setDefaultOutputDevice).toHaveBeenLastCalledWith('default');
+        expect(kits.offOutputDeviceChange).toHaveBeenCalledExactlyOnceWith('currentOutputDeviceChanged', kits.onOutputDeviceChange.mock.lastCall?.[1]);
+      } else {
+        expect(kits.setCommunicationDevice).toHaveBeenCalledTimes(2);
+      }
+    },
+  );
+
+  it.each([['sco', 'bluetooth'], ['wired', 'headset']])(
+    'keeps the connected %s device when the video default is applied',
+    async (deviceType, route) => {
+      setup();
+      VoipBridge.adopt(ringingCall('video'));
+      kits.getOutputDevices.mockReturnValue([{ deviceType }]);
+      VoipBridge.speaker(true, false);
+      await vi.waitFor(() => expect(VoipBridge.audioRoutePending).toBe(false));
+      expect(kits.setCommunicationDevice).not.toHaveBeenCalled();
+      expect(VoipBridge.queue).toContainEqual(expect.objectContaining({ type: 'audioRoute', selected: route }));
+      VoipBridge.finish('ended', false);
+      await vi.waitFor(() => expect(kits.deactivateAudioSession).toHaveBeenCalledOnce());
+    },
+  );
+
+  it('binds the push listener before session restore and preserves the system envelope identifier', async () => {
+    const ability = { context: {} } as any;
+    kits.loadAsset.mockReturnValue([new Map([[undefined, new TextEncoder().encode(JSON.stringify(config))]])]);
+    kits.receive.mockImplementation(() => expect(VoipBridge.configuration).toBeNull());
+    VoipBridge.bindPush(ability);
+    VoipBridge.bindPush(ability);
+    expect(kits.receive).toHaveBeenCalledExactlyOnceWith('VoIP', ability, expect.any(Function));
+    expect(VoipBridge.configuration?.userId).toBe('alice');
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+
+    const received = kits.receive.mock.calls[0][2];
+    received({ data: JSON.stringify({ header: 'system', callId: systemId, data: JSON.stringify(invite()) }) });
+    await vi.waitFor(() => expect(VoipBridge.current?.callId).toBe(callId));
+    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ callId: systemId, abilityName: 'NuwaxVoipMediaAbility' }));
+    expect(VoipBridge.current?.roomName).toBe('authenticated-room');
+    expect(VoipBridge.queue).toContainEqual(expect.objectContaining({ type: 'snapshot', nativeIncomingUI: true }));
+  });
+
+  it.each([undefined, { source: 'vendor' }])('uses the envelope call ID regardless of header metadata (%j)', async (header) => {
+    setup();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    await VoipBridge.incoming({ type: 'VoIP', callId: '', data: JSON.stringify({ header, callId: systemId, data: JSON.stringify(invite()) }) });
+    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ callId: systemId }));
+    expect(VoipBridge.current?.callId).toBe(callId);
+  });
+
+  it('reports the system call when IM validation is slow and processes an early locked-screen voice answer once', async () => {
+    setup();
+    vi.useFakeTimers();
+    let resolveMessage!: (value: any) => void;
+    vi.mocked(VoipBridge.request).mockReturnValueOnce(new Promise(resolve => { resolveMessage = resolve; }))
+      .mockResolvedValueOnce(detail as any);
+    vi.spyOn(VoipBridge, 'ensurePermissions').mockResolvedValue(true);
+    const media = vi.spyOn(VoipBridge, 'startMedia').mockImplementation(() => {});
+
+    const pending = VoipBridge.incoming(push());
+    expect(VoipBridge.request).toHaveBeenCalledExactlyOnceWith(`/api/instant-message/messages/${msgId}?convId=${convId}`, '', true);
+    await vi.advanceTimersByTimeAsync(1800);
+    await VoipBridge.incoming(push());
+    await VoipBridge.incoming(push({}, 'duplicate-system-call'));
+    await VoipBridge.receiveInvitation(message() as any);
+    const answer = { callId: systemId, voipCallUiEvent: 'answer-voice' } as any;
+    VoipBridge.systemEvent(answer);
+    VoipBridge.systemEvent(answer);
+    expect(kits.report).toHaveBeenCalledOnce();
+    expect(kits.reportError).toHaveBeenCalledWith('duplicate-system-call', 'busy');
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'answered');
+    expect(media).not.toHaveBeenCalled();
+    expect(VoipBridge.current).toBeNull();
+    expect(hasNativeVoipCall()).toBe(true);
+
+    resolveMessage(message()); await pending;
+    await vi.waitFor(() => expect(media).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      callId, state: 'connecting', mediaType: 'audio', roomName: 'authenticated-room',
+    })));
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'answered');
+    vi.spyOn(VoipBridge, 'startTask').mockResolvedValue();
+    vi.spyOn(VoipBridge, 'mediaJoined').mockResolvedValue();
+    VoipBridge.mediaEvent(JSON.stringify({ type: 'connected', callId }));
+    expect(kits.reportState).toHaveBeenCalledOnce();
+    VoipBridge.mediaEvent(JSON.stringify({ type: 'peerMediaReady', callId }));
+    expect(kits.reportState).toHaveBeenLastCalledWith(systemId, 'active', 'voice');
+    expect(VoipBridge.current?.state).toBe('active');
+  });
+
+  it('reports the verified caller profile without using an avatar from the push payload', async () => {
+    setup();
+    const avatar = 'https://cdn.example/caller.png';
+    const body = new ArrayBuffer(64);
+    const picture = { release: vi.fn() };
+    const source = { getImageInfo: vi.fn().mockResolvedValue({ size: { width: 192, height: 192 } }),
+      createPixelMap: vi.fn().mockResolvedValue(picture), release: vi.fn().mockResolvedValue(undefined) };
+    kits.createImageSource.mockReturnValue(source);
+    transport.request.mockResolvedValue({ responseCode: 200, result: body });
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce({ ...detail, peerAvatar: avatar } as any);
+
+    await VoipBridge.incoming(push({ senderAvatar: 'https://unverified.example/other.png', displayName: '旧昵称' }));
+
+    expect(transport.request).toHaveBeenCalledExactlyOnceWith(avatar, expect.objectContaining({ method: 'GET' }));
+    expect(transport.request.mock.calls[0][1]).not.toHaveProperty('header');
+    expect(kits.createImageSource).toHaveBeenCalledWith(body);
+    expect(source.createPixelMap).toHaveBeenCalledWith(expect.objectContaining({ desiredSize: { width: 96, height: 96 } }));
+    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ callId: systemId, userProfile: picture, userName: 'Bob' }));
+    expect(kits.createPicture).not.toHaveBeenCalled();
+    expect(source.release).toHaveBeenCalledOnce();
+    expect(picture.release).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])('passes a verified notification avatar into the app after a WS invitation: %s', async arrivedAfterWs => {
+    setup();
+    const avatar = 'https://cdn.example/caller.png';
+    VoipBridge.execute(JSON.stringify({ op: 'background', scope: config.scope, hidden: false }));
+    if (arrivedAfterWs) {
+      vi.mocked(VoipBridge.request).mockResolvedValueOnce(detail as any);
+      await VoipBridge.receiveInvitation(message() as any);
+      expect(VoipBridge.current?.callerAvatar).toBe('');
+    }
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    VoipBridge.execute(JSON.stringify({ op: 'invitation', scope: config.scope, convId, msgId, callId, senderAvatar: avatar }));
+    await vi.waitFor(() => expect(VoipBridge.current?.callerAvatar).toBe(avatar));
+    expect(VoipBridge.current?.version).toBe(arrivedAfterWs ? 2 : 1);
+  });
+
+  it('fills the missing avatar on a native retransmission without re-ringing or overriding the selected media', async () => {
+    setup();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    await VoipBridge.incoming(push());
+    const current = VoipBridge.current!;
+    expect(current.callerAvatar).toBe('');
+    current.state = 'active';
+    current.mediaType = 'audio';
+    const senderAvatar = 'https://cdn.example/caller.png';
+    await VoipBridge.incoming(push({ msgId: '42', senderAvatar }));
+    expect(current.callerAvatar).toBe('');
+    await VoipBridge.incoming(push({ senderAvatar }));
+    await VoipBridge.incoming(push({ senderAvatar: 'https://cdn.example/other.png' }));
+    expect(VoipBridge.current).toMatchObject({ callerAvatar: senderAvatar, version: 2, state: 'active', mediaType: 'audio' });
+    expect(kits.report).toHaveBeenCalledOnce();
+    expect(VoipBridge.request).toHaveBeenCalledTimes(2);
+  });
+
+  it('loads a relative meeting avatar after validation and rings if its response is too slow', async () => {
+    VoipBridge.initialize(meetingConfig);
+    vi.useFakeTimers();
+    const senderAvatar = '/api/user/avatar/bob/current';
+    const fallback = { release: vi.fn() };
+    kits.createPicture.mockResolvedValue(fallback);
+    transport.request.mockReturnValue(new Promise(() => {}));
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce({ ...meetingMessage(), senderName: '会议发起人' } as any);
+
+    const pending = VoipBridge.incoming(push({ scene: 'meeting', inviteId: 'qa-meeting', senderAvatar }));
+    await vi.advanceTimersByTimeAsync(750);
+    await pending;
+
+    expect(transport.request).toHaveBeenCalledExactlyOnceWith(meetingConfig.apiBaseUrl + senderAvatar,
+      expect.not.objectContaining({ header: expect.anything() }));
+    expect(transport.destroy).toHaveBeenCalledOnce();
+    expect(kits.report).toHaveBeenCalledWith(expect.objectContaining({ userProfile: fallback,
+      isConferenceCall: true, userName: '会议发起人' }));
+  });
+
+  it.each(['foreground', 'content'])('requests video access once when %s is ready last', async last => {
+    setup();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    const permission = vi.spyOn(VoipBridge, 'ensurePermissions').mockResolvedValue(true);
+    const media = vi.spyOn(VoipBridge, 'startMedia').mockImplementation(() => {});
+    await VoipBridge.incoming(push());
+    VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'answer-video' } as any);
+
+    VoipBridge.mediaForeground = last === 'content';
+    VoipBridge.mediaContentLoaded = last === 'foreground';
+    VoipBridge.resumeSystemVideoAnswer();
+    expect(permission).not.toHaveBeenCalled();
+    expect(media).not.toHaveBeenCalled();
+
+    VoipBridge.mediaForeground = true;
+    VoipBridge.mediaContentLoaded = true;
+    VoipBridge.resumeSystemVideoAnswer();
+    VoipBridge.resumeSystemVideoAnswer();
+    await vi.waitFor(() => expect(media).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      callId, state: 'connecting', mediaType: 'video',
+    })));
+    expect(permission).toHaveBeenCalledExactlyOnceWith('video');
+  });
+
+  it('does not request camera access when the caller cancels before the window is ready', async () => {
+    setup();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    const permission = vi.spyOn(VoipBridge, 'ensurePermissions');
+    await VoipBridge.incoming(push());
+    VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'answer-video' } as any);
+    VoipBridge.receiveSignal({ eventType: 'voip:cancel', payload: { convId, callId } } as any);
+
+    VoipBridge.mediaForeground = true;
+    VoipBridge.mediaContentLoaded = true;
+    VoipBridge.resumeSystemVideoAnswer();
+    expect(permission).not.toHaveBeenCalled();
+    expect(VoipBridge.current).toBeNull();
+  });
+
+  it('rings on time when decoding is slow and releases the late avatar', async () => {
+    setup();
+    vi.useFakeTimers();
+    const picture = { release: vi.fn().mockResolvedValue(undefined) };
+    let decoded!: (value: typeof picture) => void;
+    const decode = new Promise(resolve => { decoded = resolve; });
+    const fallback = { release: vi.fn() };
+    kits.createPicture.mockResolvedValue(fallback);
+    kits.createImageSource.mockReturnValue({ getImageInfo: vi.fn().mockResolvedValue({ size: { width: 96, height: 96 } }),
+      createPixelMap: () => decode, release: vi.fn().mockResolvedValue(undefined) });
+    transport.request.mockResolvedValue({ responseCode: 200, result: new ArrayBuffer(64) });
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any)
+      .mockResolvedValueOnce({ ...detail, peerAvatar: 'https://cdn.example/caller.png' } as any);
+
+    const pending = VoipBridge.incoming(push());
+    await vi.advanceTimersByTimeAsync(1800);
+    await pending;
+    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ userProfile: fallback }));
+    expect(VoipBridge.current?.callId).toBe(callId);
+
+    decoded(picture);
+    await vi.waitFor(() => expect(picture.release).toHaveBeenCalledOnce());
+    expect(kits.report).toHaveBeenCalledOnce();
+  });
+
+  it('reports a verified WS invitation in the background and rejects a later push as already presented', async () => {
+    setup();
+    VoipBridge.execute(JSON.stringify({ op: 'background', scope: config.scope, hidden: true }));
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(detail as any);
+
+    await VoipBridge.receiveInvitation(message() as any);
+    await VoipBridge.incoming(push());
+
+    expect(VoipBridge.request).toHaveBeenCalledExactlyOnceWith(`/api/instant-message/conversations/${convId}`, '', true);
+    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ callId: 'local-system-call' }));
+    expect(kits.reportError).toHaveBeenCalledExactlyOnceWith(systemId, 'busy');
+    expect(VoipBridge.current?.callId).toBe(callId);
+    expect(VoipBridge.queue).toContainEqual(expect.objectContaining({ type: 'snapshot', nativeIncomingUI: true }));
+  });
+
+  it('retains a verified background invitation if Call Service Kit rejects its presentation', async () => {
+    setup();
+    VoipBridge.execute(JSON.stringify({ op: 'background', scope: config.scope, hidden: true }));
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(detail as any);
+    kits.report.mockResolvedValueOnce(1);
+    await VoipBridge.receiveInvitation(message() as any);
+    expect(VoipBridge.current).toMatchObject({ callId, state: 'ringing' });
+    expect(VoipBridge.pendingIncoming).toBeNull();
+    expect(VoipBridge.nativeId).toBe('');
+  });
+
+  it.each(['cancel', 'answered', 'account switch'])('drops validation after %s while ringing', async reason => {
+    setup();
+    vi.useFakeTimers();
+    let resolveMessage!: (value: any) => void;
+    vi.mocked(VoipBridge.request).mockReturnValueOnce(new Promise(resolve => { resolveMessage = resolve; }));
+    const pending = VoipBridge.incoming(push());
+    await vi.advanceTimersByTimeAsync(1800);
+    expect(VoipBridge.nativeId).toBe(systemId);
+    if (reason === 'account switch') VoipBridge.initialize({ ...config, userId: 'charlie' });
+    else VoipBridge.receiveSignal({ eventType: `voip:${reason}`, payload: { convId, msgId, userId: 'alice' } } as any);
+    resolveMessage(message()); await pending;
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
+    expect(VoipBridge.current).toBeNull();
+    expect(VoipBridge.request).toHaveBeenCalledOnce();
+  });
+
+  it('rejects expired or wrong-account pushes and never uses a naked business ID for Call Service', async () => {
+    setup();
+    await VoipBridge.incoming(push({ expiresAt: Date.now() - 1 }));
+    await VoipBridge.incoming(push({ calleeId: 'bob' }));
+    await VoipBridge.incoming(push({ scene: 'meeting' }));
+    await VoipBridge.incoming({ data: JSON.stringify(invite()) } as any);
+    expect(kits.reportError.mock.calls).toEqual(Array(3).fill([systemId, 'other']));
+    expect(kits.report).not.toHaveBeenCalled();
+    expect(VoipBridge.request).not.toHaveBeenCalled();
+  });
+
+  it('dismisses mismatched IM invitations without letting a retransmission ring again', async () => {
+    setup();
+    vi.useFakeTimers();
+    let resolveMessage!: (value: any) => void;
+    vi.mocked(VoipBridge.request).mockReturnValueOnce(new Promise(resolve => { resolveMessage = resolve; }));
+    const pending = VoipBridge.incoming(push({ senderAvatar: 'https://cdn.example/caller.png' }));
+    await vi.advanceTimersByTimeAsync(1800);
+    resolveMessage({ ...message(), msgId: '9001' });
+    await pending;
+    expect(VoipBridge.current).toBeNull();
+    expect(transport.request).not.toHaveBeenCalled();
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
+    await VoipBridge.incoming(push({}, 'replacement-system-call'));
+    expect(kits.report).toHaveBeenCalledOnce();
+    expect(kits.reportError).toHaveBeenCalledWith('replacement-system-call', 'busy');
+  });
+
+  it('cleans up a late system report after the user signs out', async () => {
+    setup();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    let finishReport!: (value: number) => void;
+    kits.report.mockReturnValueOnce(new Promise(resolve => { finishReport = resolve; }));
+    const pending = VoipBridge.incoming(push());
+    await vi.waitFor(() => expect(kits.report).toHaveBeenCalledOnce());
+    VoipBridge.reset();
+    finishReport(0); await pending;
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
+    expect(VoipBridge.request).toHaveBeenCalledTimes(2);
+    expect(VoipBridge.current).toBeNull();
+  });
+
+  it('waits for the IM message before routing a cold-start meeting answer to the app', async () => {
+    vi.mocked(VoipBridge.finish).mockImplementation(actualFinish);
+    const startAbility = vi.fn().mockResolvedValue(undefined);
+    VoipBridge.context = { abilityInfo: { bundleName: 'com.nuwax.apphm', moduleName: 'entry' }, startAbility } as any;
+    VoipBridge.initialize(meetingConfig, true);
+    vi.useFakeTimers();
+    let resolveMessage!: (value: any) => void;
+    vi.mocked(VoipBridge.request).mockReturnValueOnce(new Promise(resolve => { resolveMessage = resolve; }));
+    const startMedia = vi.spyOn(VoipBridge, 'startMedia');
+    const pending = VoipBridge.incoming(meetingPush());
+    await vi.advanceTimersByTimeAsync(1800);
+    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      callId: systemId, abilityName: 'EntryAbility', isConferenceCall: true,
+    }));
+    expect(hasNativeVoipCall()).toBe(false);
+
+    VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'answer-voice' } as any);
+    expect(startAbility).not.toHaveBeenCalled();
+    expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([]);
+    resolveMessage(meetingMessage());
+    await pending;
+
+    VoipBridge.initialize({ ...meetingConfig, scope: 'ui-scope' });
+    expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([expect.objectContaining({
+      scope: 'ui-scope', action: 'accept', convId, msgId, inviteId: 'qa-meeting',
+      roomName: '123456789', passcode: '1234', mediaType: 'audio', handoffExpiresAt: Date.now() + 60_000,
+    })]);
+    expect(startAbility).toHaveBeenCalledOnce();
+    expect(kits.reportState).toHaveBeenLastCalledWith(systemId, 'disconnected');
+    expect(VoipBridge.current).toBeNull();
+    expect(startMedia).not.toHaveBeenCalled();
+  });
+
+  it('exposes native meeting ownership only for a matching meeting message in the test environment', async () => {
+    VoipBridge.initialize(meetingConfig);
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(meetingMessage() as any);
+    await VoipBridge.incoming(meetingPush());
+    expect(VoipBridge.meetingInviteState(msgId)).toBe('pending');
+    expect(VoipBridge.meetingInviteState('different-message')).toBe('');
+    expect(VoipBridge.queue).toContainEqual(expect.objectContaining({
+      type: 'meetingInvite', action: 'presented', inviteId: 'qa-meeting', msgId, passcode: '',
+    }));
+    VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'answer-voice' } as any);
+    expect(VoipBridge.meetingInviteState(msgId)).toBe('handled');
+    VoipBridge.reset();
+    expect(VoipBridge.meetingInviteState(msgId)).toBe('');
+  });
+
+  it.each(['reject', 'timeout'])('reports a verified meeting %s without carrying the password', async action => {
+    vi.mocked(VoipBridge.finish).mockImplementation(actualFinish);
+    VoipBridge.initialize(meetingConfig);
+    vi.useFakeTimers();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(meetingMessage() as any);
+    await VoipBridge.incoming(meetingPush());
+
+    if (action === 'reject') VoipBridge.systemEvent({ callId: systemId, voipCallUiEvent: 'reject' } as any);
+    else await vi.advanceTimersByTimeAsync(30000);
+    expect(VoipBridge.queue).toContainEqual(expect.objectContaining({
+      type: 'meetingInvite', action, convId, msgId, roomName: '123456789', passcode: '',
+    }));
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
+    expect(VoipBridge.pendingIncoming).toBeNull();
+  });
+
+  it('ignores a duplicate meeting push after the same account handled it on another device', async () => {
+    vi.mocked(VoipBridge.finish).mockImplementation(actualFinish);
+    VoipBridge.initialize(meetingConfig);
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(meetingMessage() as any);
+    await VoipBridge.incoming(meetingPush());
+    VoipBridge.receiveSignal({ eventType: 'meeting:invite-handled', payload: { convId, msgId, userId: 'alice' } } as any);
+    await VoipBridge.incoming({ ...meetingPush(), callId: 'repeat-system-id' });
+
+    expect(kits.report).toHaveBeenCalledOnce();
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
+    expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([]);
+  });
+
+  it('ignores a late push after the invite was handled in the local foreground banner', async () => {
+    VoipBridge.initialize(meetingConfig);
+    const handled = { op: 'meetingInviteHandled', msgId };
+    VoipBridge.execute(JSON.stringify({ ...handled, scope: 'old-account-scope' }));
+    expect(VoipBridge.meetingInviteState(msgId)).toBe('');
+
+    VoipBridge.execute(JSON.stringify({ ...handled, scope: meetingConfig.scope }));
+    expect(VoipBridge.meetingInviteState(msgId)).toBe('handled');
+    await VoipBridge.incoming(meetingPush());
+    expect(kits.report).not.toHaveBeenCalled();
+    expect(VoipBridge.request).not.toHaveBeenCalled();
+  });
+
+  it('closes the late system card when the foreground banner is handled during its presentation', async () => {
+    VoipBridge.initialize(meetingConfig);
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(meetingMessage() as any);
+    let finishReport!: (value: number) => void;
+    kits.report.mockReturnValueOnce(new Promise(resolve => { finishReport = resolve; }));
+    const push = VoipBridge.incoming(meetingPush());
+    await vi.waitFor(() => expect(kits.report).toHaveBeenCalledOnce());
+    VoipBridge.execute(JSON.stringify({ op: 'meetingInviteHandled', scope: meetingConfig.scope, msgId }));
+    finishReport(0);
+    await push;
+    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
+    expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([]);
+  });
+
+  it.each([{ inviteId: 'other' }, { silent: true }, { mediaType: 'audio' }])('rejects a non-matching IM meeting invitation: %j', async overrides => {
+    vi.mocked(VoipBridge.finish).mockImplementation(actualFinish);
+    VoipBridge.initialize(meetingConfig);
+    const message = meetingMessage();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce({ ...message, body: { ...message.body, ...overrides } } as any);
+    await VoipBridge.incoming(meetingPush());
+
+    expect(VoipBridge.pendingIncoming).toBeNull();
+    expect(kits.report).not.toHaveBeenCalled();
+    expect(kits.reportError).toHaveBeenCalledExactlyOnceWith(systemId, 'other');
+    expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([]);
+  });
+});
 
 describe('Harmony push registration lifetime', () => {
   it('registers the actual bundle and explicit environment', async () => {
@@ -233,53 +831,6 @@ describe('IM call event ordering and isolation', () => {
     expect(adopt).toHaveBeenCalledWith(expect.objectContaining({ state: 'ringing', callId: 'c1', callerId: 'bob', calleeId: 'alice', msgId: '1987654321098765432' }));
     expect(connect).not.toHaveBeenCalled();
     expect(token.get).not.toHaveBeenCalled(); // current backend has no Harmony native-token contract
-  });
-  it('reports a decoded avatar for a verified Huawei push and keeps it in the App snapshot', async () => {
-    const adopt = setup();
-    const convId = '12345';
-    const message = { ...invitation(), convId };
-    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message as any);
-    const picture = { release: vi.fn() };
-    const avatar = '/api/user/avatar/10001/profile-hash';
-    const loadAvatar = vi.spyOn(VoipBridge, 'loadIncomingAvatar').mockResolvedValue(picture as any);
-    const push = { type: 'voip', convId, msgId: message.msgId, callId: 'c1', calleeId: 'alice',
-      mediaType: 'audio', expiresAt: Date.now() + 30_000, senderAvatar: avatar };
-    await VoipBridge.incoming({ callId: 'native-c1', data: JSON.stringify(push) } as any);
-    expect(loadAvatar).toHaveBeenCalledWith(avatar, 'http://development.example');
-    expect(system.incoming).toHaveBeenCalledWith(expect.objectContaining({ callId: 'native-c1', userProfile: picture }));
-    expect(adopt).toHaveBeenCalledWith(expect.objectContaining({ callId: 'c1', callerAvatar: avatar, roomName: message.body.roomName }));
-    expect(picture.release).toHaveBeenCalledOnce();
-  });
-  it('skips the avatar request when the native push does not identify the authenticated message', async () => {
-    const adopt = setup();
-    const message = { ...invitation(), convId: '12345' };
-    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message as any);
-    const loadAvatar = vi.spyOn(VoipBridge, 'loadIncomingAvatar');
-    const push = { type: 'voip', convId: message.convId, msgId: '12346', callId: 'c1', calleeId: 'alice',
-      mediaType: 'audio', expiresAt: Date.now() + 30_000, senderAvatar: '/api/user/avatar/10001/profile-hash' };
-    await VoipBridge.incoming({ callId: 'native-c1', data: JSON.stringify(push) } as any);
-    expect(system.error).toHaveBeenCalledWith('native-c1', 1);
-    expect(system.incoming).not.toHaveBeenCalled();
-    expect(loadAvatar).not.toHaveBeenCalled();
-    expect(adopt).not.toHaveBeenCalled();
-  });
-  it('uses the conversation avatar ahead of the optional push reference', async () => {
-    const adopt = setup();
-    vi.mocked(VoipBridge.request).mockResolvedValueOnce({ convType: 1, peerUserId: 'bob',
-      peerAvatar: 'https://images.example.test/latest.png' } as any);
-    await VoipBridge.receiveInvitation({ ...invitation(), senderAvatar: '/api/user/avatar/bob/previous' } as any,
-      '/api/user/avatar/bob/pushed');
-    expect(adopt).toHaveBeenCalledWith(expect.objectContaining({ callerAvatar: 'https://images.example.test/latest.png' }));
-  });
-  it('stops waiting for a slow system avatar request', async () => {
-    vi.useFakeTimers();
-    transport.request.mockReturnValue(new Promise(() => {}));
-    const avatar = VoipBridge.loadIncomingAvatar('/api/user/avatar/bob/current', 'https://app.example.test');
-    await vi.advanceTimersByTimeAsync(750);
-    await expect(avatar).resolves.toBeNull();
-    expect(transport.request).toHaveBeenCalledWith('https://app.example.test/api/user/avatar/bob/current',
-      expect.not.objectContaining({ header: expect.anything() }));
-    expect(transport.destroy).toHaveBeenCalledOnce();
   });
   it('does not fall back to msgId when the signal contains a conflicting callId', () => {
     setup(); VoipBridge.current = { callId: 'current', convId: 'chat', msgId: 'm1', state: 'ringing' } as any;

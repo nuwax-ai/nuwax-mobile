@@ -9,6 +9,7 @@ struct NuwaxVoipPushInvitation {
     let expiresAt: Double
     let mediaType: String
     let displayName: String
+    let senderAvatar: String?
     let convId: String?
     let msgId: String?
     /// Meeting-only fields. They never authorize media; they only locate the invite.
@@ -62,8 +63,17 @@ struct NuwaxVoipPushInvitation {
         callId = id; calleeId = callee; expiresAt = expiry.doubleValue; mediaType = media
         convId = conv; msgId = msg
         inviteId = invite; roomName = room; title = meetingTitle
-        let name = (payload["displayName"] as? String ?? "Nuwax").trimmingCharacters(in: .whitespacesAndNewlines)
-        displayName = name.isEmpty ? "Nuwax" : String(name.prefix(80))
+        displayName = Self.callerName(excluding: [id], payload["senderName"],
+                                      payload["callerDisplayName"], payload["displayName"]) ?? "Nuwax"
+        senderAvatar = Self.avatarReference(payload["senderAvatar"])
+    }
+
+    static func avatarReference(_ value: Any?) -> String? {
+        guard let avatar = NuwaxVoipClientPolicy.avatarURL(value), avatar.utf8.count <= 256,
+              avatar.range(of: #"\A(?:https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/|/api/(?:user/avatar|f)/)[A-Za-z0-9._~%/+-]+\z"#,
+                           options: .regularExpression) != nil,
+              avatar.range(of: #"(?i)%2e|%2f|%5c|/\.{1,2}(?:/|\z)"#, options: .regularExpression) == nil else { return nil }
+        return avatar
     }
 
     init?(meetingMessage message: [String: Any], userId: String, now: Double) {
@@ -87,8 +97,22 @@ struct NuwaxVoipPushInvitation {
         let meeting = scene == "meeting"
         return ["callId": callId,
                 "displayName": meeting ? "\(meetingLabel) · \(title ?? displayName)" : displayName,
-                "handle": meeting ? "\(numberLabel) \(roomName ?? "")" : callId,
+                "handle": meeting ? "\(numberLabel) \(roomName ?? "")" : displayName,
                 "mediaType": mediaType, "scene": scene]
+    }
+
+    static func callerName(excluding identifiers: [String], _ candidates: Any?...) -> String? {
+        for candidate in candidates {
+            guard let name = (candidate as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !name.isEmpty, !identifiers.contains(name) else { continue }
+            return String(name.prefix(80))
+        }
+        return nil
+    }
+
+    static func systemCallerName(_ payload: [AnyHashable: Any]) -> String? {
+        let identifiers = [payload["callId"], payload["callerId"]].compactMap { $0 as? String }
+        return callerName(excluding: identifiers, payload["callerDisplayName"], payload["displayName"], payload["senderName"])
     }
 
     func matches(_ message: [String: Any], now: Double) -> Bool {

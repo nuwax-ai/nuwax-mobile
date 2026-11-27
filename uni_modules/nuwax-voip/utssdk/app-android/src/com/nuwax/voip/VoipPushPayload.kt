@@ -2,10 +2,15 @@ package com.nuwax.voip
 
 import org.json.JSONObject
 
-/** The push is only a locator. Native incoming() still verifies the message and its parties. */
+/** Native incoming() verifies the message and its parties before using push display data. */
 object VoipPushPayload {
     private const val NATIVE = "android-native"
     private val callId = Regex("[A-Za-z0-9_-]{1,128}")
+    private val avatar = Regex("(?:https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/|/api/(?:user/avatar|f)/)[A-Za-z0-9._~%/+-]+")
+    private val unsafeAvatarPath = Regex("%2e|%2f|%5c|/\\.{1,2}(?:/|$)", RegexOption.IGNORE_CASE)
+
+    internal fun avatarReference(value: Any?): String? = (value as? String)?.trim()
+        ?.takeIf { it.length <= 256 && avatar.matches(it) && !unsafeAvatarPath.containsMatchIn(it) }
 
     @JvmStatic fun invitation(raw: String): String? {
         if (raw.length > 8192) return null
@@ -25,8 +30,8 @@ object VoipPushPayload {
             val conv = id(value.opt("convId")) ?: return null
             val message = id(value.opt("msgId")) ?: return null
             val meeting = value.optString("scene") == "meeting"
-            // Do not forward tokens, URLs or unrelated notification fields to the call bridge.
             val locator = JSONObject().put("type", "voip").put("convId", conv).put("msgId", message)
+            avatarReference(value.opt("senderAvatar"))?.let { locator.put("senderAvatar", it) }
             if (value.has("pushEnvironment")) {
                 val environment = value.opt("pushEnvironment")
                 if (environment != "test" && environment != "production") return null

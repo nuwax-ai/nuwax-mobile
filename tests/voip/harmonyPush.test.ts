@@ -316,21 +316,51 @@ describe('Harmony system call cold start', () => {
     const avatar = 'https://cdn.example/caller.png';
     const body = new ArrayBuffer(64);
     const picture = { release: vi.fn() };
-    const source = { createPixelMap: vi.fn().mockResolvedValue(picture), release: vi.fn().mockResolvedValue(undefined) };
+    const source = { getImageInfo: vi.fn().mockResolvedValue({ size: { width: 192, height: 192 } }),
+      createPixelMap: vi.fn().mockResolvedValue(picture), release: vi.fn().mockResolvedValue(undefined) };
     kits.createImageSource.mockReturnValue(source);
     transport.request.mockResolvedValue({ responseCode: 200, result: body });
     vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce({ ...detail, peerAvatar: avatar } as any);
 
-    await VoipBridge.incoming(push({ callerAvatar: 'https://unverified.example/other.png' }));
+    await VoipBridge.incoming(push({ senderAvatar: 'https://unverified.example/other.png', displayName: '旧昵称' }));
 
     expect(transport.request).toHaveBeenCalledExactlyOnceWith(avatar, expect.objectContaining({ method: 'GET' }));
     expect(transport.request.mock.calls[0][1]).not.toHaveProperty('header');
     expect(kits.createImageSource).toHaveBeenCalledWith(body);
     expect(source.createPixelMap).toHaveBeenCalledWith(expect.objectContaining({ desiredSize: { width: 96, height: 96 } }));
-    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ callId: systemId, userProfile: picture }));
+    expect(kits.report).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ callId: systemId, userProfile: picture, userName: 'Bob' }));
     expect(kits.createPicture).not.toHaveBeenCalled();
     expect(source.release).toHaveBeenCalledOnce();
     expect(picture.release).toHaveBeenCalledOnce();
+  });
+
+  it('passes a verified direct invitation avatar into the app when the profile is empty', async () => {
+    setup();
+    const avatar = '/api/user/avatar/bob/current';
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
+    VoipBridge.execute(JSON.stringify({ op: 'background', scope: config.scope, hidden: false }));
+    VoipBridge.execute(JSON.stringify({ op: 'invitation', scope: config.scope, convId, msgId, callId, senderAvatar: avatar }));
+    await vi.waitFor(() => expect(VoipBridge.current?.callerAvatar).toBe(avatar));
+  });
+
+  it('loads a relative meeting avatar after validation and rings if its response is too slow', async () => {
+    VoipBridge.initialize(meetingConfig);
+    vi.useFakeTimers();
+    const senderAvatar = '/api/user/avatar/bob/current';
+    const fallback = { release: vi.fn() };
+    kits.createPicture.mockResolvedValue(fallback);
+    transport.request.mockReturnValue(new Promise(() => {}));
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce({ ...meetingMessage(), senderName: '会议发起人' } as any);
+
+    const pending = VoipBridge.incoming(push({ scene: 'meeting', inviteId: 'qa-meeting', senderAvatar }));
+    await vi.advanceTimersByTimeAsync(750);
+    await pending;
+
+    expect(transport.request).toHaveBeenCalledExactlyOnceWith(meetingConfig.apiBaseUrl + senderAvatar,
+      expect.not.objectContaining({ header: expect.anything() }));
+    expect(transport.destroy).toHaveBeenCalledOnce();
+    expect(kits.report).toHaveBeenCalledWith(expect.objectContaining({ userProfile: fallback,
+      isConferenceCall: true, userName: '会议发起人' }));
   });
 
   it.each(['foreground', 'content'])('requests video access once when %s is ready last', async last => {
@@ -380,7 +410,8 @@ describe('Harmony system call cold start', () => {
     const decode = new Promise(resolve => { decoded = resolve; });
     const fallback = { release: vi.fn() };
     kits.createPicture.mockResolvedValue(fallback);
-    kits.createImageSource.mockReturnValue({ createPixelMap: () => decode, release: vi.fn().mockResolvedValue(undefined) });
+    kits.createImageSource.mockReturnValue({ getImageInfo: vi.fn().mockResolvedValue({ size: { width: 96, height: 96 } }),
+      createPixelMap: () => decode, release: vi.fn().mockResolvedValue(undefined) });
     transport.request.mockResolvedValue({ responseCode: 200, result: new ArrayBuffer(64) });
     vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any)
       .mockResolvedValueOnce({ ...detail, peerAvatar: 'https://cdn.example/caller.png' } as any);
@@ -451,9 +482,15 @@ describe('Harmony system call cold start', () => {
 
   it('dismisses mismatched IM invitations without letting a retransmission ring again', async () => {
     setup();
-    vi.mocked(VoipBridge.request).mockResolvedValueOnce({ ...message(), msgId: '9001' } as any);
-    await VoipBridge.incoming(push());
+    vi.useFakeTimers();
+    let resolveMessage!: (value: any) => void;
+    vi.mocked(VoipBridge.request).mockReturnValueOnce(new Promise(resolve => { resolveMessage = resolve; }));
+    const pending = VoipBridge.incoming(push({ senderAvatar: 'https://cdn.example/caller.png' }));
+    await vi.advanceTimersByTimeAsync(1800);
+    resolveMessage({ ...message(), msgId: '9001' });
+    await pending;
     expect(VoipBridge.current).toBeNull();
+    expect(transport.request).not.toHaveBeenCalled();
     expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
     await VoipBridge.incoming(push({}, 'replacement-system-call'));
     expect(kits.report).toHaveBeenCalledOnce();
@@ -462,6 +499,7 @@ describe('Harmony system call cold start', () => {
 
   it('cleans up a late system report after the user signs out', async () => {
     setup();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message() as any).mockResolvedValueOnce(detail as any);
     let finishReport!: (value: number) => void;
     kits.report.mockReturnValueOnce(new Promise(resolve => { finishReport = resolve; }));
     const pending = VoipBridge.incoming(push());
@@ -469,7 +507,7 @@ describe('Harmony system call cold start', () => {
     VoipBridge.reset();
     finishReport(0); await pending;
     expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
-    expect(VoipBridge.request).toHaveBeenCalledOnce();
+    expect(VoipBridge.request).toHaveBeenCalledTimes(2);
     expect(VoipBridge.current).toBeNull();
   });
 
@@ -585,7 +623,8 @@ describe('Harmony system call cold start', () => {
     await VoipBridge.incoming(meetingPush());
 
     expect(VoipBridge.pendingIncoming).toBeNull();
-    expect(kits.reportState).toHaveBeenCalledExactlyOnceWith(systemId, 'disconnected');
+    expect(kits.report).not.toHaveBeenCalled();
+    expect(kits.reportError).toHaveBeenCalledExactlyOnceWith(systemId, 'other');
     expect(VoipBridge.queue.filter(event => event.type === 'meetingInvite')).toEqual([]);
   });
 });

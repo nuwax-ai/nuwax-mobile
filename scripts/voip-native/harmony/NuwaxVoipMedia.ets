@@ -131,7 +131,8 @@ struct NuwaxVoipMedia {
       const outgoing = call.callerId === VoipBridge.configuration?.userId
       this.lastPeer = (outgoing ? call.calleeDisplayName : call.callerDisplayName) || call.displayName
       this.lastVideo = call.mediaType === 'video'
-      const avatar = (outgoing ? call.calleeAvatar : call.callerAvatar) ?? ''
+      const reference = (outgoing ? call.calleeAvatar : call.callerAvatar) ?? ''
+      const avatar = VoipBridge.avatarAddress(reference, VoipBridge.configuration?.apiBaseUrl ?? '')
       if (avatar !== this.avatar) {
         this.avatar = avatar
         this.avatarFailed = false

@@ -8,14 +8,15 @@ SDK=Path(os.environ['UNIAPPX_SDK_ROOT']).resolve()
 BUSINESS=os.environ.get('NUWAX_VOIP_BUSINESS_HOST')=='1'
 HX_DEV=BUSINESS and os.environ.get('NUWAX_IOS_HX_DEV_NATIVE')=='1'
 QA_PROJECT=Path(os.environ['NUWAX_IOS_QA_PROJECT']).resolve() if os.environ.get('NUWAX_IOS_QA_PROJECT') else None
-assert not (QA_PROJECT and HX_DEV), 'Standalone QA and HX development resources must not be mixed'
+STANDALONE=bool(QA_PROJECT) or (BUSINESS and os.environ.get('NUWAX_IOS_STANDALONE')=='1')
+assert not (STANDALONE and HX_DEV), 'Standalone and HX development resources must not be mixed'
 if QA_PROJECT:
  assert BUSINESS and str(QA_PROJECT).startswith(str(ROOT/'out')+'/'), 'QA source must be isolated under this worktree out/'
  qa=json.loads((QA_PROJECT/'nuwax-local-qa.json').read_text())
  assert qa['flavor']=='voip-business-qa' and qa['apiOrigin']=='https://testagent.xspaceagi.com', 'Invalid QA source variant'
 HX_DEV_ROOT=ROOT/'unpackage/dist/dev/app-ios'
 PROJECT='VoipBusiness' if BUSINESS else 'VoipDeviceTest'
-OUT=ROOT/('out/voip-business-qa-ios' if QA_PROJECT else 'out/voip-business-ios' if BUSINESS else 'out/voip-device-ios')
+OUT=ROOT/('out/voip-business-qa-ios' if STANDALONE else 'out/voip-business-ios' if BUSINESS else 'out/voip-device-ios')
 RES=ROOT/('unpackage/resources/app-ios' if BUSINESS else 'out/voip-device-project/unpackage/resources/app-ios')
 if QA_PROJECT: RES=QA_PROJECT/'unpackage/resources/app-ios'
 MANIFEST=json.loads((ROOT/'manifest.json').read_text())
@@ -24,7 +25,7 @@ assert (RES/'__UNI__8BF05E4/www/app-service.js').is_file(), 'Export device proje
 if HX_DEV:
  assert (HX_DEV_ROOT/'app-service.js').is_file(), 'HX development resources missing: finish the HBuilderX iOS compile before building the development host; never fall back to release resources'
 push_info, push_entitlements = selected_push_configuration('com.nuwax.app')
-if QA_PROJECT and push_entitlements['aps-environment'] != 'development':
+if STANDALONE and push_entitlements['aps-environment'] != 'development':
  raise ValueError('The standalone QA host requires a development APNs profile')
 OUT.mkdir(parents=True,exist_ok=True)
 APP=OUT/'App'
@@ -107,7 +108,7 @@ for scenes in info.get('UIApplicationSceneManifest',{}).get('UISceneConfiguratio
 if BUSINESS:
  info.pop('NuwaxVoipDeviceTest',None)
  info['CFBundleDisplayName']=MANIFEST['name']
- info['uniapp-x']['ipatype']=2 if QA_PROJECT else 1
+ info['uniapp-x']['ipatype']=2 if STANDALONE else 1
  if QA_PROJECT:
   info['NuwaxBuildFlavor']='voip-business-qa'
   info['NuwaxAPIOrigin']=qa['apiOrigin']
@@ -128,7 +129,7 @@ if BUSINESS:
 libs={p.stem:p for p in (SDK/'SDK/Libs').glob('*.xcframework')}
 libs['DCloudUTSExtAPI']=SDK/'TemporarySampleFramework/DCloudUTSExtAPI.xcframework'
 queue=['DCloudUniappRuntime','DCloudUTSFoundation','DCloudUTSExtAPI','DCloudPermissionMicrophone','DCloudPermissionCamera','DCloudPermissionPush'];seen=set()
-if BUSINESS and not QA_PROJECT: queue.append('DCloudDebugServe')
+if BUSINESS and not STANDALONE: queue.append('DCloudDebugServe')
 while queue:
  n=queue.pop()
  if n in seen:continue

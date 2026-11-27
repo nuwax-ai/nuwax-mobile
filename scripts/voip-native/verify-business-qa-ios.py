@@ -5,14 +5,15 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[2]
 app = root/'out/voip-business-qa-ios-derived/Build/Products/Debug-iphoneos/UniAppX.app'
-qa = Path(os.environ['NUWAX_IOS_QA_PROJECT'])
-export = qa/'unpackage/resources/app-ios/__UNI__8BF05E4/www'
+qa = Path(os.environ['NUWAX_IOS_QA_PROJECT']) if os.environ.get('NUWAX_IOS_QA_PROJECT') else None
+export = (qa or root)/'unpackage/resources/app-ios/__UNI__8BF05E4/www'
 www = app/'uni-app-x/apps/__UNI__8BF05E4/www'
 info = plistlib.loads((app/'Info.plist').read_bytes())
 assert info['CFBundleIdentifier'] == 'com.nuwax.app'
 assert info['CFBundleDisplayName'] == json.loads((root/'manifest.json').read_text())['name']
-assert info['NuwaxBuildFlavor'] == 'voip-business-qa'
-assert info['NuwaxAPIOrigin'] == 'https://testagent.xspaceagi.com'
+if qa:
+    assert info['NuwaxBuildFlavor'] == 'voip-business-qa'
+    assert info['NuwaxAPIOrigin'] == 'https://testagent.xspaceagi.com'
 assert info['uniapp-x']['ipatype'] == 2 and info['uniapp-x']['uniRuntimeVersion'] == '5.34'
 assert 'NuwaxVoipDeviceTest' not in info
 assert not (app/'Frameworks/DCloudDebugServe.framework').exists(), 'Standalone QA must not depend on the HX debug service'
@@ -27,7 +28,8 @@ for file in files:
     target = www/file.relative_to(export)
     assert target.is_file() and digest(file) == digest(target), f'Embedded resource mismatch: {file.relative_to(export)}'
 assert (www/'app-service.js').stat().st_size > 0
-assert b'https://testagent.xspaceagi.com' in (www/'app-service.js').read_bytes()
+if qa:
+    assert b'https://testagent.xspaceagi.com' in (www/'app-service.js').read_bytes()
 
 native = {}
 for file in (root/'uni_modules/nuwax-voip/utssdk/app-ios').glob('*.swift'):
@@ -38,7 +40,7 @@ for file in (root/'uni_modules/nuwax-voip/utssdk/app-ios').glob('*.swift'):
 subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
 subprocess.run(['python3', str(root/'scripts/voip-native/device/ios_push_config.py'), str(app)], check=True)
 result = {'bundleId': info['CFBundleIdentifier'], 'version': info['CFBundleShortVersionString'], 'build': info['CFBundleVersion'],
-          'flavor': info['NuwaxBuildFlavor'], 'apiOrigin': info['NuwaxAPIOrigin'], 'ipatype': 2,
+          'flavor': info.get('NuwaxBuildFlavor', 'current-project'), 'apiOrigin': info.get('NuwaxAPIOrigin'), 'ipatype': 2,
           'hxRuntime': '5.34', 'embeddedResourceFiles': len(files), 'nativeSources': native,
           'independentResources': True, 'realDeviceAcceptance': False}
 output = root/'out/voip-business-packages/ios-qa-verification.json'

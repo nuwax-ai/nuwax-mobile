@@ -30,7 +30,7 @@ function harness(platform = 'APP-IOS', origin = 'https://testagent.xspaceagi.com
     activeRoom: value => { activeRoom = value; }, resumes: () => resumeCount,
     clearSession: () => listeners.get('cleared')({}),
     tick: () => { for (const fn of [...timers.values()]) fn(); },
-    open: (id = 'invite-1', room = '123456789', expiry = 0) => context.openMeetingInvite(id, room, '测试 & 会议', 'video', '12&34', expiry),
+    open: (id = 'invite-1', room = '123456789', expiry = 0) => context.openMeetingInvite(id, room, '测试 & 会议', '12&34', expiry),
     finish(success = true) { const n = navigations.at(-1); if (success) n.success({}); n.complete({}); },
   };
 }
@@ -46,7 +46,9 @@ test('锁屏/后台接受邀请，等前台和页面就绪再入会，保留主�
   assert.equal(url.searchParams.get('room'), '123456789');
   assert.equal(url.searchParams.get('title'), '测试 & 会议');
   assert.equal(url.searchParams.get('pc'), '12&34');
-  assert.equal(url.searchParams.get('video'), '1');
+  // 邀请入会不再自动开麦/开摄像头：URL 不带 call/video。
+  assert.equal(url.searchParams.get('call'), null);
+  assert.equal(url.searchParams.get('video'), null);
   h.finish(); h.tick(); assert.equal(h.timers.size, 0);
 });
 
@@ -159,7 +161,7 @@ function meetingNotificationClick(nativeVoip = true) {
   vm.runInContext(stripTypeScriptTypes(preprocessHarmony(source, 'APP-HARMONY')), context);
   return {
     opens, handled, dismissed, webViews, appEntryStage,
-    click: () => context.openMeetingRoomWithRetry('123', '会议', 'video', 'p&c', 0, stamp, 'invite', 'msg', 'callee'),
+    click: () => context.openMeetingRoomWithRetry('123', '会议', 'p&c', 0, stamp, 'invite', 'msg', 'callee'),
     loginAs: id => { userId = id; },
     switchSession: () => { stamp = 'new-session'; },
     tick: () => timers.shift()?.(),
@@ -177,7 +179,7 @@ test('鸿蒙点会议通知等主界面和收件账号就绪，再交接原生�
   h.tick();
   h.click();
   h.tick();
-  assert.deepEqual(h.opens, [['invite', '123', '会议', 'video', 'p&c']]);
+  assert.deepEqual(h.opens, [['invite', '123', '会议', 'p&c']]);
   assert.deepEqual(h.handled, ['msg']);
   assert.deepEqual(h.dismissed, [['msg', 'invite']]);
   assert.deepEqual(h.webViews, []);
@@ -241,6 +243,7 @@ function meetingInviteReceiver(platform, nativeVoip = true) {
     },
     advance: elapsed => { now += elapsed; },
     foreground: () => { background = false; context.resumeHarmonyMeetingInvite?.(); },
+    enterRoom: room => context.hideMeetingInviteBannerForRoom(room),
     invite: (inviteId = 'invite-1', offset = 0) => listeners.get('message')({
       msgType: 'meeting_invite', sendTime: now + offset, senderId: 'caller',
       convId: '245475557381246976', msgId: '9223372036854775807',
@@ -287,6 +290,16 @@ test('iOS 和 Android 继续由原生处理后台会议来电，鸿蒙生产入�
   harmonyProduction.invite();
   assert.equal(harmonyProduction.banner.value.inviteId, 'invite-1');
   assert.equal(harmonyProduction.banner.value.expiresAt, undefined);
+});
+
+test('从聊天卡片/邀请链接进入同一场会议时收起邀请条，其它房间不受影响', () => {
+  const h = meetingInviteReceiver('APP-HARMONY', false);
+  h.invite();
+  assert.equal(h.banner.value.inviteId, 'invite-1');
+  h.enterRoom('987654321');
+  assert.equal(h.banner.value.inviteId, 'invite-1');
+  h.enterRoom('123456789');
+  assert.equal(h.banner.value, null);
 });
 
 

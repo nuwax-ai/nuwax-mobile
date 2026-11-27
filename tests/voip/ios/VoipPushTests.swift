@@ -40,6 +40,30 @@ final class VoipPushTests: XCTestCase {
             XCTAssertNil(parse(fields)?.senderAvatar)
         }
     }
+
+    func testPushCanFillMissingAvatarAfterTheIMInvitationWasVerified() throws {
+        let avatar = "/api/user/avatar/10001/profile-hash"
+        var fields = payload
+        fields["senderAvatar"] = avatar
+        fields["mediaType"] = "video"
+        let invitation = try XCTUnwrap(parse(fields))
+        let call: [String: Any] = ["protocol": "im-voip-v1", "callId": "call-123", "calleeId": "bob", "mediaType": "audio",
+                                   "convId": "245475557381246976", "msgId": "9223372036854775807", "state": "connecting", "version": 2]
+        let updated = try XCTUnwrap(invitation.backfillCallerAvatar(call, now: now))
+        XCTAssertEqual(updated["callerAvatar"] as? String, avatar)
+        XCTAssertEqual(updated["state"] as? String, "connecting")
+        XCTAssertEqual(updated["version"] as? Int, 3)
+        XCTAssertNil(invitation.backfillCallerAvatar(updated, now: now))
+        XCTAssertNil(invitation.backfillCallerAvatar(call, now: now + 45_000))
+        for key in ["protocol", "callId", "calleeId", "convId", "msgId"] {
+            var other = call; other[key] = "different"
+            XCTAssertNil(invitation.backfillCallerAvatar(other, now: now), key)
+        }
+        var ringing = call; ringing["state"] = "ringing"
+        XCTAssertNil(invitation.backfillCallerAvatar(ringing, now: now))
+        var ended = call; ended["state"] = "ended"
+        XCTAssertNil(invitation.backfillCallerAvatar(ended, now: now))
+    }
     func testSystemReportDoesNotDisplayTheCallIdentifier() throws {
         var fields = payload
         fields["displayName"] = "call-123"

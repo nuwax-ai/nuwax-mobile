@@ -76,6 +76,16 @@ struct NuwaxVoipPushInvitation {
         return avatar
     }
 
+    func backfillCallerAvatar(_ call: [String: Any], now: Double) -> [String: Any]? {
+        guard scene == "call", expiresAt > now, let convId, let msgId, let senderAvatar,
+              call["protocol"] as? String == "im-voip-v1", call["callId"] as? String == callId,
+              call["convId"] as? String == convId, call["msgId"] as? String == msgId,
+              call["calleeId"] as? String == calleeId else { return nil }
+        // The callee can answer a video invitation with audio only.
+        if call["state"] as? String == "ringing", call["mediaType"] as? String != mediaType { return nil }
+        return NuwaxVoipClientPolicy.backfillCallerAvatar(call, from: senderAvatar)
+    }
+
     init?(meetingMessage message: [String: Any], userId: String, now: Double) {
         guard let sender = Self.responseId(message["senderId"]), sender != userId,
               let conv = Self.responseId(message["convId"]), let msg = Self.responseId(message["msgId"]),

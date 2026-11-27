@@ -67,6 +67,21 @@ final class ClientStateTests: XCTestCase {
         XCTAssertNil(NuwaxVoipClientPolicy.backfillCallerAvatar(call, callID: "call-a", callerID: "42", contacts: Array(contacts.dropLast())))
     }
 
+    func testDuplicateVerifiedInvitationCanFillOnlyTheSameCallersAvatar() throws {
+        let call: [String: Any] = ["protocol": "im-voip-v1", "callId": "call-a", "convId": "1", "msgId": "2",
+                                   "callerId": "42", "calleeId": "43", "mediaType": "video", "version": 3, "state": "active"]
+        var duplicate = call
+        duplicate["version"] = 1
+        duplicate["state"] = "ringing"
+        duplicate["callerAvatar"] = "/api/f/caller.png"
+        let updated = try XCTUnwrap(NuwaxVoipClientPolicy.backfillCallerAvatar(call, from: duplicate))
+        XCTAssertEqual(updated["callerAvatar"] as? String, "/api/f/caller.png")
+        XCTAssertEqual(updated["state"] as? String, "active")
+        XCTAssertEqual(updated["version"] as? Int, 4)
+        duplicate["callerId"] = "44"
+        XCTAssertNil(NuwaxVoipClientPolicy.backfillCallerAvatar(call, from: duplicate))
+    }
+
     func testFirstAnswerRequiresForegroundOnlyWhenPermissionUndetermined() {
         XCTAssertEqual(NuwaxVoipClientPolicy.permissionPlan(microphone: .notDetermined, camera: .denied, video: false, foreground: false), .foreground)
         XCTAssertEqual(NuwaxVoipClientPolicy.permissionPlan(microphone: .notDetermined, camera: .denied, video: false, foreground: true), .request)

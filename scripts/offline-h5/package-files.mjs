@@ -28,6 +28,11 @@ export function sourceFingerprint(root) {
   walk(root);
   return digest(JSON.stringify(entries));
 }
+/** macOS 会在资源目录留下 .DS_Store。清单可能记下它，云打包又不会打进 APK。 */
+function isDesktopStoreFile(resourcePath) {
+  return resourcePath === '.DS_Store' || resourcePath.endsWith('/.DS_Store');
+}
+
 export function verifyResourcePackage(directory) {
   directory = path.resolve(directory);
   const manifest = JSON.parse(fs.readFileSync(path.join(directory, RESOURCE_LIST_FILE), 'utf8'));
@@ -35,6 +40,7 @@ export function verifyResourcePackage(directory) {
   const seen = new Set();
   for (const entry of manifest.files) {
     if (typeof entry.path !== 'string' || entry.path.includes('\\') || entry.path.startsWith('/') || entry.path.split('/').some(p => !p || p === '.' || p === '..') || seen.has(entry.path)) throw new Error('Invalid resource path');
+    if (isDesktopStoreFile(entry.path)) continue;
     seen.add(entry.path);
     const file = path.join(directory, entry.path);
     for (let current = file; current !== path.resolve(directory); current = path.dirname(current)) {

@@ -6,6 +6,9 @@ const kits = vi.hoisted(() => ({
   receive: vi.fn(), loadAsset: vi.fn(), report: vi.fn(), reportError: vi.fn(), reportState: vi.fn(),
   onCall: vi.fn(), createPicture: vi.fn(), createImageSource: vi.fn(), createCallId: vi.fn(),
   getOutputDevices: vi.fn(), setCommunicationDevice: vi.fn(),
+  setDefaultOutputDevice: vi.fn(), getDefaultOutputDevice: vi.fn(), isAudioSessionActivated: vi.fn(),
+  activateAudioSession: vi.fn(), deactivateAudioSession: vi.fn(), setAudioSessionScene: vi.fn(),
+  onOutputDeviceChange: vi.fn(), offOutputDeviceChange: vi.fn(),
   checkAccessToken: vi.fn(), requestPermissions: vi.fn(),
 }));
 vi.mock('BuildProfile', () => ({ default: { DEBUG: true } }));
@@ -50,14 +53,28 @@ vi.mock('@kit.ImageKit', () => ({ image: {
   createPixelMap: kits.createPicture, createImageSource: kits.createImageSource, PixelMapFormat: { RGBA_8888: 0 },
 } }));
 vi.mock('@kit.AudioKit', () => ({ audio: {
-  getAudioManager: () => ({ getRoutingManager: () => ({
-    getPreferredOutputDeviceForRendererInfoSync: kits.getOutputDevices,
-    setCommunicationDevice: kits.setCommunicationDevice,
-  }) }),
+  getAudioManager: () => ({
+    getRoutingManager: () => ({
+      getPreferredOutputDeviceForRendererInfoSync: kits.getOutputDevices,
+      setCommunicationDevice: kits.setCommunicationDevice,
+    }),
+    getSessionManager: () => ({
+      isAudioSessionActivated: kits.isAudioSessionActivated,
+      setAudioSessionScene: kits.setAudioSessionScene,
+      activateAudioSession: kits.activateAudioSession,
+      deactivateAudioSession: kits.deactivateAudioSession,
+      getDefaultOutputDevice: kits.getDefaultOutputDevice,
+      setDefaultOutputDevice: kits.setDefaultOutputDevice,
+      on: kits.onOutputDeviceChange,
+      off: kits.offOutputDeviceChange,
+    }),
+  }),
+  AudioSessionScene: { AUDIO_SESSION_SCENE_VOICE_COMMUNICATION: 'call' },
+  AudioConcurrencyMode: { CONCURRENCY_MIX_WITH_OTHERS: 'mix' },
   StreamUsage: { STREAM_USAGE_VIDEO_COMMUNICATION: 'video', STREAM_USAGE_VOICE_COMMUNICATION: 'voice' },
   CommunicationDeviceType: { SPEAKER: 'speaker' },
   DeviceType: {
-    SPEAKER: 'speaker', EARPIECE: 'earpiece', BLUETOOTH_SCO: 'sco', BLUETOOTH_A2DP: 'a2dp',
+    DEFAULT: 'default', SPEAKER: 'speaker', EARPIECE: 'earpiece', BLUETOOTH_SCO: 'sco', BLUETOOTH_A2DP: 'a2dp',
     WIRED_HEADSET: 'wired', WIRED_HEADPHONES: 'headphones', USB_HEADSET: 'usb',
   },
 } }));
@@ -95,6 +112,17 @@ beforeEach(() => {
   kits.createImageSource.mockReset();
   kits.createCallId.mockReset().mockReturnValue('local-system-call');
   kits.getOutputDevices.mockReset().mockReturnValue([{ deviceType: 'earpiece' }]);
+  kits.getDefaultOutputDevice.mockReset().mockReturnValue('default');
+  kits.isAudioSessionActivated.mockReset().mockReturnValue(false);
+  kits.setAudioSessionScene.mockReset();
+  kits.activateAudioSession.mockReset().mockImplementation(async () => { kits.isAudioSessionActivated.mockReturnValue(true); });
+  kits.deactivateAudioSession.mockReset().mockImplementation(async () => { kits.isAudioSessionActivated.mockReturnValue(false); });
+  kits.onOutputDeviceChange.mockReset(); kits.offOutputDeviceChange.mockReset();
+  kits.setDefaultOutputDevice.mockReset().mockImplementation(async deviceType => {
+    const preferred = kits.getOutputDevices();
+    const hasAccessory = ['sco', 'wired'].includes(preferred[0]?.deviceType);
+    kits.onOutputDeviceChange.mock.lastCall?.[1]({ devices: hasAccessory ? preferred : [{ deviceType }] });
+  });
   kits.checkAccessToken.mockReset().mockReturnValue(-1);
   kits.requestPermissions.mockReset().mockResolvedValue({ authResults: [] });
   kits.setCommunicationDevice.mockReset().mockImplementation(async (_device, enabled) => {
@@ -172,16 +200,34 @@ describe('Harmony system call cold start', () => {
     async (mediaType, usage, route) => {
       setup();
       VoipBridge.adopt(ringingCall(mediaType));
+      if (mediaType === 'video') kits.getOutputDevices.mockReturnValue([{ deviceType: 'speaker' }]);
       VoipBridge.speaker(mediaType === 'video', false);
       await vi.waitFor(() => expect(VoipBridge.audioRoutePending).toBe(false));
       expect(kits.getOutputDevices).toHaveBeenCalledWith({ usage, rendererFlags: 0 });
-      expect(kits.setCommunicationDevice).toHaveBeenCalledExactlyOnceWith('speaker', mediaType === 'video');
+      if (mediaType === 'video') {
+        expect(kits.setDefaultOutputDevice).toHaveBeenCalledExactlyOnceWith('speaker');
+        expect(kits.setCommunicationDevice).not.toHaveBeenCalled();
+      } else {
+        expect(kits.setCommunicationDevice).toHaveBeenCalledExactlyOnceWith('speaker', false);
+      }
       expect(VoipBridge.audioRoute).toBe(route);
       VoipBridge.speaker(mediaType === 'audio');
       VoipBridge.speaker(mediaType === 'video', false);
       await vi.waitFor(() => expect(VoipBridge.audioRoutePending).toBe(false));
-      expect(kits.setCommunicationDevice).toHaveBeenCalledTimes(2);
       expect(VoipBridge.audioRoute).toBe(mediaType === 'audio' ? 'speaker' : 'earpiece');
+      if (mediaType === 'video') {
+        VoipBridge.speaker(true);
+        await vi.waitFor(() => expect(VoipBridge.audioRoutePending).toBe(false));
+        expect(VoipBridge.audioRoute).toBe('speaker');
+        expect(kits.setDefaultOutputDevice.mock.calls).toEqual([['speaker'], ['earpiece'], ['speaker']]);
+        expect(kits.activateAudioSession).toHaveBeenCalledOnce();
+        VoipBridge.finish('ended', false);
+        await vi.waitFor(() => expect(kits.deactivateAudioSession).toHaveBeenCalledOnce());
+        expect(kits.setDefaultOutputDevice).toHaveBeenLastCalledWith('default');
+        expect(kits.offOutputDeviceChange).toHaveBeenCalledExactlyOnceWith('currentOutputDeviceChanged', kits.onOutputDeviceChange.mock.lastCall?.[1]);
+      } else {
+        expect(kits.setCommunicationDevice).toHaveBeenCalledTimes(2);
+      }
     },
   );
 
@@ -195,6 +241,8 @@ describe('Harmony system call cold start', () => {
       await vi.waitFor(() => expect(VoipBridge.audioRoutePending).toBe(false));
       expect(kits.setCommunicationDevice).not.toHaveBeenCalled();
       expect(VoipBridge.queue).toContainEqual(expect.objectContaining({ type: 'audioRoute', selected: route }));
+      VoipBridge.finish('ended', false);
+      await vi.waitFor(() => expect(kits.deactivateAudioSession).toHaveBeenCalledOnce());
     },
   );
 

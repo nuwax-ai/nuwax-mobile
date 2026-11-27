@@ -537,7 +537,9 @@ async function handle(event, invocationId) {
     }))
   }
   const harmonyRoute = body.callRoute?.transport === 'harmony-huawei'
-  const nativeAttempt = scene?.meeting && !meetingRinging ? null : prepareNativeVoip(body)
+  const harmonyMeetingEnabled = process.env.NUWAX_VOIP_HARMONY_MEETING_RING !== '0'
+  const skipMeetingNativeRoute = scene?.meeting && (!meetingRinging || (harmonyRoute && !harmonyMeetingEnabled))
+  const nativeAttempt = skipMeetingNativeRoute ? null : prepareNativeVoip(body)
   const nativeVoip = nativeAttempt?.error && strictCids && !harmonyRoute ? null : nativeAttempt
   if (nativeVoip) {
     if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
@@ -559,8 +561,8 @@ async function handle(event, invocationId) {
   // iOS 读 IM 登记，其他设备继续按个推档案选路。普通通知合并发送。
   const invitation = scene?.call ?? (meetingRinging ? ringAttempt : null)
   if (body.callRoute == null && invitation != null) {
-    // Existing Harmony test packages only handle the single-chat native route.
-    const allowHarmony = scene?.call != null || process.env.NUWAX_VOIP_HARMONY_MEETING_RING === '1'
+    // Test HAPs support native meeting invitations. Allow a rollback for meetings only.
+    const allowHarmony = scene?.call != null || harmonyMeetingEnabled
     const results = []
     const notificationCids = []
     for (let i = 0; i < ids.length; i++) {

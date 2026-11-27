@@ -359,6 +359,7 @@ test('resource verification rejects altered files and symlink directories', () =
       fs.writeFileSync(path.join(dir, name), name);
       return { path: name, bytes: Buffer.byteLength(name), sha256: digest(name) };
     });
+    files.push({ path: 'static/.DS_Store', bytes: 8, sha256: digest('store') });
     fs.writeFileSync(path.join(dir, RESOURCE_LIST_FILE), JSON.stringify({ schemaVersion: 1, protocolVersion: 1, files, resourceVersion: digest(JSON.stringify(files)) }));
     verifyResourcePackage(dir);
     fs.writeFileSync(path.join(dir, 'index.html'), 'broken');

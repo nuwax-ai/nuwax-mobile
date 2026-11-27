@@ -21,6 +21,29 @@ public enum VoiceNoteM4aSeal {
     /// 最近一次没封上的原因。成功时为空。页面日志会带上它。
     private static var lastDetail = ""
 
+    /// 单独识别只有容器头的录音。无法完整解析的布局仍走保留和修复流程。
+    static func hasNoMedia(_ path: String) -> Bool {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe),
+              data.count >= 16, readU32(data, 4) == 0x66747970 else { return false } // ftyp
+        var offset = 0
+        while offset + 8 <= data.count {
+            let type = readU32(data, offset + 4)
+            let size32 = readU32(data, offset)
+            let header = size32 == 1 ? 16 : 8
+            guard let size = boxByteSize(data, offset), size >= header, size <= data.count - offset else { return false }
+            switch type {
+            case 0x6d646174: // mdat
+                if size > header { return false }
+            case 0x66747970, 0x6d6f6f76, 0x66726565, 0x736b6970, 0x77696465: // ftyp, moov, free, skip, wide
+                if size32 == 0 { return false }
+            default:
+                return false
+            }
+            offset += size
+        }
+        return offset == data.count
+    }
+
     public static func sealFile(_ path: String) -> String {
         if path.isEmpty {
             return "0:path"

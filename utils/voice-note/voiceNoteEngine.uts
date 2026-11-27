@@ -80,6 +80,9 @@ let closedDurationOverride = 0;
 /** 切段过程中点了暂停。新文件打开后再暂停同一个采集器。 */
 let pauseAfterRotate = false;
 // #endif
+// #ifdef APP-IOS
+let lastIosHoldState = "";
+// #endif
 /**
  * 回前台时这一段已经超时长。先别切段，让停止、继续先用当前文件。
  * 继续录音返回后再允许切段。
@@ -444,6 +447,12 @@ async function finishM4aStop(intent: string, path: string): Promise<void> {
       rotatedPath = "";
     }
   }
+  // #ifdef APP-IOS
+  // 用户结束/重录在切段期间到达时，还要停掉已经打开的原生段。
+  if (intent == "rotate" && queuedIntent.length > 0 && m4aRecorder != null) {
+    await m4aRecorder!.stop();
+  }
+  // #endif
   let intentToUse = intent;
   if (queuedIntent.length > 0) {
     intentToUse = queuedIntent;
@@ -546,6 +555,10 @@ function onTick(): void {
   // #endif
   const segmentElapsed = openSegmentMs(record, Date.now());
   if (!deferRotate && segmentElapsed >= segmentMs && stopIntent.length == 0) {
+    // #ifdef APP-IOS
+    const state = readIosRecorderState(record.localId);
+    if (!state.startsWith("live|") || iosRecorderPath(state) != record.openSegmentPath || recorderBusy) return;
+    // #endif
     // 鸿蒙切段要先停掉 AVRecorder 再 start。后台不允许重新 start，文件继续写，回前台再切。
     // #ifdef APP-HARMONY
     if (isAppInBackground()) {
@@ -764,13 +777,16 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
       }
     }
     const state = readIosRecordingFile(filePath);
-    const missing = state == "missing" || (state == "legacy" && await segmentFileSize(filePath) <= 0);
+    const missing = state == "missing" || state == "empty" || (state == "legacy" && await segmentFileSize(filePath) <= 0);
     if (missing) {
       if (record.openSegmentPath == filePath || record.openSegmentPath == tempPath) {
         record.openSegmentPath = "";
+        record.openElapsedMs = 0;
+        record.segmentStartedAt = 0;
       }
       touch(record);
       acknowledgeIosRecording(filePath);
+      if (state == "empty") void unlinkVoiceFile(filePath);
       return -1;
     }
     // 文件不可读时先登记为待补封口，不能以墙钟估算时长或删除。
@@ -794,7 +810,9 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
     record.openSegmentPath = "";
   } else if (record.openSegmentIndex <= index) {
     record.openSegmentIndex = index + 1;
+    // #ifndef APP-IOS
     record.openElapsedMs = 0;
+    // #endif
     if (record.phase != "recording") {
       record.segmentStartedAt = 0;
     }
@@ -890,6 +908,9 @@ function onNativeError(err: any | null): void {
 
 /** App 的 m4a 录音器不占用 RecorderManager。小程序才需要松开那组单例回调。 */
 function releaseRecorderCallbacks(): void {
+  // #ifdef APP-IOS
+  lastIosHoldState = "";
+  // #endif
   pausedByInterruption = false;
   stopInterruptWatch();
   recorderBound = false;
@@ -992,22 +1013,19 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     if (path.length == 0 && record.openSegmentPath.length > 0) {
       path = record.openSegmentPath;
     }
-    let closedIndex = -1;
-    if (path.length > 0) {
-      closedIndex = await closeSegment(record, path);
-    }
     // #ifdef APP-IOS
-    await recoverIosRecordingFiles(record, false);
+    await recoverIosRecordingFiles(record, false, path);
     const recovered = noteByLocalId(record.localId);
     if (recovered != null) record = recovered;
+    // #endif
+    // #ifndef APP-IOS
+    if (path.length > 0 && await closeSegment(record, path) >= 0) {
+      record.openSegmentPath = "";
+    }
     // #endif
     record.phase = "uploading";
     record.awaitComplete = true;
     record.segmentStartedAt = 0;
-    // 没收到分段就清掉路径的话，文件还在磁盘上，补传却找不到它。
-    if (closedIndex >= 0) {
-      record.openSegmentPath = "";
-    }
     touch(record);
     endBackground();
     stopTicker();
@@ -1105,6 +1123,19 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
   }
   pendingRotatedPath = "";
   // #endif
+  // #ifdef APP-IOS
+  if (rotateOpenFailed) {
+    rotateOpenFailed = false;
+    const state = readIosRecorderState(record.localId);
+    record.phase = "paused";
+    record.heldByCall = state.startsWith("held|");
+    record.segmentStartedAt = 0;
+    record.openElapsedMs = 0;
+    pausedByInterruption = record.heldByCall;
+    markCaptureRunning(record.localId);
+    touch(record);
+  }
+  // #endif
   // #ifdef APP-HARMONY
   if (rotateOpenFailed) {
     rotateOpenFailed = false;
@@ -1163,7 +1194,12 @@ function writeSegmentUpload(
     if (error.length > 0) {
       record.error = error;
     } else if (status == "uploaded") {
+      // #ifdef APP-IOS
+      if (record.error != "录音文件待修复") record.error = "";
+      // #endif
+      // #ifndef APP-IOS
       record.error = "";
+      // #endif
     }
     touch(record);
     return record;
@@ -1503,7 +1539,12 @@ function compactPendingSegmentIndexes(record: VoiceNoteRecord): void {
   const used: number[] = [];
   for (let i = 0; i < record.segments.length; i++) {
     const row = record.segments[i];
-    if (row.uploadStatus == "uploaded") used.push(row.segmentIndex);
+    if (row.uploadStatus == "uploaded") {
+      used.push(row.segmentIndex);
+    }
+    // #ifdef APP-IOS
+    if (row.uploadStatus == "uploading") used.push(row.segmentIndex);
+    // #endif
   }
   let next = 0;
   let maxIndex = -1;
@@ -1513,6 +1554,12 @@ function compactPendingSegmentIndexes(record: VoiceNoteRecord): void {
       if (row.segmentIndex > maxIndex) maxIndex = row.segmentIndex;
       continue;
     }
+    // #ifdef APP-IOS
+    if (row.uploadStatus == "uploading") {
+      if (row.segmentIndex > maxIndex) maxIndex = row.segmentIndex;
+      continue;
+    }
+    // #endif
     while (segmentIndexUsed(used, next)) {
       next = next + 1;
     }
@@ -1534,6 +1581,10 @@ function removeMissingSegment(localId: string, segmentIndex: number): VoiceNoteR
     const row = record.segments[i];
     if (row.segmentIndex != segmentIndex || row.uploadStatus == "uploaded") {
       kept.push(row);
+    } else {
+      // #ifdef APP-IOS
+      record.accumulatedMs = Math.max(0, record.accumulatedMs - row.durationMs);
+      // #endif
     }
   }
   while (record.segments.length > 0) {
@@ -1668,9 +1719,12 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
   const protectedLocalId = panelAtStart != null ? panelAtStart.localId : "";
   try {
     await stageOpenFileForUpload(localId);
-    const skipped: number[] = [];
     // #ifdef APP-IOS
+    const skippedPaths: string[] = [];
     let waitingForNativeTransfer = false;
+    // #endif
+    // #ifndef APP-IOS
+    const skipped: number[] = [];
     // #endif
     let guard = 0;
     while (guard < 10000) {
@@ -1685,7 +1739,12 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
       let pending: VoiceNoteSegmentRecord | null = null;
       for (let i = 0; i < open.segments.length; i++) {
         const row = open.segments[i];
+        // #ifdef APP-IOS
+        if (skippedPaths.indexOf(row.filePath) >= 0) continue;
+        // #endif
+        // #ifndef APP-IOS
         if (segmentSkipped(skipped, row.segmentIndex)) continue;
+        // #endif
         if (history) {
           if (!historySegmentNeedsUpload(row)) continue;
         } else if (!segmentCanUpload(row)) {
@@ -1726,7 +1785,7 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
         const nativeStatus = iosNativeUploadStatus(missingPath);
         if (nativeStatus == "pending") {
           waitingForNativeTransfer = true;
-          skipped.push(pending.segmentIndex);
+          skippedPaths.push(missingPath);
           pollIosNativeUpload(sessionId);
           continue;
         }
@@ -1748,6 +1807,7 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
         state = readIosRecordingFile(missingPath);
         if (state == "pending") bumpSegmentSeal(sessionId, pending.segmentIndex);
       }
+      if (state == "empty") void unlinkVoiceFile(missingPath);
       if (state == "legacy") {
         gate = await segmentUploadReady(missingPath);
         if (gate == "unsealed" && pending.sealAttempts < maxSealAttempts) {
@@ -1820,12 +1880,15 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
         if (gate == "unsealed") {
           // #ifdef APP-IOS
           const retained = findVoiceNoteByLocalId(sessionId);
-          if (retained != null && retained.error.length == 0) {
+          if (retained != null && retained.phase != "recording" && retained.phase != "paused") {
             retained.error = "录音文件待修复";
             touch(retained);
           }
+          skippedPaths.push(missingPath);
           // #endif
+          // #ifndef APP-IOS
           skipped.push(pending.segmentIndex);
+          // #endif
           continue;
         }
         const left = removeMissingSegment(sessionId, pending.segmentIndex);
@@ -1849,6 +1912,12 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
       if (ready == null || ready.noteId.length == 0) {
         break;
       }
+      // #ifdef APP-IOS
+      // 移除空段后未上传的段号可能移动。用路径从最新记录取上传参数。
+      const readySegment = ready.segments.find(row => row.filePath == missingPath && row.uploadStatus != "uploaded");
+      if (readySegment == null) continue;
+      pending = readySegment;
+      // #endif
       const segmentIndex = pending.segmentIndex;
       const filePath = pending.filePath;
       const durationMs = pending.durationMs;
@@ -1866,7 +1935,12 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
       } catch (e) {
         writeSegmentUpload(sessionId, segmentIndex, "failed", "", `${e}`, attempts);
         if (history || backfill || attempts >= maxSegmentUploadAttempts) {
+          // #ifdef APP-IOS
+          skippedPaths.push(filePath);
+          // #endif
+          // #ifndef APP-IOS
           skipped.push(segmentIndex);
+          // #endif
         }
       }
     }
@@ -1967,7 +2041,7 @@ async function stageOpenFileForUpload(localId: string): Promise<void> {
   const path = record.openSegmentPath;
   if (path.length == 0) return;
   // #ifdef APP-IOS
-  await closeSegment(record, path);
+  await recoverIosRecordingFiles(record, false, path);
   // #endif
   // #ifndef APP-IOS
   let listed = false;
@@ -2088,6 +2162,9 @@ async function completeRecord(record: VoiceNoteRecord): Promise<void> {
   if (record.phase == "recording" || record.phase == "paused") {
     return;
   }
+  // #ifdef APP-IOS
+  if (hasUnstagedOpenFile(record)) return;
+  // #endif
   if (record.noteId.length == 0) {
     return;
   }
@@ -2425,6 +2502,24 @@ function bindNoteAfterCapture(localId: string): void {
 /** 暂停后的同一条笔记接着录，不新建会话，也不新开文件。 */
 async function resumePausedNote(record: VoiceNoteRecord): Promise<void> {
   bindRecorder();
+  // #ifdef APP-IOS
+  if (m4aRecorder == null) return;
+  if (record.heldByCall || readIosRecorderState(record.localId).startsWith("held|")) {
+    m4aRecorder!.requestInterruptionResume(record.localId);
+    ensureInterruptWatch();
+    await pollVoiceInterruption();
+    return;
+  }
+  if (record.openSegmentPath.length > 0) {
+    if (await m4aRecorder!.resume() != "1") return;
+  } else {
+    const path = await m4aRecorder!.start(record.localId, segmentStampName(record.openSegmentIndex));
+    if (path.length == 0) return;
+  }
+  ensureInterruptWatch();
+  await pollVoiceInterruption();
+  // #endif
+  // #ifndef APP-IOS
   record.phase = "recording";
   record.segmentStartedAt = Date.now();
   record.awaitComplete = false;
@@ -2450,6 +2545,7 @@ async function resumePausedNote(record: VoiceNoteRecord): Promise<void> {
   }
   // #endif
   await startRecorder();
+  // #endif
 }
 
 function releaseRotateIfRecording(): void {
@@ -2517,156 +2613,102 @@ function newestSegmentPath(record: VoiceNoteRecord): string {
   return "";
 }
 
-/**
- * 电话打断时先停掉当前文件。iOS 在挂断后对同一个 AVAudioRecorder 再 record()
- * 会从文件头重写，接通前的音频就没了。这里先 stop() 封口收成一段，挂断后另开文件。
- */
-async function sealInterruptedIosSegment(record: VoiceNoteRecord): Promise<void> {
-  // #ifdef APP-IOS
-  if (m4aRecorder == null) {
-    return;
-  }
-  recorderBusy = true;
+// #ifdef APP-IOS
+function readIosRecorderState(localId: string): string {
+  if (m4aRecorder == null) return "";
   try {
-    await m4aRecorder!.sealForInterruption();
-    const target = noteByLocalId(record.localId);
-    if (target == null) return;
-    const sealedPath = target.openSegmentPath;
-    currentSegmentPath = "";
-    if (!sessionEnding && queuedIntent != "finish") {
-      target.phase = "paused";
-      target.awaitComplete = false;
-      target.heldByCall = true;
-      target.segmentStartedAt = 0;
-    }
-    if (sealedPath.length > 0) {
-      closedDurationOverride = m4aRecorder!.takeClosedDurationMs();
-      await closeSegment(target, sealedPath);
-    } else {
-      touch(target);
-    }
-    await recoverIosRecordingFiles(target, false);
-  } finally {
-    recorderBusy = false;
-  }
-  if (sessionEnding || queuedIntent == "finish") {
-    queuedIntent = "";
-    stopActiveRecorder("finish");
-    return;
-  }
-  void pumpQueue(record.localId, false);
-  // #endif
-}
-
-/** 原生挂断回调里已经开好的下一段。旧基座没有这个方法时返回空。 */
-function takeLiveIosPath(): string {
-  // #ifdef APP-IOS
-  if (m4aRecorder == null) {
-    return "";
-  }
-  try {
-    return m4aRecorder!.currentRecordingPath();
+    return m4aRecorder!.recordingState(localId);
   } catch (_e) {
     return "";
   }
-  // #endif
-  // #ifndef APP-IOS
-  return "";
-  // #endif
 }
 
-/** 挂断后原生已经录进去的时长。页面计时从这里继续，不把通话算进去。 */
-function takeLiveIosElapsedMs(): number {
-  // #ifdef APP-IOS
-  if (m4aRecorder == null) {
-    return 0;
-  }
-  try {
-    const elapsed = m4aRecorder!.currentRecordingElapsedMs();
-    if (elapsed > 0) {
-      return elapsed;
-    }
-  } catch (_e) {
-    return 0;
-  }
-  // #endif
-  return 0;
+function iosRecorderPath(state: string): string {
+  const separator = state.indexOf("|", state.indexOf("|") + 1);
+  return separator >= 0 ? state.substring(separator + 1) : "";
 }
 
-/**
- * 原生已经 stop 过的当前段收进列表。时长用录音器停下来时的读数，不把通话时间算进去。
- * @returns 收进列表才为 true。封口失败时保留原路径，避免被新文件盖掉。
- */
-async function commitSealedOpenSegment(record: VoiceNoteRecord): Promise<boolean> {
-  const path = record.openSegmentPath;
-  if (path.length == 0) {
-    return true;
-  }
-  // #ifdef APP-IOS
-  if (m4aRecorder != null) {
-    try {
-      const durationMs = m4aRecorder!.takeClosedDurationMs();
-      if (durationMs > 0) {
-        closedDurationOverride = durationMs;
-      }
-    } catch (_e) {
-      closedDurationOverride = 0;
-    }
-  }
-  // #endif
-  const closed = await closeSegment(record, path);
-  return closed >= 0;
+function iosRecorderDuration(state: string): number {
+  const start = state.indexOf("|") + 1;
+  const end = state.indexOf("|", start);
+  if (end < start) return 0;
+  const value = parseInt(state.substring(start, end), 10);
+  return isNaN(value) || value < 0 ? 0 : value;
 }
 
-/** 飞书铃声没占住麦克风。上一段已封口，页面保持录音，改记新文件。 */
-async function adoptSwappedIosSegment(): Promise<void> {
-  // #ifdef APP-IOS
-  const record = activeRecord();
-  if (record == null || m4aRecorder == null) {
-    return;
-  }
-  const live = takeLiveIosPath();
-  if (record.openSegmentPath.length > 0 && record.openSegmentPath != live) {
-    const kept = await commitSealedOpenSegment(record);
-    if (!kept) {
-      return;
-    }
-  }
-  const latest = activeRecord();
-  const target = latest != null ? latest : record;
-  if (live.length > 0) {
-    adoptLiveRecording(target, live);
-  }
-  // #endif
-}
-
-/** 页面轮询停住期间，原生已经接着录了。直接用那个文件，不要再开一段。 */
-function adoptLiveRecording(record: VoiceNoteRecord, path: string): boolean {
-  if (path.length == 0) {
-    return false;
-  }
-  const elapsed = takeLiveIosElapsedMs();
-  const sameFile = record.openSegmentPath == path;
+function adoptIosRecording(record: VoiceNoteRecord, state: string): void {
+  const path = iosRecorderPath(state);
+  lastIosHoldState = "";
   currentSegmentPath = path;
   record.phase = "recording";
   record.openSegmentPath = path;
-  if (!sameFile) {
-    record.openElapsedMs = 0;
-    record.segmentStartedAt = Date.now() - elapsed;
-  } else if (record.segmentStartedAt <= 0) {
-    record.segmentStartedAt = Date.now() - elapsed;
-  }
+  record.openElapsedMs = 0;
+  record.segmentStartedAt = Date.now() - iosRecorderDuration(state);
   record.awaitComplete = false;
   record.heldByCall = false;
   record.error = "";
   markCaptureRunning(record.localId);
   saveRecordQuiet(record);
   stopIntent = "";
-  ensureTicker();
   pausedByInterruption = false;
+  ensureTicker();
+  releaseRotateIfRecording();
   armCaptureSideEffects(record.localId);
-  return true;
 }
+
+/** 原生状态和文件索引可以跨过 UTS 停止运行期间的多次分段。 */
+async function reconcileIosInterruption(): Promise<void> {
+  if (recorderBusy || sessionEnding || stopIntent.length > 0) return;
+  const active = activeRecord();
+  const record = active != null ? active : findPausedVoiceNote();
+  if (record == null) return;
+  const state = readIosRecorderState(record.localId);
+  const path = iosRecorderPath(state);
+  const held = state.startsWith("held|");
+  if (!held && (!state.startsWith("live|") || path.length == 0)) return;
+  if (held && state == lastIosHoldState && record.phase == "paused" && record.heldByCall && record.openSegmentPath.length == 0) return;
+  if (!held && record.phase == "recording" && path == record.openSegmentPath) return;
+
+  recorderBusy = true;
+  try {
+    const oldPath = record.openSegmentPath;
+    currentSegmentPath = "";
+    if (held) {
+      lastIosHoldState = state;
+      pausedByInterruption = true;
+      record.phase = "paused";
+      record.heldByCall = true;
+      record.segmentStartedAt = 0;
+      record.openElapsedMs = oldPath == path ? iosRecorderDuration(state) : 0;
+      touch(record);
+      stopTicker();
+      ensureInterruptWatch();
+    }
+    const fallback = held || oldPath != path ? oldPath : "";
+    await recoverIosRecordingFiles(record, false, fallback);
+    const latest = noteByLocalId(record.localId);
+    if (latest == null || sessionEnding || queuedIntent.length > 0 || pauseAfterRotate) return;
+    const live = readIosRecorderState(record.localId);
+    // 再读一次，避免对账时经过了下一次中断。
+    if (!held && live.startsWith("live|") && iosRecorderPath(live) == path) {
+      adoptIosRecording(latest, live);
+    }
+  } finally {
+    recorderBusy = false;
+    const intent = queuedIntent;
+    queuedIntent = "";
+    if (intent.length > 0) {
+      stopActiveRecorder(intent);
+    } else if (pauseAfterRotate) {
+      pauseAfterRotate = false;
+      const latest = noteByLocalId(record.localId);
+      if (latest != null) await pauseActiveRecorder(latest);
+    } else {
+      void pumpQueue(record.localId, false);
+    }
+  }
+}
+// #endif
 
 async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
   if (sessionEnding) {
@@ -2679,11 +2721,36 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
     return;
   }
   // #ifdef APP-IOS
-  if (pausedByInterruption && m4aRecorder != null && record.openSegmentPath.length > 0) {
-    await sealInterruptedIosSegment(record);
-    return;
+  if (m4aRecorder == null || (record.phase == "paused" && !record.heldByCall)) return;
+  recorderBusy = true;
+  try {
+    const state = readIosRecorderState(record.localId);
+    const nativePath = state.startsWith("live|") ? iosRecorderPath(state) : "";
+    if (await m4aRecorder!.pause() != "1") return;
+    const latest = noteByLocalId(record.localId);
+    if (latest == null || sessionEnding || queuedIntent.length > 0) return;
+    const oldPath = latest.openSegmentPath;
+    latest.phase = "paused";
+    latest.heldByCall = false;
+    latest.awaitComplete = false;
+    latest.segmentStartedAt = 0;
+    currentSegmentPath = nativePath;
+    latest.openSegmentPath = nativePath;
+    latest.openElapsedMs = iosRecorderDuration(state);
+    if (nativePath.length == 0) latest.openElapsedMs = 0;
+    pausedByInterruption = false;
+    stopInterruptWatch();
+    touch(latest);
+    stopTicker();
+    await recoverIosRecordingFiles(latest, false, oldPath == nativePath ? "" : oldPath);
+  } finally {
+    recorderBusy = false;
+    const intent = queuedIntent;
+    queuedIntent = "";
+    if (intent.length > 0) stopActiveRecorder(intent);
   }
   // #endif
+  // #ifndef APP-IOS
   if (m4aRecorder != null && record.openSegmentPath.length > 0) {
     recorderBusy = true;
     let paused = "0";
@@ -2733,6 +2800,7 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
     return;
   }
   // #endif
+  // #endif
   if (sessionEnding) {
     stopActiveRecorder("finish");
     return;
@@ -2740,15 +2808,13 @@ async function pauseActiveRecorder(record: VoiceNoteRecord): Promise<void> {
   // 停不住采集时也不要 stop。stop 会把未满分段的文件落盘并上传。
 }
 
+// #ifndef APP-IOS
 /** 鸿蒙通话中 pause 会失败，当前段已经封口。这里新开下一段；麦克风还被占用时安静失败，不弹错、不丢掉这次录音。 */
 async function openSealedInterruptSegment(record: VoiceNoteRecord): Promise<boolean> {
   // #ifdef APP
   bindRecorder();
   if (m4aRecorder == null) {
     m4aRecorder = new VoiceNoteM4aRecorder();
-  }
-  if (adoptLiveRecording(record, takeLiveIosPath())) {
-    return true;
   }
   let path = "";
   try {
@@ -2808,10 +2874,6 @@ async function resumeInterruptedNote(record: VoiceNoteRecord): Promise<boolean> 
     return false;
     // #endif
 
-    // 文件还没封口时不要另开。电话打断会先 stop 再清空路径，挂断后走下面的新文件。
-    // #ifdef APP-IOS
-    return false;
-    // #endif
   }
   // 鸿蒙封口之后文件已经关掉，resume 会失败。改成新开一段。
   return await openSealedInterruptSegment(record);
@@ -2821,6 +2883,7 @@ async function resumeInterruptedNote(record: VoiceNoteRecord): Promise<boolean> 
   return captureAlive;
   // #endif
 }
+// #endif
 
 /** 录音面板还在时把中断监听拉起来。退到通话界面后定时器可能停住，回到面板要继续试。 */
 export function keepVoiceNoteInterruptionWatch(): void {
@@ -2843,6 +2906,10 @@ async function pollVoiceInterruption(): Promise<void> {
   }
   interruptBusy = true;
   try {
+    // #ifdef APP-IOS
+    await reconcileIosInterruption();
+    // #endif
+    // #ifndef APP-IOS
     let event = "";
     try {
       event = m4aRecorder!.takeInterruption();
@@ -2850,12 +2917,6 @@ async function pollVoiceInterruption(): Promise<void> {
       return;
     }
     const kind = interruptionKind(event);
-    // #ifdef APP-IOS
-    if (kind == "swap") {
-      await adoptSwappedIosSegment();
-      return;
-    }
-    // #endif
     if (kind == "began") {
       const record = activeRecord();
       if (record == null) {
@@ -2882,30 +2943,10 @@ async function pollVoiceInterruption(): Promise<void> {
     }
     // 通话结束后系统经常仍报着电话场景，也不会再发 ended。文件还在就隔一会儿 resume 一次。
     let retryOpen = false;
-    // #ifdef APP-IOS || APP-HARMONY
+    // #ifdef APP-HARMONY
     retryOpen = event != "ended" && paused.openSegmentPath.length > 0 && interruptRetryDue();
     // #endif
-    let retrySealed = event != "ended" && paused.openSegmentPath.length == 0 && interruptRetryDue();
-    // #ifdef APP-IOS
-    // 飞书通话中路径已经清空。这时重试会把计时和波浪马上打开。只等挂断事件。
-    const liveDuringHold = takeLiveIosPath();
-    if (liveDuringHold.length > 0) {
-      if (paused.openSegmentPath.length > 0 && paused.openSegmentPath != liveDuringHold) {
-        const kept = await commitSealedOpenSegment(paused);
-        if (!kept) {
-          return;
-        }
-      }
-      const latestPaused = findPausedVoiceNote();
-      const adoptTarget = latestPaused != null ? latestPaused : paused;
-      if (adoptLiveRecording(adoptTarget, liveDuringHold)) {
-        pausedByInterruption = false;
-        stopInterruptWatch();
-        return;
-      }
-    }
-    retrySealed = false;
-    // #endif
+    const retrySealed = event != "ended" && paused.openSegmentPath.length == 0 && interruptRetryDue();
     if (event != "ended" && !retrySealed && !retryOpen) {
       return;
     }
@@ -2915,6 +2956,7 @@ async function pollVoiceInterruption(): Promise<void> {
     }
     pausedByInterruption = false;
     stopInterruptWatch();
+    // #endif
   } finally {
     interruptBusy = false;
   }
@@ -2952,7 +2994,10 @@ export function stopVoiceNote(): void {
   pausedByInterruption = false;
   stopInterruptWatch();
   deferRotate = true;
-  const record = activeRecord();
+  let record = activeRecord();
+  // #ifdef APP-IOS
+  if (record == null) record = findPausedVoiceNote();
+  // #endif
   if (record == null) return;
   void pauseActiveRecorder(record);
 }
@@ -3070,7 +3115,7 @@ function markInterruptedComplete(record: VoiceNoteRecord): void {
 }
 
 // #ifdef APP-IOS
-async function recoverIosRecordingFiles(record: VoiceNoteRecord, includeOpen: boolean): Promise<void> {
+async function recoverIosRecordingFiles(record: VoiceNoteRecord, includeOpen: boolean, fallbackPath: string = ""): Promise<void> {
   let paths: string[] = [];
   try {
     const indexed = JSON.parseArray<string>(iosVoiceNoteRecoveryPaths(record.localId, includeOpen));
@@ -3078,8 +3123,14 @@ async function recoverIosRecordingFiles(record: VoiceNoteRecord, includeOpen: bo
   } catch (_e) {
     // On older bases the persisted UTS path is the only recovery source.
   }
-  if (includeOpen && record.openSegmentPath.length > 0 && paths.indexOf(record.openSegmentPath) < 0) {
-    paths.unshift(record.openSegmentPath);
+  const fallback = includeOpen && fallbackPath.length == 0 ? record.openSegmentPath : fallbackPath;
+  if (fallback.length > 0 && paths.indexOf(fallback) < 0) {
+    // 旧版缓存的活动段可能没有索引。已知较早的活动段在原生后续分段前登记。
+    if (includeOpen && fallback == record.openSegmentPath) {
+      paths.unshift(fallback);
+    } else {
+      paths.push(fallback);
+    }
   }
   for (let i = 0; i < paths.length; i++) {
     const latest = findVoiceNoteByLocalId(record.localId);
@@ -3110,7 +3161,7 @@ async function recoverAbandonedRecording(): Promise<void> {
       // #ifdef APP-IOS
       const keptPath = latest.openSegmentPath.length > 0 ? latest.openSegmentPath : path;
       const keptSize = keptPath.length > 0 ? await segmentFileSize(keptPath) : 0;
-      if (keptSize > 0) {
+      if (keptSize > 0 && readIosRecordingFile(keptPath) != "empty") {
         latest.openSegmentPath = keptPath;
         latest.phase = "failed";
         latest.awaitComplete = false;
@@ -3161,7 +3212,7 @@ async function sealLeftoverOpenFiles(): Promise<void> {
     if (row.openSegmentPath.length == 0) continue;
     const current = findVoiceNoteByLocalId(row.localId);
     if (current == null || current.openSegmentPath != row.openSegmentPath) continue;
-    await closeSegment(current, row.openSegmentPath);
+    await recoverIosRecordingFiles(current, false, row.openSegmentPath);
     const latest = findVoiceNoteByLocalId(row.localId);
     if (latest == null || latest.segments.length == 0) continue;
     latest.phase = "uploading";

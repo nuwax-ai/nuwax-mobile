@@ -14,11 +14,11 @@ public final class VoiceNoteRecordingFiles {
 
     public init() {}
 
-    static func remember(_ path: String, durationMs: Int? = nil, closed: Bool = false) {
+    static func remember(_ path: String, openedAt: Date = Date(), durationMs: Int? = nil, closed: Bool = false) {
         let file = URL(fileURLWithPath: path)
         let marker = file.appendingPathExtension(String(suffix.dropFirst()))
         let previous = read(marker)
-        let entry = Entry(name: file.lastPathComponent, openedAt: previous?.openedAt ?? Date(),
+        let entry = Entry(name: file.lastPathComponent, openedAt: previous?.openedAt ?? openedAt,
                           durationMs: durationMs, closed: closed)
         do {
             try JSONEncoder().encode(entry).write(to: marker, options: .atomic)
@@ -76,7 +76,8 @@ public final class VoiceNoteRecordingFiles {
             return "pending"
         }
         let durationMs = Self.durationMs(path)
-        return durationMs > 0 ? "ready|\(durationMs)" : "pending"
+        if durationMs > 0 { return "ready|\(durationMs)" }
+        return VoiceNoteM4aSeal.hasNoMedia(path) ? "empty" : "pending"
     }
 
     static func durationMs(_ path: String) -> Int {

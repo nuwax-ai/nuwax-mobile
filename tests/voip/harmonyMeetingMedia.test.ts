@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RoomEvent, Track } from 'livekit-client';
 import { createMeetingMedia, createMeetingPictureInPicture, meetingStageLayout } from '../../scripts/meeting-harmony/room.mjs';
@@ -62,6 +63,14 @@ afterEach(() => {
 });
 
 describe('Harmony LiveKit room', () => {
+  it('fills camera cards while keeping shared screens fully visible', () => {
+    const page = readFileSync(new URL('../../scripts/meeting-harmony/media.html', import.meta.url), 'utf8');
+    expect(page).toContain('video { position: absolute; inset: 0;');
+    expect(page).toContain('object-fit: cover !important;');
+    expect(page).toContain('#share video { object-fit: contain !important; }');
+    expect(page).not.toMatch(/#cameras \{[^}]*padding:/);
+  });
+
   it('uses the shared page and focus selection across ArkWeb camera and screen tracks', () => {
     const members = [{ identity: 'a', name: 'Alice' }, { identity: 'b', name: 'Bob' }, { identity: 'c', name: 'Carol' }];
     const cameras = [{ participant: members[0] }];

@@ -632,9 +632,16 @@ export class MeetingStageHost {
         const on = command.on === true
         const routing = audio.getAudioManager().getRoutingManager()
         await routing.setCommunicationDevice(audio.CommunicationDeviceType.SPEAKER, on)
-        if (MeetingStageSession.host !== this || MeetingStageSession.id !== command.id ||
-            !MeetingStageSession.isConnected()) return
-        if (!this.readSpeaker() || MeetingStageSession.speaker !== on) MeetingStageSession.controlError = command.type
+        // Harmony can resolve setCommunicationDevice before the route query reflects the new device.
+        // Confirm it for a short bounded period instead of reporting a successful switch as failed.
+        for (let attempt = 0; attempt < 4; attempt++) {
+          if (MeetingStageSession.host !== this || MeetingStageSession.id !== command.id ||
+              !MeetingStageSession.isConnected()) return
+          if (this.readSpeaker() && MeetingStageSession.speaker === on) return
+          if (attempt < 3) await new Promise<void>((resolve) => { setTimeout(resolve, 80) })
+        }
+        if (MeetingStageSession.host === this && MeetingStageSession.id === command.id &&
+            MeetingStageSession.isConnected()) MeetingStageSession.controlError = command.type
         return
       }
       if (command.on && (command.type === 'mic' || command.type === 'camera')) {

@@ -184,21 +184,37 @@ function settle() {
 
 it('reads back the system speaker state after switching and on return to the foreground', async () => {
   const { session, routing } = connectedStage();
+  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
   session.control('speaker', false);
   await settle();
   expect(routing.setCommunicationDevice).toHaveBeenCalledWith(2, false);
-  expect(session.speaker).toBe(true);
-  expect(session.controlError).toBe('speaker');
+  expect(session.speaker).toBe(false);
+  expect(session.controlError).toBe('');
 
   session.setAppForeground(false);
-  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
+  routing.isCommunicationDeviceActiveSync.mockReturnValue(true);
   session.setAppForeground(true);
-  expect(session.speaker).toBe(false);
+  expect(session.speaker).toBe(true);
 
   routing.isCommunicationDeviceActiveSync.mockReturnValue(true);
   session.control('speaker', true);
   await settle();
   expect(session.speaker).toBe(true);
+});
+
+it('waits for a delayed Harmony speaker route update before reporting failure', async () => {
+  const { session, routing, timers } = connectedStage();
+  session.control('speaker', false);
+  await settle();
+  expect(session.controlError).toBe('');
+  expect(timers.size).toBe(1);
+
+  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
+  Array.from(timers.values())[0].callback();
+  await settle();
+  expect(session.speaker).toBe(false);
+  expect(session.controlError).toBe('');
+  expect(routing.isCommunicationDeviceActiveSync).toHaveBeenCalledTimes(2);
 });
 
 it('ignores a speaker change that finishes after the room generation changes', async () => {

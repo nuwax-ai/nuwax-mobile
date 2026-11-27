@@ -1,0 +1,679 @@
+<template>
+  <!-- 待办详情：标题与状态、属性、提交内容，以及完成操作 -->
+  <view class="detail">
+    <!-- 顶栏 -->
+    <custom-nav-bar :title="t('Mobile.Discover.todoDetailTitle')" className="border-b" hasSafetyZone :show-back="true" />
+    <scroll-view v-if="ready" class="detail__scroll" direction="vertical" :show-scrollbar="false">
+      <!-- 标题、完成状态、负责人 -->
+      <view class="detail__card">
+        <text class="detail__title">{{ title }}</text>
+        <view class="detail__status" :class="needSubmit ? 'detail__status--need' : ''">
+          <text class="detail__status-text" :class="needSubmit ? 'detail__status-text--need' : ''">{{ statusText }}</text>
+        </view>
+        <view v-if="people.length > 0" class="detail__people">
+          <view v-for="(person, index) in people" :key="index" class="detail__person">
+            <image v-if="person.avatar.length > 0" class="detail__avatar" :src="person.avatar" mode="aspectFill" />
+            <view v-else class="detail__avatar" :style="person.avatarStyle">
+              <text class="detail__letters">{{ person.letters }}</text>
+            </view>
+            <text class="detail__person-name">{{ person.name }}</text>
+          </view>
+        </view>
+      </view>
+
+      <!-- 截止日期、重要程度、完成模式、提醒、完成要求和创建人 -->
+      <view class="detail__card detail__card--gap">
+        <view class="detail__row">
+          <text class="detail__label">{{ t("Mobile.Discover.todoDueDate") }}</text>
+          <text class="detail__value">{{ dueText }}</text>
+        </view>
+        <view class="detail__row">
+          <text class="detail__label">{{ t("Mobile.Discover.todoPriority") }}</text>
+          <text class="detail__value">{{ priorityText }}</text>
+        </view>
+        <view class="detail__row">
+          <text class="detail__label">{{ t("Mobile.Discover.todoCompleteMode") }}</text>
+          <text class="detail__value">{{ completeText }}</text>
+        </view>
+        <view class="detail__row">
+          <text class="detail__label">{{ t("Mobile.Discover.todoDetailRemind") }}</text>
+          <text class="detail__value" :class="remindMuted ? 'detail__value--muted' : ''">{{ remindText }}</text>
+        </view>
+        <view v-if="requireFile" class="detail__row">
+          <text class="detail__label">{{ t("Mobile.Discover.todoRequirements") }}</text>
+          <text class="detail__value">{{ t("Mobile.Discover.todoRequireFile") }}</text>
+        </view>
+        <view class="detail__row detail__row--last">
+          <text class="detail__label">{{ t("Mobile.Discover.todoCreator") }}</text>
+          <text class="detail__value">{{ creatorName }}</text>
+        </view>
+      </view>
+
+      <!-- 已提交的内容 -->
+      <view class="detail__card detail__card--gap">
+        <text class="detail__section">{{ t("Mobile.Discover.todoSubmitTitle") }}</text>
+        <text v-if="submits.length == 0" class="detail__muted">{{ t("Mobile.Discover.todoSubmitEmpty") }}</text>
+        <text v-for="(line, index) in submits" :key="index" class="detail__submit">{{ line }}</text>
+      </view>
+    </scroll-view>
+    <!-- 未完成时停在底部的确认按钮 -->
+    <view v-if="ready && canComplete" class="detail__footer">
+      <view class="detail__done" :class="submitting ? 'detail__done--busy' : ''" hover-class="detail__done--hover" @click="confirmDone">
+        <text class="detail__done-text">{{ t("Mobile.Discover.todoConfirmDone") }}</text>
+      </view>
+      <safety-zone />
+    </view>
+    <!-- 需要提交内容时，从这里打开完成弹层 -->
+    <todo-complete-sheet ref="completeSheetRef" @done="onCompleteDone" />
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { ref, type ComponentPublicInstance } from "vue";
+  import { onLoad } from "@dcloudio/uni-app";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+  import { avatarGradient } from "@/pages/message/components/im-row-helpers.uts";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiErrorMessage, apiResCode, apiResData } from "@/utils/apiResponse";
+  import { apiCalendarDetail } from "@/servers/calendar/calendar.uts";
+  import { CalendarIdReq } from "@/types/interfaces/calendar";
+  import { CalendarCompleteModeEnum, CalendarEventStatusEnum, CalendarRemindTypeEnum } from "@/types/enums/calendar";
+  import { getMyUserIdSync } from "@/utils/imNoticeBar";
+  import TodoCompleteSheet from "./components/todo-complete-sheet/todo-complete-sheet.uvue";
+  import { readTodoCompleteHint } from "./components/todo-complete-scope.uts";
+
+  class TodoPerson {
+    name: string = "";
+    avatar: string = "";
+    letters: string = "";
+    avatarStyle: string = "";
+  }
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  const ready = ref<boolean>(false);
+  const submitting = ref<boolean>(false);
+  const canComplete = ref<boolean>(false);
+  const needSubmit = ref<boolean>(false);
+  const requireFile = ref<boolean>(false);
+  const assigneeLine = ref<string>("");
+  const isCreator = ref<boolean>(false);
+  const completeMode = ref<string>("");
+  const completeScope = ref<string>("");
+  const pendingNames = ref<string>("");
+  const completeSheetRef = ref<any | null>(null);
+  const title = ref<string>("");
+  const statusText = ref<string>("");
+  const dueText = ref<string>("");
+  const priorityText = ref<string>("");
+  const completeText = ref<string>("");
+  const remindText = ref<string>("");
+  const remindMuted = ref<boolean>(false);
+  const creatorName = ref<string>("");
+  const people = ref<TodoPerson[]>([]);
+  const submits = ref<string[]>([]);
+  let eventId = "";
+
+  function readQuery(options: any | null, key: string): string {
+    if (options == null) {
+      return "";
+    }
+    const obj = options as UTSJSONObject;
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    return `${raw}`.trim();
+  }
+
+  function readText(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const text = `${raw}`.trim();
+    if (text == "null" || text == "undefined") {
+      return "";
+    }
+    return text;
+  }
+
+  function readBool(obj: UTSJSONObject, key: string): boolean {
+    const raw = obj[key];
+    if (raw == true) {
+      return true;
+    }
+    return raw != null && `${raw}` == "true";
+  }
+
+  function asObject(raw: any | null): UTSJSONObject | null {
+    if (raw == null) {
+      return null;
+    }
+    try {
+      const text = JSON.stringify(raw);
+      if (text == null || text.length == 0 || text.charAt(0) != "{") {
+        return null;
+      }
+      return JSON.parse(text) as UTSJSONObject | null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function asRecordList(raw: any | null): UTSJSONObject[] {
+    const list: UTSJSONObject[] = [];
+    if (raw == null) {
+      return list;
+    }
+    try {
+      const text = JSON.stringify(raw);
+      if (text == null || text.length == 0 || text.charAt(0) != "[") {
+        return list;
+      }
+      const parsed = JSON.parse(text) as UTSJSONObject[] | null;
+      if (parsed == null) {
+        return list;
+      }
+      for (let i = 0; i < parsed.length; i++) {
+        const row = parsed[i];
+        if (row != null) {
+          list.push(row);
+        }
+      }
+    } catch (_error) {
+      return list;
+    }
+    return list;
+  }
+
+  function pad2(value: number): string {
+    if (value < 10) {
+      return `0${value}`;
+    }
+    return `${value}`;
+  }
+
+  function formatDay(date: Date): string {
+    return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+  }
+
+  function datePart(raw: string): string {
+    if (raw.length < 10) {
+      return "";
+    }
+    return raw.substring(0, 10);
+  }
+
+  function timePart(raw: string): string {
+    if (raw.length < 16) {
+      return "";
+    }
+    const separator = raw.charAt(10);
+    if (separator != "T" && separator != " ") {
+      return "";
+    }
+    return raw.substring(11, 16);
+  }
+
+  function weekdayText(day: string): string {
+    const parts = day.split("-");
+    if (parts.length < 3) {
+      return "";
+    }
+    const year = parseInt(parts[0]);
+    const month = parseInt(parts[1]);
+    const date = parseInt(parts[2]);
+    if (year <= 0 || month <= 0 || date <= 0) {
+      return "";
+    }
+    const parsed = new Date(year, month - 1, date);
+    const index = parsed.getDay();
+    if (index == 1) {
+      return t("Mobile.Discover.weekdayMon");
+    }
+    if (index == 2) {
+      return t("Mobile.Discover.weekdayTue");
+    }
+    if (index == 3) {
+      return t("Mobile.Discover.weekdayWed");
+    }
+    if (index == 4) {
+      return t("Mobile.Discover.weekdayThu");
+    }
+    if (index == 5) {
+      return t("Mobile.Discover.weekdayFri");
+    }
+    if (index == 6) {
+      return t("Mobile.Discover.weekdaySat");
+    }
+    return t("Mobile.Discover.weekdaySun");
+  }
+
+  function dueLabel(raw: string, allDay: boolean): string {
+    const due = datePart(raw);
+    if (due.length == 0) {
+      return "";
+    }
+    let clock = "";
+    if (!allDay) {
+      clock = timePart(raw);
+    }
+    const now = new Date();
+    const todayText = formatDay(now);
+    const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    const tomorrowText = formatDay(tomorrow);
+    const weekday = now.getDay();
+    const mondayOffset = weekday == 0 ? 6 : weekday - 1;
+    const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - mondayOffset);
+    const weekEnd = new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 6);
+    const nextWeekEnd = new Date(weekEnd.getFullYear(), weekEnd.getMonth(), weekEnd.getDate() + 7);
+    let label = "";
+    if (due == todayText) {
+      label = t("Mobile.Discover.scheduleToday");
+    } else if (due == tomorrowText) {
+      label = t("Mobile.Discover.todoTomorrow");
+    } else if (due >= formatDay(weekStart) && due <= formatDay(weekEnd)) {
+      label = weekdayText(due);
+    } else if (due > formatDay(weekEnd) && due <= formatDay(nextWeekEnd)) {
+      label = t("Mobile.Discover.todoNextWeek") + weekdayText(due);
+    } else {
+      label = due.substring(5);
+    }
+    if (clock.length > 0) {
+      return label + " " + clock;
+    }
+    return label;
+  }
+
+  function lettersOf(name: string): string {
+    let cleaned = "";
+    for (let i = 0; i < name.length; i++) {
+      const ch = name.charAt(i);
+      if (ch != " " && ch != "\t" && ch != "　") {
+        cleaned += ch;
+      }
+    }
+    if (cleaned.length == 0) {
+      return "#";
+    }
+    let hasCjk = false;
+    for (let i = 0; i < cleaned.length; i++) {
+      const code = cleaned.charCodeAt(i);
+      if (code != null && code > 0x2e80) {
+        hasCjk = true;
+        break;
+      }
+    }
+    if (hasCjk && cleaned.length >= 2) {
+      return cleaned.substring(cleaned.length - 2);
+    }
+    return cleaned.charAt(0);
+  }
+
+  function displayName(row: UTSJSONObject, myId: string): string {
+    const userId = readText(row, "userId");
+    if (myId.length > 0 && userId == myId) {
+      return t("Mobile.Discover.todoAssigneeMe");
+    }
+    const name = readText(row, "name");
+    if (name.length > 0) {
+      return name;
+    }
+    const nick = readText(row, "nickName");
+    if (nick.length > 0) {
+      return nick;
+    }
+    return readText(row, "userName");
+  }
+
+  function priorityLabel(raw: string): string {
+    if (raw == "1") {
+      return t("Mobile.Discover.todoPriorityLow");
+    }
+    if (raw == "3") {
+      return t("Mobile.Discover.todoPriorityHigh");
+    }
+    if (raw == "2") {
+      return t("Mobile.Discover.todoPriorityMid");
+    }
+    return "";
+  }
+
+  function completeLabel(raw: string): string {
+    if (raw == `${CalendarCompleteModeEnum.BY_RATIO}`) {
+      return t("Mobile.Discover.todoCompleteRatio");
+    }
+    if (raw == `${CalendarCompleteModeEnum.ALL}`) {
+      return t("Mobile.Discover.todoCompleteAll");
+    }
+    if (raw == `${CalendarCompleteModeEnum.ANY_ONE}`) {
+      return t("Mobile.Discover.todoCompleteSingle");
+    }
+    return "";
+  }
+
+  function applyDetail(obj: UTSJSONObject): void {
+    const myId = getMyUserIdSync();
+    title.value = readText(obj, "title");
+    if (title.value.length == 0) {
+      title.value = readText(obj, "description");
+    }
+    const status = readText(obj, "status");
+    const mustSubmit = readBool(obj, "requireSubmit");
+    requireFile.value = mustSubmit;
+    if (status == `${CalendarEventStatusEnum.COMPLETED}`) {
+      statusText.value = t("Mobile.Discover.todoStatusDone");
+      canComplete.value = false;
+      needSubmit.value = false;
+    } else if (status == `${CalendarEventStatusEnum.CANCELED}`) {
+      statusText.value = t("Mobile.Discover.todoStatusOpen");
+      canComplete.value = false;
+      needSubmit.value = false;
+    } else {
+      needSubmit.value = mustSubmit;
+      statusText.value = mustSubmit ? t("Mobile.Discover.todoNeedSubmit") : t("Mobile.Discover.todoStatusOpen");
+      canComplete.value = true;
+    }
+    const endTime = readText(obj, "endTime");
+    const startTime = readText(obj, "startTime");
+    dueText.value = dueLabel(endTime.length > 0 ? endTime : startTime, readBool(obj, "allDay"));
+    priorityText.value = priorityLabel(readText(obj, "priority"));
+    completeText.value = completeLabel(readText(obj, "completeMode"));
+    if (!readBool(obj, "remindEnabled")) {
+      remindText.value = t("Mobile.Discover.scheduleRemindNone");
+      remindMuted.value = true;
+    } else if (readText(obj, "remindType") == `${CalendarRemindTypeEnum.REPEAT}`) {
+      remindText.value = t("Mobile.Discover.todoRemindEarly");
+      remindMuted.value = false;
+    } else {
+      remindText.value = t("Mobile.Discover.todoRemindDue");
+      remindMuted.value = false;
+    }
+    const participants = asRecordList(obj["participants"]);
+    const nextPeople: TodoPerson[] = [];
+    const nextSubmits: string[] = [];
+    const eventRemark = readText(obj, "completeRemark");
+    if (eventRemark.length > 0) {
+      nextSubmits.push(eventRemark);
+    }
+    let creator = "";
+    const creatorId = readText(obj, "creatorId");
+    if (myId.length > 0 && creatorId == myId) {
+      creator = t("Mobile.Discover.todoAssigneeMe");
+    }
+    for (let i = 0; i < participants.length; i++) {
+      const row = participants[i];
+      const person = new TodoPerson();
+      person.name = displayName(row, myId);
+      person.avatar = readText(row, "avatar");
+      person.letters = lettersOf(person.name);
+      person.avatarStyle = "background-image: " + avatarGradient(person.name) + ";";
+      if (person.name.length > 0) {
+        nextPeople.push(person);
+      }
+      if (creator.length == 0 && readText(row, "userId") == creatorId) {
+        creator = person.name;
+      }
+      const remark = readText(row, "completeRemark");
+      const fileKey = readText(row, "submitFileKey");
+      if (fileKey.length == 0) {
+        const keys = readText(row, "completeFileKeys");
+        if (remark.length > 0) {
+          nextSubmits.push(person.name.length > 0 ? person.name + "：" + remark : remark);
+        } else if (keys.length > 0 && person.name.length > 0) {
+          nextSubmits.push(person.name);
+        }
+      } else if (person.name.length > 0) {
+        nextSubmits.push(remark.length > 0 ? person.name + "：" + remark : person.name);
+      }
+    }
+    creatorName.value = creator;
+    people.value = nextPeople;
+    submits.value = nextSubmits;
+    isCreator.value = myId.length > 0 && creatorId == myId;
+    completeMode.value = readText(obj, "completeMode");
+    const hint = readTodoCompleteHint(obj, myId);
+    completeScope.value = hint.scope;
+    pendingNames.value = hint.pending;
+    let namesText = "";
+    for (let i = 0; i < nextPeople.length; i++) {
+      if (i > 0) {
+        namesText += "、";
+      }
+      namesText += nextPeople[i].name;
+    }
+    const params = new Map<string, string | number>();
+    params.set("names", namesText);
+    let line = translateFn("Mobile.Discover.todoCompleteAssignee", toI18nParams(params), "");
+    if (isCreator.value) {
+      line = line + " · " + t("Mobile.Discover.todoCompleteCreatorHint");
+    }
+    assigneeLine.value = line;
+    ready.value = true;
+  }
+
+  async function loadDetail(): Promise<void> {
+    if (eventId.length == 0) {
+      return;
+    }
+    try {
+      const query = new CalendarIdReq();
+      query.id = eventId;
+      const res = await apiCalendarDetail(query);
+      if (apiResCode(res) != SUCCESS_CODE) {
+        return;
+      }
+      const obj = asObject(apiResData<any>(res));
+      if (obj == null) {
+        return;
+      }
+      applyDetail(obj);
+    } catch (error) {
+      const message = apiErrorMessage(error);
+      if (message.length > 0) {
+        uni.showToast({ title: message, icon: "none" });
+      }
+    }
+  }
+
+  function openCompleteSheet(): void {
+    const proxy = completeSheetRef.value as ComponentPublicInstance | null;
+    if (proxy == null || eventId.length == 0) {
+      return;
+    }
+    const payload =
+      `{"id":${JSON.stringify(eventId)},"title":${JSON.stringify(title.value)},"line":${JSON.stringify(assigneeLine.value)},"creator":${isCreator.value ? "true" : "false"},"submit":${needSubmit.value ? "true" : "false"},"mode":${JSON.stringify(completeMode.value)},"scope":${JSON.stringify(completeScope.value)},"pending":${JSON.stringify(pendingNames.value)}}`;
+    proxy.$callMethod("open", payload);
+  }
+
+  function onCompleteDone(): void {
+    loadDetail();
+  }
+
+  function confirmDone(): void {
+    if (eventId.length == 0 || !canComplete.value) {
+      return;
+    }
+    openCompleteSheet();
+  }
+
+  onLoad((options: any) => {
+    eventId = readQuery(options, "id");
+    loadDetail();
+  });
+</script>
+
+<style scoped>
+  .detail {
+    flex: 1;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    background-color: #f7f7f8;
+  }
+
+  .detail__scroll {
+    flex: 1;
+    height: 0;
+  }
+
+  .detail__card {
+    margin: 12px 12px 0;
+    padding: 16px;
+    background-color: #ffffff;
+    border-radius: 12px;
+  }
+
+  .detail__card--gap {
+    margin-top: 12px;
+  }
+
+  .detail__title {
+    font-size: 20px;
+    line-height: 28px;
+    font-weight: 600;
+    color: #1f2329;
+  }
+
+  .detail__status {
+    margin-top: 10px;
+    align-self: flex-start;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background-color: #f2f3f5;
+  }
+
+  .detail__status-text {
+    font-size: 12px;
+    line-height: 18px;
+    color: #86909c;
+  }
+
+  .detail__status--need {
+    padding: 0;
+    background-color: transparent;
+  }
+
+  .detail__status-text--need {
+    color: #c4a06a;
+  }
+
+  .detail__people {
+    margin-top: 14px;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .detail__person {
+    height: 32px;
+    margin-right: 8px;
+    margin-bottom: 8px;
+    padding: 0 10px 0 4px;
+    border-radius: 16px;
+    background-color: #f5f6f8;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .detail__avatar {
+    width: 24px;
+    height: 24px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+
+  .detail__letters {
+    font-size: 11px;
+    color: #ffffff;
+  }
+
+  .detail__person-name {
+    margin-left: 6px;
+    font-size: 14px;
+    color: #1f2329;
+  }
+
+  .detail__row {
+    height: 48px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom-width: 1px;
+    border-bottom-style: solid;
+    border-bottom-color: #f2f3f5;
+  }
+
+  .detail__row--last {
+    border-bottom-width: 0;
+  }
+
+  .detail__label {
+    font-size: 15px;
+    color: #86909c;
+  }
+
+  .detail__value {
+    margin-left: 16px;
+    font-size: 15px;
+    color: #1f2329;
+    text-align: right;
+  }
+
+  .detail__value--muted {
+    color: #c9cdd4;
+  }
+
+  .detail__section {
+    font-size: 16px;
+    font-weight: 600;
+    color: #1f2329;
+  }
+
+  .detail__muted {
+    margin-top: 12px;
+    font-size: 14px;
+    color: #c9cdd4;
+  }
+
+  .detail__submit {
+    margin-top: 10px;
+    font-size: 14px;
+    line-height: 20px;
+    color: #1f2329;
+  }
+
+  .detail__footer {
+    padding: 12px 16px 8px;
+    background-color: #f7f7f8;
+  }
+
+  .detail__done {
+    height: 48px;
+    border-radius: 12px;
+    background-color: #1f2329;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .detail__done--hover {
+    background-color: #3a3a3a;
+  }
+
+  .detail__done--busy {
+    opacity: 0.72;
+  }
+
+  .detail__done-text {
+    font-size: 16px;
+    font-weight: 600;
+    color: #ffffff;
+  }
+</style>

@@ -2,7 +2,8 @@
  * 日程 / 待办接口。
  * 本目录承接 /api/calendar/*，后续创建、查询等接口也加在这里。
  *
- * 创建：POST /api/calendar/create。可同时按人邀请和按群邀请。
+ * 创建：POST /api/calendar/create。可带 groupConvId，也可同时按人邀请和按群邀请。
+ * requireSubmit 表示完成时必须提交内容，requireConfirmation 表示完成时需要确认。
  *
  * 更新契约：POST /api/calendar/update。
  * 创建者或可编辑参与人可调用。请求里为 null 的字段服务端保持原值；
@@ -10,7 +11,11 @@
  *
  * 重新打开：POST /api/calendar/reopen。请求体为 CalendarIdReq，只传 id。
  *
- * 日程详情：POST /api/calendar/detail。请求体为 CalendarIdReq，只传 id。返回含参与人列表与回复状态。
+ * 一键完成：POST /api/calendar/force-complete。仅创建者可调用。
+ * 请求体为 CalendarIdReq，只传 id。服务端直接把整条待办置为完成，不等参与人逐人完成。
+ *
+ * 日程详情：POST /api/calendar/detail。请求体为 CalendarIdReq，只传 id。
+ * 返回整条日程，含参与人列表与回复状态，以及 completeRemark、completeAttachments、completeFileKeys、requireConfirmation。
  *
  * 删除日程：POST /api/calendar/delete。请求体为 CalendarIdReq，只传 id。
  *
@@ -26,10 +31,26 @@
  * participants 按人邀请，inviteGroupConvIds 按群整体邀请。
  *
  * 参与人完成份额：POST /api/calendar/participant/complete。
- * 多人待办由服务端按完成模式判定整体是否完成；requireSubmit 时 fileKey 必传。
+ * 请求体为 id、completeFileKeys（字符串数组）和 completeRemark。
+ * 多人待办由服务端按完成模式判定整体是否完成。fileKey 来自附件上传接口。
+ *
+ * 上传待办附件：POST /api/calendar/attachment/upload。multipart 字段名为 file。
+ * 服务端按 calendar-attachment 归档，data 为字符串映射，从中读取 fileKey 交给完成接口。
+ *
+ * 删除待办附件：POST /api/calendar/attachment/delete。无请求参数，Content-Type 为表单。
+ * 仅上传者本人可删，data 为是否成功。
  *
  * 我的日程列表：POST /api/calendar/list/my。
  * 传 beginTime、endTime 时按日历窗口查询；都不传时返回未完成全量，以及前后 90 天内已完成的日程。
+ *
+ * 我创建的日程 / 待办列表：POST /api/calendar/list-my-created。
+ * 请求体同样是 CalendarEventQueryReq，可按群会话 groupConvId 过滤。只返回当前用户创建的记录。
+ *
+ * 我参与的日程 / 待办列表：POST /api/calendar/list-my-participated。
+ * 请求体同样是 CalendarEventQueryReq。我创建但参与人里没有自己的记录不在其中。
+ *
+ * 群待办列表：POST /api/calendar/list-by-group。按来源群查全部，调用人须为该群成员。
+ * groupConvId 必填，仍用十进制字符串写入原始数字。
  *
  * 联系人工作日程：POST /api/calendar/list/contact。含其参与的日程，服务端校验好友关系。
  *
@@ -40,6 +61,11 @@
  *
  * id、eventId、userId、contactUserId、群会话 ID 是 int64。入参用十进制字符串，请求体里以原始数字写出，不经过 number。
  */
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { ACCESS_TOKEN } from "@/constants/home.constants";
+import { getApiBaseUrl } from "@/constants/config";
+import { applyBearerAuthorization } from "@/utils/authSession";
+import { applyXClientTypeHeader } from "@/utils/appWebViewDetect";
 import request from "@/servers/useRequest";
 import type { RequestResponse } from "@/types/interfaces/request";
 import type { CalendarBusySlotDto, CalendarEventDto, CalendarInvitationDto, CalendarParticipantDto } from "@/types/interfaces/calendar";
@@ -126,6 +152,8 @@ function buildCalendarEventUpdateBody(data: CalendarEventUpdateDto): string {
   pushJsonString(parts, "completeMode", data.completeMode);
   pushJsonInt(parts, "completeRatio", data.completeRatio);
   pushJsonBool(parts, "requireSubmit", data.requireSubmit);
+  pushJsonBool(parts, "requireConfirmation", data.requireConfirmation);
+  pushJsonInt64(parts, "groupConvId", data.groupConvId);
   const extraFields = extraFieldsJson(data.extraFields);
   if (extraFields != null) {
     parts.push(`"extraFields":${extraFields}`);
@@ -188,6 +216,7 @@ function buildCalendarInviteBody(data: CalendarInviteReq): string {
 function buildCalendarEventCreateBody(data: CalendarEventCreateDto): string {
   const parts: string[] = [];
   pushJsonString(parts, "category", data.category);
+  pushJsonInt64(parts, "groupConvId", data.groupConvId);
   pushJsonString(parts, "title", data.title);
   pushJsonString(parts, "description", data.description);
   pushJsonString(parts, "location", data.location);
@@ -210,6 +239,7 @@ function buildCalendarEventCreateBody(data: CalendarEventCreateDto): string {
   pushJsonString(parts, "completeMode", data.completeMode);
   pushJsonInt(parts, "completeRatio", data.completeRatio);
   pushJsonBool(parts, "requireSubmit", data.requireSubmit);
+  pushJsonBool(parts, "requireConfirmation", data.requireConfirmation);
   const extraFields = extraFieldsJson(data.extraFields);
   if (extraFields != null) {
     parts.push(`"extraFields":${extraFields}`);
@@ -236,6 +266,7 @@ function buildCalendarEventQueryBody(data: CalendarEventQueryReq): string {
   pushJsonString(parts, "category", data.category);
   pushJsonStringList(parts, "statuses", data.statuses);
   pushJsonString(parts, "keyword", data.keyword);
+  pushJsonInt64(parts, "groupConvId", data.groupConvId);
   return `{${parts.join(",")}}`;
 }
 
@@ -260,11 +291,12 @@ function buildCalendarBusyQueryBody(data: CalendarBusyQueryReq): string {
   return `{${parts.join(",")}}`;
 }
 
-/** 参与人完成份额请求体。null 字段不提交。 */
+/** 参与人完成份额请求体。null 字段不提交。completeFileKeys 写成字符串数组。 */
 function buildCalendarParticipantCompleteBody(data: CalendarParticipantCompleteReq): string {
   const parts: string[] = [];
-  pushJsonInt64(parts, "eventId", data.eventId);
-  pushJsonString(parts, "fileKey", data.fileKey);
+  pushJsonInt64(parts, "id", data.id);
+  pushJsonStringList(parts, "completeFileKeys", data.completeFileKeys);
+  pushJsonString(parts, "completeRemark", data.completeRemark);
   return `{${parts.join(",")}}`;
 }
 
@@ -279,9 +311,10 @@ function buildCalendarParticipantOpBody(data: CalendarParticipantOpReq): string 
 }
 
 /**
- * 创建日程 / 待办。可同时按人邀请和按群邀请。
+ * 创建日程 / 待办。可带群会话，也可同时按人邀请和按群邀请。
+ * requireConfirmation 为 true 时，完成需要确认。
  * @param data 要创建的字段；不需要的字段保持 null
- * @returns 创建后的日程。业务成功码为 0000，id 与 creatorId 按字符串读取
+ * @returns 创建后的日程。业务成功码为 0000。id、creatorId、groupConvId 按字符串读取
  */
 export async function apiCalendarCreate(data: CalendarEventCreateDto): Promise<RequestResponse<CalendarEventDto>> {
   return await request({
@@ -292,9 +325,10 @@ export async function apiCalendarCreate(data: CalendarEventCreateDto): Promise<R
 }
 
 /**
- * 更新日程 / 待办。
+ * 更新日程 / 待办。创建者或可编辑参与人可调用。
+ * null 字段不提交，服务端保持原值。改期后服务端按新时间重算提醒。
  * @param data 只填需要修改的字段；其余保持 null
- * @returns 更新后的日程。业务成功码为 0000，data 运行时为 UTSJSONObject
+ * @returns 更新后的日程。业务成功码为 0000。id、creatorId、groupConvId 按字符串读取
  */
 export async function apiCalendarUpdate(data: CalendarEventUpdateDto): Promise<RequestResponse<CalendarEventDto>> {
   return await request({
@@ -318,9 +352,23 @@ export async function apiCalendarReopen(data: CalendarIdReq): Promise<RequestRes
 }
 
 /**
- * 日程详情，含参与人列表与回复状态。
+ * 一键完成日程 / 待办。仅创建者可调用，直接把整体置为完成，不等参与人逐人完成。
  * @param data 事件 ID
- * @returns 日程详情。业务成功码为 0000，id、creatorId、参与人 userId 按字符串读取
+ * @returns 完成后的日程。业务成功码为 0000，id 与 creatorId 按字符串读取
+ */
+export async function apiCalendarForceComplete(data: CalendarIdReq): Promise<RequestResponse<CalendarEventDto>> {
+  return await request({
+    url: "/api/calendar/force-complete",
+    method: "POST",
+    data: buildCalendarIdBody(data.id),
+  });
+}
+
+/**
+ * 日程详情。请求体只传 id，按十进制数字写出。
+ * data 为整条日程：参与人带回复状态，并含完成说明、完成附件、completeFileKeys、requireConfirmation。
+ * @param data 事件 ID（int64 十进制字符串）
+ * @returns 日程详情。业务成功码为 0000。id、creatorId、groupConvId、参与人 userId 按字符串读取
  */
 export async function apiCalendarDetail(data: CalendarIdReq): Promise<RequestResponse<CalendarEventDto>> {
   return await request({
@@ -410,10 +458,135 @@ export async function apiCalendarParticipantInvite(data: CalendarInviteReq): Pro
   });
 }
 
+function calendarUploadHeader(): UTSJSONObject {
+  const header = new UTSJSONObject();
+  const token = uni.getStorageSync(ACCESS_TOKEN);
+  applyBearerAuthorization(header, token != null ? `${token}` : null);
+  applyXClientTypeHeader(header);
+  return header;
+}
+
+function parseUploadObject(raw: any | null): UTSJSONObject | null {
+  if (raw == null) {
+    return null;
+  }
+  if (typeof raw != "string") {
+    try {
+      const obj = raw as UTSJSONObject;
+      if (obj["code"] != null || obj["data"] != null) {
+        return obj;
+      }
+    } catch (_error) {
+      return null;
+    }
+    return null;
+  }
+  const text = `${raw}`.trim();
+  if (text.length == 0 || text.charAt(0) != "{") {
+    return null;
+  }
+  try {
+    return JSON.parse(text) as UTSJSONObject | null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+/** 上传成功时 data 为 { fileName, fileKey, fileUrl }。字符串形态先转回对象再读。 */
+function readUploadedFileKey(data: any | null): string {
+  if (data == null) {
+    return "";
+  }
+  let obj: UTSJSONObject | null = null;
+  try {
+    let text = "";
+    if (typeof data == "string") {
+      text = `${data}`.trim();
+    } else {
+      const encoded = JSON.stringify(data);
+      text = encoded != null ? encoded : "";
+    }
+    if (text.length == 0 || text.charAt(0) != "{") {
+      return "";
+    }
+    obj = JSON.parse(text) as UTSJSONObject | null;
+  } catch (_error) {
+    return "";
+  }
+  if (obj == null) {
+    return "";
+  }
+  const direct = obj["fileKey"];
+  if (direct == null) {
+    return "";
+  }
+  const fileKey = `${direct}`.trim();
+  if (fileKey == "null" || fileKey == "undefined") {
+    return "";
+  }
+  return fileKey;
+}
+
 /**
- * 参与人完成自己的份额。
- * 多人待办由服务端按完成模式判定整体是否完成。日程开启 requireSubmit 时必须传 fileKey。
- * @param data 事件 ID、完成时提交的文件 key
+ * 上传待办附件。multipart 字段名为 file，服务端按 calendar-attachment 归档。
+ * 成功时 data 含 fileName、fileKey、fileUrl。完成接口使用其中的 fileKey。
+ * @param filePath 本地文件路径
+ * @returns data.fileKey。业务成功码为 0000
+ */
+export function apiCalendarAttachmentUpload(filePath: string): Promise<string> {
+  const url = `${getApiBaseUrl()}/api/calendar/attachment/upload`;
+  return new Promise<string>((resolve, reject) => {
+    uni.uploadFile({
+      url: url,
+      filePath: filePath,
+      name: "file",
+      header: calendarUploadHeader(),
+      success: (res) => {
+        const parsed = parseUploadObject(res.data);
+        if (parsed == null) {
+          reject(new Error("附件上传失败"));
+          return;
+        }
+        const code = parsed["code"] != null ? `${parsed["code"]}` : "";
+        if (code != SUCCESS_CODE) {
+          const message = parsed["message"] != null ? `${parsed["message"]}` : "附件上传失败";
+          reject(new Error(message));
+          return;
+        }
+        const fileKey = readUploadedFileKey(parsed["data"]);
+        if (fileKey.length == 0) {
+          reject(new Error("附件上传失败"));
+          return;
+        }
+        resolve(fileKey);
+      },
+      fail: (err) => {
+        const message = err != null && err.errMsg != null ? `${err.errMsg}` : "附件上传失败";
+        reject(new Error(message));
+      },
+    });
+  });
+}
+
+/**
+ * 删除待办附件。无请求参数，仅上传者本人可删。
+ * @returns data 为是否成功。业务成功码为 0000，运行时用 apiResData 读取
+ */
+export async function apiCalendarAttachmentDelete(): Promise<RequestResponse<boolean>> {
+  const header = new UTSJSONObject();
+  header["Content-Type"] = "application/x-www-form-urlencoded";
+  return await request({
+    url: "/api/calendar/attachment/delete",
+    method: "POST",
+    data: "",
+    header: header,
+  });
+}
+
+/**
+ * 参与人完成自己的份额。可附多个文件和补充说明。
+ * 多人待办由服务端按完成模式判定整体是否完成。
+ * @param data 事件 ID、完成附件 fileKey 列表、补充说明。不需要的字段保持 null
  * @returns data 为是否成功。业务成功码为 0000，运行时用 apiResData 读取
  */
 export async function apiCalendarParticipantComplete(data: CalendarParticipantCompleteReq): Promise<RequestResponse<boolean>> {
@@ -433,6 +606,45 @@ export async function apiCalendarParticipantComplete(data: CalendarParticipantCo
 export async function apiCalendarListMy(data: CalendarEventQueryReq): Promise<RequestResponse<CalendarEventDto[]>> {
   return await request({
     url: "/api/calendar/list/my",
+    method: "POST",
+    data: buildCalendarEventQueryBody(data),
+  });
+}
+
+/**
+ * 我创建的日程 / 待办列表。只返回当前用户创建的记录。
+ * @param data 时间范围、分类、状态、关键词、群会话 ID。不需要的字段保持 null
+ * @returns data 为日程列表。业务成功码为 0000，id、creatorId、groupConvId 按字符串读取
+ */
+export async function apiCalendarListMyCreated(data: CalendarEventQueryReq): Promise<RequestResponse<CalendarEventDto[]>> {
+  return await request({
+    url: "/api/calendar/list-my-created",
+    method: "POST",
+    data: buildCalendarEventQueryBody(data),
+  });
+}
+
+/**
+ * 我参与的日程 / 待办列表。我创建但参与人里没有自己的记录不返回。
+ * @param data 时间范围、分类、状态、关键词、群会话 ID。不需要的字段保持 null
+ * @returns data 为日程列表。业务成功码为 0000，id、creatorId、groupConvId 按字符串读取
+ */
+export async function apiCalendarListMyParticipated(data: CalendarEventQueryReq): Promise<RequestResponse<CalendarEventDto[]>> {
+  return await request({
+    url: "/api/calendar/list-my-participated",
+    method: "POST",
+    data: buildCalendarEventQueryBody(data),
+  });
+}
+
+/**
+ * 群待办列表。按来源群查全部，调用人须为该群成员。
+ * @param data 群会话 ID 必填；时间范围、分类、状态、关键词不需要时保持 null
+ * @returns data 为日程列表。业务成功码为 0000，id、creatorId、groupConvId 按字符串读取
+ */
+export async function apiCalendarListByGroup(data: CalendarEventQueryReq): Promise<RequestResponse<CalendarEventDto[]>> {
+  return await request({
+    url: "/api/calendar/list-by-group",
     method: "POST",
     data: buildCalendarEventQueryBody(data),
   });

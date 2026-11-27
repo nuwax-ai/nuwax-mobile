@@ -52,11 +52,6 @@ else
   GRADLE_TASK=":app:assembleDebug"
 fi
 OUT_NAME="android_${BUILD_TYPE}"
-GRADLE_ARGS=("$GRADLE_TASK" --stacktrace)
-if [[ "${1:-}" == --without-embedded-cronet ]]; then
-  OUT_NAME="${OUT_NAME}-no-embedded-cronet"
-  GRADLE_ARGS+=(--init-script "$SCRIPT_DIR/test-without-embedded-cronet.gradle")
-fi
 
 export SKIP_INSTALL=1
 if [[ "$ANDROID_BUNDLE_ID" == com.nuwax.app ]]; then
@@ -106,35 +101,19 @@ if [[ -z "${ANDROID_HOME:-}" ]]; then
   echo "✗ 未找到 ANDROID_HOME" >&2
   exit 1
 fi
-./gradlew "${GRADLE_ARGS[@]}"
+./gradlew "$GRADLE_TASK" --stacktrace
 
 APK="$PROJ/app/build/outputs/apk/${BUILD_TYPE}/app-${BUILD_TYPE}.apk"
 if [[ ! -f "$APK" ]]; then
   APK="$(find "$PROJ/app/build/outputs/apk/${BUILD_TYPE}" -name '*.apk' 2>/dev/null | head -1 || true)"
 fi
-if [[ ( -z "${APK:-}" || ! -f "$APK" ) && "${1:-}" != --without-embedded-cronet ]]; then
+if [[ -z "${APK:-}" || ! -f "$APK" ]]; then
   # 兜底：任意变体产物
   APK="$(find "$PROJ/app/build/outputs/apk" -name '*.apk' | head -1 || true)"
 fi
 if [[ -z "${APK:-}" || ! -f "$APK" ]]; then
   echo "✗ 未找到 ${BUILD_TYPE} apk" >&2
   exit 1
-fi
-
-if [[ "${1:-}" == --without-embedded-cronet ]]; then
-  python3 - "$APK" <<'PY'
-import fnmatch
-import sys
-from zipfile import ZipFile
-
-with ZipFile(sys.argv[1]) as apk:
-    for name in apk.namelist():
-        if name.startswith('lib/') and (
-            name.endswith('/libcronet.so') or fnmatch.fnmatchcase(name, '*/libcronet.*.so')
-        ):
-            raise SystemExit(f'✗ Cronet 对照包仍含原生引擎: {name}')
-print('✓ Cronet 对照包已核对：无内置 Cronet 原生库')
-PY
 fi
 
 STAMP="$(date +%Y%m%d-%H%M%S)"

@@ -69,7 +69,7 @@
 1. **打成单个 IIFE。** esbuild 以 `index.html` 里的 module 入口为起点 `bundle + format: iife`。页面 JS chunk 全部内联；`assets/` 里的 `.js` 不再拷贝。Vite 的 JS `modulepreload` 被改成「非 CSS 直接 return」，否则 `file://` 上会去拉已经不存在的 chunk。CSS preload 保留。
 2. **路径改相对。** `"/m/` 改成 `"./"`；CSS 里的 `url(/m/...)` 按文件深度补 `../`。`import.meta.url` 在 IIFE 里会被 esbuild 置空，wasm / `scriptDirectory` 改用 `document.baseURI`（即 `index.html` 的 `file://` 地址）。
 3. **躲开 App 编译器的静默过滤。** uni 编译器把任意深度的 `static/web` 当成 Web 平台资源，打 App 时直接丢掉（历史上一次丢掉约 60 个 KaTeX 字体）。目录段改名为 `static/webres/`，JS / CSS / HTML 里的字面量同步改写，最后断言产物里不再出现 `static/web/`。`uni_modules/` 同时改名为 `modules/`。
-4. **只裁剪已知资源。** `EXCLUDED_RESOURCES` 排除已用「全产物零引用 + 运行时闭包探测」确认过的目录（启动图、图标、已内联的 grammar、ai-provider 等）。生成清单前，再剔除离线会话未引用的通话图标和铃声，以及内容相同且未被引用的字体和高亮 WASM 副本。会话运行时使用的 WASM 路径和 proxy-web 资源随包保留。
+4. **整目录排除，不做按引用删文件。** `EXCLUDED_RESOURCES` 只排除已用「全产物零引用 + 运行时闭包探测」确认过的目录（启动图、图标、已内联的 grammar、ai-provider 等）。运行时 `fetch` 拼接出来的 wasm、proxy-web 不在排除名单里。按字面引用裁单个文件曾经造成「挂载成功、零报错、整页白屏」。
 5. **重写入口 HTML。** 去掉会把 `file://` 导向 `file:///m/` 的端跳转脚本，去掉阿里云验证码外链。脚本顺序是桥 → 项目 bootstrap → `app-bundle.js` → `uni.webview.1.5.5.js`。JSSDK 必须在应用包之后：uni-app x 运行时会覆盖 `window.uni`，先加载的桥会被冲掉。`#app` 里放一段纯 CSS 骨架，盖住数 MB bundle 解析前的白屏，Vue 挂载后替换掉。
 6. **写资源清单。** `offline-h5-resources.json` 记录每个文件的相对路径、字节数和 sha256，外加 `sourceFingerprint`、`resourceVersion`、协议版本。文件名故意不以 `manifest.json` 结尾：HBuilderX 读自定义基座时用 `endsWith("manifest.json")` 取 appid，排在真正 manifest 后面的清单会把 appid 读空，资源被同步到 `apps/null`。
 
@@ -124,9 +124,7 @@ pnpm offline-h5:prepare
 
 源码指纹（`scripts/offline-h5/package-files.mjs` 的 `sourceFingerprint`）覆盖仓库内 `.uts/.uvue/.vue/.js/.mjs/.css/.scss/.html`，以及 `pages.json`、`manifest.json`、`package.json`。跳过 `.git`、`node_modules`、`unpackage`、`.hbuilderx`、`.diag`、符号链接，以及 `static/app/`（安装目录本身不能参与指纹，否则每次安装都算源码变化）。指纹是这些路径与文件 sha256 的稳定 JSON 再做一次 sha256。
 
-`scripts/hx-cli.sh` 在 `launch app-*`、`publish app` 和 `pack` 编译前自动跑 prepare。Android/iOS 云打包统一用 `pnpm app:cloud:pack --config /绝对路径/pack.json`，配置中的 `project` 指向本次已导入的打包工作区。HBuilderX 菜单编译没有编译前钩子，界面路线要先执行 `pnpm offline-h5:prepare`。
-
-下载 APK/IPA 后执行 `pnpm app:cloud:verify <产物路径>`。脚本验离线资源哈希、清单外文件、跨平台静态资源和 APK 的 ARM64 原生库，并输出离线 H5 和 Cronet 实测占用。可另传 `--offline-manifest <打包工作区>/static/app/offline-h5/offline-h5-resources.json` 对照本次产物指纹。Cronet 裁剪用于 `WITHOUT_EMBEDDED_CRONET=1 make android-tester` 对照包。
+`scripts/hx-cli.sh` 在 `launch app-*`、`publish app`、`pack app*` 之前自动跑 prepare。HBuilderX 菜单编译没有编译前钩子，界面路线要自己先执行这条命令。
 
 ### `offline-h5:verify`
 

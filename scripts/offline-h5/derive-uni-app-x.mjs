@@ -9,7 +9,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RESOURCE_LIST_FILE } from './package-files.mjs';
 import { removeInlinedJsPreloads } from './preload.mjs';
-import { pruneConversationResources } from './prune-conversation-resources.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const SRC = path.resolve(ROOT, process.env.WEB_DIST || 'unpackage/dist/build/web');
@@ -193,7 +192,7 @@ walkCss(OUT);
 // 字面路径扫描看不到运行时拼接的资源路径（fetch('a/'+name+'.json')、worker、动态 import），
 // 误删后是静默 404（已实证：页面挂载成功 0 报错但整页白屏）。体积治理只走两条路：
 // (1) 源头 pages 子集构建（build-offline-h5.mjs 编译期收窄，未列页面不进 bundle）；
-// (2) 上方 EXCLUDED_RESOURCES 整目录排除，以及下方针对会话页的已知资源副本检查。
+// (2) 上方 EXCLUDED_RESOURCES 整目录排除（双证据准入，见其注释），不做逐文件手术。
 
 // --- 6. 重写 index.html ------------------------------------------------------
 // 通用桥与项目配置适配脚本是源码文件，不再用“DOM 非空”猜测应用就绪。
@@ -243,7 +242,6 @@ assertNoStaticWeb(OUT);
 if (webResidue.length > 0) fail(`产物仍引用 static/web（需补充改写）：${webResidue.slice(0, 5).join(', ')}`);
 
 // --- 7. 校验清单（所有资源，不仅 JS）与原子替换 -------------------------------
-pruneConversationResources(OUT);
 const entries = [];
 function inventory(dir) {
   for (const name of fs.readdirSync(dir).sort()) {

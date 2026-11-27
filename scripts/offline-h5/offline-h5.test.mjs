@@ -6,7 +6,6 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { createRequire } from 'node:module';
 import { digest, RESOURCE_LIST_FILE, verifyResourcePackage } from './package-files.mjs';
-import { pruneConversationResources } from './prune-conversation-resources.mjs';
 const require = createRequire(import.meta.url);
 const hx = process.env.HX_APP_ROOT || '/Applications/HBuilderX.app/Contents/HBuilderX';
 const { transformSync } = require(path.join(hx, 'plugins/uniapp-cli-vite/node_modules/esbuild'));
@@ -366,46 +365,6 @@ test('resource verification rejects altered files and symlink directories', () =
     fs.writeFileSync(path.join(dir, 'index.html'), 'broken');
     assert.throws(() => verifyResourcePackage(dir), /modified/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('conversation resource pruning preserves referenced resources and requires byte-identical copies', () => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'offline-h5-prune-'));
-  const write = (name, content) => {
-    const file = path.join(directory, name);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, content);
-  };
-  const exists = name => fs.existsSync(path.join(directory, name));
-  const sharedFont = 'modules/uni-ai-x/static/proxy-web/libs/fonts/KaTeX_Main-Regular.ttf';
-  const duplicateFont = 'modules/uni-ai-x/static/webres/kaTeX-fonts/KaTeX_Main-Regular.ttf';
-  const differentFont = 'subpackages/uni_modules/mp-html/static/fonts/KaTeX_Main-Regular.ttf';
-  const canonicalWasm = 'static/uni-highlight/_onig.wasm';
-  const duplicateWasm = 'modules/uni-highlight/static/_onig.wasm';
-  try {
-    write(sharedFont, 'font');
-    write(duplicateFont, 'font');
-    write(differentFont, 'FONT');
-    write(canonicalWasm, 'wasm');
-    write(duplicateWasm, 'wasm');
-    write('static/voip/call-icons/phone.png', 'icon');
-    write('static/ringtones/ringtone.m4a', 'ringtone');
-    write('app-bundle.js', `load('./${canonicalWasm}'); load('static/voip/' + icon);`);
-    write('assets/chat.css', `@font-face {src: url('../${duplicateFont}')}`);
-    pruneConversationResources(directory);
-    assert.ok(exists('static/voip/call-icons/phone.png'));
-    assert.ok(exists(duplicateFont));
-    assert.ok(exists(differentFont));
-    assert.ok(exists(canonicalWasm));
-    assert.ok(!exists(duplicateWasm));
-    assert.ok(!exists('static/ringtones'));
-
-    write('assets/chat.css', '');
-    pruneConversationResources(directory);
-    assert.ok(!exists(duplicateFont));
-    assert.ok(exists(sharedFont));
-  } finally {
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
 });
 
 test('IIFE preload skips JS but waits for CSS and propagates CSS errors', async () => {

@@ -5,6 +5,7 @@
 # 例： bash scripts/hx-cli.sh devices list
 #      bash scripts/hx-cli.sh launch app-android --project nuwax-mobile
 #      bash scripts/hx-cli.sh publish app --type appResource
+#      bash scripts/hx-cli.sh pack --config /absolute/path/to/pack.json
 #
 # 环境变量：
 #   HX_CLI      CLI 可执行文件（默认 /Applications/HBuilderX.app/Contents/MacOS/cli）
@@ -29,49 +30,86 @@ fi
 # - publish：发行（含生成本地打包 App 资源 appResource、打 wgt）
 # - pack：云打包 / 鸿蒙本地打包等
 args=("$@")
-if [[ ${#args[@]} -gt 0 ]]; then
-  cmd="${args[0]}"
-  case "$cmd" in
-    launch|logcat|publish|pack)
-      has_project=0
-      for a in "${args[@]}"; do
-        if [[ "$a" == "--project" ]]; then
-          has_project=1
-          break
-        fi
-      done
-      if [[ "$has_project" -eq 0 ]]; then
-        args+=(--project "$PROJECT")
-      fi
-      ;;
+cmd="${1:-}"
+action="${2:-}"
+project_arg=""
+config_arg=""
+help_requested=0
+for ((i = 1; i < $#; i++)); do
+  case "${args[i]}" in
+    --project) project_arg="${args[i+1]:-}" ;;
+    --config) config_arg="${args[i+1]:-}" ;;
+    --help|-h) help_requested=1 ;;
   esac
-fi
+done
+case "$cmd" in
+  launch|logcat|publish|pack)
+    if [[ -z "$project_arg" && ( "$cmd" != pack || -z "$config_arg" ) && "$help_requested" == 0 ]]; then
+      args+=(--project "$PROJECT")
+    fi
+    ;;
+esac
 
 # App 编译必须带入与当前源码匹配的完整离线资源。
 hx_run() {
   "${HX_NODE:-/Applications/HBuilderX.app/Contents/HBuilderX/plugins/node/node}" "$@"
 }
 cli_kind=""
-case "${1:-}:${2:-}" in
+prepare_scripts="$SCRIPT_DIR"
+case "$cmd:$action" in
   launch:app-android)
     bash "$SCRIPT_DIR/patch-hx-android-base-appid.sh"
     ;;
 esac
-case "${1:-}:${2:-}" in
+case "$cmd:$action" in
   launch:app-*|publish:app|publish:app-android|pack:app*)
-    hx_run "$SCRIPT_DIR/generate-app-privacy-policy.mjs"
-    hx_run "$SCRIPT_DIR/prepare-offline-h5.mjs"
-    hx_run "$SCRIPT_DIR/prepare-voip-media.mjs"
-    cli_kind="${1}:${2}"
+    cli_kind="$cmd:$action"
+    ;;
+  pack:|pack:--*)
+    if [[ "$help_requested" == 0 ]]; then
+      cli_kind="pack:cloud"
+      pack_project="${project_arg:-$PROJECT}"
+      if [[ -n "$config_arg" ]]; then
+        config_project="$(hx_run -e '
+          try {
+            const config = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            process.stdout.write(typeof config.project === "string" ? config.project : "");
+          } catch {
+            console.error("无法读取云打包配置，请检查文件路径和 JSON 格式。");
+            process.exit(1);
+          }
+        ' "$config_arg")"
+        pack_project="${config_project:-$pack_project}"
+        if [[ -z "$config_project" && -z "$project_arg" ]]; then
+          args+=(--project "$pack_project")
+        fi
+      fi
+      if [[ -d "$pack_project/scripts" ]]; then
+        prepare_scripts="$(cd "$pack_project/scripts" && pwd)"
+      elif [[ "$pack_project" != "$(basename "$ROOT_DIR")" && "$pack_project" != "$ROOT_DIR" ]]; then
+        echo "无法定位云打包项目的脚本目录，请使用已导入项目的绝对路径：$pack_project" >&2
+        exit 1
+      fi
+    fi
     ;;
 esac
+if [[ -n "$cli_kind" ]]; then
+  hx_run "$prepare_scripts/generate-app-privacy-policy.mjs"
+  hx_run "$prepare_scripts/prepare-offline-h5.mjs"
+  hx_run "$prepare_scripts/prepare-voip-media.mjs"
+  if [[ "$cli_kind" == pack:cloud ]]; then
+    hx_run "$prepare_scripts/verify-offline-h5-package.mjs" "$prepare_scripts/../static/app/offline-h5"
+  fi
+fi
 
 cli_status=0
 "$CLI" "${args[@]}" || cli_status=$?
 
 # 编译成功不代表离线资源完整：uni 编译器会按平台过滤 static/ 下的目录段
 # （如 static/web），编译后必须对最终 App 资源跑清单校验，缺文件直接失败。
-if [[ -n "$cli_kind" && $cli_status -eq 0 ]]; then
+if [[ "$cli_kind" == pack:cloud && $cli_status -eq 0 ]]; then
+  echo "[cloud-pack] 下载 APK/IPA 后运行 pnpm app:cloud:verify <产物路径> 核对裁剪和离线资源。"
+elif [[ -n "$cli_kind" && $cli_status -eq 0 ]]; then
   verify_targets=()
   case "$cli_kind" in
     launch:app-*)

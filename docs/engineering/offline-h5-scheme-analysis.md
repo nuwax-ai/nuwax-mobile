@@ -124,7 +124,9 @@ pnpm offline-h5:prepare
 
 源码指纹（`scripts/offline-h5/package-files.mjs` 的 `sourceFingerprint`）覆盖仓库内 `.uts/.uvue/.vue/.js/.mjs/.css/.scss/.html`，以及 `pages.json`、`manifest.json`、`package.json`。跳过 `.git`、`node_modules`、`unpackage`、`.hbuilderx`、`.diag`、符号链接，以及 `static/app/`（安装目录本身不能参与指纹，否则每次安装都算源码变化）。指纹是这些路径与文件 sha256 的稳定 JSON 再做一次 sha256。
 
-`scripts/hx-cli.sh` 在 `launch app-*`、`publish app`、`pack app*` 之前自动跑 prepare。HBuilderX 菜单编译没有编译前钩子，界面路线要自己先执行这条命令。
+`scripts/hx-cli.sh` 在 `launch app-*`、`publish app` 和 `pack` 编译前自动跑 prepare。Android/iOS 云打包统一用 `pnpm app:cloud:pack --config /绝对路径/pack.json`，配置中的 `project` 指向本次已导入的打包工作区。HBuilderX 菜单编译没有编译前钩子，界面路线要先执行 `pnpm offline-h5:prepare`。
+
+下载 APK/IPA 后执行 `pnpm app:cloud:verify <产物路径>`。脚本验离线资源哈希、清单外文件、跨平台静态资源和 APK 的 ARM64 原生库，并输出离线 H5 和 Cronet 实测占用。可另传 `--offline-manifest <打包工作区>/static/app/offline-h5/offline-h5-resources.json` 对照本次产物指纹。Cronet 裁剪用于 `WITHOUT_EMBEDDED_CRONET=1 make android-tester` 对照包。
 
 ### `offline-h5:verify`
 

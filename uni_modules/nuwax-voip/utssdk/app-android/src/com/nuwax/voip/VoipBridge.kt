@@ -26,7 +26,9 @@ import android.provider.Settings
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.telecom.DisconnectCause
+import android.view.View
 import android.widget.FrameLayout
+import android.widget.ImageView
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
 import androidx.core.app.NotificationManagerCompat
@@ -66,6 +68,7 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import kotlin.math.roundToInt
 import android.util.Base64
 import android.util.Log
 
@@ -108,6 +111,7 @@ object VoipBridge {
     private var camera = false
     private var cameraHandoffJob: Job? = null
     private var remoteVideo = false
+    private var remoteVideoLossJob: Job? = null
     private var switchingCameraTrack: LocalVideoTrack? = null
     private var hidden = false
     private var nativeUiId = ""
@@ -152,6 +156,7 @@ object VoipBridge {
     }
     private const val PREFIX = "/api/instant-message/calls"
     private const val CAMERA_HANDOFF_MS = 750L
+    private const val REMOTE_VIDEO_LOSS_MS = 350L
 
     /** Only lifecycle stages: never log invitations, identities, URLs or credentials. */
     private fun trace(stage: String) {
@@ -1221,7 +1226,7 @@ object VoipBridge {
                             }
                             is RoomEvent.TrackUnsubscribed, is RoomEvent.TrackUnpublished,
                             is RoomEvent.TrackMuted, is RoomEvent.TrackUnmuted -> refreshViews()
-                            is RoomEvent.ParticipantConnected -> { everHadRemote = true; observeRemotePresence(next, id, run); announceMediaReady() }
+                            is RoomEvent.ParticipantConnected -> { everHadRemote = true; observeRemotePresence(next, id, run); refreshViews(); announceMediaReady() }
                             is RoomEvent.DataReceived -> {
                                 if (event.participant != null && event.topic == "nuwax.voip.media-ready.v1" && event.data.size <= 256) {
                                     val payload = runCatching { JSONObject(String(event.data, Charsets.UTF_8)) }.getOrNull()
@@ -1391,12 +1396,23 @@ object VoipBridge {
         view.removeAllViews()
     }
 
-    internal fun detachVideoTrackForExit(view: FrameLayout) {
+    internal fun freezeVideoForExit(view: FrameLayout) {
+        if (view.visibility != View.VISIBLE) return
         val renderer = renderers.remove(view) ?: return
         views.remove(view)
         bindings.remove(view)?.removeRenderer(renderer)
+        // The page owns the last frame until its native view is disposed.
+        if (!renderer.isAvailable || renderer.width <= 0 || renderer.height <= 0) return
+        val width = minOf(renderer.width, 540)
+        val height = (renderer.height.toFloat() * width / renderer.width).roundToInt().coerceAtLeast(1)
+        val frame = runCatching { renderer.getBitmap(width, height) }.getOrNull() ?: return
+        view.addView(ImageView(view.context).apply {
+            scaleType = ImageView.ScaleType.FIT_XY
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            setImageBitmap(frame)
+        }, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
     }
-    private fun refreshViews() {
+    private fun refreshViews(deferRemoteVideoLoss: Boolean = true) {
         val r = room ?: return
         val localTrack = if (camera && cameraVisible()) {
             r.localParticipant.getTrackPublication(Track.Source.CAMERA)?.takeUnless { it.muted }?.track as? LocalVideoTrack
@@ -1404,7 +1420,24 @@ object VoipBridge {
         val remoteTrack = r.remoteParticipants.values.firstNotNullOfOrNull { participant ->
             participant.getTrackPublication(Track.Source.CAMERA)?.takeUnless { it.muted }?.track as? VideoTrack
         }
-        val remoteVideoOn = remoteTrack != null
+        val hasRemoteFrame = remoteVideo && views.any { (host, kind) ->
+            kind == "remote" && host.isShown && renderers[host]?.isAvailable == true
+        }
+        // Track removal can arrive before the participant leaves. Keep the last
+        // frame during that interval and while the room confirms a departure.
+        val holdRemoteFrame = remoteTrack == null && hasRemoteFrame &&
+            (r.remoteParticipants.isEmpty() || deferRemoteVideoLoss)
+        if (holdRemoteFrame && r.remoteParticipants.isNotEmpty()) {
+            if (remoteVideoLossJob == null) remoteVideoLossJob = scope.launch {
+                delay(REMOTE_VIDEO_LOSS_MS)
+                remoteVideoLossJob = null
+                if (room === r) refreshViews(deferRemoteVideoLoss = false)
+            }
+        } else {
+            remoteVideoLossJob?.cancel()
+            remoteVideoLossJob = null
+        }
+        val remoteVideoOn = remoteTrack != null || holdRemoteFrame
         if (remoteVideo != remoteVideoOn) {
             remoteVideo = remoteVideoOn
             emit("remoteVideo", "enabled", remoteVideoOn)
@@ -1412,6 +1445,10 @@ object VoipBridge {
         for ((host, kind) in views) {
             val track = if (kind == "local") localTrack else remoteTrack
             if (track == null) {
+                if (kind == "remote") {
+                    renderers[host]?.let { bindings.remove(host)?.removeRenderer(it) }
+                    continue
+                }
                 renderers.remove(host)?.let { renderer ->
                     bindings.remove(host)?.removeRenderer(renderer)
                     host.removeView(renderer)
@@ -1434,6 +1471,7 @@ object VoipBridge {
     private fun releaseMedia() {
         cancelCameraHandoff()
         remoteLeftJob?.cancel(); remoteLeftJob = null; everHadRemote = false
+        remoteVideoLossJob?.cancel(); remoteVideoLossJob = null
         reconnecting = false
         val old = room; room = null
         remoteVideo = false
@@ -1458,6 +1496,9 @@ object VoipBridge {
         nativeUiId = ""
         onNativeUiEnded = null
         closeNativeUi?.invoke()
+        if (id.isNotEmpty() && appCallUiId == id && !hidden) {
+            renderers.keys.toList().forEach(::freezeVideoForExit)
+        }
         expiryJob?.cancel(); expiryJob = null
         clearIncomingUiWait()
         clearIncomingAvatar()

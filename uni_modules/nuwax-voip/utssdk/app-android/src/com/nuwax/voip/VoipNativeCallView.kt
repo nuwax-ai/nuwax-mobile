@@ -8,7 +8,6 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.text.TextUtils
 import android.view.Gravity
-import android.view.TextureView
 import android.view.View
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
@@ -282,27 +281,10 @@ internal class VoipNativeCallView(
     fun freezeVideoForExit(): Boolean {
         val hadVideo = remote.visibility == VISIBLE || local.visibility == VISIBLE
         if (hadVideo) {
-            freezeFrame(remote)
-            freezeFrame(local)
+            VoipBridge.freezeVideoForExit(remote)
+            VoipBridge.freezeVideoForExit(local)
         }
         return hadVideo
-    }
-
-    private fun freezeFrame(host: FrameLayout) {
-        if (host.visibility != VISIBLE) return
-        val texture = host.getChildAt(0) as? TextureView ?: return
-        // Leave the last surface buffer attached until onDestroy, even if a snapshot is unavailable.
-        VoipBridge.detachVideoTrackForExit(host)
-        if (!texture.isAvailable || texture.width <= 0 || texture.height <= 0) return
-        val width = minOf(texture.width, 540)
-        val height = (texture.height.toFloat() * width / texture.width).roundToInt().coerceAtLeast(1)
-        val frame = runCatching { texture.getBitmap(width, height) }.getOrNull() ?: return
-        // Keep the last frame in memory while the outgoing window is detached.
-        host.addView(ImageView(context).apply {
-            scaleType = ImageView.ScaleType.FIT_XY
-            importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
-            setImageBitmap(frame)
-        }, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
     }
 
     fun release() {

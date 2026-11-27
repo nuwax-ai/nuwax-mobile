@@ -227,8 +227,9 @@ internal class VoipNativeCallView(
             val end = if (hasVideo) videoHangup else hangup
             mic.update(if (muted) "unmute" else "mute", if (muted) "microphone_off" else "microphone", selected = muted)
             val outputLabel = value.optString("audioOutput").ifEmpty { if (loudspeaker) "speaker" else "earpiece" }
-            val outputIcon = if (outputLabel == "earpiece") "earpiece" else "speaker"
-            route.update(if (routePending) "connecting" else outputLabel, iconName = outputIcon, selected = !routePending && loudspeaker)
+            val outputIcon = if (outputLabel == "earpiece") "speaker_off" else "speaker"
+            val outputCaption = when (outputLabel) { "earpiece" -> "speakerOff"; "speaker" -> "speakerOn"; else -> outputLabel }
+            route.update(if (routePending) "connecting" else outputCaption, iconName = outputIcon, selected = !routePending && loudspeaker)
             route.isEnabled = !routePending
             end.update("hangup", color = DANGER)
             if (hasVideo) {

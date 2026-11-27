@@ -64,7 +64,7 @@ resources = run(tools / "aapt", "dump", "--values", "resources", APK)
 for label in ["nuwax_voip_incoming_channel", "nuwax_voip_ongoing_channel", "音视频通话邀请通知", "通话状态",
               "Audio and video call invitations", "音視訊通話邀請通知", "音視像通話邀請通知"]:
     assert label in resources, f"Missing native notification translation: {label}"
-for icon in ["hangup", "phone", "video", "video_off", "switch_camera", "microphone", "microphone_off", "speaker", "minimize"]:
+for icon in ["hangup", "phone", "video", "video_off", "switch_camera", "microphone", "microphone_off", "speaker", "speaker_off", "minimize"]:
     name = "nuwax_voip_" + icon
     assert f"drawable/{name}" in resources, f"Missing native call drawable: {name}"
     shared = ROOT / "static/voip/call-icons" / (icon.replace("_", "-") + "-white.png")

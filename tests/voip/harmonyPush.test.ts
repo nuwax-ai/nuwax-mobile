@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const token = vi.hoisted(() => ({ get: vi.fn() }));
 const transport = vi.hoisted(() => ({ request: vi.fn(), destroy: vi.fn() }));
+const system = vi.hoisted(() => ({ incoming: vi.fn(), error: vi.fn() }));
 vi.mock('BuildProfile', () => ({ default: { DEBUG: true } }));
 vi.mock('@kit.AbilityKit', () => ({ bundleManager: {
   BundleFlag: { GET_BUNDLE_INFO_DEFAULT: 0 },
@@ -19,7 +20,11 @@ vi.mock('@kit.AssetStoreKit', () => ({ asset: {
   addSync: vi.fn(), removeSync: vi.fn(),
 } }));
 vi.mock('@kit.PushKit', () => ({ pushService: { getToken: token.get } }));
-vi.mock('@kit.CallServiceKit', () => ({ voipCall: { on: vi.fn() } }));
+vi.mock('@kit.CallServiceKit', () => ({ voipCall: { on: vi.fn(),
+  reportIncomingCall: system.incoming, reportIncomingCallError: system.error,
+  VoipCallType: { VOIP_CALL_VIDEO: 1, VOIP_CALL_VOICE: 0 }, VoipCallState: { VOIP_CALL_STATE_RINGING: 1 },
+  VoipCallFailureCause: { OTHER: 1, ROUTE_BUSY: 2 }, ErrorReason: { ERROR_NONE: 0 },
+} }));
 vi.mock('@kit.BackgroundTasksKit', () => ({ backgroundTaskManager: {} }));
 vi.mock('@kit.ImageKit', () => ({ image: {} }));
 vi.mock('@kit.AudioKit', () => ({ audio: {} }));
@@ -39,6 +44,7 @@ beforeEach(() => {
   if (VoipBridge.expiry >= 0) clearTimeout(VoipBridge.expiry);
   VoipBridge.expiry = -1; VoipBridge.mediaId = ''; VoipBridge.nativeId = ''; VoipBridge.connected = false; VoipBridge.readySent = false;
   token.get.mockReset();
+  system.incoming.mockReset().mockResolvedValue(0); system.error.mockReset().mockResolvedValue(undefined);
   transport.request.mockReset(); transport.destroy.mockClear();
   vi.spyOn(VoipBridge, 'startStream').mockImplementation(() => {});
   vi.spyOn(VoipBridge, 'finish').mockImplementation(() => {});
@@ -227,6 +233,53 @@ describe('IM call event ordering and isolation', () => {
     expect(adopt).toHaveBeenCalledWith(expect.objectContaining({ state: 'ringing', callId: 'c1', callerId: 'bob', calleeId: 'alice', msgId: '1987654321098765432' }));
     expect(connect).not.toHaveBeenCalled();
     expect(token.get).not.toHaveBeenCalled(); // current backend has no Harmony native-token contract
+  });
+  it('reports a decoded avatar for a verified Huawei push and keeps it in the App snapshot', async () => {
+    const adopt = setup();
+    const convId = '12345';
+    const message = { ...invitation(), convId };
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message as any);
+    const picture = { release: vi.fn() };
+    const avatar = '/api/user/avatar/10001/profile-hash';
+    const loadAvatar = vi.spyOn(VoipBridge, 'loadIncomingAvatar').mockResolvedValue(picture as any);
+    const push = { type: 'voip', convId, msgId: message.msgId, callId: 'c1', calleeId: 'alice',
+      mediaType: 'audio', expiresAt: Date.now() + 30_000, senderAvatar: avatar };
+    await VoipBridge.incoming({ callId: 'native-c1', data: JSON.stringify(push) } as any);
+    expect(loadAvatar).toHaveBeenCalledWith(avatar, 'http://development.example');
+    expect(system.incoming).toHaveBeenCalledWith(expect.objectContaining({ callId: 'native-c1', userProfile: picture }));
+    expect(adopt).toHaveBeenCalledWith(expect.objectContaining({ callId: 'c1', callerAvatar: avatar, roomName: message.body.roomName }));
+    expect(picture.release).toHaveBeenCalledOnce();
+  });
+  it('skips the avatar request when the native push does not identify the authenticated message', async () => {
+    const adopt = setup();
+    const message = { ...invitation(), convId: '12345' };
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce(message as any);
+    const loadAvatar = vi.spyOn(VoipBridge, 'loadIncomingAvatar');
+    const push = { type: 'voip', convId: message.convId, msgId: '12346', callId: 'c1', calleeId: 'alice',
+      mediaType: 'audio', expiresAt: Date.now() + 30_000, senderAvatar: '/api/user/avatar/10001/profile-hash' };
+    await VoipBridge.incoming({ callId: 'native-c1', data: JSON.stringify(push) } as any);
+    expect(system.error).toHaveBeenCalledWith('native-c1', 1);
+    expect(system.incoming).not.toHaveBeenCalled();
+    expect(loadAvatar).not.toHaveBeenCalled();
+    expect(adopt).not.toHaveBeenCalled();
+  });
+  it('uses the conversation avatar ahead of the optional push reference', async () => {
+    const adopt = setup();
+    vi.mocked(VoipBridge.request).mockResolvedValueOnce({ convType: 1, peerUserId: 'bob',
+      peerAvatar: 'https://images.example.test/latest.png' } as any);
+    await VoipBridge.receiveInvitation({ ...invitation(), senderAvatar: '/api/user/avatar/bob/previous' } as any,
+      '/api/user/avatar/bob/pushed');
+    expect(adopt).toHaveBeenCalledWith(expect.objectContaining({ callerAvatar: 'https://images.example.test/latest.png' }));
+  });
+  it('stops waiting for a slow system avatar request', async () => {
+    vi.useFakeTimers();
+    transport.request.mockReturnValue(new Promise(() => {}));
+    const avatar = VoipBridge.loadIncomingAvatar('/api/user/avatar/bob/current', 'https://app.example.test');
+    await vi.advanceTimersByTimeAsync(750);
+    await expect(avatar).resolves.toBeNull();
+    expect(transport.request).toHaveBeenCalledWith('https://app.example.test/api/user/avatar/bob/current',
+      expect.not.objectContaining({ header: expect.anything() }));
+    expect(transport.destroy).toHaveBeenCalledOnce();
   });
   it('does not fall back to msgId when the signal contains a conflicting callId', () => {
     setup(); VoipBridge.current = { callId: 'current', convId: 'chat', msgId: 'm1', state: 'ringing' } as any;

@@ -9,6 +9,7 @@ struct NuwaxVoipPushInvitation {
     let expiresAt: Double
     let mediaType: String
     let displayName: String
+    let senderAvatar: String?
     let convId: String?
     let msgId: String?
     /// Meeting-only fields. They never authorize media; they only locate the invite.
@@ -64,6 +65,15 @@ struct NuwaxVoipPushInvitation {
         inviteId = invite; roomName = room; title = meetingTitle
         displayName = Self.callerName(excluding: [id], payload["senderName"],
                                       payload["callerDisplayName"], payload["displayName"]) ?? "Nuwax"
+        senderAvatar = Self.avatarReference(payload["senderAvatar"])
+    }
+
+    static func avatarReference(_ value: Any?) -> String? {
+        guard let avatar = NuwaxVoipClientPolicy.avatarURL(value), avatar.utf8.count <= 256,
+              avatar.range(of: #"\A(?:https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/|/api/(?:user/avatar|f)/)[A-Za-z0-9._~%/+-]+\z"#,
+                           options: .regularExpression) != nil,
+              avatar.range(of: #"(?i)%2e|%2f|%5c|/\.{1,2}(?:/|\z)"#, options: .regularExpression) == nil else { return nil }
+        return avatar
     }
 
     init?(meetingMessage message: [String: Any], userId: String, now: Double) {

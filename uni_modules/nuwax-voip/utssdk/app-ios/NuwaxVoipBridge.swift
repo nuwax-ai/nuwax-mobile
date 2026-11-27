@@ -206,7 +206,8 @@ import LiveKitClient
                     guard let message = try? await self.request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true),
                           run == self.generation, self.wireString(message["convId"]) == conv,
                           self.wireString(message["msgId"]) == msg else { return }
-                    await self.receiveInvitation(message, notificationCallID: commandId, notificationExpiry: expiresAt)
+                    await self.receiveInvitation(message, notificationCallID: commandId, notificationExpiry: expiresAt,
+                                                 senderAvatar: NuwaxVoipPushInvitation.avatarReference(command["senderAvatar"]))
                 }
             }
         case "watch":
@@ -493,9 +494,10 @@ import LiveKitClient
         trace("background meeting invitation received from IM")
         system.register(invitation.report(labels: configuration["labels"] as? [String: Any] ?? [:]), uuid: systemUUID, incoming: true)
     }
-    private func receiveInvitation(_ message: [String: Any], notificationCallID: String = "", notificationExpiry: Double = 0) async {
+    private func receiveInvitation(_ message: [String: Any], notificationCallID: String = "", notificationExpiry: Double = 0,
+                                   senderAvatar: String? = nil) async {
         trace("control invitation received")
-        guard var next = await businessInvitation(message), let id = next["callId"] as? String,
+        guard var next = await businessInvitation(message, senderAvatar: senderAvatar), let id = next["callId"] as? String,
               notificationCallID.isEmpty || notificationCallID == id,
               !terminal.contains(id), snapshot?["callId"] as? String != id,
               let messageExpiry = next["expiresAt"] as? Double,
@@ -504,7 +506,7 @@ import LiveKitClient
         next["expiresAt"] = expiry
         adoptBusinessInvitation(next)
     }
-    private func businessInvitation(_ message: [String: Any]) async -> [String: Any]? {
+    private func businessInvitation(_ message: [String: Any], senderAvatar: String? = nil) async -> [String: Any]? {
         let run = generation, user = configuration["userId"] as? String
         guard message["msgType"] as? String == "voip", (message["senderType"] as? Int ?? 1) == 1, (message["msgStatus"] as? Int ?? 1) == 1,
               let body = message["body"] as? [String: Any], let id = body["callId"] as? String, let roomName = body["roomName"] as? String,
@@ -517,7 +519,7 @@ import LiveKitClient
               run == generation, user == configuration["userId"] as? String,
               conversation["convType"] as? Int == 1, wireString(conversation["peerUserId"]) == sender else { return nil }
         let callerAvatar = NuwaxVoipClientPolicy.avatarURL(conversation["peerAvatar"])
-            ?? NuwaxVoipClientPolicy.avatarURL(message["senderAvatar"]) ?? ""
+            ?? NuwaxVoipClientPolicy.avatarURL(message["senderAvatar"]) ?? senderAvatar ?? ""
         let name = NuwaxVoipPushInvitation.callerName(excluding: [id, sender], conversation["peerName"], message["senderName"]) ?? sender
         let next: [String: Any] = ["protocol": "im-voip-v1", "callId": id, "roomName": roomName, "msgId": wireString(message["msgId"]), "convId": conv, "version": 1, "state": "ringing", "callerId": sender, "calleeId": configuration["userId"] as? String ?? "", "callerDeviceId": "", "acceptedDeviceId": "", "mediaType": media, "displayName": name, "callerDisplayName": name, "calleeDisplayName": configuration["userId"] as? String ?? "", "callerAvatar": callerAvatar, "expiresAt": sent + 60000]
         return next
@@ -1623,7 +1625,7 @@ extension NuwaxVoipBridge: @preconcurrency PKPushRegistryDelegate {
                 let message = try await request("/api/instant-message/messages/\(msg)?convId=\(conv)", absolute: true)
                 guard !Task.isCancelled, run == generation, route == requiredPushRegistration,
                       invitation.matches(message, now: Date().timeIntervalSince1970 * 1000),
-                      var next = await businessInvitation(message), run == generation,
+                      var next = await businessInvitation(message, senderAvatar: invitation.senderAvatar), run == generation,
                       !Task.isCancelled, route == requiredPushRegistration, let pending = pendingPushes[systemUUID] else { endIfUnverified(); return }
                 next["expiresAt"] = invitation.expiresAt
                 if pending.declined { notifyBusinessEnd(next, reason: "rejected"); system.end(uuid: systemUUID); return }

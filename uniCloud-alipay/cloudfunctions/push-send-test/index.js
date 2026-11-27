@@ -1,7 +1,7 @@
 'use strict';
 
 const crypto = require('crypto')
-const { callTargetCids, androidCallRouteForCid, iosCallRouteForCid, prepareVoip, prepareNativeVoip, prepareVoipScene, prepareMeetingRingInvitation } = require('./voip')
+const { MAX_PAYLOAD, callTargetCids, androidCallRouteForCid, iosCallRouteForCid, prepareVoip, prepareNativeVoip, prepareVoipScene, prepareMeetingRingInvitation } = require('./voip')
 
 const APP_ID = '__UNI__8BF05E4'          // 本项目的 DCloud AppID
 // 后端握手密钥：**只**从环境变量读（uniCloud 控制台 → 云函数 → 环境变量 PUSH_SIGN_KEY）。
@@ -12,7 +12,6 @@ const BATCH_SIZE = 500                    // 单次最多 500 个 cid
 // 官方长度上限（uni-push 2.0 服务端 sendMessage 入参说明）：超长会被厂商通道截断或拒绝
 const MAX_TITLE = 19                      // 通知栏标题（官方：小于 20，留一格给省略号）
 const MAX_CONTENT = 49                    // 通知栏内容（官方：小于 50）
-const MAX_PAYLOAD = 800                   // 透传数据字符数
 // 临时联调开关：设为 1 时输出推送正文、完整 payload 与目标 cid。
 // 默认关闭，避免生产云函数日志长期留存用户私聊内容。
 const DEBUG_MESSAGE_CONTENT = process.env.PUSH_DEBUG_MESSAGE_CONTENT === '1'
@@ -289,7 +288,12 @@ function attachBadgeToPayload(payload, badge) {
   if (n === null) return payload
   const out = Object.assign({}, payload)
   out.badge = n
-  return JSON.stringify(out).length <= MAX_PAYLOAD ? out : payload
+  if (JSON.stringify(out).length <= MAX_PAYLOAD) return out
+  if ((payload.type === 'voip' || payload.type === 'meeting_invite') && payload.senderAvatar) {
+    delete out.senderAvatar
+    if (JSON.stringify(out).length <= MAX_PAYLOAD) return out
+  }
+  return payload
 }
 
 // ==================== 无 callRoute 时的厂商通道动态判定 ====================

@@ -26,6 +26,20 @@ final class VoipPushTests: XCTestCase {
         let data = try JSONSerialization.data(withJSONObject: payload)
         XCTAssertNotNil(parse(["payload": String(decoding: data, as: UTF8.self)]))
     }
+    func testPushRetainsOnlyShortAvatarReferencesForAppDisplay() throws {
+        let avatar = "/api/user/avatar/10001/profile-hash"
+        var fields = payload
+        fields["senderAvatar"] = " \(avatar) "
+        let invitation = try XCTUnwrap(parse(["payload": fields]))
+        XCTAssertEqual(invitation.senderAvatar, avatar)
+        XCTAssertNil(invitation.report(labels: [:])["senderAvatar"])
+
+        for unsafe in ["https://images.example.test/avatar?token=secret", "//example.test/avatar", "/api/f/%2e%2e/private"] {
+            fields["senderAvatar"] = unsafe
+            XCTAssertNotNil(parse(fields))
+            XCTAssertNil(parse(fields)?.senderAvatar)
+        }
+    }
     func testSystemReportDoesNotDisplayTheCallIdentifier() throws {
         var fields = payload
         fields["displayName"] = "call-123"

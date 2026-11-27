@@ -12,6 +12,7 @@ const { prepareVoip } = createRequire(latestEntry)('./voip');
 const ordinaryFixtures = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures/push-send-ordinary.json'), 'utf8'));
 const now = 1_793_000_000_000;
 const locator = { type: 'voip', convId: '245475557381246976', msgId: '9223372036854775807' };
+const senderAvatar = '/api/user/avatar/10001/profile-hash';
 const notificationOnlyTransports = [
   ['android-honor', 'ho'],
   ['android-xiaomi', 'xm'],
@@ -58,7 +59,7 @@ describe('native call delivery', () => {
     };
     const result = await call({
       ...body, push_clientid: [cid, 'second-ios', 'android-cid', 'invalid-ios', cid],
-      payload: { ...body.payload, scene: 'call', calleeId: '1234', iosVoip },
+      payload: { ...body.payload, scene: 'call', calleeId: '1234', iosVoip, senderAvatar },
     });
     expect(result.errCode).toBe(0);
     expect(send).toHaveBeenCalledTimes(3);
@@ -67,10 +68,11 @@ describe('native call delivery', () => {
     ]);
     for (const [index, expected] of [registrationId, nextRegistrationId].entries()) {
       const args = send.mock.calls[index][0];
-      expect(JSON.parse(args.options.ios.payload)).toMatchObject({ routeRegistrationId: expected, calleeId: '1234' });
+      expect(JSON.parse(args.options.ios.payload)).toMatchObject({ routeRegistrationId: expected, calleeId: '1234', senderAvatar });
       expect(args.payload).not.toHaveProperty('iosVoip');
     }
     expect(send.mock.calls[2][0].push_clientid).toEqual(['android-cid', 'invalid-ios']);
+    expect(send.mock.calls[2][0].payload.senderAvatar).toBe(senderAvatar);
     expect(send.mock.calls[2][0].payload).not.toHaveProperty('iosVoip');
   });
 
@@ -93,7 +95,7 @@ describe('native call delivery', () => {
   it('sends Huawei Android pure transmission for a verified route', async () => {
     const transport = 'android-huawei';
     const body = makeBody();
-    const invitation = { ...body, callRoute: { cid, platform: 'android', transport }, settings: { ttl: 2000 }, options: { ios: { type: 'voip' } } };
+    const invitation = { ...body, payload: { ...body.payload, senderAvatar }, callRoute: { cid, platform: 'android', transport }, settings: { ttl: 2000 }, options: { ios: { type: 'voip' } } };
 
     const { call, send, request, manager } = load();
     expect((await call(invitation)).errCode).toBe(0);
@@ -105,7 +107,7 @@ describe('native call delivery', () => {
     });
     const transmission = args.requestData.push_message.transmission;
     expect(args.requestData.push_channel).toEqual({ android: { ups: { transmission } } });
-    expect(JSON.parse(transmission)).toEqual({ unipush_version: '2.0', payload: { ...body.payload, delivery: 'android-native' } });
+    expect(JSON.parse(transmission)).toEqual({ unipush_version: '2.0', payload: { ...body.payload, delivery: 'android-native', senderAvatar } });
 
     Object.assign(manager, { request: undefined });
     expect(await call(invitation)).toMatchObject({ errCode: 503, errMsg: 'UniPush transmission adapter unavailable' });
@@ -137,7 +139,7 @@ describe('native call delivery', () => {
     const { payload, ...body } = makeBody();
     const invitation = { ...body, push_clientid: [cid],
       callRoute: { cid, platform: 'harmonyos', transport: 'harmony-huawei' },
-      payload: { ...payload, scene: 'call', calleeId: '10002', roomName: 'call-same-call', token: 'omitted' },
+      payload: { ...payload, scene: 'call', calleeId: '10002', roomName: 'call-same-call', token: 'omitted', senderAvatar },
       options: { ios: { type: 'voip' } }, settings: { ttl: 30000 },
     };
     expect((await call(invitation)).errCode).toBe(0);
@@ -150,7 +152,7 @@ describe('native call delivery', () => {
     });
     const channel = args.requestData.push_channel.harmony.custom.HW;
     expect(channel.type).toBe('voip_call');
-    expect(JSON.parse(JSON.parse(channel.payload).extraData)).toEqual({ ...payload, calleeId: '10002' });
+    expect(JSON.parse(JSON.parse(channel.payload).extraData)).toEqual({ ...payload, calleeId: '10002', senderAvatar });
     expect(Object.keys(args.requestData.push_channel)).toEqual(['harmony']);
     await call({ ...invitation, push_clientid: cid });
     expect(request.mock.calls[1][0].requestData.request_id).toBe(args.requestData.request_id);
@@ -271,17 +273,32 @@ describe('IM invitation scenes', () => {
   const meetingFields = { ...locator, scene: 'meeting', convType: 2, inviteId: 'fixture-invite', roomName: '123456789',
     title: '周会', mediaType: 'audio', senderName: '张三', silent: true, groupCall: true, passcode: '1234' };
 
+  it('drops only the avatar when the meeting would otherwise exceed the push budget', async () => {
+    const { call, send } = load();
+    const payload = { ...meetingFields, title: '会'.repeat(120), senderName: '人'.repeat(120),
+      roomName: 'r'.repeat(128), inviteId: 'm'.repeat(128), senderAvatar: 'https://images.example.test/' + 'a'.repeat(210) };
+    expect((await call({ ...envelope, payload })).errCode).toBe(0);
+    expect(send.mock.calls[0][0].payload).toMatchObject({ type: 'meeting_invite', inviteId: payload.inviteId });
+    expect(send.mock.calls[0][0].payload).not.toHaveProperty('senderAvatar');
+  });
+
+  it.each(['//images.example.test/avatar', 'https://images.example.test/avatar?token=secret', '/api/f/../private',
+    'file:///tmp/avatar', 'https://images.example.test/' + 'a'.repeat(240), 42])('ignores an invalid optional avatar %s', value => {
+    const result = prepareVoip({ payload: { ...locator, senderAvatar: value } }, now);
+    expect(result.payload).toEqual(locator);
+  });
+
   it('keeps a meeting with an IM envelope on the IM category', async () => {
     const { call, send, database } = load();
     const { scene, ...expected } = meetingFields;
     const request = {
       ...envelope, type: 'im',
-      payload: { ...meetingFields, expiresAt: 1, accessToken: 'fixture-extra' },
+      payload: { ...meetingFields, expiresAt: 1, accessToken: 'fixture-extra', senderAvatar },
     };
     const result = await call(request);
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
-    expect(args.payload).toEqual({ ...expected, type: 'meeting_invite' });
+    expect(args.payload).toEqual({ ...expected, type: 'meeting_invite', senderAvatar });
     expect(args.category).toEqual({ harmony: 'IM', huawei: 'IM', vivo: 'IM' });
     expect(args).not.toHaveProperty('settings');
     expect(args).not.toHaveProperty('options');
@@ -432,7 +449,7 @@ describe('meeting ringing delivery', () => {
     const result = await call({
       ...envelope, push_clientid: cid, channelId: 'VoipCall',
       callRoute: { cid, platform: 'ios', transport: 'ios-voip', environment: 'development', registrationId },
-      payload: ringPayload(),
+      payload: { ...ringPayload(), senderAvatar },
     });
     expect(result.errCode).toBe(0);
     const args = send.mock.calls[0][0];
@@ -442,7 +459,7 @@ describe('meeting ringing delivery', () => {
     expect(args.options).not.toHaveProperty('android');
     const pushed = JSON.parse(args.options.ios.payload);
     expect(pushed).toMatchObject({ type: 'voip', scene: 'meeting', callId: 'mi-ring', calleeId: '10002',
-      inviteId: 'mi-ring', roomName: '123456789', title: '周会', mediaType: 'video', displayName: '张三' });
+      inviteId: 'mi-ring', roomName: '123456789', title: '周会', mediaType: 'video', displayName: '张三', senderAvatar });
     expect(pushed.expiresAt).toBeLessThanOrEqual(Date.now() + 61_000);
   });
 
@@ -519,13 +536,13 @@ describe('meeting ringing delivery', () => {
     const result = await call({
       ...envelope, push_clientid: cid,
       callRoute: { cid, platform: 'android', transport: 'android-huawei' },
-      payload: ringPayload(),
+      payload: { ...ringPayload(), senderAvatar },
     });
     expect(result.errCode).toBe(0);
     const [{ requestData }] = request.mock.calls[0];
     expect(requestData.audience.cid).toEqual([cid]);
     expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({
-      type: 'voip', scene: 'meeting', calleeId: '10002', delivery: 'android-native',
+      type: 'voip', scene: 'meeting', calleeId: '10002', delivery: 'android-native', senderAvatar,
     });
     expect(send).not.toHaveBeenCalled();
     expect(database).not.toHaveBeenCalled();

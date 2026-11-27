@@ -3,9 +3,20 @@
 const { createHash } = require('crypto')
 
 const MAX_CALL_TARGETS = 1000
+const MAX_PAYLOAD = 800
+exports.MAX_PAYLOAD = MAX_PAYLOAD
 const matches = (value, pattern) => typeof value === 'string' && pattern.exec(value)?.[0] === value
 const locator = value => matches(value, /^[1-9][0-9]{0,18}$/) && BigInt(value) <= 9223372036854775807n
 const isCallCid = value => matches(value, /^[A-Za-z0-9_-]{1,128}$/)
+
+function withSenderAvatar(payload, value) {
+  if (typeof value !== 'string') return payload
+  const avatar = value.trim()
+  const shortReference = /^(?:https:\/\/[A-Za-z0-9.-]+(?::[0-9]{1,5})?\/|\/api\/(?:user\/avatar|f)\/)[A-Za-z0-9._~%/+-]+$/
+  if (avatar.length > 256 || !matches(avatar, shortReference) || /%2e|%2f|%5c|\/\.{1,2}(?:\/|$)/i.test(avatar)) return payload
+  const result = { ...payload, senderAvatar: avatar }
+  return JSON.stringify(result).length <= MAX_PAYLOAD ? result : payload
+}
 
 exports.callTargetCids = value => {
   const ids = Array.isArray(value) ? value : [value]
@@ -62,7 +73,7 @@ exports.prepareVoip = (body, now = Date.now()) => {
     if (!Number.isSafeInteger(body.settings.ttl) || body.settings.ttl <= 0) return { error: 'invalid voip ttl' }
     ttl = Math.min(ttl, body.settings.ttl)
   }
-  return { payload, settings: { ttl } }
+  return { payload: withSenderAvatar(payload, source.senderAvatar), settings: { ttl } }
 }
 
 function prepareCallInvitation(body, now) {
@@ -141,7 +152,7 @@ function prepareMeetingRingInvitation(body, now = Date.now()) {
     : now + 60_000
   payload.expiresAt = Math.min(deadline, cap)
   if (payload.expiresAt <= now) return { expired: true }
-  return { payload, settings: { ttl: Math.min(60_000, payload.expiresAt - now) } }
+  return { payload: withSenderAvatar(payload, source.senderAvatar), settings: { ttl: Math.min(60_000, payload.expiresAt - now) } }
 }
 
 exports.prepareMeetingRingInvitation = prepareMeetingRingInvitation
@@ -171,7 +182,7 @@ exports.prepareVoipScene = (body, now = Date.now()) => {
   for (const field of ['convId', 'convType', 'msgId', 'inviteId', 'roomName', 'title', 'mediaType', 'senderName', 'silent', 'groupCall', 'passcode']) {
     if (source[field] !== undefined) meeting[field] = source[field]
   }
-  return { meeting }
+  return { meeting: withSenderAvatar(meeting, source.senderAvatar) }
 }
 
 // Getui brand codes and the UniPush strategies exercised in this test space.
@@ -251,6 +262,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   if (platform === 'android') payload.delivery = 'android-native'
   // Harmony retrieves the authorized room through IM after waking.
   if (harmony) delete payload.roomName
+  const { senderAvatar, ...callFields } = payload
   const requestId = createHash('sha256')
     .update(JSON.stringify([route.transport, route.cid, ios ? route.registrationId : '', payload.callId]))
     .digest('hex').slice(0, 32)
@@ -262,7 +274,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
     // Test-space probe via UniPush. Vendor receipt and SDK callback are verified separately.
     const seconds = Math.floor(ttl / 1000)
     if (seconds < 1) return { expired: true }
-    const callPayload = { ...payload, scene: payload.scene ?? 'call', pushEnvironment: 'test' }
+    const callPayload = withSenderAvatar({ ...callFields, scene: payload.scene ?? 'call', pushEnvironment: 'test' }, senderAvatar)
     const options = { android: { VV: {
       '/header/message-type': 3,
       '/message/extraData': JSON.stringify(callPayload),
@@ -271,6 +283,7 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
     } } }
     return { payload: callPayload, requestId, settings, options }
   }
-  return { payload, requestId, settings,
-    ...(ios ? { options: { ios: { type: 'voip', payload: JSON.stringify(payload) } } } : {}) }
+  const callPayload = withSenderAvatar(callFields, senderAvatar)
+  return { payload: callPayload, requestId, settings,
+    ...(ios ? { options: { ios: { type: 'voip', payload: JSON.stringify(callPayload) } } } : {}) }
 }

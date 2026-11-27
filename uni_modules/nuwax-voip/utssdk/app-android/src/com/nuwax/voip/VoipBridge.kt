@@ -385,7 +385,17 @@ object VoipBridge {
                             emit("openPage")
                         }
                     }
-                    "invitation" -> if (business()) receiveInvitation(api("/api/instant-message/messages/" + Uri.encode(command.getString("msgId")) + "?convId=" + Uri.encode(command.getString("convId")), absolute = true))
+                    "invitation" -> if (business()) {
+                        val conv = command.getString("convId")
+                        val msg = command.getString("msgId")
+                        val message = api("/api/instant-message/messages/" + Uri.encode(msg) + "?convId=" + Uri.encode(conv), absolute = true)
+                        val callId = command.optString("callId")
+                        if (message.optString("convId") == conv && message.optString("msgId") == msg &&
+                            (callId.isEmpty() || callId == message.optJSONObject("body")?.optString("callId"))) {
+                            receiveInvitation(message, sessionScope = command.getString("scope"),
+                                senderAvatar = VoipPushPayload.avatarReference(command.opt("senderAvatar")).orEmpty())
+                        }
+                    }
                     "action" -> act(command.optString("action"), command.optString("answerMediaType", "audio"))
                     "microphone" -> setMicrophone(command.optBoolean("enabled"))
                     "camera" -> setCamera(command.optBoolean("enabled"))
@@ -587,9 +597,10 @@ object VoipBridge {
             }
         }
     }
-    private suspend fun receiveInvitation(message: JSONObject, push: JSONObject? = null, sessionScope: String? = null) {
+    private suspend fun receiveInvitation(message: JSONObject, push: JSONObject? = null, sessionScope: String? = null,
+                                          senderAvatar: String = "") {
         trace("invitation validating")
-        if (message.optString("msgType") == "meeting_invite") { receiveMeetingInvitation(message, push, sessionScope); return }
+        if (message.optString("msgType") == "meeting_invite") { receiveMeetingInvitation(message, push, sessionScope, senderAvatar); return }
         if (message.optString("msgType") != "voip" || message.optInt("senderType", 1) != 1 || message.optInt("msgStatus", 1) != 1) return
         val body = message.optJSONObject("body") ?: return
         val id = body.optString("callId"); val conv = message.optString("convId"); val sender = message.optString("senderId")
@@ -604,6 +615,7 @@ object VoipBridge {
         if (deadline <= System.currentTimeMillis() || terminal.contains(id) || current?.optString("callId") == id) return
         val peerAvatar = (conversation.opt("peerAvatar") as? String)?.trim().orEmpty()
             .ifEmpty { (message.opt("senderAvatar") as? String)?.trim().orEmpty() }
+            .ifEmpty { senderAvatar }
         val next = JSONObject().put("protocol", "im-voip-v1").put("callId", id).put("roomName", body.getString("roomName")).put("msgId", message.getString("msgId")).put("convId", conv)
             .put("version", 1).put("state", "ringing").put("callerId", sender).put("calleeId", config.getString("userId")).put("callerDeviceId", "").put("acceptedDeviceId", "")
             .put("mediaType", media).put("callerDisplayName", conversation.optString("peerName", sender)).put("calleeDisplayName", config.getString("userId"))
@@ -615,7 +627,7 @@ object VoipBridge {
      * 会议来电只借用系统来电界面和铃声，不进入 1:1 通话状态机：
      * 接听后由 JS 打开会议页，忽略/超时回写 meeting-invite-handled。
      */
-    private fun receiveMeetingInvitation(message: JSONObject, push: JSONObject?, sessionScope: String?) {
+    private fun receiveMeetingInvitation(message: JSONObject, push: JSONObject?, sessionScope: String?, senderAvatar: String) {
         // Foreground meeting invitations are presented by the existing in-app banner.
         if (!hidden) return
         if (message.optInt("senderType", 1) != 1 || message.optInt("msgStatus", 1) != 1) return
@@ -648,7 +660,7 @@ object VoipBridge {
             .put("callerId", sender).put("calleeId", config.optString("userId")).put("acceptedDeviceId", "")
             .put("mediaType", media)
             .put("callerDisplayName", message.optString("senderName", title))
-            .put("callerAvatar", message.opt("senderAvatar") as? String ?: "")
+            .put("callerAvatar", (message.opt("senderAvatar") as? String)?.trim().orEmpty().ifEmpty { senderAvatar })
             .put("calleeDisplayName", config.optString("userId"))
             .put("expiresAt", deadline)
         current = next
@@ -1433,9 +1445,12 @@ object VoipBridge {
                 val message = api("/api/instant-message/messages/" + Uri.encode(invitation.getString("msgId")) +
                     "?convId=" + Uri.encode(invitation.getString("convId")), absolute = true)
                 if (config.optString("scope") != sessionScope) return@launch
+                if (message.optString("convId") != invitation.getString("convId") ||
+                    message.optString("msgId") != invitation.getString("msgId")) return@launch
                 val native = VoipPushPayload.isNative(invitation)
                 if (native && !VoipPushPayload.matches(invitation, message, config.optString("userId"), System.currentTimeMillis())) return@launch
-                receiveInvitation(message, invitation.takeIf { native }, sessionScope)
+                receiveInvitation(message, invitation.takeIf { native }, sessionScope,
+                    VoipPushPayload.avatarReference(invitation.opt("senderAvatar")).orEmpty())
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { if (config.optString("scope") == sessionScope) emit("error", "code", "CALL_INVITATION_FAILED") }
         }

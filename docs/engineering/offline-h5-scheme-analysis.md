@@ -69,7 +69,7 @@
 1. **打成单个 IIFE。** esbuild 以 `index.html` 里的 module 入口为起点 `bundle + format: iife`。页面 JS chunk 全部内联；`assets/` 里的 `.js` 不再拷贝。Vite 的 JS `modulepreload` 被改成「非 CSS 直接 return」，否则 `file://` 上会去拉已经不存在的 chunk。CSS preload 保留。
 2. **路径改相对。** `"/m/` 改成 `"./"`；CSS 里的 `url(/m/...)` 按文件深度补 `../`。`import.meta.url` 在 IIFE 里会被 esbuild 置空，wasm / `scriptDirectory` 改用 `document.baseURI`（即 `index.html` 的 `file://` 地址）。
 3. **躲开 App 编译器的静默过滤。** uni 编译器把任意深度的 `static/web` 当成 Web 平台资源，打 App 时直接丢掉（历史上一次丢掉约 60 个 KaTeX 字体）。目录段改名为 `static/webres/`，JS / CSS / HTML 里的字面量同步改写，最后断言产物里不再出现 `static/web/`。`uni_modules/` 同时改名为 `modules/`。
-4. **整目录排除，不做按引用删文件。** `EXCLUDED_RESOURCES` 只排除已用「全产物零引用 + 运行时闭包探测」确认过的目录（启动图、图标、已内联的 grammar、ai-provider 等）。运行时 `fetch` 拼接出来的 wasm、proxy-web 不在排除名单里。按字面引用裁单个文件曾经造成「挂载成功、零报错、整页白屏」。
+4. **只裁剪已知资源。** `EXCLUDED_RESOURCES` 排除已用「全产物零引用 + 运行时闭包探测」确认过的目录（启动图、图标、已内联的 grammar、ai-provider 等）。生成清单前，再剔除离线会话未引用的通话图标和铃声，以及内容相同且未被引用的字体和高亮 WASM 副本。会话运行时使用的 WASM 路径和 proxy-web 资源随包保留。
 5. **重写入口 HTML。** 去掉会把 `file://` 导向 `file:///m/` 的端跳转脚本，去掉阿里云验证码外链。脚本顺序是桥 → 项目 bootstrap → `app-bundle.js` → `uni.webview.1.5.5.js`。JSSDK 必须在应用包之后：uni-app x 运行时会覆盖 `window.uni`，先加载的桥会被冲掉。`#app` 里放一段纯 CSS 骨架，盖住数 MB bundle 解析前的白屏，Vue 挂载后替换掉。
 6. **写资源清单。** `offline-h5-resources.json` 记录每个文件的相对路径、字节数和 sha256，外加 `sourceFingerprint`、`resourceVersion`、协议版本。文件名故意不以 `manifest.json` 结尾：HBuilderX 读自定义基座时用 `endsWith("manifest.json")` 取 appid，排在真正 manifest 后面的清单会把 appid 读空，资源被同步到 `apps/null`。
 

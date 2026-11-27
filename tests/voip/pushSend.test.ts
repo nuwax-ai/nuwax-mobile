@@ -152,6 +152,7 @@ describe('native call delivery', () => {
     });
     const channel = args.requestData.push_channel.harmony.custom.HW;
     expect(channel.type).toBe('voip_call');
+    expect(args.requestData.push_channel.harmony.options.HW).toEqual({ '/pushOptions/testMessage': true });
     expect(JSON.parse(JSON.parse(channel.payload).extraData)).toEqual({ ...payload, calleeId: '10002', senderAvatar });
     expect(Object.keys(args.requestData.push_channel)).toEqual(['harmony']);
     await call({ ...invitation, push_clientid: cid });
@@ -548,6 +549,42 @@ describe('meeting ringing delivery', () => {
     expect(database).not.toHaveBeenCalled();
   });
 
+  it('keeps the avatar on the Harmony meeting route and retrieves the room and passcode through IM', async () => {
+    const cid = 'fixture-harmony-meeting-cid';
+    const { call, send, request } = load(latestEntry);
+    const body = {
+      ...envelope, push_clientid: [cid],
+      callRoute: { cid, platform: 'harmonyos', transport: 'harmony-huawei' },
+      payload: { ...ringPayload(), passcode: '1234', senderAvatar },
+    };
+    expect((await call(body)).errCode).toBe(0);
+    const [{ requestData }] = request.mock.calls[0];
+    const { custom, options } = requestData.push_channel.harmony;
+    expect(options.HW).toEqual({ '/pushOptions/testMessage': true });
+    const pushed = JSON.parse(JSON.parse(custom.HW.payload).extraData);
+    expect(pushed).toMatchObject({ scene: 'meeting', inviteId: 'mi-ring', calleeId: '10002',
+      convId: body.payload.convId, msgId: body.payload.msgId, senderAvatar });
+    expect(pushed).not.toHaveProperty('roomName');
+    expect(pushed).not.toHaveProperty('passcode');
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { enabled: false, silent: false, explicit: false },
+    { enabled: false, silent: false, explicit: true },
+    { enabled: true, silent: true, explicit: false },
+  ])('keeps ordinary Harmony meeting delivery with %j', async ({ enabled, silent, explicit }) => {
+    const cid = 'fixture-harmony-meeting-cid';
+    const { call, send, request, manager } = load(latestEntry, { NUWAX_VOIP_HARMONY_MEETING_RING: enabled ? '1' : '0' });
+    manager.getClientDetailByCid = vi.fn().mockResolvedValue({
+      errCode: 0, data: { validCids: { [cid]: { device_token: 'vendor-token', brand: 'hoshw', phone_type: 7 } } },
+    });
+    const callRoute = explicit ? { cid, platform: 'harmonyos', transport: 'harmony-huawei' } : undefined;
+    expect((await call({ ...envelope, push_clientid: [cid], callRoute, payload: { ...ringPayload(), silent, senderAvatar } })).errCode).toBe(0);
+    expect(request).not.toHaveBeenCalled();
+    expect(send.mock.calls[0][0]).toMatchObject({ push_clientid: [cid], payload: { type: 'meeting_invite', senderAvatar } });
+  });
+
   it.each([{ silent: true }, { calleeId: undefined }])('falls back for meetings that cannot ring: %j', async overrides => {
     const { call, send, request } = load(latestEntry, { ...ringEnv, NUWAX_VOIP_ANDROID_TRANSPORTS: 'android-huawei' });
     const cid = 'meeting-recipient';
@@ -723,7 +760,7 @@ describe('automatic vendor route resolution', () => {
     expect(JSON.parse(requestData.push_message.transmission).payload).toMatchObject({ delivery: 'android-native' });
   });
 
-  it.each([[7, 'hoshw'], ['7', 'HW']])('routes only single-chat calls to Harmony (%s, %s)', async (phoneType, brand) => {
+  it.each([[7, 'hoshw'], ['7', 'HW']])('routes direct calls and audible meeting invitations to Harmony (%s, %s)', async (phoneType, brand) => {
     const cid = 'harmony-registry-cid';
     const { call, send, request } = withRegistry(load(), {
       [cid]: { device_token: 'vendor-token', brand, phone_type: phoneType },
@@ -736,10 +773,11 @@ describe('automatic vendor route resolution', () => {
     });
     expect(send).not.toHaveBeenCalled();
 
-    await call({ ...body, payload: { ...body.payload, scene: 'meeting', convType: 2,
+    const meeting = await call({ ...body, payload: { ...body.payload, scene: 'meeting', convType: 2,
       inviteId: 'qa-meeting', roomName: 'qa-room', title: '测试会议', silent: false, groupCall: true } });
-    expect(request).toHaveBeenCalledOnce();
-    expect(send).toHaveBeenCalledOnce();
+    expect(meeting.data.results).toMatchObject([{ cid, transport: 'harmony-huawei', delivery: 'native', errCode: 0 }]);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it.each([

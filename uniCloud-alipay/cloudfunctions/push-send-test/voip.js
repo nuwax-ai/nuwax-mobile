@@ -249,9 +249,10 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   if (ios && !validIosRegistration(route)) {
     return { error: 'signed environment and current iOS route registration are required' }
   }
-  if (harmony && (body.payload?.scene === 'meeting' || !locator(body.payload?.calleeId))) {
-    return { error: 'Harmony native push requires a single-chat call' }
+  if (harmony && !locator(body.payload?.calleeId)) {
+    return { error: 'Harmony native push requires a target user' }
   }
+  if (harmony && body.payload?.scene === 'meeting' && body.payload.silent === true) return { notificationOnly: true }
   const invitation = body.payload?.scene === 'meeting'
     ? prepareMeetingRingInvitation(body, now)
     : prepareCallInvitation(body, now)
@@ -260,8 +261,11 @@ exports.prepareNativeVoip = (body, now = Date.now()) => {
   const payload = { ...invitation.payload }
   if (ios) payload.routeRegistrationId = route.registrationId
   if (platform === 'android') payload.delivery = 'android-native'
-  // Harmony retrieves the authorized room through IM after waking.
-  if (harmony) delete payload.roomName
+  // Harmony retrieves the authorized room and any passcode through IM after waking.
+  if (harmony) {
+    delete payload.roomName
+    delete payload.passcode
+  }
   const { senderAvatar, ...callFields } = payload
   const requestId = createHash('sha256')
     .update(JSON.stringify([route.transport, route.cid, ios ? route.registrationId : '', payload.callId]))

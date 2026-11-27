@@ -302,7 +302,7 @@ function attachBadgeToPayload(payload, badge) {
 //   cid → 厂商 token / 品牌的档案存在个推服务端，是设备上次在线注册时写入并持久化的，
 //   云函数按 cid 查档案即可，不依赖接收端 App 存活 —— 与普通厂商通知用同一份数据。
 // device_token 非空时按 brand 选路。缺少专用发送能力或查档失败时走普通通知。
-async function resolveAutoCallRoute(cid, invocationId, singleChatCall, androidGetuiCids) {
+async function resolveAutoCallRoute(cid, invocationId, allowHarmony, androidGetuiCids) {
   const getuiRoute = androidGetuiCids?.has(cid)
     ? { cid, platform: 'android', transport: 'android-getui' }
     : null
@@ -326,7 +326,7 @@ async function resolveAutoCallRoute(cid, invocationId, singleChatCall, androidGe
         [k, typeof v === 'string' ? (/token/i.test(k) ? `len:${v.length}` : v.slice(0, 24)) : v]))
     : null
   const phoneType = detail?.phone_type
-  const harmony = singleChatCall && (brand === 'hoshw' || brand === 'hw') &&
+  const harmony = allowHarmony && (brand === 'hoshw' || brand === 'hw') &&
     (phoneType === 7 || phoneType === '7')
   const vendorRoute = token && harmony
     ? { cid, platform: 'harmonyos', transport: 'harmony-huawei' }
@@ -351,10 +351,14 @@ async function sendNativeVoip(body, route, nativeVoip, invocationId) {
     if (huaweiTransmission || harmony) {
       const transmission = JSON.stringify({ unipush_version: '2.0', payload: nativeVoip.payload })
       const pushChannel = harmony
-        ? { harmony: { custom: { HW: {
-            type: 'voip_call',
-            payload: JSON.stringify({ extraData: JSON.stringify(nativeVoip.payload) })
-          } } } }
+        ? { harmony: {
+            custom: { HW: {
+              type: 'voip_call',
+              payload: JSON.stringify({ extraData: JSON.stringify(nativeVoip.payload) })
+            } },
+            // Huawei requires the test marker while the calling entitlement is in commissioning.
+            options: { HW: { '/pushOptions/testMessage': true } }
+          } }
         : { android: { ups: { transmission } } }
       // sendMessage builds ups.notification even when force_notification is false.
       result = await uniPush.request({
@@ -396,6 +400,7 @@ async function sendNativeVoip(body, route, nativeVoip, invocationId) {
     console.log('[push-send] call transport', JSON.stringify({
       invocationId, transport: route.transport, cid: route.cid, callId: nativeVoip.payload.callId,
       requestId: nativeVoip.requestId, scene: nativeVoip.payload.scene, errCode, tasks,
+      ...(harmony ? { testMessage: true } : {}),
     }))
     return { errCode, data: { requestId: nativeVoip.requestId, tasks } }
   } catch {
@@ -545,7 +550,9 @@ async function handle(event, invocationId) {
     }))
   }
   const harmonyRoute = body.callRoute?.transport === 'harmony-huawei'
-  const nativeAttempt = scene?.meeting && (!meetingRinging || harmonyRoute) ? null : prepareNativeVoip(body)
+  const harmonyMeetingEnabled = process.env.NUWAX_VOIP_HARMONY_MEETING_RING !== '0'
+  const skipMeetingNativeRoute = scene?.meeting && (!meetingRinging || (harmonyRoute && !harmonyMeetingEnabled))
+  const nativeAttempt = skipMeetingNativeRoute ? null : prepareNativeVoip(body)
   const nativeVoip = nativeAttempt?.error && strictCids && !harmonyRoute ? null : nativeAttempt
   if (nativeVoip) {
     if (nativeVoip.error) return { errCode: 400, errMsg: nativeVoip.error }
@@ -567,6 +574,7 @@ async function handle(event, invocationId) {
   // iOS 读 IM 登记，其他设备继续按个推档案选路。普通通知合并发送。
   const invitation = scene?.call ?? (meetingRinging ? ringAttempt : null)
   if (body.callRoute == null && invitation != null) {
+    const allowHarmony = scene?.call != null || harmonyMeetingEnabled
     const results = []
     const notificationCids = []
     for (let i = 0; i < ids.length; i++) {
@@ -574,7 +582,7 @@ async function handle(event, invocationId) {
       const iosRoute = iosCallRouteForCid(cid, iosRegistrations,
         process.env.NUWAX_VOIP_IOS_APNS_ENVIRONMENT || 'development')
       const route = iosRoute ?? await resolveAutoCallRoute(
-        cid, invocationId, scene?.call != null, androidGetui)
+        cid, invocationId, allowHarmony, androidGetui)
       if (route != null) {
         const native = prepareNativeVoip({
           ...body, push_clientid: cid, payload: invitation.payload, callRoute: route,

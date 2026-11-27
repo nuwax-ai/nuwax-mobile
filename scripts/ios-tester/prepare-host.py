@@ -78,6 +78,29 @@ def configure_app(app, resources, metadata):
     shutil.rmtree(app / "uni-app-x")
     shutil.copytree(resources / APP_ID, app / "uni-app-x/apps" / APP_ID)
 
+    background_voice_note_upload = os.environ.get("NUWAX_VOICE_NOTE_BACKGROUND_UPLOAD") == "1"
+    if background_voice_note_upload:
+        delegate = app / "AppDelegate.m"
+        source = delegate.read_text()
+        declaration = "@implementation AppDelegate"
+        if source.count(declaration) != 1 or "handleEventsForBackgroundURLSession" in source:
+            raise ValueError("iOS 宿主已变更，请合并后台 URLSession 回调后再启用录音后台上传")
+        hook = """@interface NuwaxVoiceNoteBackgroundUploader : NSObject
++ (BOOL)handleBackgroundEvents:(NSString *)identifier completionHandler:(void (^)(void))completionHandler;
+@end
+
+@implementation AppDelegate
+
+- (void)application:(UIApplication *)application
+    handleEventsForBackgroundURLSession:(NSString *)identifier
+                      completionHandler:(void (^)(void))completionHandler {
+    if (![NuwaxVoiceNoteBackgroundUploader handleBackgroundEvents:identifier completionHandler:completionHandler]) {
+        completionHandler();
+    }
+}
+"""
+        delegate.write_text(source.replace(declaration, hook, 1))
+
     # Keep the SDK scene lifecycle and avoid exposing the sample app menu.
     scene = app / "SceneDelegate.m"
     source = scene.read_text()
@@ -126,6 +149,7 @@ def configure_app(app, resources, metadata):
         "NuwaxBuildFlavor": metadata["flavor"],
         "NuwaxAPIOrigin": metadata["apiOrigin"],
         "NuwaxSourceDigest": metadata["sourceDigest"],
+        "NuwaxVoiceNoteBackgroundUpload": background_voice_note_upload,
         "UILaunchStoryboardName": "LaunchScreen",
         "UIBackgroundModes": IOS["UIBackgroundModes"],
         "ITSAppUsesNonExemptEncryption": False,

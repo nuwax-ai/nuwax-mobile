@@ -18,8 +18,10 @@ public class VoiceNoteM4aBridge {
     private var recorder: AVAudioRecorder?
     private var lastClosedDurationMs: Int = 0
     private var currentPath = ""
+    private var interruptionUpload: VoiceNoteUploadContext?
     private var lastError = ""
     private var interruptObserver: NSObjectProtocol?
+    private var audioLifecycleObservers: [NSObjectProtocol] = []
     private var interruptHold = false
     private var interruptBeganAt = Date()
     private var pendingEvents: [String] = []
@@ -37,6 +39,7 @@ public class VoiceNoteM4aBridge {
     private var segmentIndexName = ""
     /// 同一次挂断只使用一个文件名，失败重试时不另起一堆空文件。
     private var resumeKey = ""
+    private var resumeCandidatePath = ""
     private var wakeTask: UIBackgroundTaskIdentifier = .invalid
     /// 自己激活会话时会再收到一次 began。这段时间内不能把刚开的下一段又封掉。
     private var suppressBeganUntil = Date()
@@ -98,6 +101,7 @@ public class VoiceNoteM4aBridge {
         ) { [weak self] notification in
             self?.handleInterruption(notification)
         }
+        observeAudioLifecycle()
         routeObserver = center.addObserver(
             forName: AVAudioSession.routeChangeNotification,
             object: AVAudioSession.sharedInstance(),
@@ -130,6 +134,9 @@ public class VoiceNoteM4aBridge {
     }
 
     deinit {
+        for observer in audioLifecycleObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
         if let observer = interruptObserver {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -176,6 +183,18 @@ public class VoiceNoteM4aBridge {
         }
     }
 
+    public func configureInterruptionUpload(_ raw: String) -> String {
+        return onMain {
+            self.interruptionUpload = nil
+            guard VoiceNoteBackgroundUploader.enabled,
+                  let context = try? JSONDecoder().decode(VoiceNoteUploadContext.self, from: Data(raw.utf8)),
+                  context.path == self.currentPath, !context.authorization.isEmpty,
+                  context.url.scheme == "https" || context.url.scheme == "http" else { return "0" }
+            self.interruptionUpload = context
+            return "1"
+        }
+    }
+
     /// 封上当前 m4a，立刻打开下一段。
     public func rotateSegment(_ segmentKey: String) -> String {
         return onMain {
@@ -183,7 +202,7 @@ public class VoiceNoteM4aBridge {
                 self.lastError = "录音路径无效"
                 return ""
             }
-            self.closeRecorder()
+            _ = self.closeRecorder()
             if self.openRecorder(path) {
                 return path
             }
@@ -258,6 +277,7 @@ public class VoiceNoteM4aBridge {
             self.userPaused = true
             self.interruptHold = false
             self.interruptEnded = false
+            self.resumeCandidatePath = ""
             self.keepAliveForInterrupt = false
             self.pendingEvents.removeAll()
             self.clearThirdPartyWatch()
@@ -338,7 +358,7 @@ public class VoiceNoteM4aBridge {
 
     /// 原生在挂断后已经开好的文件。页面轮询停住时用它接着录，避免再开一个。
     public func currentRecordingPath() -> String {
-        if let recorder = recorder, recorder.isRecording {
+        if let recorder = recorder, recorder.isRecording, resumeCandidatePath.isEmpty {
             return currentPath
         }
         return ""
@@ -565,7 +585,6 @@ public class VoiceNoteM4aBridge {
               let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else {
             return
         }
-        beginWake()
         if type == .began {
             logState("interruption began notification")
             guard recorder != nil, !currentPath.isEmpty else {
@@ -586,6 +605,7 @@ public class VoiceNoteM4aBridge {
                 logState("interruption began ignored: session idle")
                 return
             }
+            beginWake()
             if phoneBusy() {
                 if !interruptHold {
                     interruptBeganAt = Date()
@@ -627,14 +647,42 @@ public class VoiceNoteM4aBridge {
             return
         }
         // 收到了挂断。前台或后台都在这次回调里续录。没收到这条通知时，不能在这里续。
+        guard !interruptEnded else { return }
         NSLog("[voice-note] interruption ended")
         interruptEnded = true
         micProbeArmed = true
         logState("interruption ended: resume in foreground or background")
-        resumeRecordingAfterInterrupt()
-        if recorder?.isRecording != true {
-            scheduleResumeAttempts()
-        }
+        scheduleResumeAttempts()
+    }
+
+    /// iOS 27 真机先观测送达时机。通过长通话验收后，才能打开实验性的恢复路径。
+    private func observeAudioLifecycle() {
+        #if compiler(>=6.4)
+        guard #available(iOS 27.0, *) else { return }
+        let center = NotificationCenter.default
+        let session = AVAudioSession.sharedInstance()
+        audioLifecycleObservers.append(center.addObserver(
+            forName: AVAudioSession.didBecomeInactiveNotification, object: session, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.recorder != nil || self.interruptHold else { return }
+            self.logState("iOS 27 audio session inactive")
+        })
+        audioLifecycleObservers.append(center.addObserver(
+            forName: AVAudioSession.resumptionRecommendationNotification, object: session, queue: .main
+        ) { [weak self] notification in
+            guard let self, self.interruptHold, !self.userPaused,
+                  let context = notification.userInfo?[AVAudioSession.resumptionContextKey] as? AVAudioSession.ResumptionContext else {
+                return
+            }
+            let shouldResume = context.recommendation == .shouldResume
+            self.logState("iOS 27 resumption recommendation shouldResume=\(shouldResume)")
+            guard shouldResume, !self.interruptEnded, !self.holdIsPhone, !self.phoneBusy(),
+                  UserDefaults.standard.bool(forKey: "NuwaxVoiceNoteResumeRecommendation") else { return }
+            self.interruptEnded = true
+            self.micProbeArmed = true
+            self.scheduleResumeAttempts()
+        })
+        #endif
     }
 
     /// 已经收到挂断后，路由切回本机时再试一次。接通过程中的路由变化不能当成挂断。
@@ -732,23 +780,28 @@ public class VoiceNoteM4aBridge {
     private func activateSession() -> Bool {
         let session = AVAudioSession.sharedInstance()
         do {
+            var options: AVAudioSession.CategoryOptions = [.defaultToSpeaker]
+            if UserDefaults.standard.bool(forKey: "NuwaxVoiceNoteMixWithOthers") {
+                options.insert(.mixWithOthers)
+            }
             try session.setCategory(
                 .playAndRecord,
                 mode: .default,
-                options: [.defaultToSpeaker]
+                options: options
             )
             try session.setActive(true)
             return true
         } catch {
             lastError = "音频会话失败"
-            NSLog("[voice-note] m4a session failed \(error.localizedDescription)")
+            let failure = error as NSError
+            NSLog("[voice-note] m4a session activation failed domain=%@ code=%ld", failure.domain, failure.code)
             return false
         }
     }
 
     private func openRecorder(_ path: String) -> Bool {
         let holding = keepAliveForInterrupt
-        closeRecorder()
+        _ = closeRecorder()
         if writeRecorder(path, bitRate: 64000) {
             keepAliveForInterrupt = false
             return true
@@ -947,7 +1000,10 @@ public class VoiceNoteM4aBridge {
     private func sealActiveFileForInterrupt() {
         beginWake()
         if !currentPath.isEmpty {
-            _ = closeRecorder()
+            let eligible = interruptionUpload?.path == currentPath ? interruptionUpload : nil
+            if closeRecorder() == "1", let eligible {
+                VoiceNoteBackgroundUploader.shared.enqueue(eligible)
+            }
         }
         interruptHold = true
         interruptEnded = false
@@ -975,7 +1031,7 @@ public class VoiceNoteM4aBridge {
 
     /// 在挂断回调里直接开下一段。这时页面定时器通常是停的。
     private func resumeRecordingAfterInterrupt() {
-        if phoneBusy() {
+        if phoneBusy() || userPaused || !interruptHold || !resumeCandidatePath.isEmpty {
             return
         }
         // 没收到挂断通知时，后台不能开下一段。收到 interruption ended 后，前台后台都可以续。
@@ -1018,7 +1074,8 @@ public class VoiceNoteM4aBridge {
             return
         }
         if openRecorder(path) {
-            finishInterruptResume(path)
+            resumeCandidatePath = path
+            verifyInterruptResume(path, remainingChecks: 4)
             return
         }
         NSLog("[voice-note] resume failed: recorder did not start")
@@ -1027,6 +1084,23 @@ public class VoiceNoteM4aBridge {
         }
         keepAliveForInterrupt = true
         startSilence()
+    }
+
+    private func verifyInterruptResume(_ path: String, remainingChecks: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, self.interruptHold, !self.userPaused,
+                  self.resumeCandidatePath == path, self.currentPath == path else { return }
+            if let recorder = self.recorder, recorder.isRecording, recorder.currentTime > 0 {
+                self.resumeCandidatePath = ""
+                self.finishInterruptResume(path)
+            } else if remainingChecks > 1 {
+                self.verifyInterruptResume(path, remainingChecks: remainingChecks - 1)
+            } else {
+                self.logState("resume candidate produced no samples")
+                _ = self.closeRecorder()
+                self.resumeKey = ""
+            }
+        }
     }
 
     /// 丢掉提前准备好的下一段。这个文件还没开始录，不能留在磁盘上被收成一段。
@@ -1064,6 +1138,7 @@ public class VoiceNoteM4aBridge {
             return
         }
         wakeTask = UIApplication.shared.beginBackgroundTask(withName: "voice-note-call") { [weak self] in
+            self?.logState("interruption background task expired")
             self?.endWake()
         }
     }
@@ -1150,6 +1225,8 @@ public class VoiceNoteM4aBridge {
             next.isMeteringEnabled = true
             recorder = next
             currentPath = path
+            VoiceNoteRecordingFiles.remember(path)
+            NSLog("[voice-note] m4a writing localId=%@ file=%@", segmentLocalId, URL(fileURLWithPath: path).lastPathComponent)
             return true
         } catch {
             lastError = "创建录音文件失败"
@@ -1169,18 +1246,23 @@ public class VoiceNoteM4aBridge {
         }
         recorder = nil
         currentPath = ""
+        interruptionUpload = nil
+        resumeCandidatePath = ""
         if path.isEmpty {
             return "1"
         }
         let attrs = try? FileManager.default.attributesOfItem(atPath: path)
         let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
-        if size <= 0 || lastClosedDurationMs <= 0 {
+        if size == 0 && attrs != nil {
             try? FileManager.default.removeItem(atPath: path)
+            VoiceNoteRecordingFiles().acknowledge(path)
             lastClosedDurationMs = 0
             lastError = "录音文件是空的"
             NSLog("[voice-note] m4a closed empty \(path)")
             return "0"
         }
+        VoiceNoteRecordingFiles.remember(path, durationMs: lastClosedDurationMs > 0 ? lastClosedDurationMs : nil, closed: true)
+        NSLog("[voice-note] recording closed bytes=%ld recorderMs=%ld", size, lastClosedDurationMs)
         return "1"
     }
 
@@ -1206,7 +1288,7 @@ public class VoiceNoteM4aBridge {
         }
         let path = (dir as NSString).appendingPathComponent("\(indexName).m4a")
         if FileManager.default.fileExists(atPath: path) {
-            try? FileManager.default.removeItem(atPath: path)
+            return (dir as NSString).appendingPathComponent("\(indexName)-\(UUID().uuidString).m4a")
         }
         return path
     }

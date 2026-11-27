@@ -20,6 +20,9 @@ import {
   apiVoiceNoteDelete,
   apiVoiceNoteUploadSegment,
 } from "@/servers/voiceNote.uts";
+// #ifdef APP-IOS
+import { iosVoiceNoteBackgroundUploadResult, iosVoiceNoteUploadContext } from "@/servers/voiceNote.uts";
+// #endif
 import { isAppInBackground } from "@/utils/appLifecycle.uts";
 
 // #ifdef APP-ANDROID
@@ -33,8 +36,14 @@ import {
 // #ifdef APP-IOS
 import {
   VoiceNoteM4aRecorder,
+  acknowledgeIosVoiceNoteFile,
   beginVoiceNoteBackground,
+  cancelIosVoiceNoteBackgroundUpload,
   endVoiceNoteBackground,
+  inspectIosVoiceNoteFile,
+  iosVoiceNoteBackgroundUploadStatus,
+  iosVoiceNoteRecoveryPaths,
+  sealIosVoiceNoteFile,
 } from "@/uni_modules/nuwax-stream-pcm-player";
 // #endif
 // #ifdef APP-HARMONY
@@ -139,6 +148,11 @@ function forgetPanelMemory(localId: string): void {
 }
 
 function deleteVoiceNote(localId: string): void {
+  // #ifdef APP-IOS
+  try {
+    cancelIosVoiceNoteBackgroundUpload(localId);
+  } catch (_e) {}
+  // #endif
   forgetPanelMemory(localId);
   removeVoiceNote(localId);
 }
@@ -609,7 +623,7 @@ async function splitLongHarmonySegment(record: VoiceNoteRecord): Promise<void> {
  * 杀掉进程后补写 moov。成功返回 "1"。
  * 旧基座没有 seal 方法时返回 "0"，Android、鸿蒙按原文件上传。
  * 0:nomdat 只表示文件里没有音频数据。盒子尺寸读断返回 0:layout，不当成没音频。
- * 补封口失败最多 3 次，第 3 次仍失败就删掉这段，不再每次补传都封。
+ * 补封口失败最多自动再试 3 次。iOS 保留仍无法校验的分段，其他平台沿用原清理逻辑。
  */
 const maxSealAttempts = 3;
 
@@ -647,13 +661,76 @@ async function dropFailedSeal(localId: string, segmentIndex: number, filePath: s
 async function sealUnfinishedM4a(filePath: string): Promise<string> {
   if (filePath.length == 0) return "0";
   try {
+    // #ifdef APP-IOS
+    return sealIosVoiceNoteFile(filePath);
+    // #endif
+    // #ifndef APP-IOS
     const sealer = new VoiceNoteM4aRecorder();
     const result = await sealer.seal(filePath);
     if (result.length == 0) return "0";
     return result;
+    // #endif
   } catch (e) {
     console.warn("[voice-note] m4a 封口失败 " + e);
     return "0";
+  }
+}
+// #endif
+
+// #ifdef APP-IOS
+function iosFileDuration(state: string): number {
+  if (!state.startsWith("ready|")) return 0;
+  const duration = parseInt(state.substring(6), 10);
+  return isNaN(duration) || duration <= 0 ? 0 : duration;
+}
+
+function readIosRecordingFile(path: string): string {
+  try {
+    return inspectIosVoiceNoteFile(path);
+  } catch (_e) {
+    return "legacy";
+  }
+}
+
+function acknowledgeIosRecording(path: string): void {
+  try {
+    acknowledgeIosVoiceNoteFile(path);
+  } catch (_e) {
+    // Older bases do not keep a native recovery index.
+  }
+}
+
+function iosNativeUploadStatus(path: string): string {
+  try {
+    return iosVoiceNoteBackgroundUploadStatus(path);
+  } catch (_e) {
+    return "";
+  }
+}
+
+const iosUploadPolls: string[] = [];
+
+function pollIosNativeUpload(localId: string): void {
+  if (isAppInBackground() || iosUploadPolls.indexOf(localId) >= 0) return;
+  iosUploadPolls.push(localId);
+  setTimeout(() => {
+    const index = iosUploadPolls.indexOf(localId);
+    if (index >= 0) iosUploadPolls.splice(index, 1);
+    if (!isAppInBackground()) void pumpQueue(localId, false);
+  }, 2_000);
+}
+
+async function reconcileIosNativeUploads(): Promise<void> {
+  const notes = loadVoiceNotes();
+  for (let i = 0; i < notes.length; i++) {
+    const record = notes[i];
+    for (let j = 0; j < record.segments.length; j++) {
+      const segment = record.segments[j];
+      if (segment.segmentIndex == 0 && segmentCanUpload(segment) && iosNativeUploadStatus(segment.filePath).length > 0) {
+        await pumpQueue(record.localId, false);
+        break;
+      }
+    }
   }
 }
 // #endif
@@ -669,62 +746,35 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
   if (durationMs <= 0) {
     durationMs = openSegmentMs(record, endedAt);
   }
-  const startedAt = endedAt - durationMs;
   // App 的 m4a 已经写在最终路径上。小程序拿到的是临时 aac，再拷进会话目录。
   let filePath = tempPath;
   // #ifndef APP
   filePath = await copySegmentFile(tempPath, record.localId, index);
   // #endif
   // #ifdef APP-IOS
-  // stop() 才会写 moov。进程被杀掉时先补封口，封好才收成一段。封不了就留着路径，下次再试。
   if (isM4aPath(filePath)) {
-    let gate = await segmentUploadReady(filePath);
-    if (gate == "unsealed") {
-      if (record.openSealAttempts >= maxSealAttempts) {
-        await unlinkVoiceFile(filePath);
-        record.openSegmentPath = "";
-        record.openSealAttempts = 0;
-        touch(record);
-        if (record.segments.length <= 0) {
-          abandonUnsealableNote(record);
-        }
-        return -1;
-      }
-      const sealResult = await sealUnfinishedM4a(filePath);
-      if (sealResult == "1") {
-        record.openSealAttempts = 0;
-        gate = await segmentUploadReady(filePath);
-      } else {
-        record.openSealAttempts = record.openSealAttempts + 1;
-        touch(record);
-        if (record.openSealAttempts >= maxSealAttempts) {
-          await unlinkVoiceFile(filePath);
+    for (let i = 0; i < record.segments.length; i++) {
+      if (record.segments[i].filePath == filePath) {
+        if (record.openSegmentPath == filePath) {
           record.openSegmentPath = "";
-          record.openSealAttempts = 0;
           touch(record);
-          if (record.segments.length <= 0) {
-            abandonUnsealableNote(record);
-          }
-          return -1;
         }
+        acknowledgeIosRecording(filePath);
+        return record.segments[i].segmentIndex;
       }
     }
-    if (gate == "unsealed") {
-      if (record.segments.length == 0 && record.error.length == 0) {
-        record.error = "录音文件未封口";
-      }
-      touch(record);
-      console.warn("[voice-note] m4a 未封口，先不上传");
-      return -1;
-    }
-    if (gate == "missing" || durationMs <= 0) {
-      await unlinkVoiceFile(filePath);
+    const state = readIosRecordingFile(filePath);
+    const missing = state == "missing" || (state == "legacy" && await segmentFileSize(filePath) <= 0);
+    if (missing) {
       if (record.openSegmentPath == filePath || record.openSegmentPath == tempPath) {
         record.openSegmentPath = "";
       }
       touch(record);
+      acknowledgeIosRecording(filePath);
       return -1;
     }
+    // 文件不可读时先登记为待补封口，不能以墙钟估算时长或删除。
+    if (state != "legacy") durationMs = iosFileDuration(state);
   }
   // #endif
   const segment = new VoiceNoteSegmentRecord();
@@ -732,7 +782,7 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
   segment.filePath = filePath;
   const duration = durationMs > 0 ? durationMs : 0;
   segment.durationMs = duration;
-  segment.startedAt = startedAt;
+  segment.startedAt = endedAt - duration;
   segment.uploadStatus = "pending";
   segment.uploadAttempts = 0;
   record.segments.push(segment);
@@ -751,6 +801,9 @@ async function closeSegment(record: VoiceNoteRecord, tempPath: string): Promise<
   }
   record.accumulatedMs = record.accumulatedMs + duration;
   touch(record);
+  // #ifdef APP-IOS
+  acknowledgeIosRecording(filePath);
+  // #endif
   await splitLongHarmonySegment(record);
   return index;
 }
@@ -943,6 +996,11 @@ async function handleRecorderStop(intent: string, tempPath: string): Promise<voi
     if (path.length > 0) {
       closedIndex = await closeSegment(record, path);
     }
+    // #ifdef APP-IOS
+    await recoverIosRecordingFiles(record, false);
+    const recovered = noteByLocalId(record.localId);
+    if (recovered != null) record = recovered;
+    // #endif
     record.phase = "uploading";
     record.awaitComplete = true;
     record.segmentStartedAt = 0;
@@ -1611,6 +1669,9 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
   try {
     await stageOpenFileForUpload(localId);
     const skipped: number[] = [];
+    // #ifdef APP-IOS
+    let waitingForNativeTransfer = false;
+    // #endif
     let guard = 0;
     while (guard < 10000) {
       const open = findVoiceNoteByLocalId(localId);
@@ -1634,6 +1695,9 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
         break;
       }
       if (pending == null) {
+        // #ifdef APP-IOS
+        if (waitingForNativeTransfer) break;
+        // #endif
         if (history) {
           const latest = findVoiceNoteByLocalId(localId);
           if (latest != null && allSegmentsUploaded(latest)) {
@@ -1657,9 +1721,61 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
       guard = guard + 1;
       const sessionId = open.localId;
       const missingPath = pending.filePath;
+      // #ifdef APP-IOS
+      if (pending.segmentIndex == 0) {
+        const nativeStatus = iosNativeUploadStatus(missingPath);
+        if (nativeStatus == "pending") {
+          waitingForNativeTransfer = true;
+          skipped.push(pending.segmentIndex);
+          pollIosNativeUpload(sessionId);
+          continue;
+        }
+        if (nativeStatus.startsWith("response|")) {
+          const segmentId = iosVoiceNoteBackgroundUploadResult(nativeStatus.substring(9));
+          if (segmentId != null) {
+            writeSegmentUpload(sessionId, pending.segmentIndex, "uploaded", segmentId, "", -1);
+            continue;
+          }
+        }
+      }
+      // #endif
       let gate = "missing";
       let sealResult = "";
-      // #ifdef APP
+      // #ifdef APP-IOS
+      let state = readIosRecordingFile(missingPath);
+      if (state == "pending" && pending.sealAttempts < maxSealAttempts) {
+        await sealUnfinishedM4a(missingPath);
+        state = readIosRecordingFile(missingPath);
+        if (state == "pending") bumpSegmentSeal(sessionId, pending.segmentIndex);
+      }
+      if (state == "legacy") {
+        gate = await segmentUploadReady(missingPath);
+        if (gate == "unsealed" && pending.sealAttempts < maxSealAttempts) {
+          await sealUnfinishedM4a(missingPath);
+          gate = await segmentUploadReady(missingPath);
+          if (gate == "unsealed") bumpSegmentSeal(sessionId, pending.segmentIndex);
+        }
+      } else if (state == "pending") {
+        gate = "unsealed";
+      } else if (iosFileDuration(state) > 0) {
+        gate = "ready";
+        const fileDuration = iosFileDuration(state);
+        if (pending.durationMs != fileDuration) {
+          const latest = findVoiceNoteByLocalId(sessionId);
+          if (latest == null) break;
+          for (let i = 0; i < latest.segments.length; i++) {
+            const row = latest.segments[i];
+            if (row.filePath != missingPath) continue;
+            latest.accumulatedMs = latest.accumulatedMs + fileDuration - row.durationMs;
+            row.durationMs = fileDuration;
+            pending.durationMs = fileDuration;
+            touch(latest);
+            break;
+          }
+        }
+      }
+      // #endif
+      // #ifdef APP-ANDROID || APP-HARMONY
       gate = await segmentUploadReady(missingPath);
       if (gate == "unsealed") {
         if (pending.sealAttempts >= maxSealAttempts) {
@@ -1672,7 +1788,7 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
         // 没封上的文件绝不能当正常音频传上去，否则服务端拿到的是空音频、转写必失败。
         gate = await segmentUploadReady(missingPath);
         // #endif
-        // #ifdef APP-IOS || APP-HARMONY
+        // #ifdef APP-HARMONY
         if (sealResult == "1") {
           gate = "ready";
         }
@@ -1702,6 +1818,13 @@ async function pumpQueue(localId: string, backfill: boolean, history: boolean = 
       if (gate != "ready") {
         // 还没封口的文件留在记录里，下次再补 moov。删掉记录这段就找不回来了。
         if (gate == "unsealed") {
+          // #ifdef APP-IOS
+          const retained = findVoiceNoteByLocalId(sessionId);
+          if (retained != null && retained.error.length == 0) {
+            retained.error = "录音文件待修复";
+            touch(retained);
+          }
+          // #endif
           skipped.push(pending.segmentIndex);
           continue;
         }
@@ -1843,6 +1966,10 @@ async function stageOpenFileForUpload(localId: string): Promise<void> {
   if (record.phase == "recording" || record.phase == "paused") return;
   const path = record.openSegmentPath;
   if (path.length == 0) return;
+  // #ifdef APP-IOS
+  await closeSegment(record, path);
+  // #endif
+  // #ifndef APP-IOS
   let listed = false;
   for (let i = 0; i < record.segments.length; i++) {
     if (record.segments[i].filePath == path) listed = true;
@@ -1876,6 +2003,7 @@ async function stageOpenFileForUpload(localId: string): Promise<void> {
   }
   record.error = "";
   touch(record);
+  // #endif
   // #endif
 }
 
@@ -2256,11 +2384,28 @@ async function bindVoiceNoteId(localId: string): Promise<void> {
     return;
   }
   try {
+    // #ifdef APP-IOS
+    const bound = await ensureNoteId(localId);
+    if (bound != null) configureIosInterruptionUpload(bound);
+    // #endif
+    // #ifndef APP-IOS
     await ensureNoteId(localId);
+    // #endif
   } catch (e) {
     rememberCreateError(localId, `${e}`);
   }
 }
+
+// #ifdef APP-IOS
+function configureIosInterruptionUpload(record: VoiceNoteRecord): void {
+  if (m4aRecorder == null || record.phase != "recording" || record.openSegmentIndex != 0) return;
+  try {
+    m4aRecorder!.configureInterruptionUpload(iosVoiceNoteUploadContext(record.noteId, record.openSegmentPath));
+  } catch (_e) {
+    // The host without a background URLSession callback uses the existing upload queue.
+  }
+}
+// #endif
 
 /** 原生录音已经在写之后才创建笔记。已有 noteId、未在录、或会话已结束时不请求。 */
 function bindNoteAfterCapture(localId: string): void {
@@ -2268,7 +2413,12 @@ function bindNoteAfterCapture(localId: string): void {
   const latest = findVoiceNoteByLocalId(localId);
   if (latest == null) return;
   if (latest.phase != "recording") return;
-  if (latest.noteId.length > 0) return;
+  if (latest.noteId.length > 0) {
+    // #ifdef APP-IOS
+    configureIosInterruptionUpload(latest);
+    // #endif
+    return;
+  }
   void bindVoiceNoteId(localId);
 }
 
@@ -2377,67 +2527,34 @@ async function sealInterruptedIosSegment(record: VoiceNoteRecord): Promise<void>
     return;
   }
   recorderBusy = true;
-  let ok = "0";
   try {
-    ok = await m4aRecorder!.sealForInterruption();
-  } catch (_e) {
-    try {
-      ok = await m4aRecorder!.stop();
-    } catch (_stop) {
-      ok = "0";
+    await m4aRecorder!.sealForInterruption();
+    const target = noteByLocalId(record.localId);
+    if (target == null) return;
+    const sealedPath = target.openSegmentPath;
+    currentSegmentPath = "";
+    if (!sessionEnding && queuedIntent != "finish") {
+      target.phase = "paused";
+      target.awaitComplete = false;
+      target.heldByCall = true;
+      target.segmentStartedAt = 0;
     }
+    if (sealedPath.length > 0) {
+      closedDurationOverride = m4aRecorder!.takeClosedDurationMs();
+      await closeSegment(target, sealedPath);
+    } else {
+      touch(target);
+    }
+    await recoverIosRecordingFiles(target, false);
+  } finally {
+    recorderBusy = false;
   }
-  let durationMs = 0;
-  try {
-    durationMs = m4aRecorder!.takeClosedDurationMs();
-  } catch (_e) {
-    durationMs = 0;
-  }
-  recorderBusy = false;
   if (sessionEnding || queuedIntent == "finish") {
     queuedIntent = "";
     stopActiveRecorder("finish");
     return;
   }
-  const sealedPath = record.openSegmentPath;
-  currentSegmentPath = "";
-  const latest = noteByLocalId(record.localId);
-  const target = latest != null ? latest : record;
-  if (ok == "1" && sealedPath.length > 0) {
-    if (durationMs > 0) {
-      closedDurationOverride = durationMs;
-    }
-    const closed = await closeSegment(target, sealedPath);
-    if (closed < 0) {
-      const size = await segmentFileSize(sealedPath);
-      if (size <= 0 || durationMs <= 0) {
-        await unlinkVoiceFile(sealedPath);
-      } else {
-        const index = target.openSegmentIndex;
-        const segment = new VoiceNoteSegmentRecord();
-        segment.segmentIndex = index;
-        segment.filePath = sealedPath;
-        segment.durationMs = durationMs;
-        segment.startedAt = Date.now() - durationMs;
-        segment.uploadStatus = "pending";
-        segment.uploadAttempts = 0;
-        target.segments.push(segment);
-        target.openSegmentIndex = index + 1;
-        target.accumulatedMs = target.accumulatedMs + durationMs;
-        target.openElapsedMs = 0;
-        target.error = "";
-      }
-    }
-    target.openSegmentPath = "";
-  }
-  if (ok == "1") {
-    void pumpQueue(target.localId, false);
-  }
-  target.phase = "paused";
-  target.awaitComplete = false;
-  target.heldByCall = true;
-  target.segmentStartedAt = 0;
-  touch(target);
+  void pumpQueue(record.localId, false);
   // #endif
 }
 
@@ -2952,19 +3069,41 @@ function markInterruptedComplete(record: VoiceNoteRecord): void {
   releaseRecorderCallbacks();
 }
 
-/**
- * 进程被杀掉后，先给没封口的 m4a 补上 moov，再按完成结束并上传。
- * 文件里还有音频但暂时封不上时，保留本地记录和下次再试的路径，不删。
- */
+// #ifdef APP-IOS
+async function recoverIosRecordingFiles(record: VoiceNoteRecord, includeOpen: boolean): Promise<void> {
+  let paths: string[] = [];
+  try {
+    const indexed = JSON.parseArray<string>(iosVoiceNoteRecoveryPaths(record.localId, includeOpen));
+    if (indexed != null) paths = indexed;
+  } catch (_e) {
+    // On older bases the persisted UTS path is the only recovery source.
+  }
+  if (includeOpen && record.openSegmentPath.length > 0 && paths.indexOf(record.openSegmentPath) < 0) {
+    paths.unshift(record.openSegmentPath);
+  }
+  for (let i = 0; i < paths.length; i++) {
+    const latest = findVoiceNoteByLocalId(record.localId);
+    if (latest == null) return;
+    await closeSegment(latest, paths[i]);
+  }
+}
+// #endif
+
+/** 进程重启后把仍在本地的分段入队，再按完成结束这条录音。 */
 async function recoverAbandonedRecording(): Promise<void> {
   try {
     const record = findInterruptedVoiceNote();
     if (record == null) return;
     const localId = record.localId;
     const path = record.openSegmentPath;
+    // #ifdef APP-IOS
+    await recoverIosRecordingFiles(record, true);
+    // #endif
+    // #ifndef APP-IOS
     if (path.length > 0) {
       await closeSegment(record, path);
     }
+    // #endif
     const latest = findVoiceNoteByLocalId(localId);
     if (latest == null) return;
     if (latest.segments.length <= 0) {
@@ -3012,7 +3151,7 @@ async function recoverAbandonedRecording(): Promise<void> {
   }
 }
 
-/** 上次没封上的文件留在 openSegmentPath。再次进入时继续补封口，封好再上传。 */
+/** 把旧版仍留在 openSegmentPath 的文件登记到补传队列。 */
 async function sealLeftoverOpenFiles(): Promise<void> {
   // #ifdef APP-IOS
   const rows = loadVoiceNotes();
@@ -3020,44 +3159,11 @@ async function sealLeftoverOpenFiles(): Promise<void> {
     const row = rows[i];
     if (row.phase == "recording" || row.phase == "paused") continue;
     if (row.openSegmentPath.length == 0) continue;
-    const path = row.openSegmentPath;
-    if (row.openSealAttempts >= maxSealAttempts) {
-      await unlinkVoiceFile(path);
-      const full = findVoiceNoteByLocalId(row.localId);
-      if (full != null && full.segments.length <= 0) {
-        abandonUnsealableNote(full);
-      } else if (full != null) {
-        full.openSegmentPath = "";
-        full.openSealAttempts = 0;
-        touch(full);
-      }
-      continue;
-    }
-    const sealResult = await sealUnfinishedM4a(path);
-    const currentTry = findVoiceNoteByLocalId(row.localId);
-    if (currentTry == null) continue;
-    if (sealResult != "1") {
-      currentTry.openSealAttempts = currentTry.openSealAttempts + 1;
-      touch(currentTry);
-      if (currentTry.openSealAttempts >= maxSealAttempts) {
-        await unlinkVoiceFile(path);
-        if (currentTry.segments.length <= 0) {
-          abandonUnsealableNote(currentTry);
-        } else {
-          currentTry.openSegmentPath = "";
-          currentTry.openSealAttempts = 0;
-          touch(currentTry);
-        }
-      }
-      continue;
-    }
-    currentTry.openSealAttempts = 0;
-    touch(currentTry);
     const current = findVoiceNoteByLocalId(row.localId);
-    if (current == null || current.openSegmentPath != path) continue;
-    await closeSegment(current, path);
+    if (current == null || current.openSegmentPath != row.openSegmentPath) continue;
+    await closeSegment(current, row.openSegmentPath);
     const latest = findVoiceNoteByLocalId(row.localId);
-    if (latest == null) continue;
+    if (latest == null || latest.segments.length == 0) continue;
     latest.phase = "uploading";
     latest.awaitComplete = true;
     latest.error = "";
@@ -3111,6 +3217,9 @@ async function uploadMistakenFailedNotes(): Promise<void> {
 
 /** 回前台：本进程仍在录就继续计时和切段。从最近任务划掉或进程已被杀掉，则把这次按完成结束，不在这里上传。 */
 export function voiceNoteOnAppShow(): void {
+  // #ifdef APP-IOS
+  void reconcileIosNativeUploads();
+  // #endif
   void uploadMistakenFailedNotes();
   clearStaleBackfillRunning();
   dropStoredSuccessNotes();

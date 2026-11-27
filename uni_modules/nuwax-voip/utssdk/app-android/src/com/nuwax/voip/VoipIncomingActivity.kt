@@ -144,6 +144,9 @@ class VoipIncomingActivity : Activity() {
         VoipBridge.receiveAction(callId, action)
     }
 
+    private var requestedAudioRoute = ""
+    private var requestedAudioRouteAt = 0L
+
     private fun toggleMedia(control: String) {
         val value = VoipBridge.uiSnapshot(callId) ?: return
         val enabled = !value.optBoolean(control)
@@ -153,12 +156,24 @@ class VoipIncomingActivity : Activity() {
             Toast.makeText(this, VoipBridge.label("permissionRequired"), Toast.LENGTH_LONG).show()
             return
         }
+        if (control == "speaker") {
+            requestedAudioRoute = if (enabled) "speaker" else "earpiece"
+            requestedAudioRouteAt = android.os.SystemClock.elapsedRealtime()
+        }
         VoipBridge.uiCommand(callId, control, enabled)
     }
 
     private fun render() {
         val value = VoipBridge.uiSnapshot(callId)
         if (value == null) { finish(); return }
+        if (requestedAudioRoute.isNotEmpty()) {
+            if (android.os.SystemClock.elapsedRealtime() - requestedAudioRouteAt > 5000) requestedAudioRoute = ""
+            else if (value.optString("audioOutput") == requestedAudioRoute) {
+                val message = if (requestedAudioRoute == "speaker") "speakerOn" else "switchedToEarpiece"
+                requestedAudioRoute = ""
+                Toast.makeText(this, VoipBridge.label(message), Toast.LENGTH_SHORT).show()
+            }
+        }
         val ringing = value.optString("state") == "ringing"
         val hasVideo = value.optString("mediaType") == "video"
         val snapshot = value.toString()

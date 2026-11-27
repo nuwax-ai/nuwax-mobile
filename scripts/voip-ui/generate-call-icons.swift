@@ -26,7 +26,7 @@ func icon(_ name: String, _ c: CGContext) {
         c.addCurve(to: CGPoint(x: 18, y: 12), control1: CGPoint(x: 6, y: 20), control2: CGPoint(x: 18, y: 20))
         c.addLine(to: CGPoint(x: 18, y: 10)); c.strokePath()
         line(c, 12, 18, 12, 21); line(c, 9, 21, 15, 21)
-    case "speaker":
+    case "speaker", "speaker-off":
         path(c, [CGPoint(x: 11, y: 4), CGPoint(x: 6, y: 8), CGPoint(x: 3, y: 8), CGPoint(x: 3, y: 16), CGPoint(x: 6, y: 16), CGPoint(x: 11, y: 20), CGPoint(x: 11, y: 4)])
         c.move(to: CGPoint(x: 15, y: 8)); c.addCurve(to: CGPoint(x: 15, y: 16), control1: CGPoint(x: 18, y: 10), control2: CGPoint(x: 18, y: 14)); c.strokePath()
         c.move(to: CGPoint(x: 18, y: 4.5)); c.addCurve(to: CGPoint(x: 18, y: 19.5), control1: CGPoint(x: 23, y: 8), control2: CGPoint(x: 23, y: 16)); c.strokePath()
@@ -64,7 +64,7 @@ func icon(_ name: String, _ c: CGContext) {
     }
 }
 
-for name in ["microphone", "microphone-off", "speaker", "earpiece", "video", "video-off", "switch-camera", "minimize", "hangup", "phone", "close"] {
+for name in ["microphone", "microphone-off", "speaker", "speaker-off", "earpiece", "video", "video-off", "switch-camera", "minimize", "hangup", "phone", "close"] {
     for (variant, color) in [("white", NSColor.white), ("ink", NSColor(calibratedRed: 0.12, green: 0.16, blue: 0.15, alpha: 1))] {
         let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 96, pixelsHigh: 96, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
         let graphics = NSGraphicsContext(bitmapImageRep: bitmap)!

@@ -537,7 +537,7 @@ export class StreamRequest {
    * 空闲阈值需更宽，避免误杀仍在进行的长连接。
    */
   private readonly TIMEOUT_DURATION_APP: number = 180000;
-  private timeoutCallback: (() => void) | null = null;
+  private timeoutCallback: ((reason: string) => void) | null = null;
   /** 当前请求使用的空闲超时（ms） */
   private activeTimeoutDuration: number = 60000;
 
@@ -640,30 +640,25 @@ export class StreamRequest {
         body: config.body,
         abortController: this.abortController,
         onMessage: (data: any) => {
-          if (this.isAborted) return;
+          if (this.isAborted || this.receivedTerminalMarker) return;
           // 更新最后接收数据的时间
           this.updateLastChunkTime();
 
           try {
-            // 检查是否完成
-            if (isCompletedPayload(data)) {
-              // 与 App 对齐：标记终态，避免随后 onClose 误触发 onTimeout
-              this.receivedTerminalMarker = true;
-
-              // 清除超时监控
-              this.clearTimeoutMonitor();
-
-              config.onComplete?.();
-              return;
-            }
-
             // FINAL_RESULT：业务终态事件（正常会话进入即整轮结束，可能不带 completed）。
-            // 与 completed 帧不同，其携带 finalResult 载荷，须先派发业务层再标终态收尾。
+            // 带 completed=true 时也须先派发 finalResult 载荷再收尾。
             if (isFinalResultPayload(data)) {
               const finalChunk = createContentChunk(
                 data != null ? JSON.stringify(data) : "",
               );
               config.onChunk?.(finalChunk);
+              this.receivedTerminalMarker = true;
+              this.clearTimeoutMonitor();
+              config.onComplete?.();
+              return;
+            }
+
+            if (data == "[DONE]" || isCompletedPayload(data)) {
               this.receivedTerminalMarker = true;
               this.clearTimeoutMonitor();
               config.onComplete?.();
@@ -684,15 +679,13 @@ export class StreamRequest {
           }
         },
         onError: (error: any) => {
-          // 清除超时监控
-          this.clearTimeoutMonitor();
-          // 如果是中止错误，不触发错误回调
-          if (isAbortError(error) || this.isAborted) {
-            return;
-          }
+          if (this.isAborted || this.receivedTerminalMarker) return;
+          this.abort();
           config.onError?.(error);
         },
         onOpen: (response: any) => {
+          this.updateLastChunkTime();
+          config.onOpen?.(response);
         },
         onClose: () => {
           // 正常 completed 后 EventSource 也会 onClose；勿再当超时/异常断流
@@ -700,7 +693,8 @@ export class StreamRequest {
             return;
           }
           // 无终态的异常关闭：恢复停止按钮 / 触发回补
-          config.onTimeout?.();
+          this.abort();
+          config.onTimeout?.("eof_without_terminal");
         },
       });
     } catch (error) {
@@ -712,8 +706,6 @@ export class StreamRequest {
       ) {
         return;
       }
-      // 只有真正的错误才触发错误回调
-      config.onError?.(error);
       throw error; // 重新抛出非中止错误
     }
   }
@@ -1229,6 +1221,9 @@ export class StreamRequest {
       if (isAppInBackground() == true) {
         return;
       }
+      // #ifdef H5
+      if (document.hidden) return;
+      // #endif
       const now = Date.now();
       const timeSinceLastChunk = now - this.lastChunkReceivedTime;
       const limit = this.activeTimeoutDuration;
@@ -1296,9 +1291,9 @@ export class StreamRequest {
       return;
     }
 
-    this.clearTimeoutMonitor();
-    this.isAborted = true;
-    this.releaseRequestTask(true);
+    const idleMs = Date.now() - this.lastChunkReceivedTime;
+    const timeoutCallback = this.timeoutCallback;
+    this.abort();
 
     // 显示轻提示
     uni.showToast({
@@ -1308,9 +1303,8 @@ export class StreamRequest {
     });
 
     // 调用超时回调
-    const timeoutCallback = this.timeoutCallback;
     if (timeoutCallback != null) {
-      timeoutCallback();
+      timeoutCallback(`idle_timeout idleMs=${idleMs}`);
     }
   }
 
@@ -1703,7 +1697,7 @@ export class StreamRequest {
                 return;
               }
               this.clearTimeoutMonitor();
-              config.onTimeout?.();
+              config.onTimeout?.("connection_lost");
               finishStream();
             });
             return;
@@ -1743,7 +1737,7 @@ export class StreamRequest {
           }
 
               this.clearTimeoutMonitor();
-              config.onTimeout?.();
+              config.onTimeout?.("eof_without_terminal");
               finishStream();
             });
           });

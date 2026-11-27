@@ -56,18 +56,18 @@ internal class VoipNativeCallView(
     private val kind = label(13f, LABEL)
     private val minimizeText = label(12f, LABEL)
     private val initials = label(44f, Color.rgb(240, 245, 242)).apply {
-        background = rounded(AVATAR_FILL, 24)
+        background = oval(AVATAR_FILL)
     }
     private var avatarUrl = ""
     private var avatarJob: Job? = null
     private val avatarImage = ImageView(context).apply {
         scaleType = ImageView.ScaleType.CENTER_CROP
-        background = rounded(AVATAR_FILL, 24)
+        background = oval(AVATAR_FILL)
         clipToOutline = true
         visibility = GONE
     }
     private val avatar = FrameLayout(context).apply {
-        background = rounded(Color.TRANSPARENT, 30).apply { setStroke(dp(1), Color.argb(26, 255, 255, 255)) }
+        background = oval(Color.TRANSPARENT).apply { setStroke(dp(1), Color.argb(26, 255, 255, 255)) }
         setPadding(dp(6), dp(6), dp(6), dp(6))
         addView(initials, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         addView(avatarImage, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
@@ -227,8 +227,9 @@ internal class VoipNativeCallView(
             val end = if (hasVideo) videoHangup else hangup
             mic.update(if (muted) "unmute" else "mute", if (muted) "microphone_off" else "microphone", selected = muted)
             val outputLabel = value.optString("audioOutput").ifEmpty { if (loudspeaker) "speaker" else "earpiece" }
-            val outputIcon = if (outputLabel == "earpiece") "earpiece" else "speaker"
-            route.update(if (routePending) "connecting" else outputLabel, iconName = outputIcon, selected = !routePending && loudspeaker)
+            val outputIcon = if (outputLabel == "earpiece") "speaker_off" else "speaker"
+            val outputCaption = when (outputLabel) { "earpiece" -> "speakerOff"; "speaker" -> "speakerOn"; else -> outputLabel }
+            route.update(if (routePending) "connecting" else outputCaption, iconName = outputIcon, selected = !routePending && loudspeaker)
             route.isEnabled = !routePending
             end.update("hangup", color = DANGER)
             if (hasVideo) {
@@ -369,6 +370,11 @@ internal class VoipNativeCallView(
     private fun rounded(color: Int, radius: Int) = GradientDrawable().apply {
         setColor(color)
         cornerRadius = dp(radius).toFloat()
+    }
+
+    private fun oval(color: Int) = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(color)
     }
 
     private fun gradient(top: Int, bottom: Int) =

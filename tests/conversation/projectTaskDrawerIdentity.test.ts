@@ -34,6 +34,7 @@ function setup() {
     PinnedProjectInfo,
     UTSJSONObject: class { constructor() {} },
     close: vi.fn(),
+    scheduleDismissAfterNavigation: vi.fn(),
     emit: vi.fn(),
     performProjectPinToggle: vi.fn(),
     apiUserAppDelete: vi.fn().mockResolvedValue({ code: "0000" }),
@@ -85,6 +86,7 @@ describe("同号项目的抽屉操作定位", () => {
     expect(context.emit).toHaveBeenCalledWith("conversation-click", expect.objectContaining({
       id: 3, conversationId: childId, agentId, pType: type,
     }));
+    expect(context.scheduleDismissAfterNavigation).toHaveBeenCalledTimes(1);
   });
 
   it("置顶入口定位到常规项目", () => {

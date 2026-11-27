@@ -6,12 +6,19 @@ const kits = vi.hoisted(() => ({
   receive: vi.fn(), loadAsset: vi.fn(), report: vi.fn(), reportError: vi.fn(), reportState: vi.fn(),
   onCall: vi.fn(), createPicture: vi.fn(), createImageSource: vi.fn(), createCallId: vi.fn(),
   getOutputDevices: vi.fn(), setCommunicationDevice: vi.fn(),
+  checkAccessToken: vi.fn(), requestPermissions: vi.fn(),
 }));
 vi.mock('BuildProfile', () => ({ default: { DEBUG: true } }));
-vi.mock('@kit.AbilityKit', () => ({ bundleManager: {
-  BundleFlag: { GET_BUNDLE_INFO_DEFAULT: 0 },
-  getBundleInfoForSelfSync: () => ({ name: 'com.nuwax.app' }),
-} }));
+vi.mock('@kit.AbilityKit', () => ({
+  bundleManager: {
+    BundleFlag: { GET_BUNDLE_INFO_DEFAULT: 0 },
+    getBundleInfoForSelfSync: () => ({ name: 'com.nuwax.app' }),
+  },
+  abilityAccessCtrl: { createAtManager: () => ({
+    checkAccessTokenSync: kits.checkAccessToken,
+    requestPermissionsFromUser: kits.requestPermissions,
+  }) },
+}));
 vi.mock('@kit.NetworkKit', () => ({ http: {
   createHttp: () => ({ request: transport.request, destroy: transport.destroy }),
   HttpDataType: { STRING: 0, ARRAY_BUFFER: 1 }, RequestMethod: { GET: 'GET', POST: 'POST' },
@@ -57,7 +64,7 @@ vi.mock('@kit.AudioKit', () => ({ audio: {
 vi.mock('@kit.ArkWeb', () => ({ webview: {} }));
 
 import { VoipBridge, VoipBusinessPolicy } from '../../uni_modules/nuwax-voip/utssdk/app-harmony/VoipBridge.ets';
-import { hasNativeVoipCall } from '../../uni_modules/nuwax-voip/utssdk/app-harmony/index.uts';
+import { hasNativeVoipCall, openVoipAppSettings } from '../../uni_modules/nuwax-voip/utssdk/app-harmony/index.uts';
 const actualRequest = VoipBridge.request;
 const actualFinish = VoipBridge.finish;
 
@@ -75,6 +82,7 @@ beforeEach(() => {
   VoipBridge.mediaForeground = false;
   VoipBridge.mediaContentLoaded = false;
   VoipBridge.context = null;
+  VoipBridge.mediaContext = null;
   VoipBridge.answeredNativeId = ''; VoipBridge.ability = null; VoipBridge.systemRegistered = false;
   VoipBridge.clearPendingIncoming();
   token.get.mockReset();
@@ -87,6 +95,8 @@ beforeEach(() => {
   kits.createImageSource.mockReset();
   kits.createCallId.mockReset().mockReturnValue('local-system-call');
   kits.getOutputDevices.mockReset().mockReturnValue([{ deviceType: 'earpiece' }]);
+  kits.checkAccessToken.mockReset().mockReturnValue(-1);
+  kits.requestPermissions.mockReset().mockResolvedValue({ authResults: [] });
   kits.setCommunicationDevice.mockReset().mockImplementation(async (_device, enabled) => {
     kits.getOutputDevices.mockReturnValue([{ deviceType: enabled ? 'speaker' : 'earpiece' }]);
   });
@@ -97,7 +107,33 @@ beforeEach(() => {
   VoipBridge.reset();
   vi.mocked(VoipBridge.finish).mockClear();
 });
-afterEach(() => { VoipBridge.clearPendingIncoming(); VoipBridge.reset(); vi.restoreAllMocks(); vi.useRealTimers(); });
+afterEach(() => { VoipBridge.clearPendingIncoming(); VoipBridge.reset(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+
+describe('Harmony video permission recovery', () => {
+  it('opens the system authorization page from the call permission button', () => {
+    const openAppAuthorizeSetting = vi.fn();
+    vi.stubGlobal('uni', { openAppAuthorizeSetting });
+    openVoipAppSettings();
+    expect(openAppAuthorizeSetting).toHaveBeenCalledExactlyOnceWith({});
+  });
+
+  it.each([false, true])('requests only the missing camera grant from the visible Ability (media foreground: %s)', async foreground => {
+    const entry = { applicationInfo: { accessTokenId: 1 } } as NonNullable<typeof VoipBridge.context>;
+    const media = { applicationInfo: { accessTokenId: 2 } } as NonNullable<typeof VoipBridge.mediaContext>;
+    VoipBridge.context = entry;
+    VoipBridge.mediaContext = media;
+    VoipBridge.mediaForeground = foreground;
+    kits.checkAccessToken.mockImplementation((_token, permission) => permission === 'ohos.permission.CAMERA' ? -1 : 0);
+    kits.requestPermissions.mockResolvedValue({ authResults: [0] });
+
+    await expect(VoipBridge.ensurePermissions('video')).resolves.toBe(true);
+    expect(kits.requestPermissions).toHaveBeenCalledExactlyOnceWith(foreground ? media : entry, ['ohos.permission.CAMERA']);
+
+    kits.checkAccessToken.mockReturnValue(0);
+    await expect(VoipBridge.ensurePermissions('video')).resolves.toBe(true);
+    expect(kits.requestPermissions).toHaveBeenCalledOnce();
+  });
+});
 
 describe('Harmony system call cold start', () => {
   const convId = '245475557381246976';

@@ -614,22 +614,25 @@ export class VoipBridge {
     VoipBridge.action('accept', 'video', true)
   }
   static async ensurePermissions(mediaType: string): Promise<boolean> {
-    const context = VoipBridge.mediaContext ?? VoipBridge.context
+    const context = VoipBridge.mediaForeground ? (VoipBridge.mediaContext ?? VoipBridge.context) : VoipBridge.context
     if (!context) return false
     const permissions: Permissions[] = ['ohos.permission.MICROPHONE']
     if (mediaType === 'video') permissions.push('ohos.permission.CAMERA')
+    const id = VoipBridge.current?.callId ?? ''
     try {
       const manager = abilityAccessCtrl.createAtManager()
       const token = context.applicationInfo.accessTokenId
       const missing = permissions.filter(permission => manager.checkAccessTokenSync(token, permission) !== 0)
       if (!missing.length) return true
-      const id = VoipBridge.current?.callId ?? ''
       VoipBridge.traceIncoming(`permissionRequest media=${mediaType}`, id)
       const result = await manager.requestPermissionsFromUser(context, missing)
       const allowed = result.authResults.length === missing.length && result.authResults.every(value => value === 0)
       VoipBridge.traceIncoming(`permissionResult media=${mediaType} allowed=${allowed} dialog=${result.dialogShownResults?.includes(true) === true}`, id)
       return allowed
-    } catch (_) { return false }
+    } catch (error) {
+      VoipBridge.traceIncoming(`permissionRequestFailed media=${mediaType} code=${(error as BusinessError).code}`, id)
+      return false
+    }
   }
   static async setCamera(enabled: boolean): Promise<void> {
     const call = VoipBridge.current, run = VoipBridge.generation

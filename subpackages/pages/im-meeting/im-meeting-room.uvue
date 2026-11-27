@@ -684,7 +684,9 @@
                     <text v-else>{{ person.initial }}</text>
                   </view>
                   <text class="mr-invite-row__name text-ellipsis" :lines="1">{{ person.displayName }}</text>
-                  <!-- 勾选圆圈放到行尾右侧（用户要求）；智能体在列表最前由 loadInviteContacts 排序保证 -->
+                  <!-- 群通话发起的会议：群内成员排最前并带「群」标（普通会议没有这一档） -->
+                  <text v-if="person.groupMember" class="mr-invite-row__group">群</text>
+                  <!-- 勾选圆圈放到行尾右侧（用户要求）；排序由 loadInviteContacts 保证：群成员 → 智能体 → 其余联系人 -->
                   <view class="mr-invite-row__check">
                     <svg-icon v-if="isInviteSelected(person.userId)" name="icon-Check" size="12" unit="px" color="#141416" />
                   </view>
@@ -734,7 +736,7 @@
     apiImMeetingUpdatePermissions,
     apiImMeetingUpdateRoomSettings,
   } from "@/servers/imMeeting";
-  import { apiImContacts, apiImCreateP2pConversation, apiImWhoami } from "@/servers/im";
+  import { apiImContacts, apiImConvMembersAll, apiImCreateP2pConversation, apiImWhoami } from "@/servers/im";
   import { apiImSendMeetingInvite } from "@/servers/imCall";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
@@ -888,6 +890,8 @@
     subjectType: number = 1;
     /** 便捷判定：智能体在邀请列表里排最前。 */
     isAgent: boolean = false;
+    /** 是否本场会关联的群成员（群通话发起的会议）：排最前并带「群」标记。 */
+    groupMember: boolean = false;
   }
 
   class MeetingChatMessage {
@@ -933,6 +937,15 @@
   const inviteKeyword = ref<string>("");
   const invitePool = ref<MeetingInviteContact[]>([]);
   const invitePoolState = ref<string>("idle");
+  /**
+   * 本场会关联的群会话 id（群通话发起的会议）：有值才拉群成员，普通会议保持全量联系人。
+   * 来源两处：① 入口参数（群通话选人页/群邀请卡片带过来，先到先用）；
+   * ② 详情回包 meeting.convId —— 服务端建房时把 createRoom 的 convId 写进了会议记录，
+   *    所以即使是点推送/群卡片入会的参会人也能拿到（见后端 beginRoomMeeting）。
+   */
+  const groupConvId = ref<string>("");
+  /** 邀请名单拉取轮次：详情补到 convId 时作废在途请求，避免旧结果（无群成员）落地。 */
+  let invitePoolGen = 0;
   const inviteSelected = ref<MeetingInviteContact[]>([]);
   const inviteSending = ref<boolean>(false);
   /** 邀请列表刷新在途（图标淡出，防连点）。 */
@@ -1305,6 +1318,17 @@
       }
       // 详情里的 host 是按查看者算的，比入口传参更准
       isHost.value = readStr(meeting, "host") == "true";
+      // 群通话发起的会议：convId 是建房时落库的群会话 id，用来补「群成员」邀请名单。
+      // ★这里只更新 id 并作废在途/已完成的名单：loadInviteContacts 定义在本函数之后
+      //   （uvue 同级函数不能前向引用），重拉交给下一次打开面板或面板里的刷新按钮。
+      const groupConv = readStr(meeting, "convId");
+      if (groupConv.length > 0 && groupConv != groupConvId.value) {
+        groupConvId.value = groupConv;
+        invitePoolGen += 1;
+        if (invitePoolState.value == "ready" || invitePoolState.value == "loading") {
+          invitePoolState.value = "idle";
+        }
+      }
     }
     // `data["members"]` 是 Any?：先判空再强转成数组（UTS 的 Any? 不能直接当参数传）
     const membersRaw = data["members"];
@@ -2619,63 +2643,141 @@
     if (invitePoolState.value == "loading" || invitePoolState.value == "ready") {
       return;
     }
-    invitePoolState.value = "loading";
-    try {
-      const res = await apiImContacts();
-      if (apiResCode(res) != SUCCESS_CODE) {
-        invitePoolState.value = "failed";
-        return;
-      }
-      const data = apiResData<any>(res);
-      const obj = data != null ? data as UTSJSONObject : null;
-      const rawItems = obj != null ? obj["items"] : null;
-      // ★智能体不再被过滤掉（会中邀请支持智能体），且要排在列表最前；
-      //   先按类型分两桶再拼，天然稳定排序（不用 sort 比较器，App 端更稳）。
-      const agents: MeetingInviteContact[] = [];
-      const humans: MeetingInviteContact[] = [];
-      if (rawItems != null) {
-        const rows = rawItems as UTSJSONObject[];
-        for (let i = 0; i < rows.length; i++) {
-          const row = rows[i];
-          const subjectType = readNum(row, "subjectType", 1);
-          const isAgent = subjectType == 2;
-          // 人：只保留已互为联系人（status=1，2/3 是待确认）；
-          // 智能体：★不过滤（用户明确要求会中邀请要能选到智能体）。
-          if (!isAgent && readNum(row, "status", 1) != 1) {
-            continue;
+    // 最多两轮：群会话 id 可能在等待请求期间才从详情补到（applyDetail 会把状态置回
+    // idle 并递增 gen），这一轮结果作废，按新值重新拉一次。
+    for (let attempt = 0; attempt < 2; attempt++) {
+      invitePoolState.value = "loading";
+      invitePoolGen += 1;
+      const gen = invitePoolGen;
+      // 群通话发起的会议：先拉群成员排最前（拉失败只少这一档，不影响联系人列表）
+      const groupConv = groupConvId.value;
+      try {
+        const groupRows: MeetingInviteContact[] = [];
+        if (groupConv.length > 0) {
+          const memberRows = await apiImConvMembersAll(groupConv);
+          if (gen != invitePoolGen) {
+            if (invitePoolState.value == "idle") {
+              continue;
+            }
+            return;
           }
-          const userId = readStr(row, "userId");
-          if (userId.length == 0) {
-            continue;
-          }
-          const displayName = readStr(row, "displayName").length > 0 ? readStr(row, "displayName") : readStr(row, "nickName");
-          const contact = new MeetingInviteContact();
-          contact.userId = userId;
-          contact.displayName = displayName.length > 0 ? displayName : readStr(row, "userName");
-          contact.initial = contact.displayName.length > 0 ? contact.displayName.substring(0, 1) : "?";
-          contact.avatarRaw = readStr(row, "avatar");
-          contact.avatar = imAvatarDisplayUrl(contact.avatarRaw, 56);
-          contact.subjectType = subjectType;
-          contact.isAgent = isAgent;
-          if (contact.isAgent) {
-            agents.push(contact);
-          } else {
-            humans.push(contact);
+          if (memberRows != null) {
+            const rows = memberRows as UTSJSONObject[];
+            const info = getCachedMyInfo();
+            const selfId = info != null ? info.userId : "";
+            for (let i = 0; i < rows.length; i++) {
+              const row = rows[i];
+              const userId = readStr(row, "userId");
+              // 自己不进邀请名单；非在群成员（退群/被移除）服务端默认不返回，这里兜底
+              if (userId.length == 0 || userId == selfId || readStr(row, "self") == "true") {
+                continue;
+              }
+              if (readNum(row, "memberStatus", 1) != 1) {
+                continue;
+              }
+              // 群名片 > 昵称 > 占位（与 @提及面板、群通话选人页同口径）
+              let displayName = readStr(row, "nickName");
+              if (displayName.length == 0) displayName = readStr(row, "name");
+              if (displayName.length == 0) displayName = "用户" + userId;
+              const contact = new MeetingInviteContact();
+              contact.userId = userId;
+              contact.displayName = displayName;
+              contact.initial = displayName.substring(0, 1);
+              contact.avatarRaw = readStr(row, "avatar");
+              contact.avatar = imAvatarDisplayUrl(contact.avatarRaw, 56);
+              // 群成员 DTO 没有 subjectType：智能体行以 agentMode 有值为唯一标记
+              contact.isAgent = row["agentMode"] != null;
+              contact.subjectType = contact.isAgent ? 2 : 1;
+              contact.groupMember = true;
+              groupRows.push(contact);
+            }
           }
         }
+        const res = await apiImContacts();
+        if (gen != invitePoolGen) {
+          if (invitePoolState.value == "idle") {
+            continue;
+          }
+          return;
+        }
+        if (apiResCode(res) != SUCCESS_CODE) {
+          invitePoolState.value = "failed";
+          return;
+        }
+        const data = apiResData<any>(res);
+        const obj = data != null ? data as UTSJSONObject : null;
+        const rawItems = obj != null ? obj["items"] : null;
+        // ★智能体不再被过滤掉（会中邀请支持智能体），且要排在列表最前；
+        //   先按类型分两桶再拼，天然稳定排序（不用 sort 比较器，App 端更稳）。
+        const agents: MeetingInviteContact[] = [];
+        const humans: MeetingInviteContact[] = [];
+        if (rawItems != null) {
+          const rows = rawItems as UTSJSONObject[];
+          for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            const subjectType = readNum(row, "subjectType", 1);
+            const isAgent = subjectType == 2;
+            // 人：只保留已互为联系人（status=1，2/3 是待确认）；
+            // 智能体：★不过滤（用户明确要求会中邀请要能选到智能体）。
+            if (!isAgent && readNum(row, "status", 1) != 1) {
+              continue;
+            }
+            const userId = readStr(row, "userId");
+            if (userId.length == 0) {
+              continue;
+            }
+            const displayName = readStr(row, "displayName").length > 0 ? readStr(row, "displayName") : readStr(row, "nickName");
+            const contact = new MeetingInviteContact();
+            contact.userId = userId;
+            contact.displayName = displayName.length > 0 ? displayName : readStr(row, "userName");
+            contact.initial = contact.displayName.length > 0 ? contact.displayName.substring(0, 1) : "?";
+            contact.avatarRaw = readStr(row, "avatar");
+            contact.avatar = imAvatarDisplayUrl(contact.avatarRaw, 56);
+            contact.subjectType = subjectType;
+            contact.isAgent = isAgent;
+            if (contact.isAgent) {
+              agents.push(contact);
+            } else {
+              humans.push(contact);
+            }
+          }
+        }
+        // ★排序：群成员最前（群通话场景下这是用户最想邀请的人），其后智能体、再其余联系人；
+        //   已在群名单里的联系人不再重复出现。
+        const list: MeetingInviteContact[] = [];
+        const seen = new Set<string>();
+        for (let i = 0; i < groupRows.length; i++) {
+          const person = groupRows[i];
+          if (seen.has(person.userId)) {
+            continue;
+          }
+          seen.add(person.userId);
+          list.push(person);
+        }
+        for (let i = 0; i < agents.length; i++) {
+          if (seen.has(agents[i].userId)) {
+            continue;
+          }
+          seen.add(agents[i].userId);
+          list.push(agents[i]);
+        }
+        for (let i = 0; i < humans.length; i++) {
+          if (seen.has(humans[i].userId)) {
+            continue;
+          }
+          seen.add(humans[i].userId);
+          list.push(humans[i]);
+        }
+        invitePool.value = list;
+        invitePoolState.value = "ready";
+        resolveInviteAvatars();
+        return;
+      } catch (_error) {
+        if (gen == invitePoolGen) {
+          invitePoolState.value = "failed";
+        }
+        return;
       }
-      const list: MeetingInviteContact[] = [];
-      for (let i = 0; i < agents.length; i++) {
-        list.push(agents[i]);
-      }
-      for (let i = 0; i < humans.length; i++) {
-        list.push(humans[i]);
-      }
-      invitePool.value = list;
-      invitePoolState.value = "ready";
-      resolveInviteAvatars();
-    } catch (_error) {
-      invitePoolState.value = "failed";
     }
   }
 
@@ -4748,6 +4850,8 @@
     memberCount.value = readNum(obj, "members", 0);
     requiresPasscode.value = readStr(obj, "passcode") == "1";
     isHost.value = readStr(obj, "host") == "1";
+    // 群通话入口带过来的群会话 id（群选人页/群邀请卡片）：邀请面板据此拉群成员
+    groupConvId.value = readStr(obj, "convId");
     // 「加入会议」页带过来的入会密码（其余入口没有这个参数）
     joinPasscode.value = readStr(obj, "pc");
     if (meetingMediaActiveRoom().length > 0 && meetingMediaActiveRoom() != roomRaw.value) {
@@ -4763,7 +4867,8 @@
     meetingMediaSetResumeURL(
       `/subpackages/pages/im-meeting/im-meeting-room?room=${encodeURIComponent(roomRaw.value)}` +
       `&id=${encodeURIComponent(meetingId.value)}&title=${encodeURIComponent(titleRaw.value)}` +
-      `&status=1&host=${isHost.value ? "1" : "0"}&pc=${encodeURIComponent(joinPasscode.value)}`
+      `&status=1&host=${isHost.value ? "1" : "0"}&pc=${encodeURIComponent(joinPasscode.value)}` +
+      (groupConvId.value.length > 0 ? `&convId=${groupConvId.value}` : "")
     );
     meetingMediaSetMinimized(false);
     meetingMediaSetPageVisible(true);
@@ -6442,6 +6547,18 @@
     font-size: 13px;
     line-height: 18px;
     color: #141416;
+  }
+
+  /* 群成员标记（群通话发起的会议）：浅紫底，不抢名字的视觉重心 */
+  .mr-invite-row__group {
+    flex-shrink: 0;
+    margin-left: 6px;
+    padding: 0 4px;
+    border-radius: 3px;
+    background-color: #efedff;
+    color: #5147ff;
+    font-size: 10px;
+    line-height: 15px;
   }
 
   .mr-invite-panel__foot {

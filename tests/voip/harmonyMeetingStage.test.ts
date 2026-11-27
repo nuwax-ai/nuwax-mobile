@@ -72,6 +72,36 @@ function nativeStage() {
 }
 
 describe('Harmony meeting native stage', () => {
+  it('keeps ArkTS component and intercept responses non-null for strict Harmony compilation', () => {
+    const stage = readFileSync(new URL('../../uni_modules/nuwax-livekit/utssdk/app-harmony/MeetingStage.ets', import.meta.url), 'utf8');
+    const plugin = readFileSync(new URL('../../uni_modules/nuwax-livekit/utssdk/app-harmony/index.uts', import.meta.url), 'utf8');
+    expect(stage).toContain('host: MeetingStageHost = MeetingStageSession.host as MeetingStageHost');
+    expect(stage).toContain('assetResponse(url: string): WebResourceResponse');
+    expect(stage).not.toContain('assetResponse(url: string): WebResourceResponse | null');
+    expect(plugin).toContain('export function createVideoView(): any { return {}; }');
+    expect(plugin).toContain('export function createRemoteVideoView(_identity: string): any { return {}; }');
+  });
+
+  it('enables Harmony meeting media from the plugin capability without an API-origin gate', () => {
+    const media = readFileSync(new URL('../../utils/meeting/meetingMedia.uts', import.meta.url), 'utf8');
+    const page = readFileSync(new URL('../../subpackages/pages/im-meeting/im-meeting-room.uvue', import.meta.url), 'utf8');
+    const support = media.slice(media.indexOf('export function meetingMediaSupported(): boolean {'), media.indexOf('/** 当前平台名'));
+    const harmonySupport = support.slice(support.indexOf('// #ifdef APP-HARMONY'));
+    expect(harmonySupport).toContain('supported = livekitIsSupported();');
+    expect(harmonySupport).not.toContain('getApiBaseUrl');
+    expect(harmonySupport).not.toContain('testagent.xspaceagi.com');
+    expect(media).not.toContain('import { getApiBaseUrl } from "@/constants/config";');
+
+    const mic = page.slice(page.indexOf('function handleMicTap(): void {'), page.indexOf('function handleMyAvatarError'));
+    const camera = page.slice(page.indexOf('function handleCameraTap(): void {'), page.indexOf('// #ifdef APP-ANDROID || APP-IOS', page.indexOf('function handleCameraTap(): void {')));
+    expect(mic).toContain('meetingMediaSetMic(next);');
+    expect(camera).toContain('meetingMediaSetCamera(next);');
+    expect(page).toContain('meetingMediaSwitchCamera();');
+    expect(page).toContain('meetingMediaSetSpeaker(!speakerOn.value);');
+    expect(mic).not.toContain('mediaHarmonyPending');
+    expect(camera).not.toContain('mediaHarmonyPending');
+  });
+
   it('reuses the same ArkWeb frame and connection after minimizing and returning', () => {
     const { session, stages } = nativeStage();
     const initial = session.attach({}, 'Picture in picture');

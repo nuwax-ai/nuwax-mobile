@@ -544,9 +544,20 @@ export class MeetingStageHost {
     return url === mediaOrigin + '/' + name
   }
 
-  assetResponse(url: string): WebResourceResponse | null {
+  private assetNotFound(): WebResourceResponse {
+    const response = new WebResourceResponse()
+    response.setResponseData('')
+    response.setResponseMimeType('text/plain')
+    response.setResponseEncoding('utf-8')
+    response.setResponseCode(404)
+    response.setReasonMessage('Not Found')
+    response.setResponseIsReady(true)
+    return response
+  }
+
+  assetResponse(url: string): WebResourceResponse {
     const html = this.isAsset(url, 'media.html')
-    if (!html && !this.isAsset(url, 'room.js')) return null
+    if (!html && !this.isAsset(url, 'room.js')) return this.assetNotFound()
     const file = html ? meetingAsset : 'nuwax-meeting/room.js'
     try {
       const bytes = this.context.resourceManager.getRawFileContentSync(file)
@@ -558,7 +569,7 @@ export class MeetingStageHost {
       response.setReasonMessage('OK')
       response.setResponseIsReady(true)
       return response
-    } catch (_) { return null }
+    } catch (_) { return this.assetNotFound() }
   }
 
   rendererExited(): void {
@@ -700,7 +711,7 @@ export function buildMeetingMount(mount: MeetingStageMount) {
 
 @Component
 struct MeetingStageWeb {
-  host: MeetingStageHost
+  host: MeetingStageHost = MeetingStageSession.host as MeetingStageHost
 
   build() {
     Web({ src: mediaURL, controller: this.host.controller })

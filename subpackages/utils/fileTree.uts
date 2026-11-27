@@ -13,13 +13,24 @@ import { downloadAuthProtectedFileToTemp, isAuthProtectedFileUrl } from "@/utils
 // #ifdef APP-ANDROID
 import Intent from 'android.content.Intent';
 import ContentValues from 'android.content.ContentValues';
+import ContentResolver from 'android.content.ContentResolver';
+import Uri from 'android.net.Uri';
 import Environment from 'android.os.Environment';
 import Build from 'android.os.Build';
 import MediaStore from 'android.provider.MediaStore';
+import ContentUris from 'android.content.ContentUris';
 import File from 'java.io.File';
 import FileInputStream from 'java.io.FileInputStream';
 import FileOutputStream from 'java.io.FileOutputStream';
 import FileProvider from 'androidx.core.content.FileProvider';
+// #endif
+
+// #ifdef APP-HARMONY
+import type { Want } from "@kit.AbilityKit";
+import { BusinessError } from "@kit.BasicServicesKit";
+import fs from "@ohos.file.fs";
+import fileUri from "@ohos.file.fileuri";
+import picker from "@ohos.file.picker";
 // #endif
 
 /**
@@ -749,19 +760,44 @@ export function mergeDirectoryLevelFiles(
    * Android 10+ 分区存储：targetSdk>=29 时 legacy 标志在 Android 11+ 已被系统忽略、
    * WRITE_EXTERNAL_STORAGE 不再授予公共目录写权，File API 直写公共 Download 会被
    * **静默拒绝**（文件实际留在私有 cache，文件管理不可见）——API 29+ 改走
-   * MediaStore.Downloads 插入（自有文件免存储运行时权限；重名由系统自动加 (n)）；
-   * API 29 以下维持旧 File 直写。任一步失败回落临时路径。
+   * MediaStore.Downloads 插入（自有文件免存储运行时权限）。同名直接覆盖原记录，
+   * 避免系统自动改成 "name (n).ext" 后弹窗把这个序号显示出来。
+   * API 29 以下维持旧 File 直写，已存在则覆盖。任一步失败回落临时路径。
    */
+  function findOwnDownloadUri(resolver: ContentResolver, filename: string): Uri | null {
+    const cursor = resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI, null, null, null, null);
+    if (cursor == null) return null;
+    let found: Uri | null = null;
+    if (cursor.moveToFirst()) {
+      do {
+        const nameIdx = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME);
+        const idIdx = cursor.getColumnIndex(MediaStore.MediaColumns._ID);
+        if (nameIdx >= 0 && idIdx >= 0) {
+          const name = cursor.getString(nameIdx);
+          if (name != null && name == filename) {
+            found = ContentUris.withAppendedId(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cursor.getLong(idIdx));
+            break;
+          }
+        }
+      } while (cursor.moveToNext());
+    }
+    cursor.close();
+    return found;
+  }
+
   function copyToPublicDownload(tempFilePath: string, filename: string): string {
     try {
       const context = UTSAndroid.getAppContext();
       if (context == null) return tempFilePath;
       if (Build.VERSION.SDK_INT >= 29) {
         const resolver = context.getContentResolver();
-        const values = new ContentValues();
-        values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
-        values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-        const uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        let uri = findOwnDownloadUri(resolver, filename);
+        if (uri == null) {
+          const values = new ContentValues();
+          values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
+          values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+          uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+        }
         if (uri != null) {
           const inStream = new FileInputStream(new File(tempFilePath));
           const outStream = resolver.openOutputStream(uri);
@@ -775,21 +811,8 @@ export function mergeDirectoryLevelFiles(
             outStream.close();
           }
           inStream.close();
-          // 展示路径：DATA 列多数 ROM 仍回填物理路径（含系统重名加缀后的真名），取不到按标准位置拼
-          let displayPath = `${Environment.getExternalStorageDirectory()}/${Environment.DIRECTORY_DOWNLOADS}/${filename}`;
-          const cursor = resolver.query(uri, null, null, null, null);
-          if (cursor != null) {
-            if (cursor.moveToFirst()) {
-              const idx = cursor.getColumnIndex(MediaStore.MediaColumns.DATA);
-              if (idx >= 0) {
-                const p = cursor.getString(idx);
-                if (p != null && p.length > 0) {
-                  displayPath = p;
-                }
-              }
-            }
-            cursor.close();
-          }
+          // 弹窗展示原始文件名。不再读 DATA 列，避免把系统重名后的 " (n)" 显示出来。
+          const displayPath = `${Environment.getExternalStorageDirectory()}/${Environment.DIRECTORY_DOWNLOADS}/${filename}`;
           console.log('已存入公共 Download(MediaStore):', displayPath);
           return displayPath;
         }
@@ -799,17 +822,7 @@ export function mergeDirectoryLevelFiles(
           if (!downloadDir.exists()) {
             downloadDir.mkdirs();
           }
-          let targetFile = new File(downloadDir, filename);
-          if (targetFile.exists()) {
-            const dotIdx = filename.lastIndexOf('.');
-            const nameWithoutExt = dotIdx > 0 ? filename.substring(0, dotIdx) : filename;
-            const ext = dotIdx > 0 ? filename.substring(dotIdx) : '';
-            let counter = 1;
-            while (targetFile.exists() && counter < 100) {
-              targetFile = new File(downloadDir, `${nameWithoutExt}(${counter})${ext}`);
-              counter++;
-            }
-          }
+          const targetFile = new File(downloadDir, filename);
           const srcFile = new File(tempFilePath);
           const inStream = new FileInputStream(srcFile);
           const outStream = new FileOutputStream(targetFile);
@@ -942,15 +955,228 @@ export function mergeDirectoryLevelFiles(
   }
   // #endif
 
+  /** 录音文件不是文档。openDocument 在鸿蒙会按网页链接交给浏览器。 */
+  function isAudioDownloadPath(filePath: string): boolean {
+    const lower = filePath.toLowerCase();
+    const query = lower.indexOf("?");
+    const path = query >= 0 ? lower.substring(0, query) : lower;
+    return path.endsWith(".m4a") || path.endsWith(".aac") || path.endsWith(".mp3") || path.endsWith(".wav");
+  }
+
+  function audioDownloadBaseName(filePath: string): string {
+    const query = filePath.indexOf("?");
+    const path = query >= 0 ? filePath.substring(0, query) : filePath;
+    const slash = path.lastIndexOf("/");
+    if (slash < 0 || slash >= path.length - 1) return "录音.m4a";
+    return path.substring(slash + 1);
+  }
+
+  // #ifdef APP-ANDROID
+  /** 打开系统下载列表。录音已经在公共 Download 目录里。 */
+  function openAndroidDownloads(): void {
+    try {
+      const intent = new Intent("android.intent.action.VIEW_DOWNLOADS");
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+      const activity = UTSAndroid.getUniActivity();
+      if (activity != null) {
+        activity.startActivity(intent);
+        return;
+      }
+      const context = UTSAndroid.getAppContext();
+      if (context != null) {
+        context.startActivity(intent);
+      }
+    } catch (e) {
+      console.error("打开系统下载目录失败:", e);
+      uni.showToast({
+        title: t("Mobile.FileTree.openFailed"),
+        icon: "none",
+        duration: 3000,
+      });
+    }
+  }
+  // #endif
+
+  // #ifdef APP-HARMONY
+  /** 下载模式返回目录。文件名里的非法字符换成下划线，扩展名保持原样。 */
+  function harmonySafeDownloadName(rawName: string): string {
+    const dot = rawName.lastIndexOf(".");
+    const hasSuffix = dot > 0 && dot < rawName.length - 1;
+    const base = hasSuffix ? rawName.substring(0, dot) : rawName;
+    const suffix = hasSuffix ? rawName.substring(dot) : "";
+    let out = "";
+    for (let i = 0; i < base.length; i++) {
+      const ch = base.charAt(i);
+      const illegal = ch == "/" || ch == "\\" || ch == ":" || ch == "*" || ch == "?" || ch == "\"" || ch == "<" || ch == ">" || ch == "|" || ch == "(" || ch == ")" || ch == " ";
+      out += illegal ? "_" : ch;
+    }
+    if (out.length == 0) out = "文件";
+    return out + suffix;
+  }
+
+  /** viewData 会停在文件管理首页。用打开目录的链接进到本次授权的文件夹。 */
+  function showHarmonyOpenFolderFailed(): void {
+    uni.showToast({
+      title: t("Mobile.FileTree.openFailed"),
+      icon: "none",
+      duration: 3000,
+    });
+  }
+
+  function openHarmonyDownloadFolder(dirUri: string): void {
+    const context = UTSHarmony.getUIAbilityContext();
+    console.error("打开下载目录 " + dirUri);
+    context.openLink("filemanager://openDirectory", {
+      parameters: {
+        fileUri: dirUri,
+      },
+    }).catch((error: BusinessError): void => {
+      console.error("按目录打开文件管理失败:", error);
+      try {
+        const want: Want = {
+          bundleName: "com.huawei.hmos.files",
+          abilityName: "EntryAbility",
+          uri: dirUri,
+          parameters: {
+            fileUri: dirUri,
+          },
+        };
+        context.startAbility(want);
+      } catch (e) {
+        console.error("打开系统文件失败:", e);
+        showHarmonyOpenFolderFailed();
+      }
+    });
+  }
+
+  /**
+   * uni 虚拟路径换成沙盒真实路径。
+   * USER_DATA_PATH 在鸿蒙是 unifile://usr，原生 fs 不认这个 scheme。
+   */
+  function harmonySandboxPath(filePath: string): string {
+    const prefix = "unifile://usr";
+    if (!filePath.startsWith(prefix)) return filePath;
+    let rest = filePath.substring(prefix.length);
+    if (rest.startsWith("/")) {
+      rest = rest.substring(1);
+    }
+    const filesDir = `${UTSHarmony.getUIAbilityContext().getApplicationContext().filesDir}`;
+    if (filesDir.endsWith("/")) return filesDir + rest;
+    return filesDir + "/" + rest;
+  }
+
+  /** 用户关掉系统保存界面时不要再提示失败。 */
+  function harmonyPickerCancelled(error: BusinessError): boolean {
+    if (error.code == 1001) return true;
+    const message = error.message != null ? error.message.toLowerCase() : "";
+    return message.indexOf("cancel") >= 0;
+  }
+
+  /**
+   * DOWNLOAD 模式返回的是目录 URI，不能直接 open。
+   * 先用 fileUri 把「目录 + 文件名」转成真实路径，再创建并写入。
+   */
+  function writeSandboxAudioToHarmonyDir(srcPath: string, dirUri: string, fileName: string): void {
+    const separator = dirUri.endsWith("/") ? "" : "/";
+    const targetUri = dirUri + separator + encodeURIComponent(fileName);
+    const realPath = new fileUri.FileUri(targetUri).path;
+    const srcFile = fs.openSync(srcPath, fs.OpenMode.READ_ONLY);
+    let destFd = -1;
+    try {
+      const destFile = fs.openSync(realPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      destFd = destFile.fd;
+      fs.copyFileSync(srcFile.fd, destFd);
+    } finally {
+      fs.closeSync(srcFile);
+      if (destFd >= 0) fs.closeSync(destFd);
+    }
+  }
+
+  /**
+   * 沙盒重名会写成「名字 (n).后缀」。系统目录应优先用下载时的原始文件名。
+   * 只在没有传入原始文件名、只能从沙盒路径取名时去掉这个序号。
+   */
+  function harmonyOriginalDownloadName(rawName: string): string {
+    const dot = rawName.lastIndexOf(".");
+    const hasSuffix = dot > 0 && dot < rawName.length - 1;
+    const base = hasSuffix ? rawName.substring(0, dot) : rawName;
+    const suffix = hasSuffix ? rawName.substring(dot) : "";
+    if (base.length < 4 || !base.endsWith(")")) return rawName;
+    const open = base.lastIndexOf(" (");
+    if (open <= 0) return rawName;
+    const num = base.substring(open + 2, base.length - 1);
+    if (num.length == 0) return rawName;
+    for (let i = 0; i < num.length; i++) {
+      const ch = num.charAt(i);
+      if (ch < "0" || ch > "9") return rawName;
+    }
+    return base.substring(0, open) + suffix;
+  }
+
+  /**
+   * 把沙盒文件写入系统下载目录里本应用的文件夹。
+   * 手机不能直接写公共 Download；DOWNLOAD 模式会授权该目录，且不要再传文件名和后缀。
+   * preferredName 是下载时的原始文件名。沙盒路径可能已加「 (n)」，不能拿它当系统目录里的名字。
+   */
+  function saveHarmonyFileToDownload(filePath: string, preferredName: string = ""): void {
+    const rawName = preferredName.length > 0 ? preferredName : harmonyOriginalDownloadName(audioDownloadBaseName(filePath));
+    const name = harmonySafeDownloadName(rawName);
+    const src = harmonySandboxPath(filePath);
+    const options = new picker.DocumentSaveOptions();
+    options.pickerMode = picker.DocumentPickerMode.DOWNLOAD;
+    const documentPicker = new picker.DocumentViewPicker();
+    documentPicker.save(options).then((uris: string[]): void => {
+      if (uris.length == 0) {
+        uni.showToast({
+          title: t("Mobile.FileTree.openDownloadDirFailed"),
+          icon: "none",
+          duration: 3000,
+        });
+        return;
+      }
+      const dirUri = uris[0];
+      try {
+        writeSandboxAudioToHarmonyDir(src, dirUri, name);
+        openHarmonyDownloadFolder(dirUri);
+      } catch (e) {
+        console.error("写入下载目录失败:", e);
+        uni.showToast({
+          title: t("Mobile.FileTree.openDownloadDirFailed"),
+          icon: "none",
+          duration: 3000,
+        });
+      }
+    }).catch((error: BusinessError): void => {
+      if (harmonyPickerCancelled(error)) return;
+      console.error("保存到系统下载目录失败:", error);
+      uni.showToast({
+        title: t("Mobile.FileTree.openDownloadDirFailed"),
+        icon: "none",
+        duration: 3000,
+      });
+    });
+  }
+  // #endif
+
   /**
    * 打开已下载文件（下载成功弹窗「打开」同款链路，供 im-file-detail「打开」按钮复用）：
    * Android apk 发系统安装 Intent（openDocument 无接收方会静默无反应），
-   * 其余走 uni.openDocument，失败 toast 兜底。
+   * 录音文件打开系统下载目录，其余走 uni.openDocument，失败 toast 兜底。
    */
   // #ifdef APP
   export function openDownloadedFile(filePath: string): void {
     // #ifdef APP-ANDROID
     if (filePath.toLowerCase().endsWith('.apk') && tryInstallApk(filePath)) {
+      return;
+    }
+    if (isAudioDownloadPath(filePath)) {
+      openAndroidDownloads();
+      return;
+    }
+    // #endif
+    // #ifdef APP-HARMONY
+    if (isAudioDownloadPath(filePath)) {
+      saveHarmonyFileToDownload(filePath);
       return;
     }
     // #endif
@@ -1042,7 +1268,7 @@ export function mergeDirectoryLevelFiles(
    * 非 Android（iOS/鸿蒙）：把下载临时文件以真实文件名拷入沙盒 Download 目录。
    * downloadFile 临时文件名为 UUID+扩展名（用户反馈：预览顶部标题显示 70d2….docx），
    * 直接 openDocument 标题即 UUID；拷贝改名后预览标题才是真实文件名。
-   * 重名加 " (n)" 缀（异步实查，上限 20 防极端堆积）；拷贝走异步回调并回验落盘，
+   * 同名直接覆盖，不再追加 " (n)"。弹窗里的保存位置因此始终是原始文件名。
    * 任一步失败回落临时路径（与 copyToPublicDownload 失败口径一致，至少还能打开）。
    */
   async function copyToNamedSandbox(tempFilePath: string, filename: string): Promise<string> {
@@ -1058,15 +1284,19 @@ export function mergeDirectoryLevelFiles(
     } catch (_eMkdir) {
       // 已存在/权限等：拷贝回验兜底
     }
-    const dotIdx = safeName.lastIndexOf('.');
-    const base = dotIdx > 0 ? safeName.substring(0, dotIdx) : safeName;
-    const ext = dotIdx > 0 ? safeName.substring(dotIdx) : '';
-    let target = `${dir}/${safeName}`;
-    for (let i = 1; i <= 20; i++) {
-      if (!(await sandboxPathExists(target))) {
-        break;
-      }
-      target = `${dir}/${base} (${i})${ext}`;
+    const target = `${dir}/${safeName}`;
+    if (await sandboxPathExists(target)) {
+      await new Promise<void>((resolve) => {
+        fs.unlink({
+          filePath: target,
+          success: (_res) => {
+            resolve();
+          },
+          fail: (_err) => {
+            resolve();
+          },
+        });
+      });
     }
     const copied = await new Promise<boolean>((resolve) => {
       fs.copyFile({
@@ -1140,10 +1370,14 @@ export function mergeDirectoryLevelFiles(
    * @param silent 静默模式（默认 false；im-file-detail 内联下载用）：不弹全屏
    *   loading、不弹「下载完成」确认框（页面自管内联状态，本函数弹窗即被页面替换），
    *   失败 toast 仍由内部弹出。
+   * @param openDownloads 安卓点「打开」时进入系统下载目录。录音等非文档不要走 openDocument，
+   *   否则系统找不到对应应用时会把文件交给浏览器。
+   * @param openHarmonyFolder 鸿蒙点「打开」时把文件写入系统下载目录并进入该文件夹。
+   *   产物预览里的日志等文件没有对应应用，openDocument 只会弹出打开方式。
    * @returns 返回保存的文件路径
    */
   // #ifdef APP
-  export async function downloadFileInApp(downloadUrl: string, filename: string, needAuth: boolean = true, silent: boolean = false): Promise<string> {
+  export async function downloadFileInApp(downloadUrl: string, filename: string, needAuth: boolean = true, silent: boolean = false, openDownloads: boolean = false, openHarmonyFolder: boolean = false): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       const header = new UTSJSONObject();
       if (needAuth) {
@@ -1170,15 +1404,29 @@ export function mergeDirectoryLevelFiles(
             const modalParams = new Map<string, any>();
             modalParams.set("fileName", filename);
             modalParams.set("filePath", finalFilePath);
+            const savedContentKey = openDownloads
+              ? "Mobile.FileTree.audioSavedContentApp"
+              : "Mobile.FileTree.zipSavedContentApp";
             uni.showModal({
               title: t("Mobile.FileTree.downloadComplete"),
-              content: t("Mobile.FileTree.zipSavedContentApp", toI18nParams(modalParams), ""),
+              content: t(savedContentKey, toI18nParams(modalParams), ""),
               confirmText: t("Mobile.Common.open"),
               cancelText: t("Mobile.Common.cancel"),
               success: (modalRes) => {
-                if (modalRes.confirm) {
-                  openDownloadedFile(finalFilePath);
+                if (modalRes.confirm != true) return;
+                // #ifdef APP-ANDROID
+                if (openDownloads) {
+                  openAndroidDownloads();
+                  return;
                 }
+                // #endif
+                // #ifdef APP-HARMONY
+                if (openHarmonyFolder || isAudioDownloadPath(filename) || isAudioDownloadPath(finalFilePath)) {
+                  saveHarmonyFileToDownload(finalFilePath, filename);
+                  return;
+                }
+                // #endif
+                openDownloadedFile(finalFilePath);
               },
             });
           }

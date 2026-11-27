@@ -286,12 +286,13 @@ struct NuwaxVoipMedia {
           Stack() {
             if (this.avatar.startsWith('https://') && !this.avatarFailed) {
               Image(this.avatar).width('100%').height('100%').objectFit(ImageFit.Cover)
+                .borderRadius(52)
                 .onError(() => { this.avatarFailed = true })
             } else {
               Text(this.peerName().slice(0, 1)).fontSize(44).fontWeight(FontWeight.Medium).fontColor('#F0F5F2')
             }
-          }.width(104).height(104).backgroundColor('#71867C').borderRadius(24).clip(true)
-        }.width(116).height(116).border({ width: 1, color: '#1AFFFFFF', radius: 30 }).margin({ bottom: 25 })
+          }.width(104).height(104).backgroundColor('#71867C').borderRadius(52).clip(true)
+        }.width(116).height(116).border({ width: 1, color: '#1AFFFFFF', radius: 58 }).margin({ bottom: 25 })
       }
       Text(this.peerName()).width('100%').fontSize(this.showRemoteVideo() ? 20 : 28).fontWeight(FontWeight.Bold)
         .fontColor(Color.White).textAlign(this.showRemoteVideo() ? TextAlign.Start : TextAlign.Center)

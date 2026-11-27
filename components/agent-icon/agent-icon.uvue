@@ -1,5 +1,5 @@
 <template>
-  <view class="agent-icon" :style="iconStyle">
+  <view v-if="showDefaultIcon || currentIcon.length > 0" class="agent-icon" :style="iconStyle">
     <view class="agent-icon-mask">
       <image
         v-if="currentIcon.length > 0"
@@ -30,11 +30,20 @@
   import { computed, ref, watch } from "vue";
   import defaultAgentIcon from "@/static/assets/agent_image.png";
   import { resolveAppSvgUrl } from "@/utils/remoteSvgImage";
+  // #ifdef APP
+  import { getApiBaseUrl } from "@/constants/config";
+  import { isRemoteSvgUrl, resolveDisplayImageUrl } from "@/utils/remoteSvgImage";
+  import { fetchAuthProtectedFileAkUrl, isAuthProtectedFileUrl, resolveAuthProtectedFileFetchUrl } from "@/utils/authProtectedFileUrl";
+  // #endif
 
   const props = defineProps({
     icon: {
       type: String,
       required: true,
+    },
+    showDefaultIcon: {
+      type: Boolean,
+      default: true,
     },
     alt: {
       type: String,
@@ -108,7 +117,32 @@
     return (css * 750) / win;
   }
 
-  // App 端远程 SVG 需按容器实际尺寸各自解析；H5/小程序 resolveAppSvgUrl 原样透传。
+  async function resolveIconUrl(icon: string): Promise<string> {
+    // 本地资源无需补 API 域名，否则默认图也会请求服务器。
+    if (icon == defaultAgentIcon || icon.startsWith("/static/")) return icon;
+    const size = rasterSize(props.size);
+    // #ifdef APP
+    if (isAuthProtectedFileUrl(icon)) {
+      const url = resolveAuthProtectedFileFetchUrl(icon);
+      if (icon.startsWith("//") || !url.startsWith(`${getApiBaseUrl()}/`)) return icon;
+      // #ifdef APP-ANDROID || APP-IOS
+      if (isRemoteSvgUrl(url)) {
+        const resolved = await resolveAppSvgUrl(url, size, size);
+        if (resolved.startsWith("data:")) return resolved;
+        try {
+          return await fetchAuthProtectedFileAkUrl(url);
+        } catch (_error) {
+          return resolved;
+        }
+      }
+      // #endif
+      return await resolveDisplayImageUrl(url, size, size);
+    }
+    // #endif
+    return await resolveAppSvgUrl(icon, size, size);
+  }
+
+  // App 端远程 SVG 需按容器实际尺寸各自解析。
   // raw* 保存未解析的原始值用于比对，currentIcon/pendingIcon 保存解析后的 src。
   //
   // currentIcon 初始必须为空串（解析完成前不给 <image> 任何 src）：
@@ -116,7 +150,13 @@
   // 事件里拿不到是哪个 src 失败，handleImageError 会把「刚解析好的 data URL」误判为加载失败而换成默认图。
   // 表现：同一个远程 SVG 图标出现多次时，先渲染的几个（未命中缓存、真的发起过原图请求）显示默认图，
   // 后面命中 data URL 缓存的（微任务内直接给最终 src，没有被取消的请求）反而正常。Android 取消请求不报错，故只在 iOS 复现。
-  const rawCurrentIcon = ref<string>(props.icon.length > 0 ? props.icon : defaultAgentIcon);
+  function iconOrFallback(icon: string): string {
+    const trimmed = icon.trim();
+    if (trimmed.length > 0) return trimmed;
+    return props.showDefaultIcon ? defaultAgentIcon : "";
+  }
+
+  const rawCurrentIcon = ref<string>(iconOrFallback(props.icon));
   const currentIcon = ref<string>("");
   const rawPendingIcon = ref<string>("");
   const pendingIcon = ref<string>("");
@@ -126,10 +166,11 @@
   // 异步解析竞态序号：保证过期的解析结果不会覆盖新目标
   let resolveSeq = 0;
 
-  // 初始图标解析（挂载即执行；PNG/非 App 端微任务内透传完成，无闪烁）
+  // 初始图标解析（挂载即执行）。
   const applyInitialIcon = () : void => {
     const seq = ++resolveSeq;
-    resolveAppSvgUrl(rawCurrentIcon.value, rasterSize(props.size), rasterSize(props.size)).then((resolved : string) => {
+    if (rawCurrentIcon.value.length == 0) return;
+    resolveIconUrl(rawCurrentIcon.value).then((resolved : string) => {
       if (seq == resolveSeq) {
         currentIcon.value = resolved;
       }
@@ -140,7 +181,14 @@
   watch(
     () : string => props.icon,
     (icon : string) => {
-      const nextIcon = icon.length > 0 ? icon : defaultAgentIcon;
+      const nextIcon = iconOrFallback(icon);
+      if (!props.showDefaultIcon) {
+        if (nextIcon == rawCurrentIcon.value) return;
+        rawCurrentIcon.value = nextIcon;
+        currentIcon.value = "";
+        applyInitialIcon();
+        return;
+      }
       if (nextIcon == rawCurrentIcon.value) {
         pendingIconVisible.value = false;
         pendingIcon.value = "";
@@ -158,7 +206,7 @@
       pendingIconVisible.value = false;
       rawPendingIcon.value = nextIcon;
       const seq = ++resolveSeq;
-      resolveAppSvgUrl(nextIcon, rasterSize(props.size), rasterSize(props.size)).then((resolved : string) => {
+      resolveIconUrl(nextIcon).then((resolved : string) => {
         if (seq != resolveSeq || rawPendingIcon.value != nextIcon) return;
         pendingResolvedFor.value = nextIcon;
         pendingIcon.value = resolved;
@@ -169,6 +217,10 @@
   const handleImageError = () => {
     // 尚未给出 src（解析中）时收到的 error 一定不属于当前图，忽略
     if (currentIcon.value.length == 0) return;
+    if (!props.showDefaultIcon) {
+      currentIcon.value = "";
+      return;
+    }
     if (rawCurrentIcon.value != defaultAgentIcon) {
       rawCurrentIcon.value = defaultAgentIcon;
       currentIcon.value = defaultAgentIcon;
@@ -176,8 +228,8 @@
   };
 
   const handlePendingImageLoad = () => {
-    const expectedIcon = props.icon.length > 0 ? props.icon : defaultAgentIcon;
-    if (rawPendingIcon.value == expectedIcon) {
+    const expectedIcon = props.icon.trim();
+    if (rawPendingIcon.value == expectedIcon || rawPendingIcon.value == defaultAgentIcon) {
       pendingIconVisible.value = true;
     }
   };

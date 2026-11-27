@@ -14,6 +14,7 @@
 import { StreamPcmPlayerBridge } from './StreamPcmPlayerBridge.ets'
 import { StreamPcmRecorderBridge } from './StreamPcmRecorderBridge.ets'
 import { VoiceNoteM4aBridge } from './VoiceNoteM4aBridge.ets'
+import { VoiceNoteRecordKeepAlive } from './VoiceNoteRecordKeepAlive.ets'
 import { abilityAccessCtrl, Permissions } from '@kit.AbilityKit'
 import { BusinessError } from '@kit.BasicServicesKit'
 
@@ -232,8 +233,8 @@ export class StreamPcmRecorder {
 }
 
 /**
- * 伙伴页录音：AVRecorder 直接写 m4a。与 StreamPcmRecorder 无关。
- * start 返回落盘绝对路径，失败返回空字符串。stop 成功返回 "1"。
+ * 伙伴页录音。一次会话共用一个 AVRecorder，每段单独写成 m4a。与 StreamPcmRecorder 无关。
+ * start / rotate 返回落盘绝对路径，失败返回空字符串。stop、pause、resume 成功返回 "1"。
  */
 export class VoiceNoteM4aRecorder {
   private bridge: VoiceNoteM4aBridge = new VoiceNoteM4aBridge()
@@ -243,8 +244,30 @@ export class VoiceNoteM4aRecorder {
     return this.bridge.startSegment(filesDir, localId, indexName)
   }
 
+  /** 通话打断并封口后重开。旧录音器先释放，避免停在暂停态时 prepare 失败。 */
+  restart(localId: string, indexName: string): Promise<string> {
+    const filesDir = UTSHarmony.getUIAbilityContext().getApplicationContext().filesDir
+    return this.bridge.restartSegment(filesDir, localId, indexName)
+  }
+
+  /** 封上当前段并打开下一段，不释放 AVRecorder。 */
+  rotate(localId: string, indexName: string): Promise<string> {
+    const filesDir = UTSHarmony.getUIAbilityContext().getApplicationContext().filesDir
+    return this.bridge.rotateSegment(filesDir, localId, indexName)
+  }
+
   stop(): Promise<string> {
     return this.bridge.stopSegment()
+  }
+
+  /** 给没有 moov 的 m4a 补封口。成功返回 "1"。已经封口的文件原样返回成功。 */
+  seal(filePath: string): Promise<string> {
+    try {
+      return Promise.resolve(this.bridge.sealFile(filePath))
+    } catch (e) {
+      console.warn(`[voice-note] m4a seal failed ${e}`)
+      return Promise.resolve("0")
+    }
   }
 
   pause(): Promise<string> {
@@ -253,6 +276,105 @@ export class VoiceNoteM4aRecorder {
 
   resume(): Promise<string> {
     return this.bridge.resumeSegment()
+  }
+
+  /**
+   * 已封口的超长 m4a 按 segmentMs 拆开。
+   * 成功时每行是「路径\\t时长毫秒」；不需要拆或拆失败时返回空字符串。
+   */
+  split(filePath: string, segmentMs: number): Promise<string> {
+    return this.bridge.splitFile(filePath, segmentMs)
+  }
+
+  /** 刚封口的那一段按实际写入采样算出的时长，读一次后清零。 */
+  takeClosedDurationMs(): number {
+    const parsed = parseInt(`${this.bridge.takeClosedDurationMs()}`, 10)
+    if (isNaN(parsed) || parsed < 0) {
+      return 0
+    }
+    return parsed
+  }
+
+  /**
+   * 面板计时。`1\\t毫秒` 表示正在通话静音，计时应停住；`0\\t毫秒` 是剪掉静音后的当前段时长。
+   * 文件没打开时为 `0\\t-1`。
+   */
+  displayClock(): string {
+    return `${this.bridge.displayClock()}`
+  }
+
+  /** 当前输入音量，0 到 100。来自这次 AVRecorder 的采集振幅。 */
+  takeLevel(): number {
+    const parsed = parseInt(`${this.bridge.takeLevel()}`, 10)
+    if (isNaN(parsed) || parsed < 0) {
+      return 0
+    }
+    if (parsed > 100) {
+      return 100
+    }
+    return parsed
+  }
+
+  /** 其他应用抢走音频时返回一次 began 或 ended。 */
+  takeInterruption(): string {
+    const event = `${this.bridge.takeInterruption()}`
+    if (event == "began" || event == "ended") {
+      return event
+    }
+    return ""
+  }
+}
+
+/** 伙伴页录音已经开录后申请 AUDIO_RECORDING 长时任务，退后台继续写文件。 */
+export function beginVoiceNoteBackground(): void {
+  try {
+    VoiceNoteRecordKeepAlive.begin(UTSHarmony.getUIAbilityContext())
+  } catch (e) {
+    console.warn('[voice-note] begin background failed ' + e)
+  }
+}
+
+/** 暂停、完成或放弃时停掉录音长时任务。 */
+export function endVoiceNoteBackground(): void {
+  try {
+    VoiceNoteRecordKeepAlive.end()
+  } catch (e) {
+    console.warn('[voice-note] end background failed ' + e)
+  }
+}
+
+/** 长时任务可能已被系统取消。不主动停止，下次开录再申请。 */
+export function markVoiceNoteBackgroundStale(): void {
+  try {
+    VoiceNoteRecordKeepAlive.markStale()
+  } catch (e) {
+    console.warn('[voice-note] mark background stale failed ' + e)
+  }
+}
+
+/** 刚退后台时申请短时保活。接通后再申请，系统会拒绝。 */
+export function holdVoiceNoteCall(): void {
+  try {
+    VoiceNoteRecordKeepAlive.holdForCall()
+  } catch (e) {
+    console.warn('[voice-note] hold call failed ' + e)
+  }
+}
+
+/**
+ * 最近任务划掉的标记只在 Android 上有。
+ * 鸿蒙回前台也会编译到同名引用时，这里返回 false，避免调用空函数。
+ */
+export function consumeVoiceNoteTaskRemoved(): boolean {
+  return false
+}
+
+/** 已经重新开录，短时保活不再续。 */
+export function releaseVoiceNoteCall(): void {
+  try {
+    VoiceNoteRecordKeepAlive.releaseCallHold()
+  } catch (e) {
+    console.warn('[voice-note] release call hold failed ' + e)
   }
 }
 

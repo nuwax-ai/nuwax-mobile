@@ -205,6 +205,16 @@ describe('native call delivery', () => {
     expect(args.options.android.HW['/message/android/notification/channel_id']).toBe('VoipCall');
   });
 
+  it('delivers a caller name in the PushKit payload even if senderName is blank', async () => {
+    const { call, send } = load(latestEntry, env);
+    const body = makeBody();
+    const payload = { ...body.payload, calleeId: '10002', scene: 'call',
+      senderName: ' ', callerDisplayName: ' Alice ', displayName: body.payload.callId };
+    expect((await call({ ...body, type: 'voip', payload })).errCode).toBe(0);
+    const delivered = JSON.parse(send.mock.calls[0][0].options.ios.payload);
+    expect(delivered).toMatchObject({ callId: body.payload.callId, displayName: 'Alice' });
+  });
+
   it('fails closed for mixed devices, wrong platform and invalid invites', async () => {
     const { call, send } = load(latestEntry, env);
     const body = makeBody();

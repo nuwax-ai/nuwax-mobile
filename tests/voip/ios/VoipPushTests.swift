@@ -26,6 +26,26 @@ final class VoipPushTests: XCTestCase {
         let data = try JSONSerialization.data(withJSONObject: payload)
         XCTAssertNotNil(parse(["payload": String(decoding: data, as: UTF8.self)]))
     }
+    func testSystemReportDoesNotDisplayTheCallIdentifier() throws {
+        var fields = payload
+        fields["displayName"] = "call-123"
+        fields["senderName"] = "  Alice  "
+        let named = try XCTUnwrap(parse(["payload": fields])).report(labels: [:])
+        XCTAssertEqual(named["displayName"] as? String, "Alice")
+        XCTAssertEqual(named["handle"] as? String, "Alice")
+        XCTAssertEqual(named["callId"] as? String, "call-123")
+
+        fields["senderName"] = " "
+        let unnamed = try XCTUnwrap(parse(fields)).report(labels: [:])
+        XCTAssertEqual(unnamed["displayName"] as? String, "Nuwax")
+        XCTAssertEqual(unnamed["handle"] as? String, "Nuwax")
+    }
+
+    func testVerifiedCallerNameIgnoresMissingNamesAndIdentifiers() {
+        let call: [AnyHashable: Any] = ["callId": "call-123", "callerId": "42", "callerDisplayName": "42", "displayName": "call-123"]
+        XCTAssertNil(NuwaxVoipPushInvitation.systemCallerName(call))
+        XCTAssertEqual(NuwaxVoipPushInvitation.systemCallerName(call.merging(["senderName": " Alice "]) { _, new in new }), "Alice")
+    }
     func testOrdinaryUniPushLocatorCannotBecomePushKitAuthorization() {
         XCTAssertNil(parse(["type": "voip", "convId": "245475557381246976", "msgId": "123"]))
         var wrong = payload; wrong["calleeId"] = "another-account"; XCTAssertNil(parse(wrong))

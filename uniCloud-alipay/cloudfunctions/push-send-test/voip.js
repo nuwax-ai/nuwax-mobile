@@ -36,9 +36,14 @@ exports.prepareVoip = (body, now = Date.now()) => {
     if (!['audio', 'video'].includes(source.mediaType)) return { error: 'invalid voip mediaType' }
     payload.mediaType = source.mediaType
   }
-  // senderName is the IM envelope name; displayName is the legacy alias.
-  const displayName = source.displayName ?? source.senderName
-  if (typeof displayName === 'string') payload.displayName = Array.from(displayName.trim()).slice(0, 80).join('')
+  // The IM envelope uses senderName. Keep older display-name fields as fallbacks.
+  for (const value of [source.senderName, source.callerDisplayName, source.displayName]) {
+    if (typeof value !== 'string') continue
+    const name = value.trim()
+    if (!name || name === source.callId) continue
+    payload.displayName = Array.from(name).slice(0, 80).join('')
+    break
+  }
   let ttl = 60_000
   // The ringing window is either an explicit expiresAt or the IM sendTime + 60s.
   // Both are forwarded so the client can use its existing expiresAt check.
@@ -147,8 +152,7 @@ exports.prepareVoipScene = (body, now = Date.now()) => {
   if (source?.type !== 'voip' || !Object.prototype.hasOwnProperty.call(source, 'scene')) return null
   if (source.scene === 'call') {
     if (!locator(source.calleeId)) return { error: 'voip string calleeId required' }
-    const payload = { ...source, displayName: source.senderName ?? source.displayName }
-    return { call: prepareCallInvitation({ ...body, payload }, now) }
+    return { call: prepareCallInvitation(body, now) }
   }
   if (source.scene !== 'meeting') return { error: 'invalid voip scene' }
   if (!locator(source.convId) || !locator(source.msgId) ||

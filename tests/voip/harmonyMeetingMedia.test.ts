@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RoomEvent, Track } from 'livekit-client';
-import { createMeetingMedia, createMeetingPictureInPicture, meetingGridGeometry, meetingStageLayout } from '../../scripts/meeting-harmony/room.mjs';
+import { createMeetingMedia, meetingGridGeometry, meetingStageLayout } from '../../scripts/meeting-harmony/room.mjs';
 
 const rooms = vi.hoisted(() => [] as MockRoom[]);
 vi.mock('livekit-client', async (importOriginal) => {
@@ -77,6 +77,19 @@ describe('Harmony LiveKit room', () => {
     expect(meetingGridGeometry(4, 2)).toEqual({ columns: 2, rows: 2 });
     expect(meetingGridGeometry(5, 3)).toEqual({ columns: 3, rows: 2 });
     expect(meetingGridGeometry(9, 3)).toEqual({ columns: 3, rows: 3 });
+  });
+
+  it('keeps inline participant avatars in the ArkWeb layout without allowing remote image requests', () => {
+    const inline = 'data:image/png;base64,YXZhdGFy';
+    const layout = meetingStageLayout({ members: [
+      { identity: 'inline', name: 'Alice', avatar: inline },
+      { identity: 'remote', name: 'Bob', avatar: 'https://example.test/avatar.png' },
+    ] }, [], undefined, false);
+    expect(layout.details.get('inline')?.avatar).toBe(inline);
+    expect(layout.details.get('remote')?.avatar).toBe('');
+    const page = readFileSync(new URL('../../scripts/meeting-harmony/media.html', import.meta.url), 'utf8');
+    expect(page).toContain('img-src data:');
+    expect(page).toContain('.member-avatar');
   });
 
   it('uses the shared page and focus selection across ArkWeb camera and screen tracks', () => {
@@ -394,79 +407,16 @@ describe('Harmony LiveKit room', () => {
 });
 
 
-describe('Harmony system picture in picture', () => {
-  function fixture(enabled: boolean) {
-    const page = {
-      pictureInPictureEnabled: enabled,
-      pictureInPictureElement: null as object | null,
-      exitPictureInPicture: vi.fn(async () => { page.pictureInPictureElement = null; }),
-    };
-    const button = Object.assign(new EventTarget(), {
-      hidden: true, textContent: 'Picture in picture', setAttribute: vi.fn(),
-    });
-    const onError = vi.fn();
-    const pip = createMeetingPictureInPicture(page, button, onError);
-    function video(videoWidth = 1280) {
-      const candidate = {
-        videoWidth,
-        disablePictureInPicture: false,
-        requestPictureInPicture: vi.fn(async () => { page.pictureInPictureElement = candidate; }),
-      };
-      return candidate;
-    }
-    return { page, button, pip, onError, video };
-  }
-
-  it('only offers picture in picture on capable devices with decoded video', () => {
-    const { page, button, pip, video } = fixture(false);
-    pip.update([video()]);
-    expect(button.hidden).toBe(true);
-    page.pictureInPictureEnabled = true;
-    const loading = video(0);
-    pip.update([loading]);
-    expect(button.hidden).toBe(true);
-    loading.videoWidth = 640;
-    pip.refresh();
-    expect(button.hidden).toBe(false);
-  });
-
-  it('requests the first usable video from the click gesture and closes it when that track ends', async () => {
-    const { page, button, pip, video } = fixture(true);
-    const screen = video(), camera = video();
-    pip.update([screen, camera]);
-    button.dispatchEvent(new Event('click'));
-    expect(screen.requestPictureInPicture).toHaveBeenCalledOnce();
-    expect(camera.requestPictureInPicture).not.toHaveBeenCalled();
-    await waitForOperations();
-    expect(button.setAttribute).toHaveBeenLastCalledWith('aria-pressed', 'true');
-    pip.update([camera]);
-    await waitForOperations();
-    expect(page.exitPictureInPicture).toHaveBeenCalledOnce();
-  });
-
-  it('closes a late picture in picture after its track was removed', async () => {
-    const { page, button, pip, video } = fixture(true);
-    const screen = video();
-    let finish!: () => void;
-    screen.requestPictureInPicture.mockImplementationOnce(() => new Promise(resolve => {
-      finish = () => { page.pictureInPictureElement = screen; resolve(); };
-    }));
-    pip.update([screen]);
-    button.dispatchEvent(new Event('click'));
-    pip.update([]);
-    finish();
-    await waitForOperations();
-    expect(page.exitPictureInPicture).toHaveBeenCalledOnce();
-    expect(button.hidden).toBe(true);
-  });
-
-  it('reports when the platform rejects picture in picture for a live track', async () => {
-    const { button, pip, onError, video } = fixture(true);
-    const camera = video();
-    camera.requestPictureInPicture.mockRejectedValueOnce(new Error('unsupported'));
-    pip.update([camera]);
-    button.dispatchEvent(new Event('click'));
-    await waitForOperations();
-    expect(onError).toHaveBeenCalledOnce();
+describe('Harmony meeting card controls', () => {
+  it('does not expose picture in picture and uses image assets for microphone and raised hand state', () => {
+    const source = readFileSync(new URL('../../scripts/meeting-harmony/room.mjs', import.meta.url), 'utf8');
+    const page = readFileSync(new URL('../../scripts/meeting-harmony/media.html', import.meta.url), 'utf8');
+    expect(source.toLowerCase()).not.toContain('pictureinpicture');
+    expect(page).not.toContain('meeting-pip');
+    expect(source).toContain('microphone-ink.png');
+    expect(source).toContain('microphone-off-ink.png');
+    expect(source).toContain('icon-hand.svg');
+    expect(page).toContain('.member-hand { position: absolute;');
+    expect(page).toContain('top: 8px; left: 8px;');
   });
 });

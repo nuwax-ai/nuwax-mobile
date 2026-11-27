@@ -115,6 +115,7 @@ await mkdir(meeting, { recursive: true });
 await build({
   entryPoints: [`${root}/scripts/meeting-harmony/room.mjs`],
   outfile: `${meeting}/room.js`, bundle: true, format: 'iife', target: 'es2020', minify: true,
+  loader: { '.png': 'dataurl', '.svg': 'dataurl' },
 });
 await copyFile(`${root}/scripts/meeting-harmony/media.html`, `${meeting}/media.html`);
 await writeFile(modulePath, JSON.stringify(config, null, 2) + '\n');

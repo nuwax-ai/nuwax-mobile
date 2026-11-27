@@ -1,4 +1,7 @@
 import { ConnectionState, LogLevel, Room, RoomEvent, Track, setLogLevel } from 'livekit-client';
+import microphoneIcon from '../../static/voip/call-icons/microphone-ink.png';
+import microphoneOffIcon from '../../static/voip/call-icons/microphone-off-ink.png';
+import handIcon from '../../static/images/icon-hand.svg';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -265,63 +268,11 @@ export function createMeetingMedia(post, render) {
     });
   }
 
-  function pictureInPictureFailed() {
-    if (current) post({ type: 'error', id: current.id, error: 'pictureInPicture' });
-  }
-
   function stageTap(identity, thumbnail) {
     if (current) post({ type: 'stageTap', id: current.id, identity, thumbnail });
   }
 
-  return { dispatch, disconnect, startCapture, pictureInPictureFailed, stageTap };
-}
-
-export function createMeetingPictureInPicture(page, button, onError) {
-  let videos = [];
-  let changing = false;
-
-  function candidate() {
-    if (!page.pictureInPictureEnabled) return undefined;
-    return videos.find((video) => video?.videoWidth > 0 && !video.disablePictureInPicture &&
-      typeof video.requestPictureInPicture === 'function');
-  }
-
-  function refresh() {
-    const active = !!page.pictureInPictureElement;
-    button.hidden = !button.textContent || (!active && !candidate());
-    button.setAttribute('aria-pressed', active ? 'true' : 'false');
-  }
-
-  async function toggle() {
-    if (changing) return;
-    const video = candidate();
-    changing = true;
-    try {
-      if (page.pictureInPictureElement) await page.exitPictureInPicture();
-      else if (video) {
-        await video.requestPictureInPicture();
-        if (!videos.includes(video) && page.pictureInPictureElement === video) {
-          await page.exitPictureInPicture();
-        }
-      }
-    } catch {
-      if (videos.includes(video)) onError();
-    } finally {
-      changing = false;
-      refresh();
-    }
-  }
-
-  function update(nextVideos) {
-    videos = nextVideos;
-    if (page.pictureInPictureElement && !videos.includes(page.pictureInPictureElement)) {
-      void page.exitPictureInPicture().catch(() => {});
-    }
-    refresh();
-  }
-
-  button.addEventListener('click', toggle);
-  return { update, refresh };
+  return { dispatch, disconnect, startCapture, stageTap };
 }
 
 export function meetingGridGeometry(count, preferredColumns) {
@@ -342,6 +293,7 @@ export function meetingStageLayout(presentation, cameras, shared, fullscreen) {
       handRaised: member.handRaised === true,
       hostLabel: member.hostLabel || '',
       recording: member.recording === true,
+      avatar: typeof member.avatar === 'string' && member.avatar.startsWith('data:image/') ? member.avatar : '',
     };
     members.set(member.identity, detail.name);
     details.set(member.identity, detail);
@@ -350,13 +302,13 @@ export function meetingStageLayout(presentation, cameras, shared, fullscreen) {
     if (!members.has(participant.identity)) {
       const name = participant.name || participant.identity;
       members.set(participant.identity, name);
-      details.set(participant.identity, { name, micOn: false, handRaised: false, hostLabel: '', recording: false });
+      details.set(participant.identity, { name, micOn: false, handRaised: false, hostLabel: '', recording: false, avatar: '' });
     }
   }
   if (shared && !members.has(shared.participant.identity)) {
     const name = shared.participant.name || shared.participant.identity;
     members.set(shared.participant.identity, name);
-    details.set(shared.participant.identity, { name, micOn: false, handRaised: false, hostLabel: '', recording: false });
+    details.set(shared.participant.identity, { name, micOn: false, handRaised: false, hostLabel: '', recording: false, avatar: '' });
   }
   const main = members.has(presentation.main) ? presentation.main :
     shared?.participant.identity || members.keys().next().value;
@@ -377,7 +329,6 @@ function mount() {
   const confirm = document.querySelector('#start-capture');
   const cancel = document.querySelector('#cancel-capture');
   const actions = document.querySelector('#capture-actions');
-  const pipButton = document.querySelector('#meeting-pip');
   const tracks = new Map();
   const placeholders = new Map();
   let fullscreen = false;
@@ -389,7 +340,11 @@ function mount() {
 
   function createCaption() {
     const caption = document.createElement('figcaption');
-    for (const className of ['member-mic', 'member-name', 'member-hand', 'member-host', 'member-rec']) {
+    const mic = document.createElement('img');
+    mic.className = 'member-mic';
+    mic.alt = '';
+    caption.append(mic);
+    for (const className of ['member-name', 'member-host', 'member-rec']) {
       const label = document.createElement('span');
       label.className = className;
       caption.append(label);
@@ -399,13 +354,39 @@ function mount() {
 
   function updateCaption(caption, identity, fallbackName, details) {
     const detail = details.get(identity) || { name: fallbackName || identity };
-    const [mic, name, hand, host, recording] = caption.children;
-    mic.textContent = detail.micOn ? '●' : '○';
-    mic.classList.toggle('off', !detail.micOn);
+    const [mic, name, host, recording] = caption.children;
+    const micSource = detail.micOn ? microphoneIcon : microphoneOffIcon;
+    if (mic.getAttribute('src') !== micSource) mic.src = micSource;
     name.textContent = detail.name || fallbackName || identity;
-    hand.textContent = detail.handRaised ? '✋' : '';
     host.textContent = detail.hostLabel || '';
     recording.textContent = detail.recording ? 'REC' : '';
+  }
+
+  function createHand() {
+    const hand = document.createElement('img');
+    hand.className = 'member-hand';
+    hand.src = handIcon;
+    hand.alt = '';
+    hand.hidden = true;
+    return hand;
+  }
+
+  function updateHand(hand, identity, details) {
+    hand.hidden = details.get(identity)?.handRaised !== true;
+  }
+
+  function updateAvatar(image, initial, identity, name, details) {
+    const avatar = details.get(identity)?.avatar || '';
+    initial.textContent = [...name][0] || '?';
+    if (!avatar) {
+      image.hidden = true;
+      image.removeAttribute('src');
+      initial.hidden = false;
+      return;
+    }
+    if (image.getAttribute('src') !== avatar) image.src = avatar;
+    image.hidden = false;
+    initial.hidden = true;
   }
 
   function render(nextCameras, nextShared, audio, request) {
@@ -430,24 +411,20 @@ function mount() {
         const media = document.createElement(participant ? 'video' : 'audio');
         media.autoplay = true;
         media.playsInline = true;
-        if (participant) {
-          for (const event of ['loadedmetadata', 'emptied', 'enterpictureinpicture', 'leavepictureinpicture']) {
-            media.addEventListener(event, pip.refresh);
-          }
-        }
         media.classList.toggle('screen-share', track.source === Track.Source.ScreenShare);
         if (participant && track.source === Track.Source.Camera) media.muted = true;
         const element = participant ? document.createElement('figure') : media;
         const caption = participant ? createCaption() : undefined;
+        const hand = participant ? createHand() : undefined;
         if (caption) {
-          element.append(media, caption);
+          element.append(media, hand, caption);
           element.addEventListener('click', () => {
             if (element.parentElement === grid) mediaRoom.stageTap(participant.identity, false);
           });
         }
         track.attach(media);
         container.append(element);
-        tracks.set(track, { media, element, caption });
+        tracks.set(track, { media, element, caption, hand });
       }
     }
     cameras.forEach(({ participant, track }) => attach(track, grid, participant));
@@ -468,6 +445,7 @@ function mount() {
       node.element.hidden = order < 0 || replacedByShare;
       node.element.style.order = order;
       updateCaption(node.caption, participant.identity, participant.name, layout.details);
+      updateHand(node.hand, participant.identity, layout.details);
       if (order >= 0 && !replacedByShare) visualKeys.add(participant.identity);
     }
     if (shared) {
@@ -484,6 +462,7 @@ function mount() {
         node.element.style.order = '';
       }
       updateCaption(node.caption, sharedIdentity, shared.participant.name, layout.details);
+      updateHand(node.hand, sharedIdentity, layout.details);
     }
     for (const [identity, card] of placeholders) {
       if (!activeKeys.includes(identity) || visualKeys.has(identity)) {
@@ -498,16 +477,28 @@ function mount() {
       if (!card) {
         card = document.createElement('figure');
         card.className = 'placeholder';
-        card.append(document.createElement('span'), createCaption());
+        const avatar = document.createElement('img');
+        avatar.className = 'member-avatar';
+        avatar.alt = '';
+        const initial = document.createElement('span');
+        initial.className = 'member-initial';
+        avatar.addEventListener('error', () => {
+          avatar.hidden = true;
+          initial.hidden = false;
+        });
+        card.append(avatar, initial, createHand(), createCaption());
         card.addEventListener('click', () => mediaRoom.stageTap(identity, false));
         grid.append(card);
         placeholders.set(identity, card);
       }
-      card.firstElementChild.textContent = [...name][0] || '?';
+      updateAvatar(card.children[0], card.children[1], identity, name, layout.details);
       updateCaption(card.lastElementChild, identity, name, layout.details);
+      updateHand(card.children[2], identity, layout.details);
       card.style.order = order;
     }
-    const nextThumbSnapshot = layout.thumbs ? JSON.stringify([layout.main, [...layout.members]]) : '';
+    const nextThumbSnapshot = layout.thumbs ? JSON.stringify([
+      layout.main, [...layout.members], [...layout.details].map(([identity, detail]) => [identity, detail.avatar]),
+    ]) : '';
     if (nextThumbSnapshot !== thumbSnapshot) {
       thumbSnapshot = nextThumbSnapshot;
       thumbs.replaceChildren();
@@ -515,7 +506,15 @@ function mount() {
         for (const [identity, name] of layout.members) {
           const button = document.createElement('button');
           button.type = 'button';
-          button.textContent = [...(name || identity)][0] || '?';
+          const avatar = document.createElement('img');
+          avatar.alt = '';
+          const initial = document.createElement('span');
+          avatar.addEventListener('error', () => {
+            avatar.hidden = true;
+            initial.hidden = false;
+          });
+          button.append(avatar, initial);
+          updateAvatar(avatar, initial, identity, name || identity, layout.details);
           button.setAttribute('aria-label', name || identity);
           button.setAttribute('aria-pressed', identity === layout.main ? 'true' : 'false');
           button.addEventListener('click', () => mediaRoom.stageTap(identity, true));
@@ -534,12 +533,6 @@ function mount() {
     stage.classList.toggle('fullscreen', fullscreen);
     stage.classList.toggle('solo', layout.members.size <= 1);
     stage.classList.toggle('focused', presentation.focused === true);
-    const visibleCameras = cameras.filter(({ participant }) => activeKeys.includes(participant.identity) &&
-      !(layout.sharedInGrid && participant.identity === sharedIdentity));
-    const remoteCameras = visibleCameras.filter(({ track }) => !track.isLocal);
-    const localCameras = visibleCameras.filter(({ track }) => track.isLocal);
-    pip.update([...((layout.sharedVisible || layout.sharedInGrid) ? [shared] : []), ...remoteCameras, ...localCameras]
-      .map(({ track }) => tracks.get(track).media));
   }
 
   share.addEventListener('click', () => {
@@ -547,11 +540,6 @@ function mount() {
     renderLayout();
   });
   const mediaRoom = createMeetingMedia((event) => window.NuwaxMeeting?.postMessage(JSON.stringify(event)), render);
-  const pip = createMeetingPictureInPicture(document, pipButton, mediaRoom.pictureInPictureFailed);
-  function setPictureInPictureLabel(label) {
-    pipButton.textContent = label;
-    pip.refresh();
-  }
   function setStagePresentation(raw) {
     presentation = JSON.parse(raw);
     renderLayout();
@@ -560,7 +548,7 @@ function mount() {
   cancel.addEventListener('click', () => {
     if (capture) mediaRoom.dispatch({ type: 'cancelShare', id: capture.id, shareId: capture.shareId });
   });
-  window.meetingMedia = { ...mediaRoom, setPictureInPictureLabel, setStagePresentation };
+  window.meetingMedia = { ...mediaRoom, setStagePresentation };
   window.addEventListener('pagehide', mediaRoom.disconnect);
 }
 

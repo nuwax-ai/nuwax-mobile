@@ -8,6 +8,7 @@ import { BusinessError } from '@kit.BasicServicesKit'
 import { EntryVoipBackgroundTask } from './EntryVoipBackgroundTask.ets'
 
 export const meetingAsset = 'nuwax-meeting/media.html'
+export const meetingScriptAsset = 'nuwax-meeting/room.js'
 // The reserved HTTPS origin provides a secure context for WebRTC capture.
 const mediaOrigin = 'https://nuwax-meeting.invalid'
 const mediaURL = mediaOrigin + '/media.html'
@@ -119,12 +120,11 @@ export class MeetingStageSession {
     return tap
   }
 
-  static attach(context: common.UIAbilityContext, pipLabel: string): MeetingStageMount {
+  static attach(context: common.UIAbilityContext): MeetingStageMount {
     MeetingStageSession.mount?.detach()
     MeetingStageSession.stageTap = ''
     const host = MeetingStageSession.host ?? new MeetingStageHost(context)
     MeetingStageSession.host = host
-    host.setPictureInPictureLabel(pipLabel)
     MeetingStageSession.nextMountId += 1
     const mount = new MeetingStageMount(MeetingStageSession.nextMountId, host)
     MeetingStageSession.mount = mount
@@ -434,7 +434,6 @@ export class MeetingStageHost {
   screenSupported: boolean = false
   private context: common.UIAbilityContext
   private stage: BuilderNode<[MeetingStageHost]> | undefined
-  private pipLabel: string = ''
   private stagePresentation: string = ''
   leaving: Promise<boolean> | undefined
   private leavingId: number = -1
@@ -461,21 +460,12 @@ export class MeetingStageHost {
     }
   }
 
-  setPictureInPictureLabel(label: string): void {
-    this.pipLabel = label
-    if (this.ready) this.controller.runJavaScript('window.meetingMedia.setPictureInPictureLabel(' + JSON.stringify(label) + ')').catch(() => {})
-  }
-
   setStagePresentation(presentation: string): void {
     this.stagePresentation = presentation
     if (this.ready && presentation.length > 0) {
       this.controller.runJavaScript('window.meetingMedia.setStagePresentation(' +
         JSON.stringify(presentation) + ')').catch(() => {})
     }
-  }
-
-  closePictureInPicture(): void {
-    if (this.ready) this.controller.runJavaScript('if (document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {})').catch(() => {})
   }
 
   dispose(): void {
@@ -531,7 +521,6 @@ export class MeetingStageHost {
       this.ready = result === '1' || result === '2'
       this.screenSupported = result === '2'
       if (this.ready) {
-        this.setPictureInPictureLabel(this.pipLabel)
         this.setStagePresentation(this.stagePresentation)
         MeetingStageSession.flush()
       } else MeetingStageSession.error = 'connect'
@@ -558,7 +547,7 @@ export class MeetingStageHost {
   assetResponse(url: string): WebResourceResponse {
     const html = this.isAsset(url, 'media.html')
     if (!html && !this.isAsset(url, 'room.js')) return this.assetNotFound()
-    const file = html ? meetingAsset : 'nuwax-meeting/room.js'
+    const file = html ? meetingAsset : meetingScriptAsset
     try {
       const bytes = this.context.resourceManager.getRawFileContentSync(file)
       const response = new WebResourceResponse()
@@ -632,8 +621,11 @@ export class MeetingStageHost {
         const on = command.on === true
         const routing = audio.getAudioManager().getRoutingManager()
         await routing.setCommunicationDevice(audio.CommunicationDeviceType.SPEAKER, on)
-        // Harmony can resolve setCommunicationDevice before the route query reflects the new device.
-        // Confirm it for a short bounded period instead of reporting a successful switch as failed.
+        if (MeetingStageSession.host !== this || MeetingStageSession.id !== command.id ||
+            !MeetingStageSession.isConnected()) return
+        // The route query can lag behind setCommunicationDevice. The system call resolving is the
+        // success boundary; the retries only converge to the actual output device for the icon.
+        MeetingStageSession.speaker = on
         for (let attempt = 0; attempt < 4; attempt++) {
           if (MeetingStageSession.host !== this || MeetingStageSession.id !== command.id ||
               !MeetingStageSession.isConnected()) return
@@ -641,7 +633,7 @@ export class MeetingStageHost {
           if (attempt < 3) await new Promise<void>((resolve) => { setTimeout(resolve, 80) })
         }
         if (MeetingStageSession.host === this && MeetingStageSession.id === command.id &&
-            MeetingStageSession.isConnected()) MeetingStageSession.controlError = command.type
+            MeetingStageSession.isConnected()) MeetingStageSession.speaker = on
         return
       }
       if (command.on && (command.type === 'mic' || command.type === 'camera')) {
@@ -663,7 +655,13 @@ export class MeetingStageHost {
   readSpeaker(): boolean {
     try {
       const routing = audio.getAudioManager().getRoutingManager()
-      MeetingStageSession.speaker = routing.isCommunicationDeviceActiveSync(audio.CommunicationDeviceType.SPEAKER)
+      const devices = routing.getPreferredOutputDeviceForRendererInfoSync({
+        usage: audio.StreamUsage.STREAM_USAGE_VIDEO_COMMUNICATION,
+        rendererFlags: 0,
+      })
+      const type = devices[0]?.deviceType
+      if (type == null) return false
+      MeetingStageSession.speaker = type === audio.DeviceType.SPEAKER
       return true
     } catch (_) {
       return false
@@ -700,7 +698,6 @@ export class MeetingStageMount extends NodeController {
   aboutToAppear(): void {
     if (!this.attached) return
     this.host.keepActive()
-    this.host.closePictureInPicture()
   }
 
   detach(): void {

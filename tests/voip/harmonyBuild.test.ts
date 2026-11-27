@@ -24,7 +24,7 @@ async function fixture(abilitySource: string, qa = false, meetingBuilt = true) {
   for (const source of [
     'scripts/prepare-voip-harmony.mjs', 'scripts/voip-native/harmony', 'scripts/meeting-harmony',
     'scripts/voip-native/harmony-voice-qa', 'scripts/voip-native/prepare-business-qa.mjs',
-    'static/voip/call-icons', 'uni_modules/nuwax-voip/utssdk/app-harmony',
+    'static/voip/call-icons', 'static/images/icon-hand.svg', 'uni_modules/nuwax-voip/utssdk/app-harmony',
   ]) {
     mkdirSync(dirname(join(directory, source)), { recursive: true });
     cpSync(join(root, source), join(directory, source), { recursive: true });
@@ -98,8 +98,11 @@ export default class EntryAbility extends UniEntryAbility {
     expect(abilities[0].backgroundModes).toBeUndefined();
     expect(source).not.toContain('HarmonyNativeVoice');
     expect(source).not.toContain('handleMeetingBackgroundWant');
-    expect(project.read(`${entry}/resources/rawfile/nuwax-meeting/media.html`)).toContain('src="room.js"');
-    expect(project.read(`${entry}/resources/rawfile/nuwax-meeting/room.js`)).toContain('NuwaxMeeting');
+    const meetingMedia = project.read(`${entry}/resources/rawfile/nuwax-meeting/media.html`);
+    const meetingRoom = project.read(`${entry}/resources/rawfile/nuwax-meeting/room.js`);
+    expect(meetingMedia).toBe(readFileSync(join(root, 'harmony-configs/entry/src/main/resources/rawfile/nuwax-meeting/media.html'), 'utf8'));
+    expect(meetingRoom).toBe(readFileSync(join(root, 'harmony-configs/entry/src/main/resources/rawfile/nuwax-meeting/room.js'), 'utf8'));
+    expect(meetingRoom).toContain('NuwaxMeeting');
     const bridge = project.read(`${plugin}/utssdk/app-harmony/VoipBridge.ets`);
     expect(bridge).not.toContain('if (config.apiBaseUrl !== VoipBridge.nativeVoiceTestOrigin) return');
   });

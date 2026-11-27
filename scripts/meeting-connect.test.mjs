@@ -22,7 +22,7 @@ function forPlatform(raw, platform) {
 function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = false, preCode = '0', tokenCode = '0',
   apiOrigin = 'https://testagent.xspaceagi.com', screenSupported = true, nativeShareAccepted = true,
   nativeShareStopping = false, claimResult = async () => ({ code: '0' }),
-  preData = { active: true } } = {}) {
+  preData = { active: true }, tokenData = {} } = {}) {
   const raw = readFileSync(new URL('../utils/meeting/meetingMedia.uts', import.meta.url), 'utf8');
   const source = forPlatform(raw, platform).replace(/^import[\s\S]*?;\s*$/gm, '');
   const timers = new Map(), logs = [], operations = [], presentations = [], navigations = [];
@@ -42,7 +42,9 @@ function harness({ platform = 'APP-IOS', configThrows = false, coreThrows = fals
     JSON: { parseObject: JSON.parse, parse: JSON.parse, stringify: JSON.stringify },
     SUCCESS_CODE: '0', eventBus: { emit() {} },
     apiImMeetingPublicRoomSafe: async () => ({ code: preCode, data: preData }),
-    apiImMeetingIssueToken: async () => ({ code: tokenCode, data: { wsUrl: 'wss://rtc.test', token: 'secret-seat-token' } }),
+    apiImMeetingIssueToken: async () => ({ code: tokenCode, data: {
+      wsUrl: 'wss://rtc.test', token: 'secret-seat-token', ...tokenData,
+    } }),
     apiResCode: response => response.code,
     apiResData: response => response.data,
     meetingShareReleaseEndpoint: room => 'https://api.test/rooms/' + room + '/release',
@@ -599,6 +601,27 @@ test('鸿蒙会议媒体在正式环境启用，设备开关跟随实际采集�
   h.media({ mic: true, shared: true }); h.api.meetingMediaReconcile();
   assert.equal(h.api.meetingMediaState().micOn, true);
   assert.equal(h.api.meetingMediaState().visualMedia, true);
+});
+
+test('鸿蒙令牌时长立即进入页面快照，连接后启动结束与成员联动', async () => {
+  const startedAt = 1795741200000;
+  const h = harness({ platform: 'APP-HARMONY', tokenData: {
+    plannedDurationSec: 7200, meetingStartedAt: startedAt,
+  } });
+  await h.join();
+  assert.equal(h.api.meetingMediaState().plannedDurationSec, 7200);
+  assert.equal(h.api.meetingMediaState().meetingStartedAtMs, startedAt);
+
+  const page = forPlatform(readFileSync(
+    new URL('../subpackages/pages/im-meeting/im-meeting-room.uvue', import.meta.url), 'utf8'), 'APP-HARMONY');
+  const refresh = page.slice(page.indexOf('function refreshMediaState(): void {'), page.indexOf('/** 返回页时保留会议', page.indexOf('function refreshMediaState(): void {')));
+  assert.equal(refresh.includes('plannedSec.value = snap.plannedDurationSec;'), true);
+  assert.equal(refresh.includes('meetingStartedAtMs.value = snap.meetingStartedAtMs;'), true);
+  assert.equal(refresh.includes('startRemoteEndWatch();'), true);
+  assert.equal(refresh.includes('startPeoplePoll();'), true);
+  assert.equal(page.includes('return userId.length > 0 && isInMeetingUser(userId);'), true);
+  assert.equal(page.includes('if (failCode == "IM_50006")'), true);
+  assert.equal(page.includes('if (ended == 2 || ended == 3)'), true);
 });
 
 test('鸿蒙整屏共享交给原生释放，业务层停止时不重复释放', async () => {

@@ -20,7 +20,7 @@ function nativeStage() {
   };
   const routing = {
     setCommunicationDevice: vi.fn(async (_device: number, _active: boolean) => {}),
-    isCommunicationDeviceActiveSync: vi.fn((_device: number) => true),
+    getPreferredOutputDeviceForRendererInfoSync: vi.fn((_info: object) => [{ deviceType: 1 }]),
   };
   const destroy = vi.fn();
   const request = vi.fn().mockResolvedValue({ responseCode: 200, result: '{"code":"0000"}' });
@@ -50,6 +50,8 @@ function nativeStage() {
     EntryVoipBackgroundTask: task,
     audio: {
       CommunicationDeviceType: { SPEAKER: 2 },
+      DeviceType: { SPEAKER: 1, EARPIECE: 2 },
+      StreamUsage: { STREAM_USAGE_VIDEO_COMMUNICATION: 3 },
       getAudioManager: () => ({ getRoutingManager: () => routing }),
     },
     abilityAccessCtrl: { createAtManager: () => permissions },
@@ -78,6 +80,8 @@ describe('Harmony meeting native stage', () => {
     expect(stage).toContain('host: MeetingStageHost = MeetingStageSession.host as MeetingStageHost');
     expect(stage).toContain('assetResponse(url: string): WebResourceResponse');
     expect(stage).not.toContain('assetResponse(url: string): WebResourceResponse | null');
+    expect(plugin).toContain('getRawFileContentSync(meetingAsset)');
+    expect(plugin).toContain('getRawFileContentSync(meetingScriptAsset)');
     expect(plugin).toContain('export function createVideoView(): any { return {}; }');
     expect(plugin).toContain('export function createRemoteVideoView(_identity: string): any { return {}; }');
   });
@@ -100,13 +104,18 @@ describe('Harmony meeting native stage', () => {
     expect(page).toContain('meetingMediaSetSpeaker(!speakerOn.value);');
     expect(page).not.toContain('mr-harmony-roster');
     expect(page).toContain('hostLabel: tile.host ? t("Mobile.Meeting.hostBadge") : ""');
+    expect(page).toContain('resolveHarmonyMeetingAvatarData(raw)');
+    expect(page).toContain('let avatar = tile.avatar.indexOf("data:image/") == 0 ? tile.avatar : ""');
+    expect(page).toContain('if (tile.isMe && harmonyMyAvatar.value.indexOf("data:image/") == 0)');
+    expect(page).not.toContain('title = t("Mobile.Meeting.mediaHarmonyPending")');
+    expect(media).toContain('// ArkWeb 首次建页/连房比原生 SDK 慢，令牌时长先到就先刷新顶部限时提示。');
     expect(mic).not.toContain('mediaHarmonyPending');
     expect(camera).not.toContain('mediaHarmonyPending');
   });
 
   it('reuses the same ArkWeb frame and connection after minimizing and returning', () => {
     const { session, stages } = nativeStage();
-    const initial = session.attach({}, 'Picture in picture');
+    const initial = session.attach({});
     const frame = initial.makeNode({});
     const host = session.host;
     host.ready = true;
@@ -119,24 +128,23 @@ describe('Harmony meeting native stage', () => {
     expect(initial.makeNode({})).toBeNull();
     expect(host.controller.onActive).toHaveBeenCalledOnce();
     expect(stages[0].dispose).not.toHaveBeenCalled();
-    const restored = session.attach({}, 'Picture in picture');
+    const restored = session.attach({});
     expect(restored.makeNode({})).toBe(frame);
     expect(stages).toHaveLength(1);
     expect(session.id).toBe(roomGeneration);
     expect(session.isConnected()).toBe(true);
-    expect(host.controller.runJavaScript.mock.calls.map(([command]: [string]) => command))
-      .toEqual(["window.meetingMedia.setPictureInPictureLabel(\"Picture in picture\")"]);
+    expect(host.controller.runJavaScript).not.toHaveBeenCalled();
   });
 
   it('ignores a stale unmount and disposes the detached frame only after the SDK confirms leave', async () => {
     const { session, stages } = nativeStage();
-    const old = session.attach({}, 'Picture in picture');
+    const old = session.attach({});
     const frame = old.makeNode({});
     const host = session.host;
     host.ready = true;
     session.connect('wss://room.test', 'seat-token');
     session.connection = 'connected';
-    const restored = session.attach({}, 'Picture in picture');
+    const restored = session.attach({});
 
     expect(session.releaseView(old.id)).toBe(false);
     expect(restored.makeNode({})).toBe(frame);
@@ -156,7 +164,7 @@ describe('Harmony meeting native stage', () => {
 
   it('disposes a page that never joined a room', () => {
     const { session, stages } = nativeStage();
-    const mount = session.attach({}, 'Picture in picture');
+    const mount = session.attach({});
     mount.makeNode({});
     expect(session.releaseView(mount.id)).toBe(true);
     expect(stages[0].dispose).toHaveBeenCalledOnce();
@@ -170,7 +178,7 @@ const releaseURL = 'https://testagent.xspaceagi.com/api/instant-message/meetings
 function connectedStage() {
   const fixture = nativeStage();
   const { session } = fixture;
-  const mount = session.attach({ applicationInfo: { accessTokenId: 43 } }, 'Picture in picture');
+  const mount = session.attach({ applicationInfo: { accessTokenId: 43 } });
   mount.makeNode({});
   session.host.ready = true;
   session.host.screenSupported = true;
@@ -186,7 +194,7 @@ function settle() {
 
 it('reads back the system speaker state after switching and on return to the foreground', async () => {
   const { session, routing } = connectedStage();
-  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
+  routing.getPreferredOutputDeviceForRendererInfoSync.mockReturnValue([{ deviceType: 2 }]);
   session.control('speaker', false);
   await settle();
   expect(routing.setCommunicationDevice).toHaveBeenCalledWith(2, false);
@@ -194,29 +202,29 @@ it('reads back the system speaker state after switching and on return to the for
   expect(session.controlError).toBe('');
 
   session.setAppForeground(false);
-  routing.isCommunicationDeviceActiveSync.mockReturnValue(true);
+  routing.getPreferredOutputDeviceForRendererInfoSync.mockReturnValue([{ deviceType: 1 }]);
   session.setAppForeground(true);
   expect(session.speaker).toBe(true);
 
-  routing.isCommunicationDeviceActiveSync.mockReturnValue(true);
+  routing.getPreferredOutputDeviceForRendererInfoSync.mockReturnValue([{ deviceType: 1 }]);
   session.control('speaker', true);
   await settle();
   expect(session.speaker).toBe(true);
 });
 
-it('waits for a delayed Harmony speaker route update before reporting failure', async () => {
+it('waits for a delayed Harmony speaker route update without reporting a false failure', async () => {
   const { session, routing, timers } = connectedStage();
   session.control('speaker', false);
   await settle();
   expect(session.controlError).toBe('');
   expect(timers.size).toBe(1);
 
-  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
+  routing.getPreferredOutputDeviceForRendererInfoSync.mockReturnValue([{ deviceType: 2 }]);
   Array.from(timers.values())[0].callback();
   await settle();
   expect(session.speaker).toBe(false);
   expect(session.controlError).toBe('');
-  expect(routing.isCommunicationDeviceActiveSync).toHaveBeenCalledTimes(2);
+  expect(routing.getPreferredOutputDeviceForRendererInfoSync).toHaveBeenCalledTimes(2);
 });
 
 it('ignores a speaker change that finishes after the room generation changes', async () => {
@@ -229,10 +237,9 @@ it('ignores a speaker change that finishes after the room generation changes', a
 
   void session.disconnect();
   session.connect('wss://other-room.test', 'new-token');
-  routing.isCommunicationDeviceActiveSync.mockReturnValue(false);
   finish();
   await settle();
-  expect(routing.isCommunicationDeviceActiveSync).not.toHaveBeenCalled();
+  expect(routing.getPreferredOutputDeviceForRendererInfoSync).not.toHaveBeenCalled();
   expect(session.speaker).toBe(true);
   expect(session.controlError).toBe('');
 });

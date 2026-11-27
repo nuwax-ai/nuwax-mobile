@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Validate an exported broadcast extension and stage DCloud cloud-build inputs.
 
-Does not compile, sign, upload, or replace a custom base. Profiles/binaries and
-environment-specific configuration are ignored by Git.
+Does not compile, sign, upload, or replace a custom base. Git tracks the shared
+configuration and ignores profiles and signed binaries.
 """
 import argparse
 import json

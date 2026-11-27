@@ -53,7 +53,7 @@ python3 scripts/ios-broadcast/prepare_cloud.py \
 - 插件 `UTS.entitlements` 中的 App Group（保留其他已有 entitlement）
 - `nativeResources/ios/ios-extension.json` 与扩展描述文件（保留其他扩展配置）
 
-上述签名产物及环境配置均被 Git 忽略，不能因缺少这些文件就宣称其他机器的云基座已配置完成。脚本不会下载、生成或替换 `unpackage/debug` 的现有基座。升级 App 版本后须重新导出同版本扩展。
+仓库维护 `Info.plist`、`UTS.entitlements` 和 `ios-extension.json`。已签名的 `.appex` 和 `.mobileprovision` 由 Git 忽略，打包机器通过受控渠道准备。升级 App 版本后须重新导出同版本扩展。
 
 6. HBuilderX 用已包含 App Group 的主 App 描述文件重新云打自定义基座，并分别验证正式发行包。安装新基座后才能使用新增插件导出。仅重新打一个未嵌入扩展的基座仍不能整屏共享；此时先明确说明范围，用户可选择“共享本应用”恢复应用内共享，或取消。切到桌面及其他 App 的内容仍需广播扩展，不能把此备用路径视为整屏共享已配置。
 

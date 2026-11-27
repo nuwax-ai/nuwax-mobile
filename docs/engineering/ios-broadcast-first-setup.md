@@ -54,19 +54,20 @@ open MeetingBroadcast.xcworkspace
 
 ## 3. 接入 HBuilderX 云打包
 
-回到仓库根目录执行，使用真实绝对路径：
+把已签名的 `MeetingBroadcast.appex`、主 App 和广播扩展的 `.mobileprovision`，以及对应的开发证书集中放在 `nuwax-signing/ios-app`。在仓库根目录运行：
 
 ```bash
+signing_dir="${NUWAX_SIGNING_HOME:-$HOME/workspace/nuwax-signing}/ios-app"
 python3 scripts/ios-broadcast/prepare_cloud.py \
-  --appex '/实际导出目录/MeetingBroadcast.appex' \
+  --appex "$signing_dir/MeetingBroadcast.appex" \
   --bundle-id com.nuwax.app \
   --app-group group.com.nuwax.app \
-  --host-profile '/受控目录/主App.mobileprovision' \
-  --extension-profile '/受控目录/广播扩展.mobileprovision'
+  --host-profile "$signing_dir/NuwaxAppProfile.mobileprovision" \
+  --extension-profile "$signing_dir/NuwaxBroadcastDevelopment.mobileprovision"
 pnpm meeting:ios:check
 ```
 
-准备脚本校验并放置扩展、Info.plist 两个配置键、UTS.entitlements 和 `nativeResources/ios/ios-extension.json`；这些本机签名文件已被 Git 忽略。换机器必须重新准备，不能靠拉代码获得。
+仓库包含 `Info.plist`、`UTS.entitlements` 和 `nativeResources/ios/ios-extension.json`，记录扩展 ID、App Group 和描述文件名。准备脚本校验签名材料，把扩展和扩展描述文件复制到 HBuilderX 读取的项目路径，同时同步配置。项目内的签名副本由 Git 忽略，换打包机器时从受控渠道同步 `nuwax-signing/ios-app` 中适用于该次构建的材料。
 
 HBuilderX 云打包选择新主 App 描述文件和匹配证书，生成自定义基座。先完成插件代码修改再打包，避免包内原生源码版本与热更新资源不一致。正式发行包也需要同样嵌入扩展。
 

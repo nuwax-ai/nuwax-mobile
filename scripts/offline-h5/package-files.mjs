@@ -28,6 +28,11 @@ export function sourceFingerprint(root) {
   walk(root);
   return digest(JSON.stringify(entries));
 }
+/** macOS 会在资源目录留下 .DS_Store。清单可能记下它，云打包又不会打进 APK。 */
+function isDesktopStoreFile(resourcePath) {
+  return resourcePath === '.DS_Store' || resourcePath.endsWith('/.DS_Store');
+}
+
 export function verifyResourcePackage(directory) {
   directory = path.resolve(directory);
   const manifest = JSON.parse(fs.readFileSync(path.join(directory, RESOURCE_LIST_FILE), 'utf8'));
@@ -36,8 +41,7 @@ export function verifyResourcePackage(directory) {
   for (const entry of manifest.files) {
     if (typeof entry.path !== 'string' || entry.path.includes('\\') || entry.path.startsWith('/') || entry.path.split('/').some(p => !p || p === '.' || p === '..') || seen.has(entry.path)) throw new Error('Invalid resource path');
     seen.add(entry.path);
-    // macOS 会把 .DS_Store 写进清单，云打包又会丢掉点开头的文件。这个文件不参与校验。
-    if (entry.path === '.DS_Store' || entry.path.endsWith('/.DS_Store')) continue;
+    if (isDesktopStoreFile(entry.path)) continue;
     const file = path.join(directory, entry.path);
     for (let current = file; current !== path.resolve(directory); current = path.dirname(current)) {
       if (fs.lstatSync(current).isSymbolicLink()) throw new Error(`Symlink resource: ${entry.path}`);

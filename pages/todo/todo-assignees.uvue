@@ -1,0 +1,666 @@
+<template>
+  <view class="assignee-page">
+    <view class="assignee">
+      <custom-nav-bar :title="titleText" className="border-b" hasSafetyZone :show-back="true">
+        <template #right>
+          <text class="assignee__action" @click="openPicker">{{ t("Mobile.Discover.todoAssigneeAdd") }}</text>
+        </template>
+      </custom-nav-bar>
+
+      <scroll-view class="assignee__list" direction="vertical" :show-scrollbar="false">
+        <view v-for="(person, index) in people" :key="index" class="assignee__row">
+          <image
+            v-if="person.avatar.length > 0"
+            class="assignee__avatar"
+            :src="person.avatar"
+            mode="aspectFill"
+            @error="clearPersonAvatar(index)"
+          />
+          <view v-else class="assignee__avatar" :style="avatarStyle(person.name)">
+            <text class="assignee__letters">{{ avatarLetters(person.name) }}</text>
+          </view>
+          <text class="assignee__name">{{ person.name }}</text>
+          <view class="assignee__remove" @click="removeAt(index)">
+            <text class="assignee__remove-text">×</text>
+          </view>
+        </view>
+      </scroll-view>
+    </view>
+    <uni-modal-popup
+      ref="pickerPopupRef"
+      position="bottom"
+      height="100%"
+      :show-header="false"
+      :body-scroll="false"
+      :mask-click="false"
+      :round="false"
+      :close-on-slide-down="false"
+      :z-index="1200"
+    >
+    <view class="picker">
+        <custom-nav-bar :title="t('Mobile.Discover.todoAssigneePickTitle')" className="border-b" hasSafetyZone :show-back="false">
+          <template #left>
+            <text class="assignee__action assignee__action--cancel" @click="closePicker">{{ t("Mobile.Common.cancel") }}</text>
+          </template>
+          <template #right>
+            <text class="assignee__action" @click="confirmPicker">{{ confirmText }}</text>
+          </template>
+        </custom-nav-bar>
+        <view class="picker__search">
+          <view class="picker__search-box">
+            <svg-icon name="icon-Search" size="16" unit="px" color="#9999a3" />
+            <input
+              class="picker__search-input"
+              v-model="query"
+              :placeholder="t('Mobile.Discover.todoAssigneePickSearch')"
+              placeholder-style="color:#b0aebc;font-size:15px;"
+            />
+          </view>
+        </view>
+        <scroll-view
+          class="picker__list"
+          direction="vertical"
+          :show-scrollbar="false"
+          @scrolltolower="loadMoreCandidates"
+        >
+          <view v-if="loading && candidates.length == 0" class="picker__state">
+            <text class="picker__state-text">{{ t("Mobile.Page.loadingMore") }}</text>
+          </view>
+          <view v-else-if="loadFailed && candidates.length == 0" class="picker__state" @click="reloadCandidates">
+            <text class="picker__state-text">{{ t("Mobile.Message.loadFailed") }}</text>
+          </view>
+          <view v-else-if="filteredCandidates.length == 0" class="picker__state">
+            <text class="picker__state-text">{{ hasQuery ? t("Mobile.Discover.todoAssigneePickNoMatch") : t("Mobile.Discover.todoAssigneePickEmpty") }}</text>
+          </view>
+          <view
+            v-for="(candidate, candidateIndex) in filteredCandidates"
+            :key="candidateIndex"
+            class="picker__row"
+            @click="toggleCandidate(candidate.userId)"
+          >
+            <image
+              v-if="candidate.avatar.length > 0"
+              class="assignee__avatar"
+              :src="candidate.avatar"
+              mode="aspectFill"
+              @error="clearCandidateAvatar(candidate.userId)"
+            />
+            <view v-else class="assignee__avatar" :style="avatarStyle(candidate.name)">
+              <text class="assignee__letters">{{ avatarLetters(candidate.name) }}</text>
+            </view>
+            <text class="picker__name">{{ candidate.name }}</text>
+            <view :class="candidate.picked ? 'picker__check picker__check--on' : 'picker__check'">
+              <svg-icon v-if="candidate.picked" name="icon-Check" size="12" unit="px" color="#ffffff" />
+            </view>
+          </view>
+        </scroll-view>
+    </view>
+    </uni-modal-popup>
+  </view>
+</template>
+
+<script setup lang="uts">
+  import { computed, onMounted, ref, type ComponentPublicInstance } from "vue";
+  import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
+  import { avatarGradient } from "@/pages/message/components/im-row-helpers.uts";
+  import { getMyUserIdSync } from "@/utils/imNoticeBar";
+  import { apiImConversations } from "@/servers/im";
+  import { SUCCESS_CODE } from "@/constants/codes.constants";
+  import { apiResCode, apiResData } from "@/utils/apiResponse";
+  import {
+    TodoAssignee,
+    getTodoAssignees,
+    setTodoAssignees,
+  } from "./components/todo-assignee-draft.uts";
+
+  const t = (key: string): string => translateFn(key, emptyI18nParams(), "");
+
+  /** 系统通知合成主体，不进责任人候选。 */
+  const SYSTEM_NOTIFY_SUBJECT_ID = "1999999999999";
+
+  class TodoCandidate {
+    userId: string = "";
+    name: string = "";
+    avatar: string = "";
+    picked: boolean = false;
+  }
+
+  const people = ref<TodoAssignee[]>([]);
+  const pickerPopupRef = ref<any | null>(null);
+  const query = ref<string>("");
+  const candidates = ref<TodoCandidate[]>([]);
+  const loading = ref<boolean>(false);
+  const loadingMore = ref<boolean>(false);
+  const loadFailed = ref<boolean>(false);
+  let nextCursor = "";
+  let hasMore = false;
+  let loadToken = 0;
+
+  const titleText = computed((): string => {
+    const params = new Map<string, string | number>();
+    params.set("count", people.value.length);
+    return translateFn("Mobile.Discover.todoAssigneeTitle", toI18nParams(params), "");
+  });
+
+  const pickedCount = computed((): number => {
+    let count = 0;
+    const list = candidates.value;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].picked) {
+        count++;
+      }
+    }
+    return count;
+  });
+
+  const confirmText = computed((): string => {
+    const params = new Map<string, string | number>();
+    params.set("count", pickedCount.value);
+    return translateFn("Mobile.Discover.todoAssigneePickConfirm", toI18nParams(params), "");
+  });
+
+  const hasQuery = computed((): boolean => {
+    return query.value.trim().length > 0;
+  });
+
+  const filteredCandidates = computed((): TodoCandidate[] => {
+    const keyword = query.value.trim();
+    const source = candidates.value;
+    if (keyword.length == 0) {
+      return source;
+    }
+    const next: TodoCandidate[] = [];
+    for (let i = 0; i < source.length; i++) {
+      if (source[i].name.indexOf(keyword) >= 0) {
+        next.push(source[i]);
+      }
+    }
+    return next;
+  });
+
+  function avatarLetters(name: string): string {
+    let cleaned = "";
+    for (let i = 0; i < name.length; i++) {
+      const ch = name.charAt(i);
+      if (ch != " " && ch != "\t" && ch != "　") {
+        cleaned += ch;
+      }
+    }
+    if (cleaned.length == 0) {
+      return "#";
+    }
+    let hasCjk = false;
+    for (let i = 0; i < cleaned.length; i++) {
+      const code = cleaned.charCodeAt(i);
+      if (code != null && code > 0x2e80) {
+        hasCjk = true;
+        break;
+      }
+    }
+    if (hasCjk && cleaned.length >= 2) {
+      return cleaned.substring(cleaned.length - 2);
+    }
+    return cleaned.charAt(0);
+  }
+
+  function avatarStyle(name: string): string {
+    return "background-image: " + avatarGradient(name) + ";";
+  }
+
+  function publish(): void {
+    setTodoAssignees(people.value);
+  }
+
+  onMounted(() => {
+    people.value = getTodoAssignees();
+  });
+
+  function removeAt(index: number): void {
+    const next: TodoAssignee[] = [];
+    const current = people.value;
+    for (let i = 0; i < current.length; i++) {
+      if (i != index) {
+        next.push(current[i]);
+      }
+    }
+    people.value = next;
+    publish();
+  }
+
+  function clearPersonAvatar(index: number): void {
+    const next: TodoAssignee[] = [];
+    const current = people.value;
+    for (let i = 0; i < current.length; i++) {
+      const item = new TodoAssignee();
+      item.userId = current[i].userId;
+      item.name = current[i].name;
+      item.avatar = i == index ? "" : current[i].avatar;
+      item.self = current[i].self;
+      next.push(item);
+    }
+    people.value = next;
+    publish();
+  }
+
+  function readText(obj: UTSJSONObject, key: string): string {
+    const raw = obj[key];
+    if (raw == null) {
+      return "";
+    }
+    const text = `${raw}`.trim();
+    if (text == "null" || text == "undefined") {
+      return "";
+    }
+    return text;
+  }
+
+  function asObject(raw: any | null): UTSJSONObject | null {
+    if (raw == null) {
+      return null;
+    }
+    try {
+      const text = JSON.stringify(raw);
+      if (text == null || text.length == 0 || text.charAt(0) != "{") {
+        return null;
+      }
+      return JSON.parse(text) as UTSJSONObject | null;
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function asRecordList(raw: any | null): UTSJSONObject[] {
+    const list: UTSJSONObject[] = [];
+    if (raw == null) {
+      return list;
+    }
+    try {
+      const text = JSON.stringify(raw);
+      if (text == null || text.length == 0 || text.charAt(0) != "[") {
+        return list;
+      }
+      const parsed = JSON.parse(text) as UTSJSONObject[] | null;
+      if (parsed == null) {
+        return list;
+      }
+      for (let i = 0; i < parsed.length; i++) {
+        const row = parsed[i];
+        if (row != null) {
+          list.push(row);
+        }
+      }
+    } catch (_e) {
+      return list;
+    }
+    return list;
+  }
+
+  function includesUser(userId: string): boolean {
+    const current = people.value;
+    for (let i = 0; i < current.length; i++) {
+      if (current[i].userId == userId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function appendCandidates(records: UTSJSONObject[]): void {
+    const next: TodoCandidate[] = [];
+    const current = candidates.value;
+    for (let i = 0; i < current.length; i++) {
+      next.push(current[i]);
+    }
+    for (let i = 0; i < records.length; i++) {
+      const row = records[i];
+      const convType = parseFloat(readText(row, "convType").length > 0 ? readText(row, "convType") : "1");
+      if (convType != 1) {
+        continue;
+      }
+      const userId = readText(row, "peerUserId");
+      if (userId.length == 0 || userId == SYSTEM_NOTIFY_SUBJECT_ID) {
+        continue;
+      }
+      let duplicated = false;
+      for (let n = 0; n < next.length; n++) {
+        if (next[n].userId == userId) {
+          duplicated = true;
+          break;
+        }
+      }
+      if (duplicated) {
+        continue;
+      }
+      const peerName = readText(row, "peerName");
+      const name = readText(row, "name");
+      const peerAvatar = readText(row, "peerAvatar");
+      const avatar = readText(row, "avatar");
+      const item = new TodoCandidate();
+      item.userId = userId;
+      item.name = peerName.length > 0 ? peerName : name;
+      if (item.name.length == 0) {
+        item.name = userId;
+      }
+      item.avatar = peerAvatar.length > 0 ? peerAvatar : avatar;
+      item.picked = includesUser(userId);
+      next.push(item);
+    }
+    candidates.value = next;
+  }
+
+  async function fetchCandidates(reset: boolean): Promise<void> {
+    if (reset) {
+      loadToken++;
+      nextCursor = "";
+      hasMore = false;
+      candidates.value = [];
+      loading.value = true;
+      loadFailed.value = false;
+    } else if (!hasMore || loadingMore.value || loading.value) {
+      return;
+    } else {
+      loadingMore.value = true;
+    }
+    const token = loadToken;
+    const cursor = reset ? "" : nextCursor;
+    try {
+      const res = await apiImConversations(cursor, 50);
+      if (token != loadToken) {
+        return;
+      }
+      if (apiResCode(res) != SUCCESS_CODE) {
+        loadFailed.value = candidates.value.length == 0;
+        return;
+      }
+      const dataObj = asObject(apiResData<any>(res));
+      if (dataObj == null) {
+        hasMore = false;
+        nextCursor = "";
+        return;
+      }
+      appendCandidates(asRecordList(dataObj["records"]));
+      const cursorText = readText(dataObj, "nextCursor");
+      nextCursor = cursorText;
+      hasMore = cursorText.length > 0;
+    } catch (_e) {
+      if (token == loadToken) {
+        loadFailed.value = candidates.value.length == 0;
+      }
+    } finally {
+      if (token == loadToken) {
+        loading.value = false;
+        loadingMore.value = false;
+      }
+    }
+  }
+
+  function callPicker(methodName: string): void {
+    const proxy = pickerPopupRef.value as ComponentPublicInstance | null;
+    if (proxy == null) {
+      return;
+    }
+    proxy.$callMethod(methodName);
+  }
+
+  function openPicker(): void {
+    query.value = "";
+    callPicker("open");
+    fetchCandidates(true);
+  }
+
+  function closePicker(): void {
+    loadToken++;
+    query.value = "";
+    callPicker("close");
+  }
+
+  function reloadCandidates(): void {
+    fetchCandidates(true);
+  }
+
+  function loadMoreCandidates(): void {
+    fetchCandidates(false);
+  }
+
+  function toggleCandidate(userId: string): void {
+    const next: TodoCandidate[] = [];
+    const current = candidates.value;
+    for (let i = 0; i < current.length; i++) {
+      const item = new TodoCandidate();
+      item.userId = current[i].userId;
+      item.name = current[i].name;
+      item.avatar = current[i].avatar;
+      item.picked = current[i].userId == userId ? !current[i].picked : current[i].picked;
+      next.push(item);
+    }
+    candidates.value = next;
+  }
+
+  function clearCandidateAvatar(userId: string): void {
+    const next: TodoCandidate[] = [];
+    const current = candidates.value;
+    for (let i = 0; i < current.length; i++) {
+      const item = new TodoCandidate();
+      item.userId = current[i].userId;
+      item.name = current[i].name;
+      item.avatar = current[i].userId == userId ? "" : current[i].avatar;
+      item.picked = current[i].picked;
+      next.push(item);
+    }
+    candidates.value = next;
+  }
+
+  function confirmPicker(): void {
+    const selected = candidates.value;
+    const kept: TodoAssignee[] = [];
+    const current = people.value;
+    for (let i = 0; i < current.length; i++) {
+      const person = current[i];
+      let inList = false;
+      let stillPicked = false;
+      for (let j = 0; j < selected.length; j++) {
+        if (selected[j].userId == person.userId) {
+          inList = true;
+          stillPicked = selected[j].picked;
+          break;
+        }
+      }
+      if (!inList || stillPicked) {
+        kept.push(person);
+      }
+    }
+    for (let i = 0; i < selected.length; i++) {
+      if (!selected[i].picked) {
+        continue;
+      }
+      let exists = false;
+      for (let j = 0; j < kept.length; j++) {
+        if (kept[j].userId == selected[i].userId) {
+          exists = true;
+          break;
+        }
+      }
+      if (exists) {
+        continue;
+      }
+      const item = new TodoAssignee();
+      item.userId = selected[i].userId;
+      item.name = selected[i].name;
+      item.avatar = selected[i].avatar;
+      const myId = getMyUserIdSync();
+      item.self = myId.length > 0 && item.userId == myId;
+      kept.push(item);
+    }
+    const resolved: TodoAssignee[] = [];
+    let selfHasId = false;
+    for (let i = 0; i < kept.length; i++) {
+      if (kept[i].self && kept[i].userId.length > 0) {
+        selfHasId = true;
+        break;
+      }
+    }
+    for (let i = 0; i < kept.length; i++) {
+      const blankSelf = selfHasId && kept[i].self && kept[i].userId.length == 0;
+      if (!blankSelf) {
+        resolved.push(kept[i]);
+      }
+    }
+    people.value = resolved;
+    publish();
+    closePicker();
+  }
+</script>
+
+<style lang="scss" scoped>
+  .assignee-page {
+    flex: 1;
+    height: 100%;
+  }
+
+  .assignee {
+    flex: 1;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    background-color: #ffffff;
+    position: relative;
+  }
+
+  .assignee__action {
+    font-size: 16px;
+    color: #3370ff;
+    line-height: 22px;
+    padding: 8px 0;
+  }
+
+  .assignee__action--cancel {
+    color: #1f2329;
+  }
+
+  .assignee__list,
+  .picker__list {
+    flex: 1;
+    height: 0;
+  }
+
+  .assignee__row,
+  .picker__row {
+    height: 64px;
+    padding: 0 16px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    border-bottom-width: 1px;
+    border-bottom-style: solid;
+    border-bottom-color: #f2f3f5;
+  }
+
+  .assignee__avatar {
+    width: 40px;
+    height: 40px;
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .assignee__letters {
+    font-size: 13px;
+    color: #ffffff;
+    font-weight: 500;
+  }
+
+  .assignee__name,
+  .picker__name {
+    flex: 1;
+    margin-left: 12px;
+    font-size: 16px;
+    color: #1f2329;
+  }
+
+  .assignee__remove {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+  }
+
+  .assignee__remove-text {
+    font-size: 22px;
+    color: #c9cdd4;
+    line-height: 22px;
+  }
+
+  .assignee-page :deep(.uni-modal-popup__panel) {
+    max-height: 100%;
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  .picker {
+    height: 100%;
+    background-color: #ffffff;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .picker__search {
+    height: 56px;
+    padding: 0 16px;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .picker__search-box {
+    flex: 1;
+    height: 36px;
+    padding: 0 12px;
+    border-radius: 8px;
+    background-color: #f5f6f8;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .picker__search-input {
+    flex: 1;
+    margin-left: 8px;
+    font-size: 15px;
+    color: #1f2329;
+  }
+
+  .picker__state {
+    padding: 48px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .picker__state-text {
+    font-size: 14px;
+    color: #86909c;
+    text-align: center;
+  }
+
+  .picker__check {
+    width: 22px;
+    height: 22px;
+    border-radius: 11px;
+    border-width: 1px;
+    border-style: solid;
+    border-color: #c9cdd4;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .picker__check--on {
+    background-color: #3370ff;
+    border-color: #3370ff;
+  }
+</style>

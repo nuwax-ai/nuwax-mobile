@@ -212,11 +212,11 @@ test('temporary chat still waits for tenant/captcha configuration and missing co
 test('history failures expose retry, and a timed-out or disposed page cannot consume a late response', async () => {
   const code = transformSync(chatFunction('handlePageLoad') + '\nhandlePageLoad;', { loader: 'ts' }).code;
   for (const result of ['network', 'non-success', 'empty-data', 'late-timeout', 'disposed', 'query-timeout', 'query-disposed']) {
-    const data = Object.fromEntries(['agentInfo', 'agentName', 'messageList', 'conversationInfo', 'conversationId', 'agentId'].map(key => [key, { value: null }]));
+    const data = Object.fromEntries(['agentInfo', 'agentName', 'messageList', 'conversationInfo', 'conversationId', 'agentId', 'currentConversationRequestId'].map(key => [key, { value: null }]));
     let failures = 0, rendered = 0, drafts = 0;
     const scope = {
       data, parseInt, pendingDraftReadyConversationId: 0, pendingDraftAgentMode: { value: '' },
-      service: { resetSandboxSelection() {} },
+      service: { resetSandboxSelection() {}, currentStreamGeneration: 0, isCurrentStream: () => true },
       captureProjectChatQuery() {}, projectChatPType: '', beginResidentChatBoot() {}, finishResidentChatBoot() {},
       eventBindConfig: { value: null }, parseEventBindConfig: () => ({}), props: { isTempChat: false },
       chatPageDisposed: result === 'disposed', chatPageBootFailed: { value: result === 'late-timeout' },
@@ -359,6 +359,7 @@ test('resource verification rejects altered files and symlink directories', () =
       fs.writeFileSync(path.join(dir, name), name);
       return { path: name, bytes: Buffer.byteLength(name), sha256: digest(name) };
     });
+    files.push({ path: 'static/.DS_Store', bytes: 8, sha256: digest('store') });
     fs.writeFileSync(path.join(dir, RESOURCE_LIST_FILE), JSON.stringify({ schemaVersion: 1, protocolVersion: 1, files, resourceVersion: digest(JSON.stringify(files)) }));
     verifyResourcePackage(dir);
     fs.writeFileSync(path.join(dir, 'index.html'), 'broken');

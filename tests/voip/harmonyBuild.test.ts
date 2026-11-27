@@ -98,7 +98,8 @@ export default class EntryAbility extends UniEntryAbility {
     expect(abilities[0].backgroundModes).toBeUndefined();
     expect(source).not.toContain('HarmonyNativeVoice');
     expect(source).not.toContain('handleMeetingBackgroundWant');
-    expect(() => project.read(`${entry}/resources/rawfile/nuwax-meeting/media.html`)).toThrow();
+    expect(project.read(`${entry}/resources/rawfile/nuwax-meeting/media.html`)).toContain('src="room.js"');
+    expect(project.read(`${entry}/resources/rawfile/nuwax-meeting/room.js`)).toContain('NuwaxMeeting');
     const bridge = project.read(`${plugin}/utssdk/app-harmony/VoipBridge.ets`);
     expect(bridge).not.toContain('if (config.apiBaseUrl !== VoipBridge.nativeVoiceTestOrigin) return');
   });

@@ -109,13 +109,13 @@ for (const locale of ['base', 'en_US', 'zh_CN', 'zh_TW', 'zh_HK']) {
 }
 if (voiceQaLibrary) {
   await stageVoiceQa(project, resolve(voiceQaLibrary), abilityPath, preparedAbility, main);
-  const meeting = `${entry}/resources/rawfile/nuwax-meeting`;
-  await mkdir(meeting, { recursive: true });
-  await build({
-    entryPoints: [`${root}/scripts/meeting-harmony/room.mjs`],
-    outfile: `${meeting}/room.js`, bundle: true, format: 'iife', target: 'es2020', minify: true,
-  });
-  await copyFile(`${root}/scripts/meeting-harmony/media.html`, `${meeting}/media.html`);
 } else await writeFile(abilityPath, preparedAbility);
+const meeting = `${entry}/resources/rawfile/nuwax-meeting`;
+await mkdir(meeting, { recursive: true });
+await build({
+  entryPoints: [`${root}/scripts/meeting-harmony/room.mjs`],
+  outfile: `${meeting}/room.js`, bundle: true, format: 'iife', target: 'es2020', minify: true,
+});
+await copyFile(`${root}/scripts/meeting-harmony/media.html`, `${meeting}/media.html`);
 await writeFile(modulePath, JSON.stringify(config, null, 2) + '\n');
 console.log('[voip] Harmony native call host / push / background configuration regenerated');

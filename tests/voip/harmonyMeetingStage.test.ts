@@ -98,6 +98,8 @@ describe('Harmony meeting native stage', () => {
     expect(camera).toContain('meetingMediaSetCamera(next);');
     expect(page).toContain('meetingMediaSwitchCamera();');
     expect(page).toContain('meetingMediaSetSpeaker(!speakerOn.value);');
+    expect(page).not.toContain('mr-harmony-roster');
+    expect(page).toContain('hostLabel: tile.host ? t("Mobile.Meeting.hostBadge") : ""');
     expect(mic).not.toContain('mediaHarmonyPending');
     expect(camera).not.toContain('mediaHarmonyPending');
   });

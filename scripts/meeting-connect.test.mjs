@@ -585,11 +585,11 @@ test('原生页面切换尚未完成：短间隔轮询不能重复压入会议�
 });
 
 
-test('鸿蒙会议媒体仅在测试环境启用，设备开关跟随实际采集状态', async () => {
+test('鸿蒙会议媒体在正式环境启用，设备开关跟随实际采集状态', async () => {
   const production = harness({ platform: 'APP-HARMONY', apiOrigin: 'https://agent.nuwax.com' });
   await production.join();
-  assert.equal(production.api.meetingMediaSupported(), false);
-  assert.deepEqual(production.operations, []);
+  assert.equal(production.api.meetingMediaSupported(), true);
+  assert.deepEqual(production.operations, ['connect']);
 
   const h = harness({ platform: 'APP-HARMONY' });
   await h.join(); h.complete();
@@ -786,51 +786,14 @@ test('鸿蒙最后一位参会者只在退席确认后请求结束空房', async
   }
 });
 
-test('鸿蒙会中成员头像复用授权解析，不覆盖已经更新的席位头像', async () => {
-  const room = '123456789';
-  const first = { key: 'test:member:harmonyos', avatarRaw: '/api/f/old', avatar: '', avatarFailed: true };
-  let resolved;
-  const context = vm.createContext({
-    roomRaw: { value: room }, tiles: { value: [first] }, pageUnmounted: false,
-    meetingMediaActiveRoom: () => room,
-    resolveImAvatarDisplay: (raw, size) => {
-      assert.equal(raw, '/api/f/old');
-      assert.equal(size, 96);
-      return new Promise(resolve => { resolved = resolve; });
-    },
-  });
-  const source = pageFunctions(['resolveHarmonyParticipantAvatars'], 'APP-HARMONY');
-  vm.runInContext(stripTypeScriptTypes(source), context);
-  context.resolveHarmonyParticipantAvatars([first]);
-  const fresh = { ...first, avatarRaw: '/api/f/new' };
-  context.tiles.value = [fresh];
-  resolved('file://sandbox/old.png');
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(fresh.avatar, '');
-
-  const refreshed = { ...first };
-  context.tiles.value = [refreshed];
-  context.resolveHarmonyParticipantAvatars([first]);
-  resolved('file://sandbox/old.png');
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(refreshed.avatar, 'file://sandbox/old.png');
-  assert.equal(refreshed.avatarFailed, false);
-});
-
-test('鸿蒙切换会场后丢弃在途成员头像结果', async () => {
-  const current = { key: 'test:member:harmonyos', avatarRaw: '/api/f/current', avatar: '', avatarFailed: false };
-  let resolved;
-  const context = vm.createContext({
-    roomRaw: { value: '123456789' }, tiles: { value: [current] }, pageUnmounted: false,
-    meetingMediaActiveRoom: () => context.roomRaw.value,
-    resolveImAvatarDisplay: () => new Promise(resolve => { resolved = resolve; }),
-  });
-  vm.runInContext(stripTypeScriptTypes(pageFunctions(['resolveHarmonyParticipantAvatars'], 'APP-HARMONY')), context);
-  context.resolveHarmonyParticipantAvatars([current]);
-  context.roomRaw.value = '987654321';
-  resolved('file://sandbox/photo.png');
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(current.avatar, '');
+test('鸿蒙媒体舞台在卡片内承载成员状态且不再重复渲染横向名单', () => {
+  const page = readFileSync(new URL('../subpackages/pages/im-meeting/im-meeting-room.uvue', import.meta.url), 'utf8');
+  assert.equal(page.includes('mr-harmony-roster'), false);
+  const start = page.indexOf('const harmonyStagePresentation = computed(');
+  const presentation = page.slice(start, page.indexOf('// #endif', start));
+  for (const field of ['micOn:', 'handRaised:', 'hostLabel:', 'recording:']) {
+    assert.equal(presentation.includes(field), true);
+  }
 });
 
 test('iOS 会议音频按钮以原生启麦和路由的实际结果为准', async () => {

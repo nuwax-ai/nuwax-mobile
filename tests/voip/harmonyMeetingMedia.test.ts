@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RoomEvent, Track } from 'livekit-client';
-import { createMeetingMedia, createMeetingPictureInPicture, meetingStageLayout } from '../../scripts/meeting-harmony/room.mjs';
+import { createMeetingMedia, createMeetingPictureInPicture, meetingGridGeometry, meetingStageLayout } from '../../scripts/meeting-harmony/room.mjs';
 
 const rooms = vi.hoisted(() => [] as MockRoom[]);
 vi.mock('livekit-client', async (importOriginal) => {
@@ -67,8 +67,16 @@ describe('Harmony LiveKit room', () => {
     const page = readFileSync(new URL('../../scripts/meeting-harmony/media.html', import.meta.url), 'utf8');
     expect(page).toContain('video { position: absolute; inset: 0;');
     expect(page).toContain('object-fit: cover !important;');
-    expect(page).toContain('#share video { object-fit: contain !important; }');
-    expect(page).not.toMatch(/#cameras \{[^}]*padding:/);
+    expect(page).toContain('video.screen-share { object-fit: contain !important; }');
+    expect(page).toContain('#cameras > figure { height: auto; }');
+  });
+
+  it('matches the native mobile grid geometry for two through nine participants', () => {
+    expect(meetingGridGeometry(2, 1)).toEqual({ columns: 1, rows: 2 });
+    expect(meetingGridGeometry(3, 2)).toEqual({ columns: 2, rows: 2 });
+    expect(meetingGridGeometry(4, 2)).toEqual({ columns: 2, rows: 2 });
+    expect(meetingGridGeometry(5, 3)).toEqual({ columns: 3, rows: 2 });
+    expect(meetingGridGeometry(9, 3)).toEqual({ columns: 3, rows: 3 });
   });
 
   it('uses the shared page and focus selection across ArkWeb camera and screen tracks', () => {
@@ -76,9 +84,13 @@ describe('Harmony LiveKit room', () => {
     const cameras = [{ participant: members[0] }];
     const shared = { participant: members[1] };
     expect(meetingStageLayout({ mode: 'grid', members, grid: ['c', 'a'] }, cameras, shared, false))
-      .toMatchObject({ visible: ['c', 'a'], thumbs: false, sharedVisible: true });
+      .toMatchObject({ visible: ['c', 'a'], thumbs: false, sharedVisible: false, sharedInGrid: false });
+    expect(meetingStageLayout({ mode: 'grid', members, grid: ['c', 'b', 'a'] }, cameras, shared, false))
+      .toMatchObject({ visible: ['c', 'b', 'a'], thumbs: false, sharedVisible: false, sharedInGrid: true });
     expect(meetingStageLayout({ mode: 'grid', members, main: 'a', focused: true }, cameras, shared, false))
       .toMatchObject({ visible: ['a'], thumbs: false, sharedVisible: false });
+    expect(meetingStageLayout({ mode: 'grid', members, main: 'b', focused: true }, cameras, shared, false))
+      .toMatchObject({ visible: [], thumbs: false, sharedVisible: true });
     for (const mode of ['topThumbs', 'sideThumbs']) {
       expect(meetingStageLayout({ mode, members, main: 'b' }, cameras, shared, false))
         .toMatchObject({ visible: [], thumbs: true, sharedVisible: true });

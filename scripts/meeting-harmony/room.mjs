@@ -324,24 +324,49 @@ export function createMeetingPictureInPicture(page, button, onError) {
   return { update, refresh };
 }
 
+export function meetingGridGeometry(count, preferredColumns) {
+  const cells = Math.max(0, count || 0);
+  const columns = cells <= 1 ? 1 : Math.max(1, Math.min(3, preferredColumns || 2, cells));
+  return { columns, rows: Math.max(1, Math.ceil(cells / columns)) };
+}
+
 export function meetingStageLayout(presentation, cameras, shared, fullscreen) {
   const mode = presentation.mode || 'grid';
-  const members = new Map((presentation.members || []).map(member => [member.identity, member.name]));
+  const members = new Map();
+  const details = new Map();
+  for (const member of presentation.members || []) {
+    if (!member?.identity) continue;
+    const detail = {
+      name: member.name || member.identity,
+      micOn: member.micOn === true,
+      handRaised: member.handRaised === true,
+      hostLabel: member.hostLabel || '',
+      recording: member.recording === true,
+    };
+    members.set(member.identity, detail.name);
+    details.set(member.identity, detail);
+  }
   for (const { participant } of cameras) {
-    if (!members.has(participant.identity)) members.set(participant.identity, participant.name || participant.identity);
+    if (!members.has(participant.identity)) {
+      const name = participant.name || participant.identity;
+      members.set(participant.identity, name);
+      details.set(participant.identity, { name, micOn: false, handRaised: false, hostLabel: '', recording: false });
+    }
   }
   if (shared && !members.has(shared.participant.identity)) {
-    members.set(shared.participant.identity, shared.participant.name || shared.participant.identity);
+    const name = shared.participant.name || shared.participant.identity;
+    members.set(shared.participant.identity, name);
+    details.set(shared.participant.identity, { name, micOn: false, handRaised: false, hostLabel: '', recording: false });
   }
   const main = members.has(presentation.main) ? presentation.main :
     shared?.participant.identity || members.keys().next().value;
   const gridMode = mode === 'grid' && !presentation.focused;
-  const sharedVisible = !!shared && (fullscreen || gridMode || (!presentation.focused && shared.participant.identity === main));
-  const primaryShare = sharedVisible && !gridMode;
   const tiles = gridMode ? (presentation.grid?.length ? presentation.grid : [...members.keys()]) : [main];
-  const visible = fullscreen || primaryShare ? [] : tiles.filter(identity => members.has(identity));
+  const sharedInGrid = !!shared && gridMode && tiles.includes(shared.participant.identity);
+  const sharedVisible = !!shared && (fullscreen || (!gridMode && shared.participant.identity === main));
+  const visible = fullscreen || sharedVisible ? [] : tiles.filter(identity => members.has(identity));
   const thumbs = !fullscreen && (mode === 'topThumbs' || mode === 'sideThumbs');
-  return { mode, members, main, visible, thumbs, sharedVisible };
+  return { mode, members, details, main, visible, thumbs, sharedVisible, sharedInGrid };
 }
 
 function mount() {
@@ -361,6 +386,27 @@ function mount() {
   let cameras = [];
   let shared;
   let thumbSnapshot = '';
+
+  function createCaption() {
+    const caption = document.createElement('figcaption');
+    for (const className of ['member-mic', 'member-name', 'member-hand', 'member-host', 'member-rec']) {
+      const label = document.createElement('span');
+      label.className = className;
+      caption.append(label);
+    }
+    return caption;
+  }
+
+  function updateCaption(caption, identity, fallbackName, details) {
+    const detail = details.get(identity) || { name: fallbackName || identity };
+    const [mic, name, hand, host, recording] = caption.children;
+    mic.textContent = detail.micOn ? '●' : '○';
+    mic.classList.toggle('off', !detail.micOn);
+    name.textContent = detail.name || fallbackName || identity;
+    hand.textContent = detail.handRaised ? '✋' : '';
+    host.textContent = detail.hostLabel || '';
+    recording.textContent = detail.recording ? 'REC' : '';
+  }
 
   function render(nextCameras, nextShared, audio, request) {
     cameras = nextCameras;
@@ -389,19 +435,20 @@ function mount() {
             media.addEventListener(event, pip.refresh);
           }
         }
+        media.classList.toggle('screen-share', track.source === Track.Source.ScreenShare);
         if (participant && track.source === Track.Source.Camera) media.muted = true;
         const element = participant ? document.createElement('figure') : media;
-        const caption = participant ? document.createElement('figcaption') : undefined;
+        const caption = participant ? createCaption() : undefined;
         if (caption) {
           element.append(media, caption);
-          if (container === grid) element.addEventListener('click', () => mediaRoom.stageTap(participant.identity, false));
+          element.addEventListener('click', () => {
+            if (element.parentElement === grid) mediaRoom.stageTap(participant.identity, false);
+          });
         }
         track.attach(media);
         container.append(element);
         tracks.set(track, { media, element, caption });
       }
-      const caption = tracks.get(track).caption;
-      if (caption) caption.textContent = participant.name || participant.identity;
     }
     cameras.forEach(({ participant, track }) => attach(track, grid, participant));
     if (shared) attach(shared.track, share, shared.participant);
@@ -412,34 +459,52 @@ function mount() {
   function renderLayout() {
     const layout = meetingStageLayout(presentation, cameras, shared, fullscreen);
     const activeKeys = layout.visible;
-    const cameraKeys = new Set();
+    const visualKeys = new Set();
+    const sharedIdentity = shared?.participant.identity;
     for (const { participant, track } of cameras) {
       const node = tracks.get(track);
       const order = activeKeys.indexOf(participant.identity);
-      cameraKeys.add(participant.identity);
-      node.element.hidden = order < 0;
+      const replacedByShare = layout.sharedInGrid && participant.identity === sharedIdentity;
+      node.element.hidden = order < 0 || replacedByShare;
       node.element.style.order = order;
+      updateCaption(node.caption, participant.identity, participant.name, layout.details);
+      if (order >= 0 && !replacedByShare) visualKeys.add(participant.identity);
+    }
+    if (shared) {
+      const node = tracks.get(shared.track);
+      if (layout.sharedInGrid) {
+        const order = activeKeys.indexOf(sharedIdentity);
+        grid.append(node.element);
+        node.element.hidden = order < 0;
+        node.element.style.order = order;
+        if (order >= 0) visualKeys.add(sharedIdentity);
+      } else {
+        share.append(node.element);
+        node.element.hidden = false;
+        node.element.style.order = '';
+      }
+      updateCaption(node.caption, sharedIdentity, shared.participant.name, layout.details);
     }
     for (const [identity, card] of placeholders) {
-      if (!activeKeys.includes(identity) || cameraKeys.has(identity)) {
+      if (!activeKeys.includes(identity) || visualKeys.has(identity)) {
         card.remove();
         placeholders.delete(identity);
       }
     }
     for (const [order, identity] of activeKeys.entries()) {
-      if (cameraKeys.has(identity)) continue;
+      if (visualKeys.has(identity)) continue;
       const name = layout.members.get(identity) || identity;
       let card = placeholders.get(identity);
       if (!card) {
         card = document.createElement('figure');
         card.className = 'placeholder';
-        card.append(document.createElement('span'), document.createElement('figcaption'));
+        card.append(document.createElement('span'), createCaption());
         card.addEventListener('click', () => mediaRoom.stageTap(identity, false));
         grid.append(card);
         placeholders.set(identity, card);
       }
       card.firstElementChild.textContent = [...name][0] || '?';
-      card.lastElementChild.textContent = name;
+      updateCaption(card.lastElementChild, identity, name, layout.details);
       card.style.order = order;
     }
     const nextThumbSnapshot = layout.thumbs ? JSON.stringify([layout.main, [...layout.members]]) : '';
@@ -460,16 +525,20 @@ function mount() {
     }
     thumbs.hidden = !layout.thumbs;
     grid.hidden = activeKeys.length === 0;
-    const columns = activeKeys.length <= 1 ? 1 : Math.min(3, presentation.columns || 2);
-    grid.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
+    const geometry = meetingGridGeometry(activeKeys.length, presentation.columns);
+    grid.style.gridTemplateColumns = `repeat(${geometry.columns}, minmax(0, 1fr))`;
+    grid.style.gridTemplateRows = `repeat(${geometry.rows}, minmax(0, 1fr))`;
     stage.dataset.layout = layout.mode;
     share.hidden = !layout.sharedVisible;
     stage.classList.toggle('shared', layout.sharedVisible);
     stage.classList.toggle('fullscreen', fullscreen);
-    const visibleCameras = cameras.filter(({ participant }) => activeKeys.includes(participant.identity));
+    stage.classList.toggle('solo', layout.members.size <= 1);
+    stage.classList.toggle('focused', presentation.focused === true);
+    const visibleCameras = cameras.filter(({ participant }) => activeKeys.includes(participant.identity) &&
+      !(layout.sharedInGrid && participant.identity === sharedIdentity));
     const remoteCameras = visibleCameras.filter(({ track }) => !track.isLocal);
     const localCameras = visibleCameras.filter(({ track }) => track.isLocal);
-    pip.update([...(layout.sharedVisible ? [shared] : []), ...remoteCameras, ...localCameras]
+    pip.update([...((layout.sharedVisible || layout.sharedInGrid) ? [shared] : []), ...remoteCameras, ...localCameras]
       .map(({ track }) => tracks.get(track).media));
   }
 

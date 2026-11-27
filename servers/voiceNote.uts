@@ -5,34 +5,11 @@ import { ACCESS_TOKEN } from "@/constants/home.constants";
 import { SUCCESS_CODE } from "@/constants/codes.constants";
 import { getApiBaseUrl } from "@/constants/config";
 import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
+import { emptyI18nParams, t } from "@/utils/i18n";
 import { applyBearerAuthorization } from "@/utils/authSession";
 import { applyXClientTypeHeader } from "@/utils/appWebViewDetect";
 import request from "@/servers/useRequest";
 import { pushVoiceNoteDebug } from "@/utils/voice-note/voiceNoteDebugLog.uts";
-
-function logVoiceApi(name: string, state: string, detail: string): void {
-  pushVoiceNoteDebug("接口", name + " " + state + (detail.length > 0 ? " " + detail : ""));
-}
-
-/** 联调要看完整请求体和响应体。序列化失败时退回字符串，避免日志本身抛错。 */
-function payloadText(value: any | null): string {
-  if (value == null) {
-    return "null";
-  }
-  if (typeof value == "string") {
-    const text = `${value}`;
-    return text.length > 0 ? text : "空字符串";
-  }
-  try {
-    const text = JSON.stringify(value);
-    if (text != null && `${text}`.length > 0) {
-      return `${text}`;
-    }
-  } catch (_error) {
-    // 个别端 UTSJSONObject 不能直接序列化。
-  }
-  return `${value}`;
-}
 
 function authHeader(): UTSJSONObject {
   const header = {} as UTSJSONObject;
@@ -57,66 +34,179 @@ function readDataString(data: any | null, key: string): string {
   return `${raw}`;
 }
 
-/** 创建笔记会话，返回 noteId。title 可空，空则由服务端在转写后生成。 */
-export async function apiVoiceNoteCreate(title: string): Promise<string> {
+function isDigitChar(ch: string): boolean {
+  return ch >= "0" && ch <= "9";
+}
+
+function isJsonWs(ch: string): boolean {
+  return ch == " " || ch == "\n" || ch == "\r" || ch == "\t";
+}
+
+/**
+ * 上传响应里的 code 有时是未加引号的 0000。
+ * Android Gson 把前导零当成非法数字，JSON.parse 会直接打出 JsonSyntaxException，catch 拦不住。
+ * 只改写冒号后面的前导零整数，字符串里的内容不动。
+ */
+function quoteLeadingZeroInts(text: string): string {
+  let out = "";
+  let i = 0;
+  let segStart = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text.charAt(i);
+    if (ch == "\"") {
+      i = i + 1;
+      while (i < n) {
+        const sc = text.charAt(i);
+        if (sc == "\\") {
+          i = i + 2;
+          continue;
+        }
+        if (sc == "\"") {
+          i = i + 1;
+          break;
+        }
+        i = i + 1;
+      }
+      continue;
+    }
+    if (ch != ":") {
+      i = i + 1;
+      continue;
+    }
+    i = i + 1;
+    while (i < n && isJsonWs(text.charAt(i))) {
+      i = i + 1;
+    }
+    let j = i;
+    while (j < n && isDigitChar(text.charAt(j))) {
+      j = j + 1;
+    }
+    const digits = j - i;
+    const next = j < n ? text.charAt(j) : "";
+    const leadingZero = digits > 1 && text.charAt(i) == "0" && next != "." && next != "e" && next != "E";
+    if (leadingZero) {
+      out = out + text.substring(segStart, i) + "\"" + text.substring(i, j) + "\"";
+      segStart = j;
+    }
+    i = j;
+  }
+  if (segStart == 0) return text;
+  return out + text.substring(segStart, n);
+}
+
+/**
+ * 解析 uploadFile 的 res.data。
+ * 非对象正文不调用 JSON.parse，避免网关返回纯文本时打出 JsonSyntaxException。
+ */
+function parseUploadBody(raw: any | null): UTSJSONObject | null {
+  if (raw == null) return null;
+  if (typeof raw != "string") {
+    try {
+      const obj = raw as UTSJSONObject;
+      if (obj["code"] != null || obj["data"] != null || obj["message"] != null) return obj;
+    } catch (_obj) {
+      return null;
+    }
+    return null;
+  }
+  let text = `${raw}`.trim();
+  if (text.length == 0) return null;
+  if (text.charCodeAt(0) == 0xfeff) {
+    text = text.substring(1).trim();
+    if (text.length == 0) return null;
+  }
+  const first = text.charAt(0);
+  const last = text.charAt(text.length - 1);
+  const isObject = first == "{" && last == "}";
+  const isArray = first == "[" && last == "]";
+  if (!isObject && !isArray) return null;
+  const normalized = quoteLeadingZeroInts(text);
+  try {
+    const parsed = JSON.parse(normalized);
+    if (parsed == null || typeof parsed != "object") return null;
+    return parsed as UTSJSONObject;
+  } catch (_parse) {
+    return null;
+  }
+}
+
+function readSegmentId(data: any | null): string {
+  if (data == null) return "";
+  if (typeof data == "string" || typeof data == "number") return `${data}`;
+  if (typeof data != "object") return "";
+  const dataObj = data as UTSJSONObject;
+  if (dataObj["segmentId"] == null) return "";
+  return `${dataObj["segmentId"]}`;
+}
+
+/**
+ * 创建笔记会话，返回 noteId。title 可空，空则由服务端在转写后生成。
+ * quiet 为 true 时，失败不弹提示，也不因登录失效跳走。录音过程中必须用 quiet。
+ */
+export async function apiVoiceNoteCreate(title: string, quiet: boolean = false): Promise<string> {
   const body = {} as UTSJSONObject;
   if (title.length > 0) body["title"] = title;
   const path = "POST /api/voice/note/create";
-  logVoiceApi(path, "请求", payloadText(body));
+  pushVoiceNoteDebug("接口", path + " 请求");
   let response: any | null = null;
   try {
     response = await request({
       url: "/api/voice/note/create",
       method: "POST",
       data: body,
+      suppressAuthRedirect: quiet,
+      suppressErrorToast: true,
     });
   } catch (error) {
-    logVoiceApi(path, "异常", `${error}`);
+    pushVoiceNoteDebug("接口", path + " 异常 " + `${error}`);
     throw error;
   }
-  logVoiceApi(path, "响应", payloadText(response));
   const res = asApiRes(response);
+  pushVoiceNoteDebug("接口", path + " 响应 code=" + `${apiResCode(res)}`);
   if (apiResCode(res) != SUCCESS_CODE) {
-    throw new Error(apiResMessage(res));
+    const message = apiResMessage(res);
+    throw new Error(message);
   }
   const noteId = readDataString(apiResData<any>(res), "noteId");
   if (noteId.length == 0) {
-    logVoiceApi(path, "失败", "未返回 noteId");
     throw new Error("创建笔记未返回 noteId");
   }
-  logVoiceApi(path, "成功", "noteId=" + noteId);
   return noteId;
 }
 
-export async function apiVoiceNoteComplete(noteId: string, totalSegments: number): Promise<string> {
+/** quiet 为 true 时，失败不弹提示，也不因登录失效跳走。 */
+export async function apiVoiceNoteComplete(noteId: string, totalSegments: number, quiet: boolean = false): Promise<string> {
   const body = {} as UTSJSONObject;
   body["totalSegments"] = totalSegments;
   const path = "POST /api/voice/note/" + noteId + "/complete";
-  logVoiceApi(path, "请求", payloadText(body));
+  pushVoiceNoteDebug("接口", path + " 请求");
   let response: any | null = null;
   try {
     response = await request({
       url: `/api/voice/note/${noteId}/complete`,
       method: "POST",
       data: body,
+      suppressErrorToast: quiet,
+      suppressAuthRedirect: quiet,
     });
   } catch (error) {
-    logVoiceApi(path, "异常", `${error}`);
+    pushVoiceNoteDebug("接口", path + " 异常 " + `${error}`);
     throw error;
   }
-  logVoiceApi(path, "响应", payloadText(response));
   const res = asApiRes(response);
+  pushVoiceNoteDebug("接口", path + " 响应 code=" + `${apiResCode(res)}`);
   if (apiResCode(res) != SUCCESS_CODE) {
-    throw new Error(apiResMessage(res));
+    const message = apiResMessage(res);
+    throw new Error(message);
   }
   const status = readDataString(apiResData<any>(res), "status");
-  return status.length > 0 ? status : "PROCESSING";
+  const resolved = status.length > 0 ? status : "PROCESSING";
+  return resolved;
 }
 
-/** 按当前状态重试：部分转写失败、文档失败或文档已删除。返回新的 status。 */
+/** 按当前状态重试：部分转写失败、文档失败或文档已删除。返回新的 status。历史页调用，不写入录音页日志。 */
 export async function apiVoiceNoteReprocess(noteId: string): Promise<string> {
-  const path = "POST /api/voice/note/" + noteId + "/reprocess";
-  logVoiceApi(path, "请求", "{}");
   let response: any | null = null;
   try {
     response = await request({
@@ -125,10 +215,8 @@ export async function apiVoiceNoteReprocess(noteId: string): Promise<string> {
       data: {},
     });
   } catch (error) {
-    logVoiceApi(path, "异常", `${error}`);
     throw error;
   }
-  logVoiceApi(path, "响应", payloadText(response));
   const res = asApiRes(response);
   if (apiResCode(res) != SUCCESS_CODE) {
     throw new Error(apiResMessage(res));
@@ -137,12 +225,10 @@ export async function apiVoiceNoteReprocess(noteId: string): Promise<string> {
   return status.length > 0 ? status : "PROCESSING";
 }
 
-/** 回放音频列表。audioUrl 只在本次播放使用，不写入本地缓存。 */
+/** 回放音频列表。audioUrl 只在本次播放使用，不写入本地缓存。历史页调用，不写入录音页日志。 */
 export async function apiVoiceNoteAudioFiles(noteId: string, page: number, pageSize: number): Promise<UTSJSONObject | null> {
   const safePage = page > 0 ? page : 1;
   const size = pageSize > 0 ? pageSize : 50;
-  const path = "GET /api/voice/note/" + noteId + "/audio-files";
-  logVoiceApi(path, "请求", "page=" + safePage.toString() + " pageSize=" + size.toString());
   let response: any | null = null;
   try {
     response = await request({
@@ -150,10 +236,8 @@ export async function apiVoiceNoteAudioFiles(noteId: string, page: number, pageS
       method: "GET",
     });
   } catch (error) {
-    logVoiceApi(path, "异常", `${error}`);
     throw error;
   }
-  logVoiceApi(path, "响应", payloadText(response));
   const res = asApiRes(response);
   if (apiResCode(res) != SUCCESS_CODE) {
     throw new Error(apiResMessage(res));
@@ -163,24 +247,28 @@ export async function apiVoiceNoteAudioFiles(noteId: string, page: number, pageS
   return data as UTSJSONObject;
 }
 
-export async function apiVoiceNoteDelete(noteId: string): Promise<void> {
+/** quiet 为 true 时，失败不弹提示，也不因登录失效跳走。 */
+export async function apiVoiceNoteDelete(noteId: string, quiet: boolean = false): Promise<void> {
   const path = "POST /api/voice/note/" + noteId + "/delete";
-  logVoiceApi(path, "请求", "{}");
+  pushVoiceNoteDebug("接口", path + " 请求");
   let response: any | null = null;
   try {
     response = await request({
       url: `/api/voice/note/${noteId}/delete`,
       method: "POST",
       data: {},
+      suppressErrorToast: quiet,
+      suppressAuthRedirect: quiet,
     });
   } catch (error) {
-    logVoiceApi(path, "异常", `${error}`);
+    pushVoiceNoteDebug("接口", path + " 异常 " + `${error}`);
     throw error;
   }
-  logVoiceApi(path, "响应", payloadText(response));
   const res = asApiRes(response);
+  pushVoiceNoteDebug("接口", path + " 响应 code=" + `${apiResCode(res)}`);
   if (apiResCode(res) != SUCCESS_CODE) {
-    throw new Error(apiResMessage(res));
+    const message = apiResMessage(res);
+    throw new Error(message);
   }
 }
 
@@ -201,8 +289,6 @@ export async function apiVoiceNoteList(lastId: string, limit: number): Promise<U
       body["lastId"] = lastId;
     }
   }
-  const path = "POST /api/voice/note/list";
-  logVoiceApi(path, "请求", payloadText(body));
   let response: any | null = null;
   try {
     response = await request({
@@ -211,10 +297,8 @@ export async function apiVoiceNoteList(lastId: string, limit: number): Promise<U
       data: body,
     });
   } catch (error) {
-    logVoiceApi(path, "异常", `${error}`);
     throw error;
   }
-  logVoiceApi(path, "响应", payloadText(response));
   const res = asApiRes(response);
   if (apiResCode(res) != SUCCESS_CODE) {
     throw new Error(apiResMessage(res));
@@ -226,9 +310,29 @@ export async function apiVoiceNoteList(lastId: string, limit: number): Promise<U
   return data as UTSJSONObject[];
 }
 
+/**
+ * 联动回放的转写帧。历史详情页使用，不写入录音页日志。
+ * data 可能是帧数组，或带 frames / items / segments 的对象。
+ */
+export async function apiVoiceNoteTranscript(noteId: string): Promise<any | null> {
+  let response: any | null = null;
+  try {
+    response = await request({
+      url: `/api/voice/note/${noteId}/transcript`,
+      method: "GET",
+    });
+  } catch (error) {
+    throw error;
+  }
+  const res = asApiRes(response);
+  if (apiResCode(res) != SUCCESS_CODE) {
+    throw new Error(apiResMessage(res));
+  }
+  return apiResData<any>(res);
+}
+
 export async function apiVoiceNoteDetail(noteId: string): Promise<UTSJSONObject | null> {
   const path = "GET /api/voice/note/" + noteId;
-  logVoiceApi(path, "请求", "");
   let response: any | null = null;
   try {
     response = await request({
@@ -236,19 +340,20 @@ export async function apiVoiceNoteDetail(noteId: string): Promise<UTSJSONObject 
       method: "GET",
     });
   } catch (error) {
-    logVoiceApi(path, "异常", `${error}`);
     throw error;
   }
-  logVoiceApi(path, "响应", payloadText(response));
   const res = asApiRes(response);
   if (apiResCode(res) != SUCCESS_CODE) {
-    throw new Error(apiResMessage(res));
+    const message = apiResMessage(res);
+    throw new Error(message);
   }
   const data = apiResData<any>(res);
   if (data == null) {
     return null;
   }
-  return data as UTSJSONObject;
+  const obj = data as UTSJSONObject;
+  const status = obj["status"] != null ? `${obj["status"]}` : "";
+  return obj;
 }
 
 /**
@@ -267,7 +372,7 @@ export function apiVoiceNoteUploadSegment(
   if (durationMs > 0) formData["durationMs"] = `${durationMs}`;
   const url = `${getApiBaseUrl()}/api/voice/note/${noteId}/segment/upload`;
   const path = "POST /api/voice/note/" + noteId + "/segment/upload";
-  logVoiceApi(path, "请求", "file=" + filePath + " form=" + payloadText(formData));
+  pushVoiceNoteDebug("接口", path + " 请求 segment=" + segmentIndex.toString());
   return new Promise<string>((resolve, reject) => {
     uni.uploadFile({
       url: url,
@@ -276,42 +381,24 @@ export function apiVoiceNoteUploadSegment(
       header: authHeader(),
       formData: formData,
       success: (res) => {
-        const statusCode = res.statusCode != null ? `${res.statusCode}` : "";
-        logVoiceApi(path, "响应", "statusCode=" + statusCode + " body=" + payloadText(res.data));
-        try {
-          const raw = res.data;
-          let parsed: UTSJSONObject | null = null;
-          if (typeof raw == "string") {
-            const text = `${raw}`.trim();
-            if (text.length > 0) parsed = JSON.parse(text) as UTSJSONObject;
-          } else if (raw != null) {
-            parsed = raw as UTSJSONObject;
-          }
-          if (parsed == null) {
-            reject(new Error("上传响应为空"));
-            return;
-          }
-          const code = parsed["code"] != null ? `${parsed["code"]}` : "";
-          if (code != SUCCESS_CODE) {
-            const message = parsed["message"] != null ? `${parsed["message"]}` : "分段上传失败";
-            reject(new Error(message));
-            return;
-          }
-          const data = parsed["data"];
-          let segmentId = "";
-          if (data != null) {
-            const dataObj = data as UTSJSONObject;
-            if (dataObj["segmentId"] != null) segmentId = `${dataObj["segmentId"]}`;
-          }
-          resolve(segmentId);
-        } catch (e) {
-          logVoiceApi(path, "异常", `${e}`);
-          reject(e);
+        const parsed = parseUploadBody(res.data);
+        if (parsed == null) {
+          reject(new Error(t("Mobile.VoiceNote.uploadResponseInvalid", emptyI18nParams(), "")));
+          return;
         }
+        const code = parsed["code"] != null ? `${parsed["code"]}` : "";
+        pushVoiceNoteDebug("接口", path + " 响应 code=" + code);
+        if (code != SUCCESS_CODE) {
+          const message = parsed["message"] != null ? `${parsed["message"]}` : "分段上传失败";
+          reject(new Error(message));
+          return;
+        }
+        const segmentId = readSegmentId(parsed["data"]);
+        resolve(segmentId);
       },
       fail: (err) => {
-        logVoiceApi(path, "异常", payloadText(err));
         const message = err != null && err.errMsg != null ? `${err.errMsg}` : "分段上传失败";
+        pushVoiceNoteDebug("接口", path + " 异常 " + message);
         reject(new Error(message));
       },
     });

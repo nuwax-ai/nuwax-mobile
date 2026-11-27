@@ -29,7 +29,9 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { meetingInviteBanner, hideMeetingInviteBanner } from "@/utils/im/meetingInviteBanner";
 import { startForegroundCallAlert, stopForegroundCallAlert } from "@/utils/im/foregroundCallAlert";
-import { apiImMeetingInviteHandled } from "@/servers/imMeeting";
+import { apiImMeetingInviteHandled, apiImMeetingPublicRoomSafe } from "@/servers/imMeeting";
+import { SUCCESS_CODE } from "@/constants/codes.constants";
+import { apiResCode, apiResData } from "@/utils/apiResponse";
 import { imAvatarDisplayUrl, resolveImAvatarDisplay, resolveImAvatarReference } from "@/utils/imAvatarDisplay";
 import { isAuthProtectedFileUrl } from "@/utils/authProtectedFileUrl";
 import { getApiBaseUrl } from "@/constants/config";
@@ -43,6 +45,10 @@ const visible = computed((): boolean => meetingInviteBanner.value != null);
 const joinText = computed((): string => t("Mobile.Meeting.enterRoom", emptyI18nParams(), ""));
 const topPx = ref<number>(8);
 let hideTimer = 0;
+/** 邀请条展示期间轮询会议状态（主持人结束会议后不必等满 60 秒）。 */
+const ROOM_POLL_INTERVAL_MS = 20_000;
+let roomPollTimer = 0;
+let roomPollRequest = 0;
 const alertOwner = "meeting-banner-" + Date.now() + "-" + Math.floor(Math.random() * 1000000);
 
 try {
@@ -92,8 +98,66 @@ function clearTimer(): void {
   }
 }
 
+/** 停掉状态轮询，并让在途请求的结果失效（避免旧房间的响应收掉新邀请条）。 */
+function stopRoomPoll(): void {
+  roomPollRequest++;
+  if (roomPollTimer != 0) {
+    clearInterval(roomPollTimer);
+    roomPollTimer = 0;
+  }
+}
+
+function readRoomStatus(data: UTSJSONObject): number {
+  const raw = data["status"];
+  if (raw == null) return -1;
+  if (typeof raw == "number") return raw as number;
+  const parsed = parseInt(`${raw}`, 10);
+  return isNaN(parsed) ? -1 : parsed;
+}
+
+/**
+ * 邀请条展示期间核对房间状态：主持人结束/取消会议后尽快收起，不必等 60 秒自然到期。
+ *
+ * ★判定口径对齐 PC（MeetingInviteCard）：只有服务端明确返回「已结束(2)/已取消(3)」才收起；
+ *   查询失败、无记录（status 为空）一律保持原样 —— 绝不凭一次网络抖动把还能进的会判成结束。
+ * ★收起时顺手上报 handled，让本账号其它设备（含原生来电通道）一起停铃。
+ * ★轮询只覆盖 App 前台/进程存活的场景；后台熄屏的原生响铃仍以 60 秒过期为准。
+ */
+async function pollRoomStatus(): Promise<void> {
+  // ★身份在发请求前拍快照：请求返回时邀请条可能已经换成另一条，
+  //   不能拿旧房间的状态去收新邀请（watch 的 token 失效要等下一次 tick，可能晚于本回调）。
+  const room = field("roomName");
+  const inviteId = field("inviteId");
+  const convId = field("convId");
+  const msgId = field("msgId");
+  if (room.length == 0) return;
+  const request = roomPollRequest;
+  let status = -1;
+  try {
+    const res = await apiImMeetingPublicRoomSafe(room);
+    if (request != roomPollRequest) return;
+    if (apiResCode(res) != SUCCESS_CODE) return;
+    const data = apiResData<any>(res);
+    if (data != null) status = readRoomStatus(data as UTSJSONObject);
+  } catch (_error) {
+    return;
+  }
+  if (request != roomPollRequest || (status != 2 && status != 3)) return;
+  if (field("inviteId") != inviteId || field("roomName") != room) return;
+  if (convId.length > 0 && msgId.length > 0 && inviteId.length > 0) {
+    // #ifdef APP-HARMONY
+    markNativeMeetingInviteHandled(msgId);
+    // #endif
+    // 第 5 参用默认值：自动收条是后台动作，失败不弹提示。
+    apiImMeetingInviteHandled(convId, msgId, inviteId, room);
+  }
+  // watch 收到 null 后会停铃、清轮询与 60 秒隐藏计时器。
+  hideMeetingInviteBanner();
+}
+
 function syncInvite(): void {
   clearTimer();
+  stopRoomPoll();
   const request = ++avatarRequest;
   resolvedAvatar.value = "";
   // 换了一条邀请：头像失败标记跟着复位，避免上一个人的失败状态遮住新头像
@@ -132,9 +196,12 @@ function syncInvite(): void {
   hideTimer = setTimeout(() => {
     hideMeetingInviteBanner();
   }, visibleFor);
+  roomPollTimer = setInterval(() => {
+    void pollRoomStatus();
+  }, ROOM_POLL_INTERVAL_MS);
 }
 
-// 邀请条只做前台提示；60 秒后自动收起，聊天卡片仍可加入。
+// 邀请条只做前台提示；60 秒后自动收起，期间每 20 秒核对一次会议是否已结束。
 watch(meetingInviteBanner, () => { syncInvite(); });
 
 onMounted(() => { syncInvite(); });
@@ -142,6 +209,7 @@ onMounted(() => { syncInvite(); });
 onUnmounted(() => {
   avatarRequest++;
   clearTimer();
+  stopRoomPoll();
   stopForegroundCallAlert(alertOwner);
 });
 

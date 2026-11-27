@@ -105,10 +105,12 @@ object VoipBridge {
     private var readySent = false
     private var microphone = true
     private var camera = false
+    private var cameraHandoffJob: Job? = null
     private var remoteVideo = false
     private var switchingCameraTrack: LocalVideoTrack? = null
     private var hidden = false
     private var nativeUiId = ""
+    private var onNativeUiEnded: (() -> Unit)? = null
     private var appCallUiId = ""
     private var incomingUiWait: Job? = null
     private var incomingAvatarJob: Job? = null
@@ -127,6 +129,7 @@ object VoipBridge {
     private val bindings = mutableMapOf<FrameLayout, VideoTrack>()
     private var activity = WeakReference<Activity>(null)
     private const val PREFIX = "/api/instant-message/calls"
+    private const val CAMERA_HANDOFF_MS = 500L
 
     /** Only lifecycle stages: never log invitations, identities, URLs or credentials. */
     private fun trace(stage: String) {
@@ -326,7 +329,7 @@ object VoipBridge {
     internal fun developmentListenerAllowed(ctx: Context): Boolean = isTestPackage(ctx) && config.optBoolean("development") && config.optString("accessToken").isNotEmpty()
     internal fun uiSnapshot(id: String): JSONObject? {
         val value = current ?: return null
-        if (value.optString("callId") != id || value.optString("state") == "ended") return null
+        if (value.optString("callId") != id || value.optString("state") == "ended" || terminal.contains(id)) return null
         return JSONObject(value.toString()).put("incoming", value.optString("calleeId") == config.optString("userId"))
             .put("microphone", microphone).put("camera", camera).put("speaker", speaker)
             .put("audioOutput", audioOutputKind())
@@ -334,21 +337,53 @@ object VoipBridge {
             .put("defaultAudioRoutePending", defaultAudioRoutePending)
             .put("mediaReady", connected && peerReady).put("reconnecting", reconnecting)
     }
-    internal fun nativeVisible(id: String, visible: Boolean) {
+    internal fun nativeVisible(id: String, visible: Boolean, onEnded: (() -> Unit)? = null, minimizing: Boolean = false) {
         trace(if (visible) "native call activity visible" else "native call activity hidden")
         if (visible && current?.optString("callId") == id) {
             nativeUiId = id
+            onNativeUiEnded = onEnded
             updatePresentedIncoming(id)
-        } else if (!visible && nativeUiId == id) nativeUiId = ""
+        } else if (!visible && nativeUiId == id) {
+            nativeUiId = ""
+            onNativeUiEnded = null
+        } else return
         updateProximity()
-        scope.launch {
-            try {
-                if (room != null) VoipCallService.enableCapture(camera && cameraVisible())
-                room?.localParticipant?.setCameraEnabled(camera && cameraVisible())
-                refreshViews()
-            } catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { if (current?.optString("callId") == id) emit("error", "code", "CALL_NATIVE_FAILED") }
+        cancelCameraHandoff()
+        val target = room ?: return
+        // The inline minimize button returns to the App. Its onShow can arrive after this Activity pauses.
+        if (minimizing && hidden && camera && target.localParticipant.getTrackPublication(Track.Source.CAMERA)?.muted == false &&
+            activity.get()?.let { !it.isFinishing && !it.isDestroyed } == true &&
+            context?.getSystemService(PowerManager::class.java)?.isInteractive == true &&
+            context?.getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == false) {
+            trace("waiting for app to resume after video minimize")
+            cameraHandoffJob = scope.launch {
+                delay(CAMERA_HANDOFF_MS)
+                cameraHandoffJob = null
+                if (room === target) updateCameraVisibility()
+            }
+            return
         }
+        scope.launch {
+            if (room === target) updateCameraVisibility()
+        }
+    }
+
+    private fun cancelCameraHandoff() {
+        cameraHandoffJob?.cancel()
+        cameraHandoffJob = null
+    }
+
+    private suspend fun updateCameraVisibility() {
+        val target = room ?: return
+        val enabled = camera && cameraVisible()
+        try {
+            if (enabled) VoipCallService.enableCapture(true)
+            target.localParticipant.setCameraEnabled(enabled)
+            if (room !== target || enabled != (camera && cameraVisible())) return
+            if (!enabled) VoipCallService.enableCapture(false)
+            refreshViews()
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { if (room === target) emit("error", "code", "CALL_NATIVE_FAILED") }
     }
     internal fun uiCommand(id: String, op: String, enabled: Boolean = false, mediaType: String = "audio") {
         if (id != current?.optString("callId")) return
@@ -402,12 +437,12 @@ object VoipBridge {
                     "speaker" -> setSpeaker(command.optBoolean("enabled"))
                     "switchCamera" -> switchCamera()
                     "background" -> {
-                        hidden = command.optBoolean("hidden")
+                        val nextHidden = command.optBoolean("hidden")
+                        if (nextHidden != hidden || !nextHidden) cancelCameraHandoff()
+                        hidden = nextHidden
                         updateProximity()
                         if (!hidden && appCallUiId.isNotEmpty()) updatePresentedIncoming(appCallUiId)
-                        room?.localParticipant?.setCameraEnabled(camera && cameraVisible())
-                        if (room != null) VoipCallService.enableCapture(camera && cameraVisible())
-                        refreshViews()
+                        if (cameraHandoffJob == null) updateCameraVisibility()
                         if (!hidden && activity.get()?.intent?.getBooleanExtra("nuwaxVoip", false) == true) {
                             activity.get()?.intent?.removeExtra("nuwaxVoip"); emit("openPage")
                         }
@@ -1250,6 +1285,7 @@ object VoipBridge {
         } finally {
             if (switchingCameraTrack === track) {
                 switchingCameraTrack = null
+                if (room === target) refreshViews()
                 emit("cameraSwitching", "enabled", false)
             }
         }
@@ -1309,7 +1345,7 @@ object VoipBridge {
     private fun refreshViews() {
         val r = room ?: return
         val localTrack = if (camera && cameraVisible()) {
-            r.localParticipant.getTrackPublication(Track.Source.CAMERA)?.takeUnless { it.muted }?.track as? VideoTrack
+            r.localParticipant.getTrackPublication(Track.Source.CAMERA)?.takeUnless { it.muted }?.track as? LocalVideoTrack
         } else null
         val remoteTrack = r.remoteParticipants.values.firstNotNullOfOrNull { participant ->
             participant.getTrackPublication(Track.Source.CAMERA)?.takeUnless { it.muted }?.track as? VideoTrack
@@ -1332,6 +1368,7 @@ object VoipBridge {
             val renderer = renderers.getOrPut(host) {
                 TextureViewRenderer(host.context).also { r.initVideoRenderer(it); host.addView(it, FrameLayout.LayoutParams(-1, -1)) }
             }
+            renderer.setMirror(kind == "local" && localTrack?.options?.position == CameraPosition.FRONT)
             if (bindings[host] !== track) {
                 bindings.remove(host)?.removeRenderer(renderer)
                 renderer.clearImage()
@@ -1341,18 +1378,32 @@ object VoipBridge {
         }
     }
     private fun releaseMedia() {
+        cancelCameraHandoff()
         remoteLeftJob?.cancel(); remoteLeftJob = null; everHadRemote = false
         reconnecting = false
         val old = room; room = null
         remoteVideo = false
         switchingCameraTrack = null
-        for ((host, renderer) in renderers) { bindings[host]?.removeRenderer(renderer); renderer.release(); host.removeAllViews() }
+        for ((host, renderer) in renderers) {
+            bindings[host]?.removeRenderer(renderer)
+            host.removeView(renderer)
+            renderer.release()
+        }
         renderers.clear(); bindings.clear(); old?.release(); connected = false; peerReady = false; reconnecting = false
     }
     private fun finish(reason: String = "", notifyRemote: Boolean = true) {
-        if (notifyRemote && reason.isNotEmpty() && reason != "answeredElsewhere" && reason != "sessionChanged") closeServerCall(reason)
         val id = current?.optString("callId") ?: ""
-        if (id.isNotEmpty()) { terminal.add(id); if (terminal.size > 128) terminal.remove(terminal.first()) }
+        if (id.isNotEmpty()) {
+            if (!terminal.add(id)) return
+            if (terminal.size > 128) terminal.remove(terminal.first())
+        }
+        if (notifyRemote && reason.isNotEmpty() && reason != "answeredElsewhere" && reason != "sessionChanged") closeServerCall(reason)
+        if (reason.isNotEmpty()) emit("localEnded", "reason", reason)
+        // Close the visible native call screen before the renderer is detached.
+        val closeNativeUi = onNativeUiEnded.takeIf { nativeUiId == id }
+        nativeUiId = ""
+        onNativeUiEnded = null
+        closeNativeUi?.invoke()
         expiryJob?.cancel(); expiryJob = null
         clearIncomingUiWait()
         clearIncomingAvatar()
@@ -1375,8 +1426,7 @@ object VoipBridge {
         VoipCallService.removeNotification()
         context?.stopService(Intent(context, VoipCallService::class.java))
         context?.getSystemService(NotificationManager::class.java)?.cancel(9090)
-        if (reason.isNotEmpty()) emit("localEnded", "reason", reason)
-        current = null; nativeUiId = ""; appCallUiId = ""; onEarpiece = false; defaultAudioRoutePending = false
+        current = null; appCallUiId = ""; onEarpiece = false; defaultAudioRoutePending = false
         updateProximity()
     }
     private fun expireSession() {

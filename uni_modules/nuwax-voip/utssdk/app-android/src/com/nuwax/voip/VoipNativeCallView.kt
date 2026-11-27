@@ -278,6 +278,12 @@ internal class VoipNativeCallView(
         }
     }
 
+    fun hideVideoForExit() {
+        remote.visibility = INVISIBLE
+        local.visibility = INVISIBLE
+        shade.visibility = INVISIBLE
+    }
+
     fun release() {
         avatarJob?.cancel()
         VoipBridge.releaseVideoView(remote)

@@ -24,6 +24,7 @@ class VoipIncomingActivity : Activity() {
     private var callId = ""
     private var pendingAnswer: String? = null
     private var actionPending = false
+    private var minimizing = false
     private var lastRenderedSnapshot: String? = null
     private var lastRenderedSecond = -1L
     private var lastRenderedAnswering = false
@@ -40,7 +41,7 @@ class VoipIncomingActivity : Activity() {
         window.statusBarColor = VoipNativeCallView.BACKDROP_TOP
         window.navigationBarColor = VoipNativeCallView.BACKDROP_BOTTOM
         callId = intent.getStringExtra("callId") ?: ""
-        callView = VoipNativeCallView(this, ::answer, ::endCall, ::toggleMedia, ::finish) {
+        callView = VoipNativeCallView(this, ::answer, ::endCall, ::toggleMedia, ::minimizeCall) {
             VoipBridge.uiCommand(callId, "switchCamera")
         }
         setContentView(callView)
@@ -61,14 +62,15 @@ class VoipIncomingActivity : Activity() {
     override fun onResume() {
         super.onResume()
         if (isFinishing) return
+        minimizing = false
         lastRenderedSnapshot = null
-        VoipBridge.nativeVisible(callId, true)
+        VoipBridge.nativeVisible(callId, true, onEnded = ::closeEndedCall)
         handler.removeCallbacks(refresh); handler.post(refresh)
         consumeAnswerIntent()
     }
     override fun onPause() {
         handler.removeCallbacks(refresh)
-        VoipBridge.nativeVisible(callId, false)
+        VoipBridge.nativeVisible(callId, false, minimizing = minimizing)
         super.onPause()
     }
     override fun onDestroy() {
@@ -144,6 +146,17 @@ class VoipIncomingActivity : Activity() {
         VoipBridge.receiveAction(callId, action)
     }
 
+    private fun closeEndedCall() {
+        handler.removeCallbacks(refresh)
+        callView.hideVideoForExit()
+        if (!isFinishing) finish()
+    }
+
+    private fun minimizeCall() {
+        minimizing = true
+        finish()
+    }
+
     private var requestedAudioRoute = ""
     private var requestedAudioRouteAt = 0L
 
@@ -165,7 +178,7 @@ class VoipIncomingActivity : Activity() {
 
     private fun render() {
         val value = VoipBridge.uiSnapshot(callId)
-        if (value == null) { finish(); return }
+        if (value == null) { closeEndedCall(); return }
         if (requestedAudioRoute.isNotEmpty()) {
             if (android.os.SystemClock.elapsedRealtime() - requestedAudioRouteAt > 5000) requestedAudioRoute = ""
             else if (value.optString("audioOutput") == requestedAudioRoute) {

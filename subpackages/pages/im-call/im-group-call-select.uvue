@@ -35,9 +35,9 @@
   import { onLoad } from "@dcloudio/uni-app";
   import { SUCCESS_CODE } from "@/constants/codes.constants";
   import { apiUserInfo } from "@/servers/account";
-  import { apiImConvMembersAll, apiImCreateP2pConversation, getImDeviceId, imDevicePlatform } from "@/servers/im";
+  import { apiImConvMembersAll, getImDeviceId, imDevicePlatform } from "@/servers/im";
   import { apiImMeetingCreateRoom } from "@/servers/imMeeting";
-  import { apiImSendMeetingInvite } from "@/servers/imCall";
+  import { apiImSendMeetingInvite, apiImSendMeetingInviteSignal } from "@/servers/imCall";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   import { generateUUID } from "@/utils/common";
   import { imAvatarDisplayUrl } from "@/utils/imAvatarDisplay";
@@ -70,6 +70,13 @@
   function readString(obj: UTSJSONObject, key: string): string {
     const raw = obj[key];
     return raw == null ? "" : "" + raw;
+  }
+
+  function readNumber(obj: UTSJSONObject, key: string, fallback: number): number {
+    const raw = obj[key];
+    if (raw == null) return fallback;
+    const parsed = parseInt(`${raw}`, 10);
+    return isNaN(parsed) ? fallback : parsed;
   }
 
   async function myUserId(): Promise<string> {
@@ -134,20 +141,78 @@
   function clearAll(): void { selectedIds.value = []; }
   function close(): void { uni.navigateBack({ delta: 1 }); }
 
-  async function notifySelected(room: string, title: string): Promise<void> {
+  /**
+   * 给勾选的成员发邀请，返回投递读数（与 PC GroupCallDialog 同一份判据）。
+   *
+   * ★★2026-11-28 对齐 PC：被勾选的人走一帧 3007 meeting:invite（不建私聊、直接弹邀请）。
+   *   群里的通话卡片仍由 submit 里的 silent 消息负责 —— 没勾选的人也能从群里点进来，
+   *   但不会响铃（一条群消息无法只让部分人响）。
+   *
+   * ★读数三个字段分开读：`ok` 是过了闸门的人数、`failed` 是被拒人数、
+   *   `onlineDevices` 是整批的在线设备总数（0 = 一个端都不在线，邀请不会响铃）。
+   */
+  async function notifySelected(room: string, title: string): Promise<UTSJSONObject> {
     const list = members.value;
+    const ids: string[] = [];
     for (let i = 0; i < list.length; i++) {
       const m = list[i];
       if (selectedIds.value.indexOf(m.userId) < 0) continue;
+      ids.push(m.userId);
+    }
+    let ok = 0;
+    let failed = 0;
+    let onlineDevices = 0;
+    if (ids.length > 0) {
       try {
-        const conv = await apiImCreateP2pConversation(m.userId, "", true);
-        if (apiResCode(conv) != SUCCESS_CODE) continue;
-        const raw = apiResData<any>(conv);
-        const obj = raw != null ? (raw as UTSJSONObject) : null;
-        const targetConvId = obj != null ? readString(obj, "convId") : "";
-        if (targetConvId.length == 0) continue;
-        await apiImSendMeetingInvite(targetConvId, generateUUID(), room, title, mediaType.value, true, false, generateUUID());
-      } catch (_e) {}
+        const res = await apiImSendMeetingInviteSignal(ids, room, title, mediaType.value, true, generateUUID());
+        if (apiResCode(res) == SUCCESS_CODE) {
+          const raw = apiResData<any>(res);
+          const data = raw != null ? (raw as UTSJSONObject) : null;
+          if (data != null) {
+            // getArray 是 UTSJSONObject 的官方取值方式：JSON 数组在 Android 是 UTSJSONArray。
+            const invited = data.getArray("invitedUserIds");
+            if (invited != null) ok = invited.length;
+            const rejected = data.getArray("rejectedUserIds");
+            if (rejected != null) failed = rejected.length;
+            onlineDevices = readNumber(data, "targetDevices", 0);
+          }
+        } else {
+          failed = ids.length;
+        }
+      } catch (_e) {
+        failed = ids.length;
+      }
+    }
+    const out = new UTSJSONObject();
+    out["ok"] = ok;
+    out["failed"] = failed;
+    out["onlineDevices"] = onlineDevices;
+    return out;
+  }
+
+  /**
+   * 勾选成员的投递结果提示（对齐 PC GroupCallDialog 的 warning）。
+   *
+   * ★只在「有人没发出去」或「整批一个端都不在线」时提示：
+   *   3007 不落库、无离线推送，全离线时不会响铃 —— 但通话卡片已经发到群里，他们能自己点进来。
+   * ★成功且有在线设备时保持静默：跳进会中页本身就是反馈，不必再弹一条"已通知"。
+   */
+  function showInviteOutcome(outcome: UTSJSONObject, cardSent: boolean): void {
+    const ok = readNumber(outcome, "ok", 0);
+    const failed = readNumber(outcome, "failed", 0);
+    const onlineDevices = readNumber(outcome, "onlineDevices", 0);
+    let message = "";
+    if (failed > 0 && ok > 0) {
+      message = `已通知 ${ok} 人，${failed} 人没发出去`;
+    } else if (failed > 0) {
+      message = "已发起通话，但勾选的成员没有收到邀请";
+    } else if (ok > 0 && onlineDevices == 0) {
+      message = cardSent
+        ? `已发给 ${ok} 人，但他们当前不在线（不会响铃）—— 通话卡片已发到群里`
+        : `已发给 ${ok} 人，但他们当前不在线（不会响铃）；群里的通话卡片也没发出去`;
+    }
+    if (message.length > 0) {
+      uni.showToast({ title: message, icon: "none", duration: 2800 });
     }
   }
 
@@ -170,12 +235,20 @@
       body["emptyTimeoutSeconds"] = 3600;
       const created = await apiImMeetingCreateRoom(body);
       if (apiResCode(created) != SUCCESS_CODE) { uni.showToast({ title: "发起通话失败", icon: "none" }); return; }
-      await apiImSendMeetingInvite(convId.value, generateUUID(), room, title, mediaType.value, true, true, generateUUID());
-      notifySelected(room, title);
+      const cardRes = await apiImSendMeetingInvite(convId.value, generateUUID(), room, title, mediaType.value, true, true, generateUUID());
+      // 群卡片是否真的落到群里：离线提示的文案要如实说明「卡片还在群里」是否成立。
+      const cardSent = apiResCode(cardRes) == SUCCESS_CODE;
+      // 邀请读数在跳转后再提示：redirectTo 会换页，提前弹的 toast 可能被一起清掉。
+      const inviteTask = notifySelected(room, title);
       // 群通话也是会议房间：发起人同样默认静音、关摄像头，由用户主动打开设备。
       // ★带 convId：会中「邀请参会人」面板据此把群成员排在最前（普通会议没有这个参数）。
       uni.redirectTo({
         url: "/subpackages/pages/im-meeting/im-meeting-room?room=" + encodeURIComponent(room) + "&title=" + encodeURIComponent(title) + "&status=1&host=1&members=1&convId=" + convId.value,
+        success: (_res) => {
+          void inviteTask.then((outcome: UTSJSONObject): void => {
+            showInviteOutcome(outcome, cardSent);
+          });
+        },
       });
     } catch (_e) {
       uni.showToast({ title: "发起通话失败", icon: "none" });

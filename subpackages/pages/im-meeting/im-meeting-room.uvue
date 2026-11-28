@@ -738,8 +738,8 @@
     apiImMeetingUpdatePermissions,
     apiImMeetingUpdateRoomSettings,
   } from "@/servers/imMeeting";
-  import { apiImContacts, apiImConvMembersAll, apiImCreateP2pConversation, apiImWhoami } from "@/servers/im";
-  import { apiImSendMeetingInvite } from "@/servers/imCall";
+  import { apiImContacts, apiImConvMembersAll, apiImWhoami } from "@/servers/im";
+  import { apiImSendMeetingInviteSignal } from "@/servers/imCall";
   import { apiResCode, apiResData, apiResMessage } from "@/utils/apiResponse";
   import { emptyI18nParams, t as translateFn, toI18nParams } from "@/utils/i18n";
   import { getCachedMyInfo, setCachedMyInfo } from "@/utils/im/myInfoCache";
@@ -949,6 +949,12 @@
   const groupConvId = ref<string>("");
   /** 邀请名单拉取轮次：详情补到 convId 时作废在途请求，避免旧结果（无群成员）落地。 */
   let invitePoolGen = 0;
+  /** 补 groupConvId 的详情请求在途（打开面板/入会成功/点刷新可能同时触发）。 */
+  let groupConvSyncing = false;
+  /** 入会成功后自动补一次 groupConvId（refreshMediaState 会被高频调用）。 */
+  let groupConvSyncedOnConnect = false;
+  /** 详情是否成功读到过：区分「这场会没有关联群」与「刚入会还没权限读」。 */
+  let detailLoaded = false;
   const inviteSelected = ref<MeetingInviteContact[]>([]);
   const inviteSending = ref<boolean>(false);
   /** 邀请列表刷新在途（图标淡出，防连点）。 */
@@ -1411,6 +1417,7 @@
         return;
       }
       failed.value = false;
+      detailLoaded = true;
       applyDetail(data as UTSJSONObject);
       loadPasscodeIfNeeded();
       syncClock();
@@ -1418,6 +1425,37 @@
       failed.value = true;
       membersState.value = members.value.length > 0 ? "ready" : "failed";
     }
+  }
+
+  /**
+   * 补本场会关联的群会话 id（groupConvId）。
+   *
+   * ★★为什么不能只在 onLoad 拉一次（2026-11-28 用户反馈：参会人邀请不到群成员）：
+   *   主持人从群通话选人页进入时 URL 自带 convId；参会人走的是单聊邀请卡片 /
+   *   前台邀请条 / 推送，URL 里没有 convId，只能靠详情回包补。而详情要求「已是参会人」
+   *   （服务端 requireVisible），页面 onLoad 那一刻他刚点邀请、服务端还没落参会人行，
+   *   详情直接 MEETING_NOT_FOUND ⇒ convId 永远补不上，邀请面板只剩联系人一档。
+   *   ⇒ 打开邀请面板 / 点刷新 / 入会成功后再补，此时签票已落成员行，详情可读。
+   */
+  async function syncGroupConvId(): Promise<string> {
+    if (groupConvId.value.length > 0) {
+      return groupConvId.value;
+    }
+    // 详情已成功读到且仍没有 convId = 这场会本来就没关联群（普通会议），
+    // 不必每次打开邀请面板都重拉一次（onLoad 那次已经覆盖）。
+    if (detailLoaded) {
+      return "";
+    }
+    if (groupConvSyncing) {
+      return "";
+    }
+    groupConvSyncing = true;
+    try {
+      await loadDetail();
+    } finally {
+      groupConvSyncing = false;
+    }
+    return groupConvId.value;
   }
 
   // ---------------------------------------------------------------- 展示
@@ -2785,7 +2823,7 @@
   }
 
   /** 邀请参会人：改成独立底部弹层（原先是「更多」面板里的内嵌块）。 */
-  function openInvitePanel(): void {
+  async function openInvitePanel(): Promise<void> {
     if (inviteSending.value) {
       return;
     }
@@ -2796,8 +2834,11 @@
     inviteKeyword.value = "";
     inviteSelected.value = [];
     openSheet("invite");
-    loadInviteContacts();
     loadPasscodeIfNeeded();
+    // ★参会人入口不带 convId：面板打开时补一次详情（入会后详情才可读），
+    //   否则群成员档会一直缺；补到后 loadInviteContacts 才会拉群成员。
+    await syncGroupConvId();
+    loadInviteContacts();
   }
 
   function toggleInvitee(userId: string): void {
@@ -2834,9 +2875,9 @@
     }
     inviteSending.value = true;
     moreBusy.value = "invite";
-    // ★★主持人「再次邀请」被移出的人：先撤销禁入标记，再发邀请消息。
-    //   踢人时服务端写了 im_meeting_member.banned，签令牌会据此拒绝；只发消息的话，
-    //   对方点邀请卡片/通知仍会撞 IM_50006「你已被移出该会议」（2026-11-27 用户反馈）。
+    // ★★主持人「再次邀请」被移出的人：先撤销禁入标记，再发邀请。
+    //   踢人时服务端写了 im_meeting_member.banned，签令牌会据此拒绝；只发邀请的话，
+    //   对方点「加入」仍会撞 IM_50006「你已被移出该会议」（2026-11-27 用户反馈）。
     //   ★只在主持人的这场会里调：普通参会人没有撤销权限，服务端也会拒，
     //     别先发一轮无用请求；★失败不阻断邀请（对齐 PC），真进不去时入会接口有明确提示。
     if (isHost.value) {
@@ -2844,45 +2885,70 @@
         try { await apiImMeetingAllowRejoin(roomRaw.value, inviteSelected.value[i].userId); } catch (_error) {}
       }
     }
+    // 先快照：后面会清空选中态，失败名单/提示还要用这一批人的名字。
+    const selected = inviteSelected.value;
+    const ids: string[] = [];
+    for (let i = 0; i < selected.length; i++) {
+      ids.push(selected[i].userId);
+    }
     let sent = 0;
+    let targetDevices = 0;
     const failed: string[] = [];
-    const inviteBase = generateUUID();
     try {
-      for (let i = 0; i < inviteSelected.value.length; i++) {
-        const person = inviteSelected.value[i];
-        try {
-          const convRes = await apiImCreateP2pConversation(person.userId, "", true);
-          if (apiResCode(convRes) != SUCCESS_CODE) {
-            failed.push(person.displayName);
-            continue;
-          }
-          const convData = apiResData<any>(convRes);
-          const conv = convData != null ? convData as UTSJSONObject : null;
-          const convId = conv != null ? readStr(conv, "convId") : "";
-          if (convId.length == 0) {
-            failed.push(person.displayName);
-            continue;
-          }
-          const inviteId = `${inviteBase}-${i}`;
-          const sendRes = await apiImSendMeetingInvite(
-            convId,
-            inviteId,
-            roomRaw.value,
-            titleRaw.value.length > 0 ? titleRaw.value : roomRaw.value,
-            "audio",
-            false,
-            false,
-            generateUUID(),
-            passcodeState.value == "value" ? passcodeValue.value : "",
-          );
-          if (apiResCode(sendRes) == SUCCESS_CODE) {
-            sent++;
-          } else {
-            failed.push(person.displayName);
-          }
-        } catch (_error) {
-          failed.push(person.displayName);
+      // ★★2026-11-28 对齐 PC：一次 calls/meeting-invite ⇒ 一帧 3007 meeting:invite，
+      //   不建会话、不落消息；被邀请人在线就直接弹邀请条（非好友 / 同群成员也能收到）。
+      //   整批共用一个 inviteId（标识这一次邀请动作），被拒的人不报错、回 rejectedUserIds。
+      const res = await apiImSendMeetingInviteSignal(
+        ids,
+        roomRaw.value,
+        titleRaw.value.length > 0 ? titleRaw.value : roomRaw.value,
+        "audio",
+        false,
+        generateUUID(),
+        passcodeState.value == "value" ? passcodeValue.value : "",
+      );
+      if (apiResCode(res) != SUCCESS_CODE) {
+        for (let i = 0; i < selected.length; i++) {
+          failed.push(selected[i].displayName);
         }
+      } else {
+        const raw = apiResData<any>(res);
+        const data = raw != null ? (raw as UTSJSONObject) : null;
+        if (data != null) {
+          // ★getArray 是 UTSJSONObject 的官方取值方式：JSON 数组在 Android 是 UTSJSONArray，
+          //   直接 as any[] 有 CCE 风险。
+          const invited = data.getArray("invitedUserIds");
+          if (invited != null) {
+            sent = invited.length;
+          }
+          const rejectedIds = data.getArray("rejectedUserIds");
+          if (rejectedIds != null) {
+            for (let i = 0; i < selected.length; i++) {
+              const uid = selected[i].userId;
+              let hit = false;
+              for (let k = 0; k < rejectedIds.length; k++) {
+                if (`${rejectedIds[k]}` == uid) {
+                  hit = true;
+                  break;
+                }
+              }
+              if (hit) {
+                failed.push(selected[i].displayName);
+              }
+            }
+          }
+          const devices = data["targetDevices"];
+          if (devices != null) {
+            const parsed = parseInt(`${devices}`, 10);
+            if (!isNaN(parsed)) {
+              targetDevices = parsed;
+            }
+          }
+        }
+      }
+    } catch (_error) {
+      for (let i = 0; i < selected.length; i++) {
+        failed.push(selected[i].displayName);
       }
     } finally {
       inviteSending.value = false;
@@ -2890,10 +2956,20 @@
     }
     inviteSelected.value = [];
     let message = "";
-    if (failed.length == 0) {
-      const params = new Map<string, string | number>();
-      params.set("count", sent);
-      message = tOf("Mobile.Meeting.inviteesSent", params);
+    if (sent == 0 && failed.length == 0) {
+      message = t("Mobile.Meeting.inviteesFailed");
+    } else if (failed.length == 0) {
+      // ★3007 不落库、无离线推送：targetDevices=0 说明这些人当前一个端都不在线，
+      //   不会响铃 —— 不能报「已邀请成功」。
+      if (targetDevices == 0) {
+        const po = new Map<string, string | number>();
+        po.set("count", sent);
+        message = tOf("Mobile.Meeting.inviteesOffline", po);
+      } else {
+        const params = new Map<string, string | number>();
+        params.set("count", sent);
+        message = tOf("Mobile.Meeting.inviteesSent", params);
+      }
     } else if (sent > 0) {
       const params = new Map<string, string | number>();
       params.set("count", sent);
@@ -3904,6 +3980,8 @@
     }
     inviteRefreshing.value = true;
     try {
+      // 群成员档依赖 groupConvId：参会人可能刚补到（或上次补拉失败），刷新一并重试
+      await syncGroupConvId();
       // 强制重走一次联系人拉取（状态是 ready 时 loadInviteContacts 会直接 return）
       invitePoolState.value = "idle";
       loadParticipants();
@@ -4173,6 +4251,13 @@
     if (snap.connected) {
       startPeoplePoll();
       startChatPolling();
+      // ★参会人入口（单聊邀请卡片/前台邀请条/推送）不带 convId，且 onLoad 时详情还不可读
+      //   （服务端尚未落参会人行）。入会成功后再补一次（打开面板/点刷新还会再补），
+      //   群成员档不依赖用户手动操作。
+      if (!groupConvSyncedOnConnect && groupConvId.value.length == 0) {
+        groupConvSyncedOnConnect = true;
+        setTimeout(() => { void syncGroupConvId(); }, 1200);
+      }
     } else {
       stopPeoplePoll();
       stopChatPolling();
@@ -4705,7 +4790,7 @@
   /** 底部操作格里一格的分发（键值见 actionRows）。 */
   function handleAction(key: string): void {
     if (key == "invite") {
-      openInvitePanel();
+      void openInvitePanel();
       return;
     }
     if (key == "share") {

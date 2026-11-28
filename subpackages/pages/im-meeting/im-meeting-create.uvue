@@ -180,12 +180,11 @@
   import { getApiBaseUrl } from "@/constants/config";
   import {
     apiImContacts,
-    apiImCreateP2pConversation,
     apiImSearchContacts,
     getImDeviceId,
     imDevicePlatform,
   } from "@/servers/im";
-  import { apiImSendMeetingInvite } from "@/servers/imCall";
+  import { apiImSendMeetingInviteSignal } from "@/servers/imCall";
   import { apiImMeetingCreateRoom, IM_MEETING_CHANGED_EVENT } from "@/servers/imMeeting";
   import { apiResCode, apiResData } from "@/utils/apiResponse";
   // 会议数据变更广播（走仓内 eventBus，见 servers/imMeeting.uts 常量声明处）
@@ -765,14 +764,16 @@
   }
 
   /**
-   * ★把邀请逐个发给选中的参会人（对齐 PC 的 notifyMeetingInvitees）。
+   * ★把邀请发给选中的参会人（对齐 PC 的 notifyMeetingInvitees）。
    *
-   * 发的是 `meeting_invite` 定制消息（不是普通文本）：对方会话里渲染成会议邀请卡片，
-   * 前台收到时全局弹邀请条并响铃（见 utils/im/imCallSession.uts + meeting-invite-banner）；
-   * 后台/无进程走推送，点通知直接入会。与会中「邀请」面板、PC 发起会议同一条链路
-   * （servers/imCall.uts 的 apiImSendMeetingInvite）。
+   * ★★2026-11-28 起不再「逐人建单聊 + 发 meeting_invite 消息」，改成一次
+   * `POST /calls/meeting-invite` ⇒ 服务端下发一帧 3007 `meeting:invite`：
+   * 不建会话、不落消息，被邀请人在线就直接弹邀请条（非好友 / 同群成员也能收到）。
+   * 收侧见 utils/im/imCallSession.uts 的 meeting:invite 分支。
+   *
    * ★必须等建房成功后再发：房间没建起来就发邀请，对方点进去只会看到「会议不存在」。
-   * ★逐个发、失败只累计不中断：某个人发不出去不该让后面的人全都收不到。
+   * ★服务端逐人过闸门，不合格的人进 rejectedUserIds 且不报错；这里如实把
+   *   投递人数 / 被拒人数 / 在线设备数分开读，不把 HTTP 200 当成「他们都收到了」。
    */
   async function sendInvitesToContacts(room: string): Promise<string> {
     const sel = invitees.value;
@@ -782,58 +783,67 @@
     const inviteTitle = titleText.value.trim();
     // ★会议一律语音开局（PC 同口径）：卡片 mediaType=audio，进会后可再开视频
     const mediaType = "audio";
-    // 同一次提交的邀请共用一个前缀，后缀序号保证 inviteId 唯一（去重靠 inviteId）
-    const inviteBase = generateUUID();
-    let ok = 0;
-    let failed = 0;
+    const ids: string[] = [];
     for (let i = 0; i < sel.length; i++) {
-      const person = sel[i];
-      try {
-        // 单聊会话：服务端幂等，已有那一条就直接返回
-        const convRes = await apiImCreateP2pConversation(person.userId, "", true);
-        if (apiResCode(convRes) != SUCCESS_CODE) {
-          failed++;
-          continue;
-        }
-        const convRaw = apiResData<any>(convRes);
-        const convObj = convRaw != null ? (convRaw as UTSJSONObject) : null;
-        const convId = convObj == null ? "" : readString(convObj, "convId");
-        if (convId.length == 0) {
-          failed++;
-          continue;
-        }
-        const sendRes = await apiImSendMeetingInvite(
-          convId,
-          `${inviteBase}-${i}`,
-          room,
-          // 主题没填就用会议号兜底（PC 同口径，卡片不能是一张没标题的空卡）
-          inviteTitle.length > 0 ? inviteTitle : room,
-          mediaType,
-          false,
-          false,
-          generateUUID(),
-        );
-        if (apiResCode(sendRes) == SUCCESS_CODE) {
-          ok++;
-        } else {
-          failed++;
-        }
-      } catch (_e) {
-        failed++;
+      ids.push(sel[i].userId);
+    }
+    try {
+      // 整批共用一个 inviteId：它标识「这一次邀请动作」（同一动作重提会被网关去重）。
+      const res = await apiImSendMeetingInviteSignal(
+        ids,
+        room,
+        // 主题没填就用会议号兜底（PC 同口径，邀请不能是一张没标题的空卡）
+        inviteTitle.length > 0 ? inviteTitle : room,
+        mediaType,
+        false,
+        generateUUID(),
+      );
+      if (apiResCode(res) != SUCCESS_CODE) {
+        return t("Mobile.Meeting.inviteesFailed");
       }
-    }
-    if (failed == 0) {
-      const p1 = new Map<string, string | number>();
-      p1.set("count", ok);
-      return tOf("Mobile.Meeting.inviteesSent", p1);
-    }
-    if (ok == 0) {
+      const raw = apiResData<any>(res);
+      const data = raw != null ? (raw as UTSJSONObject) : null;
+      let ok = 0;
+      let failed = 0;
+      let targetDevices = 0;
+      if (data != null) {
+        // ★getArray 是 UTSJSONObject 的官方取值方式：JSON 数组在 Android 是 UTSJSONArray，
+        //   直接 as any[] 有 CCE 风险。
+        const invited = data.getArray("invitedUserIds");
+        if (invited != null) {
+          ok = invited.length;
+        }
+        const rejected = data.getArray("rejectedUserIds");
+        if (rejected != null) {
+          failed = rejected.length;
+        }
+        targetDevices = readNumber(data, "targetDevices", 0);
+      }
+      if (failed == 0 && ok == 0) {
+        return t("Mobile.Meeting.inviteesFailed");
+      }
+      if (failed == 0) {
+        // ★3007 不落库、无离线推送：targetDevices=0 说明这些人当前一个端都不在线，
+        //   不会响铃 —— 不能报「已邀请成功」。
+        if (targetDevices == 0) {
+          const po = new Map<string, string | number>();
+          po.set("count", ok);
+          return tOf("Mobile.Meeting.inviteesOffline", po);
+        }
+        const p1 = new Map<string, string | number>();
+        p1.set("count", ok);
+        return tOf("Mobile.Meeting.inviteesSent", p1);
+      }
+      if (ok == 0) {
+        return t("Mobile.Meeting.inviteesFailed");
+      }
+      const p2 = new Map<string, string | number>();
+      p2.set("count", ok);
+      p2.set("failed", failed);
+      return tOf("Mobile.Meeting.inviteesSentPartial", p2);
+    } catch (_e) {
       return t("Mobile.Meeting.inviteesFailed");
     }
-    const p2 = new Map<string, string | number>();
-    p2.set("count", ok);
-    p2.set("failed", failed);
-    return tOf("Mobile.Meeting.inviteesSentPartial", p2);
   }
 
   /**
